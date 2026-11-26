@@ -397,7 +397,23 @@ fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     }
 }
 
-/// A `/v1/completions` request lowered onto the gRPC pipeline.
+/// One prompt sequence after lowering, before any router-side tokenize.
+///
+/// Text prompts are encoded by the frontend (once, outside policy and
+/// retry); client ids pass through untouched. A batched request lowers to
+/// one entry per prompt, in client order; dispatching more than one is
+/// Stage 3's fan-out, not this lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionPrompt {
+    Ids(Vec<u32>),
+    Text(String),
+}
+
+/// A `/v1/completions` request lowered onto the gRPC pipeline: token ids only.
+///
+/// This is the lower the gRPC P/D completions path shares (`#563`): it reads
+/// `token_ids` straight off the result, so this struct keeps that field and
+/// this function keeps rejecting anything but a single `list[int]`.
 #[derive(Debug)]
 pub struct PreparedCompletion {
     pub chat: ChatCompletionRequest,
@@ -405,28 +421,70 @@ pub struct PreparedCompletion {
     pub emit_token_ids: bool,
 }
 
-/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+/// A `/v1/completions` request lowered for the regular-pool path: one entry
+/// per prompt sequence, text included.
 ///
-/// The gRPC wire protocol is token_ids-only, so the client's ids go straight
-/// through: no chat template and no router-side tokenize. Fields without a
-/// chat-shape equivalent are rejected — dropping them would answer a different
-/// request than the client sent.
-pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCompletion, String> {
-    let PromptInput::IntArray(ids) = &request.prompt else {
-        return Err(
-            "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
-        );
-    };
-    if ids.is_empty() {
-        return Err("completion prompt token_ids must not be empty".to_string());
-    }
-    let token_ids = ids
-        .iter()
+/// Only `EngineFrontend::prepare_completions` calls this lower; the gRPC P/D
+/// route never does, so a `Text` entry can never reach it.
+#[derive(Debug)]
+pub struct PreparedCompletionPrompts {
+    pub chat: ChatCompletionRequest,
+    pub prompts: Vec<CompletionPrompt>,
+    pub emit_token_ids: bool,
+}
+
+fn completion_ids(ids: &[i32]) -> Result<Vec<u32>, String> {
+    ids.iter()
         .map(|id| {
             u32::try_from(*id)
                 .map_err(|_| format!("prompt token ids must be non-negative 32-bit integers: {id}"))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect()
+}
+
+/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+///
+/// The gRPC wire protocol is token_ids-only. Token-id prompts go straight
+/// through; text prompts are lowered to `CompletionPrompt::Text` for the
+/// frontend to encode once with the model tokenizer — no chat template is
+/// applied. Fields without a chat-shape equivalent are rejected — dropping
+/// them would answer a different request than the client sent.
+///
+/// Regular-pool path only: the gRPC P/D completions path (`#563`) calls the
+/// token-id-only `prepare_grpc_completion` instead, so text never flows
+/// through a function that path reads.
+pub fn prepare_grpc_completion_prompts(
+    request: &CompletionRequest,
+) -> Result<PreparedCompletionPrompts, String> {
+    let prompts = match &request.prompt {
+        PromptInput::String(text) => vec![CompletionPrompt::Text(text.clone())],
+        PromptInput::StringArray(texts) => {
+            if texts.is_empty() {
+                return Err("completion prompt must not be empty".to_string());
+            }
+            texts.iter().cloned().map(CompletionPrompt::Text).collect()
+        }
+        PromptInput::IntArray(ids) => {
+            if ids.is_empty() {
+                return Err("completion prompt token_ids must not be empty".to_string());
+            }
+            vec![CompletionPrompt::Ids(completion_ids(ids)?)]
+        }
+        PromptInput::IntBatch(batch) => {
+            if batch.is_empty() {
+                return Err("completion prompt must not be empty".to_string());
+            }
+            batch
+                .iter()
+                .map(|ids| {
+                    if ids.is_empty() {
+                        return Err("completion prompt token_ids must not be empty".to_string());
+                    }
+                    completion_ids(ids).map(CompletionPrompt::Ids)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
     let rejected: [(&str, bool, Option<&str>); 7] = [
         ("suffix", request.suffix.is_some(), None),
         ("best_of", request.best_of.is_some(), None),
@@ -519,6 +577,40 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
         other,
         ..Default::default()
     };
+    Ok(PreparedCompletionPrompts {
+        chat,
+        prompts,
+        emit_token_ids,
+    })
+}
+
+/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+///
+/// Token ids only: this is the lower the gRPC P/D completions path (`#563`)
+/// shares — it reads `lowered.token_ids` straight off the result. Text and
+/// batched prompts are rejected here; text goes through
+/// `prepare_grpc_completion_prompts` on the regular-pool path, which the P/D
+/// route never calls.
+pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCompletion, String> {
+    let PromptInput::IntArray(ids) = &request.prompt else {
+        return Err(
+            "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
+        );
+    };
+    if ids.is_empty() {
+        return Err("completion prompt token_ids must not be empty".to_string());
+    }
+    let lowered = prepare_grpc_completion_prompts(request)?;
+    let PreparedCompletionPrompts {
+        chat,
+        mut prompts,
+        emit_token_ids,
+    } = lowered;
+    let token_ids = match prompts.pop() {
+        Some(CompletionPrompt::Ids(ids)) if prompts.is_empty() => ids,
+        // An `IntArray` lowers to exactly one `Ids` entry.
+        _ => unreachable!("IntArray lowers to exactly one Ids prompt"),
+    };
     Ok(PreparedCompletion {
         chat,
         token_ids,
@@ -533,6 +625,62 @@ mod tests {
 
     fn chat(json: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(json).unwrap()
+    }
+
+    fn completion_request(prompt: serde_json::Value) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({"prompt": prompt})).unwrap()
+    }
+
+    #[test]
+    fn completion_prompts_lowering_accepts_all_four_prompt_forms() {
+        let request = completion_request(serde_json::json!("hello"));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![CompletionPrompt::Text("hello".to_string())]
+        );
+
+        let request = completion_request(serde_json::json!(["first", "second"]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![
+                CompletionPrompt::Text("first".to_string()),
+                CompletionPrompt::Text("second".to_string()),
+            ]
+        );
+
+        let request = completion_request(serde_json::json!([1, 2]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(lowered.prompts, vec![CompletionPrompt::Ids(vec![1, 2])]);
+
+        let request = completion_request(serde_json::json!([[1], [2, 3]]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![
+                CompletionPrompt::Ids(vec![1]),
+                CompletionPrompt::Ids(vec![2, 3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_prompts_lowering_rejects_empty_and_negative_prompts() {
+        for prompt in [
+            serde_json::json!([]),
+            serde_json::json!([[]]),
+            serde_json::json!([[1], []]),
+        ] {
+            let request = completion_request(prompt);
+            let error = prepare_grpc_completion_prompts(&request).unwrap_err();
+            assert!(error.contains("must not be empty"), "{error}");
+        }
+        for prompt in [serde_json::json!([1, -2]), serde_json::json!([[1], [-1]])] {
+            let request = completion_request(prompt);
+            let error = prepare_grpc_completion_prompts(&request).unwrap_err();
+            assert!(error.contains("non-negative 32-bit integers"), "{error}");
+        }
     }
 
     #[test]
@@ -579,6 +727,35 @@ mod tests {
         assert_eq!(proto.temperature, Some(0.2));
         assert_eq!(proto.model, "qwen");
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    fn vllm_xargs_is_accepted_as_router_plane_identity_and_dropped() {
+        // The canonical Program identity travels in `vllm_xargs`; the gRPC
+        // adapter must accept it for the HTTP layer to read, and must not
+        // forward it as an Engine field.
+        let req = chat(serde_json::json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program-a",
+                "expected_resume": true
+            }}
+        }));
+        let proto = chat_to_generate_request(&req, vec![5, 6], "req-2".into()).unwrap();
+        match proto.prompt.unwrap() {
+            pb::generate_request::Prompt::TokenIds(ids) => assert_eq!(ids.ids, vec![5, 6]),
+            other => panic!("expected token_ids, got {other:?}"),
+        }
+        // The typed request still exposes the identity to the scheduler.
+        let payload =
+            crate::protocols::spec::GenerationRequest::extract_program_identity_payload(&req)
+                .unwrap();
+        assert_eq!(
+            payload["vllm_xargs"]["agentic_context"]["program_id"],
+            "program-a"
+        );
     }
 
     #[test]
@@ -829,9 +1006,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_prompts_without_usable_token_ids() {
-        let text = prepare_grpc_completion(&completion(serde_json::json!({"prompt": "hello"})))
-            .unwrap_err();
+    fn accepts_text_prompts_but_rejects_negative_ids() {
+        // Stage 1: a text prompt lowers to `Text` for the frontend to encode,
+        // on the regular-pool path only; the shared token-id lower still
+        // rejects it for not being `list[int]`.
+        let request = completion(serde_json::json!({"prompt": "hello"}));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![CompletionPrompt::Text("hello".to_string())]
+        );
+        let text = prepare_grpc_completion(&request).unwrap_err();
         assert!(text.contains("list[int]"), "{text}");
 
         let negative = prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1, -2]})))

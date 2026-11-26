@@ -36,6 +36,8 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         epd: None,
         mode: RoutingMode::Regular { worker_urls },
         pd_kv_event_sources: Default::default(),
+        pd_worker_pairs: Default::default(),
+        kv_event_strict_recovery: false,
         policy: PolicyConfig::RoundRobin,
         host: "127.0.0.1".to_string(),
         port: 3002,
@@ -663,10 +665,13 @@ async fn grpc_completions_reply_carries_token_ids_when_requested() {
 async fn grpc_completions_rejects_unsupported_requests() {
     let (grpc, app) = completion_app(MockVllmRs::default()).await;
 
+    // Text prompts are NOT in this list: Stage 1 (#592) accepts them on the
+    // regular gRPC pool (tokenized via prepare_completions); the positive
+    // coverage lives in grpc_completion_frontend.rs. A singleton batch
+    // ([[1, 2]]) is NOT in this list either: Stage 1 routes it like the
+    // flat form (one sequence), so it dispatches instead of 400ing.
     for body in [
         json!({"model": "test-model", "prompt": [1, -2, 3], "max_tokens": 8}),
-        json!({"model": "test-model", "prompt": "hello", "max_tokens": 8}),
-        json!({"model": "test-model", "prompt": [[1, 2]], "max_tokens": 8}),
         json!({"model": "test-model", "prompt": [1, 2, 3], "suffix": "tail"}),
         json!({"model": "test-model", "prompt": [1, 2, 3], "documents": [{"content": "x"}]}),
         json!({"model": "test-model", "prompt": [1, 2, 3], "guided_decoding_backend": "xgrammar"}),

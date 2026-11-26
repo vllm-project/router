@@ -8,6 +8,7 @@ from typing import Optional
 import pytest
 import requests
 
+from tests.python.helpers.process import graceful_stop
 from tools.e2e.vllm_test_compat import (
     import_run_eval,
     vllm_worker_command,
@@ -112,18 +113,6 @@ def _popen_launch_decode_worker(
     return SimpleNamespace(proc=proc, url=url)
 
 
-def _terminate(proc: subprocess.Popen, timeout: float = 120) -> None:
-    if proc is None:
-        return
-    proc.terminate()
-    start = time.perf_counter()
-    while proc.poll() is None:
-        if time.perf_counter() - start > timeout:
-            proc.kill()
-            break
-        time.sleep(1)
-
-
 @pytest.fixture(scope="module")
 def pd_cluster(e2e_model: str):
     """Start 2 prefill + 2 decode workers and one PD router, once per module."""
@@ -206,9 +195,9 @@ def pd_cluster(e2e_model: str):
         )
     finally:
         if router_proc is not None:
-            _terminate(router_proc)
+            graceful_stop(router_proc)
         for w in workers:
-            _terminate(w.proc)
+            graceful_stop(w.proc)
 
 
 @pytest.mark.e2e
