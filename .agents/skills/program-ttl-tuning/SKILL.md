@@ -11,10 +11,9 @@ eviction pressure. When capacity is comfortable, the feature can add wall-clock
 cost without a hit-rate gain. This skill sequences the work so that a negative
 result is attributable to the algorithm rather than to a wrongly set knob.
 
-Field semantics, defaults, and metric definitions are in
-[`docs/program_scheduling/program-scheduling.md`](../../../docs/program_scheduling/program-scheduling.md). This skill
-does not restate them; it covers order of operations, decision thresholds, and
-the failure modes that are easy to mistake for "no benefit".
+Follow the [reference workflow](../../../docs/program_scheduling/program-scheduling.md#performance-tuning-workflow)
+for baseline comparability, cache protection, and regression checks. This skill
+adds calibration steps, parameter sweeps, and deployment criteria.
 
 For a sample invocation, replay commands, and a deployment decision table, see
 [Tuning DeepSeek V4 Flash on Ascend A3](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md).
@@ -117,18 +116,14 @@ Match `--intra-node-data-parallel-size` to the engine layout.
   `rolling.request_samples` / `rolling.continuity_samples`. For a separate
   warm-state comparison, document equivalent warmup histories and scheduler
   state in both arms; do not present an engine-only restart as a cold start.
-- Hold the task set (same IDs and order), concurrency, sampling, engine
-  context-length and memory-utilization settings, and node count fixed. Once
-  concurrency is chosen, it is no longer a variable.
+- Follow the [baseline controls](../../../docs/program_scheduling/program-scheduling.md#establish-a-comparable-pressure-point)
+  and keep the node count fixed across arms.
 
 ### 1.3 The baseline has eviction pressure
 
-Measure the baseline token hit rate from counter increases across workers.
-For a controlled pressure sweep, roughly 80–88% is a useful starting point.
-For a deployment decision, keep normal concurrency and capacity and compare
-task completion and tail latency even when the baseline falls outside the band.
-
-Use the [prompt-token metric definition](../../../docs/program_scheduling/program-scheduling.md#establish-a-comparable-pressure-point).
+Use the [worker-counter query](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#3-use-the-replay-logs-to-evaluate-and-diagnose-the-configuration)
+for the pressure sweep in section 3.5. Make the deployment comparison at normal
+concurrency and capacity, including when the baseline falls outside the sweep band.
 
 ## 2. Three quantities to measure first
 
@@ -301,8 +296,8 @@ changes dominate everything.
 
 ## 5. Symptom to first knob
 
-Mechanism side, use `vllm_router_agent_aware_*` Prometheus metrics,
-`/scheduling/diagnostics`, and Router INFO logs as identified below:
+Use the [KV protection checks](../../../docs/program_scheduling/program-scheduling.md#verify-kv-protection-before-tuning-admission)
+to identify the symptom, then use the table to choose the next experiment.
 
 | Observation | Likely cause | First change |
 |---|---|---|
@@ -312,8 +307,9 @@ Mechanism side, use `vllm_router_agent_aware_*` Prometheus metrics,
 | `capacity_accounting_source` falls back (diagnostics) | missing engine labels or stale observations | verify per-engine metric labels, single API server per worker, idle run before traffic |
 | admits but no pauses and no hit gain | pressure too low, or Programs too short | return to section 3.5 |
 
-End-to-end side, from the run summary plus `rank_queue_size` /
-`queue_wait_seconds` (`JCT` is job completion time):
+For a job completion time (JCT) regression, collect the
+[queue and capacity signals](../../../docs/program_scheduling/program-scheduling.md#diagnose-throughput-or-job-completion-regressions)
+before choosing a change below.
 
 | Observation | Meaning | Ordered changes |
 |---|---|---|
@@ -339,14 +335,10 @@ is known.
 
 ## 6. Evidence standard and stop conditions
 
-Three layers are required. A hit-rate increase alone is a mechanism result, not
-an end-to-end result.
-
-| Layer | Evidence |
-|---|---|
-| Mechanism | token cache hit ratio moves; logical armed TTL is non-zero and consistent with the calibration; pause reasons match the workload's gap distribution. These signals do not establish physical KV residency; a residency claim needs independent engine evidence |
-| End to end | job completion time p50/p95 and wall time do not regress; TTFT p95 does not regress |
-| Correctness and cost | resolved/completed tasks do not degrade (paired test); input and output token volume stays comparable |
+Report the [reference workflow's measurements](../../../docs/program_scheduling/program-scheduling.md#diagnose-throughput-or-job-completion-regressions)
+for each paired run. Check p50/p95 JCT, wall time, p95 TTFT, and resolved or
+completed tasks for regressions, with comparable input and output token counts.
+To attribute a gain to retention, use the C0 comparison in section 8.
 
 Stop and record a negative result when any of these hold:
 
