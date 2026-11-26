@@ -6,22 +6,22 @@ use http::{header::CONTENT_ENCODING, HeaderMap, StatusCode};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use super::{CompletionHistoryRequest, HistoryObservation};
+use super::completion_output::{observe_body_with, CompletionOutputObserver};
 use crate::{
     backend::{preprocess::completion_cache_read_fallback, WorkerPoolKind},
     core::{Worker, WorkerRegistry},
-    policies::{kv_aware_ops, LoadBalancingPolicy},
+    policies::{kv_aware_ops, CompletionHistoryRequest, HistoryObservation, LoadBalancingPolicy},
     protocols::spec::{CompletionRequest, GenerationRequest, GrpcRequestRef, PromptInput},
 };
 
-pub(crate) struct KvAwareHistoryHook;
+pub(super) struct KvAwareHistoryHook;
 
-pub(crate) struct HistoryCapture {
+pub(super) struct HistoryCapture {
     request: CompletionHistoryRequest,
     echo: bool,
 }
 
-pub(crate) struct HistoryAttempt {
+pub(super) struct HistoryAttempt {
     policy: Arc<dyn LoadBalancingPolicy>,
     observation: HistoryObservation,
     registry: Arc<WorkerRegistry>,
@@ -31,7 +31,7 @@ pub(crate) struct HistoryAttempt {
 
 impl KvAwareHistoryHook {
     // Freeze the registrations before the first input-preparation await.
-    pub(crate) fn capture(
+    pub(super) fn capture(
         enabled: bool,
         pool: Option<WorkerPoolKind>,
         request: &impl GenerationRequest,
@@ -86,11 +86,11 @@ fn completion_history_input(request: &CompletionRequest) -> bool {
 }
 
 impl HistoryCapture {
-    pub(crate) fn allow_cache_read(self, fallback: Option<&str>) -> Option<Self> {
+    pub(super) fn allow_cache_read(self, fallback: Option<&str>) -> Option<Self> {
         fallback.is_none().then_some(self)
     }
 
-    pub(crate) fn request(
+    pub(super) fn request(
         &self,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
@@ -99,7 +99,7 @@ impl HistoryCapture {
     }
 
     // Only the actual policy selection can mint the observation for an attempt.
-    pub(crate) fn bind(
+    pub(super) fn bind(
         &self,
         observation: HistoryObservation,
         policy: Arc<dyn LoadBalancingPolicy>,
@@ -117,7 +117,7 @@ impl HistoryCapture {
 }
 
 impl HistoryAttempt {
-    pub(crate) fn for_http_response(
+    pub(super) fn for_http_response(
         self,
         route: &str,
         stream: bool,
@@ -143,10 +143,11 @@ impl HistoryAttempt {
         Some(HttpHistoryAttempt {
             attempt: self,
             output,
+            observer: CompletionOutputObserver::new(false),
         })
     }
 
-    pub(crate) fn grpc_callback(self) -> impl Fn() + Send + Sync + 'static {
+    pub(super) fn grpc_callback(self) -> impl Fn() + Send + Sync + 'static {
         let pending = Mutex::new(Some(self));
         move || {
             let attempt = pending.lock().take();
@@ -167,17 +168,24 @@ impl HistoryAttempt {
     }
 }
 
-pub(crate) struct HttpHistoryAttempt {
+pub(super) struct HttpHistoryAttempt {
     attempt: HistoryAttempt,
     output: HistoryOutput,
+    observer: CompletionOutputObserver,
 }
 
 impl HttpHistoryAttempt {
-    pub(crate) fn inspect(&self, event_type: Option<&[u8]>, data: &[u8]) -> ControlFlow<bool> {
-        self.output.inspect(event_type, data)
+    pub(super) fn observe(&mut self, chunk: &[u8]) -> bool {
+        let output = self.output;
+        self.observer
+            .observe_with(chunk, |event, data| output.inspect(event, data))
     }
 
-    pub(crate) fn commit(self) {
+    pub(super) fn observe_body(&self, body: &[u8]) -> bool {
+        observe_body_with(body, |event, data| self.output.inspect(event, data))
+    }
+
+    pub(super) fn commit(self) {
         self.attempt.commit();
     }
 }

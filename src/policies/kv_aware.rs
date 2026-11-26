@@ -25,13 +25,17 @@ use crate::request_identity::StableIdentity;
 pub use crate::kv_index::TieredMatchProvider;
 
 mod history;
-mod history_hook;
 pub use crate::kv_index::prefix_history::HistoryObservation;
-pub(crate) use history_hook::{HistoryAttempt, HistoryCapture, KvAwareHistoryHook};
 
 /// Confirms that a rank still belongs to the owner captured at registration.
 /// Temporary loss of placement trust does not end that registration.
 pub trait RegistrationCurrent: Send + Sync {
+    /// Perform a short, synchronous check. The policy may hold selection or
+    /// reservation locks or a targets read guard when calling this method.
+    /// A short provider lifecycle mutex is allowed, but implementations must
+    /// not reenter the policy, perform blocking I/O, or wait for external async
+    /// work. Keep lock acquisition ordered from consumer to provider: never
+    /// call the consumer while holding the provider lock.
     fn current(&self, rank: u32) -> bool;
 }
 
@@ -223,6 +227,8 @@ pub trait KvAwareOps: Send + Sync {
     fn unregister_worker(&self, worker_url: &str);
     /// Register the actual Worker object atomically with its generation.
     /// Implementations without history retain ordinary registration behavior.
+    /// A supplied guard must obey the locking contract of
+    /// [`RegistrationCurrent::current`].
     fn register_history_worker(
         &self,
         worker: &Arc<dyn Worker>,
@@ -5111,6 +5117,20 @@ mod tests {
         assert!(captured
             .registration_id(workers[0].as_ref(), &new_binding)
             .is_none());
+        assert!(
+            policy
+                .completion_history
+                .get()
+                .unwrap()
+                .match_prefix(
+                    old_binding.registration_id,
+                    &inputs[workers[0].base_url()][0],
+                    new_binding.block_size,
+                    Instant::now(),
+                )
+                .is_none(),
+            "late output must not recreate history under the retired registration"
+        );
         assert!(policy
             .completion_history
             .get()

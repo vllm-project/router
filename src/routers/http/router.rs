@@ -1,5 +1,5 @@
-use super::completion_output::{observe_body_with, CompletionOutputObserver};
 use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
+use super::history_hook::{HistoryAttempt, HistoryCapture, KvAwareHistoryHook};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
@@ -32,9 +32,7 @@ use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
     PolicyRegistry,
 };
-use crate::policies::{
-    HistoryAttempt, HistoryCapture, KvAwareHistoryHook, QualifiedKvInput, SelectionIdentity,
-};
+use crate::policies::{QualifiedKvInput, SelectionIdentity};
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
     ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
@@ -2691,9 +2689,7 @@ impl Router {
                     if let Some(completion) = &program_completion {
                         completion.observe_json(&body);
                     }
-                    if let Some(attempt) = history.filter(|attempt| {
-                        observe_body_with(&body, |event, data| attempt.inspect(event, data))
-                    }) {
+                    if let Some(attempt) = history.filter(|attempt| attempt.observe_body(&body)) {
                         attempt.commit();
                     }
                     let mut response = Response::new(axum::body::Body::from(body));
@@ -2714,8 +2710,7 @@ impl Router {
             response
         } else if load_incremented {
             let mut completion_output = completion.map(|input| input.output_observer(status));
-            let mut history =
-                history.map(|attempt| (attempt, CompletionOutputObserver::new(false)));
+            let mut history = history;
             // The forwarding task and response body share one cleanup receipt.
             let completion = if status.is_success() {
                 program_completion
@@ -2810,12 +2805,9 @@ impl Router {
                                 },
                                 None => bytes,
                             };
-                            let history_ready =
-                                history.as_mut().is_some_and(|(attempt, observer)| {
-                                    observer.observe_with(&outgoing, |event, data| {
-                                        attempt.inspect(event, data)
-                                    })
-                                });
+                            let history_ready = history
+                                .as_mut()
+                                .is_some_and(|attempt| attempt.observe(&outgoing));
                             let sent = match producer_output_frame.as_mut() {
                                 Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
                                 None => tx.send(Ok(outgoing)).is_ok(),
@@ -2824,7 +2816,7 @@ impl Router {
                                 stream_succeeded = false;
                                 break;
                             }
-                            if let Some((attempt, _)) = history.take_if(|_| history_ready) {
+                            if let Some(attempt) = history.take_if(|_| history_ready) {
                                 attempt.commit();
                             }
                             if has_output {
@@ -6510,6 +6502,14 @@ mod tests {
             ),
             ("echo", true, true, None, HISTORY_TEST_OUTPUT, b""),
             ("gzip", true, false, Some("gzip"), GZIP_OUTPUT, b""),
+            (
+                "declared gzip with parseable SSE",
+                true,
+                false,
+                Some("gzip"),
+                HISTORY_TEST_OUTPUT,
+                b"",
+            ),
             ("empty choices", false, false, None, b"{\"choices\":[]}", b""),
             ("malformed JSON", false, false, None, b"{\"choices\":[{\"text\":\"partial\"}", b""),
         ]

@@ -13,6 +13,11 @@ const MAX_ENTRIES: usize = 128;
 const PREFIX_TOKENS: usize = 256;
 const TTL: Duration = Duration::from_secs(60);
 
+/// A registration-scoped token prefix captured during worker selection and
+/// eligible to be committed only after an actual generated-output milestone.
+///
+/// This is not evidence of engine cache residency and is unrelated to
+/// Responses `HistoryBackend` storage.
 pub struct HistoryObservation {
     pub(crate) registration_id: u64,
     prefix: Arc<[u32]>,

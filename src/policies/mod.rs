@@ -28,6 +28,7 @@ pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use kv_aware::kv_aware_policy;
+pub(crate) use kv_aware::QualifiedKvInput;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView,
     CompletionHistoryRequest, CostComponents, CostDecision, CostParams, DecodeWorkEstimate,
@@ -37,7 +38,6 @@ pub use kv_aware::{
     SelectionError, SelectionIdentity, SlotManager, StagePick, TemperaturePicker,
     TieredMatchProvider, TransferCredits, WorkerTokenInputs,
 };
-pub(crate) use kv_aware::{HistoryAttempt, HistoryCapture, KvAwareHistoryHook, QualifiedKvInput};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
