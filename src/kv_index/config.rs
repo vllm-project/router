@@ -361,11 +361,10 @@ impl StaticKvEventSources {
 }
 
 fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
-    if endpoint
-        .strip_prefix("ipc://")
-        .is_some_and(|path| !path.is_empty())
-    {
-        return Ok(());
+    match endpoint.strip_prefix("ipc://") {
+        Some(path) if !path.is_empty() => return Ok(()),
+        Some(_) => return Err("ipc:// requires a non-empty path".into()),
+        None => {}
     }
     crate::kv_index::canonical_endpoint(endpoint).map(|_| ())
 }

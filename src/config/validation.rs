@@ -1966,7 +1966,7 @@ mod tests {
                 16,
                 "without credentials or paths",
             ),
-            (vec!["ipc://".into()], 16, "without credentials or paths"),
+            (vec!["ipc://".into()], 16, "requires a non-empty path"),
             (vec![], 16, "no endpoints"),
             (vec!["tcp://prefill:5557".to_string()], 0, "block_size"),
         ] {
