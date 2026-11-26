@@ -635,7 +635,7 @@ Both the Rust and Python launchers accept these options. Configure vLLM workers 
 | `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
 | `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
 | `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
-| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Use `mooncake-v2` with Ascend `MooncakeConnectorV2`. MoRI-IO requires vLLM ZMQ discovery. |
+| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` only with vLLM-Ascend's `MooncakeConnectorV2` in pull mode. |
 | `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
 | `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |
 | `--kv-hybrid-layout` | JSON file path | Unset | Supply cache groups, hashing, and reuse rules when the Router cannot derive them or read them from the worker. |
