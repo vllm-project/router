@@ -7,6 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -30,6 +31,49 @@ def _tee(stream, tail: Deque[str]) -> None:
         sys.__stderr__.write(line)
         sys.__stderr__.flush()
         tail.append(line)
+
+
+def _owns_listener(pid: int, port: int) -> Optional[bool]:
+    """Whether pid or a descendant holds a LISTEN socket on port.
+
+    Returns None without Linux /proc, so callers can skip the check.
+    """
+    if not os.path.exists("/proc/net/tcp"):
+        return None
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            # local_address is HEX_IP:HEX_PORT, st 0A is LISTEN, field 9 is inode.
+            fields = row.split()
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(f"socket:[{fields[9]}]")
+    pids = [pid]
+    while pids:
+        p = pids.pop()
+        # Any of these can vanish mid-scan if the process exits.
+        try:
+            fds = os.listdir(f"/proc/{p}/fd")
+            tasks = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{p}/fd/{fd}") in inodes:
+                    return True
+            except OSError:
+                pass
+        for task in tasks:
+            try:
+                with open(f"/proc/{p}/task/{task}/children") as f:
+                    pids.extend(int(child) for child in f.read().split())
+            except OSError:
+                pass
+    return False
 
 
 class RouterManager:
@@ -230,7 +274,13 @@ class RouterManager:
                     raise _RouterExited
                 try:
                     r = s.get(f"{base_url}/health", timeout=2)
-                    if r.status_code == 200:
+                    # Another process can win the port and answer for a child
+                    # that is about to exit on its failed bind.
+                    if r.status_code == 200 and (
+                        proc is None
+                        or _owns_listener(proc.pid, urlparse(base_url).port)
+                        is not False
+                    ):
                         return
                 except requests.RequestException:
                     pass

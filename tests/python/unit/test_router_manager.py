@@ -2,7 +2,9 @@ import io
 import socket
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock
 
 import pytest
@@ -123,6 +125,7 @@ FAKE_ROUTER = """\
 import argparse
 import socket
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 parser = argparse.ArgumentParser()
@@ -146,7 +149,9 @@ try:
     prom = socket.create_server(("127.0.0.1", args.prometheus_port), reuse_port=False)
     server = HTTPServer(("127.0.0.1", args.port), Health)
 except OSError:
-    print("Address already in use", flush=True)
+    # Exit like the real router: a moment after startup, with its bind error.
+    time.sleep(0.5)
+    print('Error: Os { code: 98, kind: AddrInUse, message: "Address already in use" }')
     sys.exit(1)
 server.serve_forever()
 """
@@ -201,3 +206,55 @@ def test_start_router_raises_on_crash_without_port_clash(tmp_path):
         assert manager._children == []
     finally:
         manager.stop_all()
+
+
+class _Healthy(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="listener ownership uses /proc")
+def test_start_router_ignores_health_from_port_squatter(monkeypatch, tmp_path):
+    release = router_manager.release_all_port_holders
+    squatters = []
+
+    def release_then_squat_api_port(holders):
+        port = holders[0].getsockname()[1] if holders else None
+        release(holders)
+        if port and not squatters:
+            # Another router wins the API port and answers /health with 200.
+            squatter = HTTPServer(("127.0.0.1", port), _Healthy)
+            threading.Thread(target=squatter.serve_forever, daemon=True).start()
+            squatters.append(squatter)
+
+    popen = subprocess.Popen
+    procs = []
+
+    def record_popen(*args, **kwargs):
+        procs.append(popen(*args, **kwargs))
+        return procs[-1]
+
+    monkeypatch.setattr(
+        router_manager, "release_all_port_holders", release_then_squat_api_port
+    )
+    monkeypatch.setattr(router_manager.subprocess, "Popen", record_popen)
+    manager = router_manager.RouterManager()
+    try:
+        handle = manager.start_router(
+            router_bin=_fake_router(tmp_path, SERVE), timeout=10
+        )
+        port = int(handle.url.rsplit(":", 1)[1])
+        assert len(procs) == 2
+        assert procs[0].returncode == 1
+        assert handle.process is procs[1]
+        assert port != squatters[0].server_address[1]
+        assert router_manager._owns_listener(handle.process.pid, port) is True
+    finally:
+        manager.stop_all()
+        for squatter in squatters:
+            squatter.shutdown()
+            squatter.server_close()
