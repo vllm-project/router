@@ -1096,6 +1096,7 @@ struct SelectionPlan {
     /// lookup, aligned by position. `Some` only when a transfer planner is set,
     /// the candidate has exactly one prompt, and its lookup was allowed to
     /// credit; `None` means the candidate's prompt residency is unknown.
+    /// Empty when no planner is set, so read it with `get`.
     peer_hits: Vec<Option<Arc<[TierMatch]>>>,
     has_tokens: bool,
 }
@@ -2047,7 +2048,10 @@ impl KvAwarePolicy {
             planner.plan(&PeerFetchPlannerInput {
                 peers: &peers,
                 picked: position,
-                destination_hits: plan.peer_hits[position].as_deref(),
+                destination_hits: plan
+                    .peer_hits
+                    .get(position)
+                    .and_then(|hits| hits.as_deref()),
                 cost_params: &self.params,
             })
         };
