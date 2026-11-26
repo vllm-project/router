@@ -25,7 +25,8 @@ use vllm_router_rs::backend::pb::{
     control_server::{Control, ControlServer},
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
-    FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
+    CandidateTokenInfo, FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, ResponseOptions,
+    SequenceOutput, TokenIds,
 };
 
 #[derive(Clone, Default)]
@@ -43,6 +44,16 @@ pub struct CapturedGrpcGenerate {
     /// `x-data-parallel-rank` request metadata.
     pub dp_rank: Option<String>,
     pub received_at: Option<Instant>,
+    /// `GenerateRequest.response` as received.
+    pub response_options: Option<ResponseOptions>,
+}
+
+/// Per-position logprobs for one streamed frame (or the prompt info).
+#[derive(Clone, Default)]
+pub struct FrameLogprobs {
+    pub logprobs: Vec<f32>,
+    pub ranks: Vec<u32>,
+    pub candidates: Vec<CandidateTokenInfo>,
 }
 
 #[derive(Clone)]
@@ -53,6 +64,18 @@ pub struct MockVllmRs {
     /// `finish_info`. `None` sends a single frame: `reply_text` + `[7, 8, 9]`.
     /// Empty text with non-empty ids reproduces a buffered decoder fragment.
     pub frames: Option<Vec<(String, Vec<u32>)>>,
+    /// Per-frame logprobs/ranks/candidates, aligned with `frames` by index.
+    pub frame_logprobs: Option<Vec<FrameLogprobs>>,
+    /// Emit one `-0.1` prompt logprob per prompt token in `PromptInfo`.
+    pub emit_prompt_logprobs: bool,
+    /// Send `PromptInfo` after the first output frame instead of before it,
+    /// as a non-conforming engine might.
+    pub prompt_info_after_first_frame: bool,
+    /// A request for zero new tokens gets a single empty finish frame, as a
+    /// real engine answers `max_tokens: 0`. Off by default: `max_new_tokens`
+    /// is 0 for most requests (the client set no limit), so this must never
+    /// apply unless a test asks for it.
+    pub zero_max_tokens_returns_empty: bool,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
     /// Returned in `FinishInfo.kv_transfer_params`, as a P/D prefill engine does.
@@ -124,6 +147,10 @@ impl Default for MockVllmRs {
             captured: Arc::new(Mutex::new(Vec::new())),
             reply_text: "hello from worker".to_string(),
             frames: None,
+            frame_logprobs: None,
+            emit_prompt_logprobs: false,
+            prompt_info_after_first_frame: false,
+            zero_max_tokens_returns_empty: false,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
             finish_kv_transfer_params: None,
@@ -289,6 +316,11 @@ impl Inference for MockVllmRs {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let req = request.into_inner();
+        let max_new_tokens = req
+            .stopping
+            .as_ref()
+            .map(|stopping| stopping.max_new_tokens)
+            .unwrap_or(0);
         let (token_ids, had_text_prompt) = match req.prompt {
             Some(generate_request::Prompt::TokenIds(TokenIds { ids })) => (ids, false),
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
@@ -317,6 +349,7 @@ impl Inference for MockVllmRs {
                     unary: false,
                     dp_rank,
                     received_at: Some(Instant::now()),
+                    response_options: req.response.clone(),
                 });
             }
         }
@@ -333,10 +366,13 @@ impl Inference for MockVllmRs {
         }
 
         let (tx, rx) = mpsc::channel(4);
-        let frames = self
-            .frames
-            .clone()
-            .unwrap_or_else(|| vec![(self.reply_text.clone(), vec![7, 8, 9])]);
+        let frames = if self.zero_max_tokens_returns_empty && max_new_tokens == 0 {
+            vec![(String::new(), Vec::new())]
+        } else {
+            self.frames
+                .clone()
+                .unwrap_or_else(|| vec![(self.reply_text.clone(), vec![7, 8, 9])])
+        };
         let n_prompt = token_ids.len() as u32;
         let finish_kv = self
             .finish_kv_transfer_params
@@ -344,6 +380,9 @@ impl Inference for MockVllmRs {
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
         let cancelled = self.cancelled.clone();
+        let frame_logprobs = self.frame_logprobs.clone();
+        let emit_prompt_logprobs = self.emit_prompt_logprobs;
+        let prompt_info_after_first_frame = self.prompt_info_after_first_frame;
         let fail_stream = self
             .stream_failures_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -365,15 +404,26 @@ impl Inference for MockVllmRs {
                     return;
                 }
             }
-            let _ = tx
-                .send(Ok(GenerateResponse {
-                    prompt_info: Some(PromptInfo {
-                        num_prompt_tokens: n_prompt,
-                        ..Default::default()
-                    }),
-                    outputs: None,
-                }))
-                .await;
+            let prompt_info = || GenerateResponse {
+                prompt_info: Some(PromptInfo {
+                    num_prompt_tokens: n_prompt,
+                    logprobs: if emit_prompt_logprobs {
+                        vec![-0.1; n_prompt as usize]
+                    } else {
+                        Vec::new()
+                    },
+                    ranks: if emit_prompt_logprobs {
+                        vec![1; n_prompt as usize]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }),
+                outputs: None,
+            };
+            if !prompt_info_after_first_frame {
+                let _ = tx.send(Ok(prompt_info())).await;
+            }
             if fail_stream {
                 let _ = tx.send(Err(Status::internal("decode failed"))).await;
                 return;
@@ -396,6 +446,21 @@ impl Inference for MockVllmRs {
                             text,
                             num_tokens: token_ids.len() as u32,
                             token_ids,
+                            logprobs: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.logprobs.clone())
+                                .unwrap_or_default(),
+                            ranks: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.ranks.clone())
+                                .unwrap_or_default(),
+                            candidate_tokens: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.candidates.clone())
+                                .unwrap_or_default(),
                             finish_info,
                             ..Default::default()
                         }),
@@ -403,6 +468,9 @@ impl Inference for MockVllmRs {
                     .await;
                 if sent.is_err() {
                     break;
+                }
+                if prompt_info_after_first_frame && index == 0 {
+                    let _ = tx.send(Ok(prompt_info())).await;
                 }
             }
         });

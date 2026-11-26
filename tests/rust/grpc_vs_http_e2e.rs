@@ -583,6 +583,48 @@ async fn grpc_completions_stream_carries_text_and_token_ids() {
     );
 }
 
+/// Echo-only streaming answers with zero generated tokens: the engine's
+/// one token is dropped, so the usage chunk must report zero completion
+/// tokens (the physical count stays with the engine observer only).
+#[tokio::test]
+async fn grpc_completions_echo_only_stream_reports_zero_completion_tokens() {
+    let (_grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(
+        app,
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "echo": true,
+            "max_tokens": 0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let text = body_text(response).await;
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    let usage_chunks: Vec<serde_json::Value> = sse_events(&text)
+        .into_iter()
+        .filter(|chunk| chunk.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(usage_chunks.len(), 1, "{text}");
+    assert_eq!(
+        usage_chunks[0]["usage"],
+        json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 0,
+            "total_tokens": 3
+        })
+    );
+}
+
 /// The decoder buffers byte-fallback fragments, so a frame can carry ids while
 /// its text is empty. `return_token_ids` clients must still receive every id.
 #[tokio::test]
@@ -614,6 +656,52 @@ async fn grpc_completions_stream_keeps_ids_from_textless_frames() {
     let (streamed_text, streamed_ids) = streamed(&sse_events(&text));
     assert_eq!(streamed_text, "hello from worker", "{text}");
     assert_eq!(streamed_ids, vec![7, 8, 9], "{text}");
+}
+
+/// Streaming `/v1/completions` with `echo` must carry the echoed prompt
+/// IDs in the first chunk's separate `prompt_token_ids` field when
+/// `return_token_ids` is set; `token_ids` holds generated ids only, as
+/// in vLLM HTTP.
+#[tokio::test]
+async fn grpc_completions_stream_echo_carries_prompt_token_ids() {
+    let (_grpc, app) = completion_app(MockVllmRs::default()).await;
+
+    let response = post_completion(
+        app,
+        json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3],
+            "echo": true,
+            "max_tokens": 8,
+            "return_token_ids": true,
+            "stream": true
+        }),
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "status {}",
+        response.status()
+    );
+    let text = body_text(response).await;
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    let choice_chunks: Vec<serde_json::Value> = sse_events(&text)
+        .into_iter()
+        .filter(|chunk| {
+            chunk["choices"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        })
+        .collect();
+    let (streamed_text, streamed_ids) = streamed(&choice_chunks);
+    assert_eq!(streamed_text, "hello from worker", "{text}");
+    assert_eq!(streamed_ids, vec![7, 8, 9], "{text}");
+    assert_eq!(
+        choice_chunks[0]["choices"][0]["prompt_token_ids"],
+        json!([1, 2, 3]),
+        "{text}"
+    );
 }
 
 /// `token_ids` is opt-in, exactly as in the OpenAI schema.

@@ -22,7 +22,7 @@ Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
 | API | Status | Behavior |
 |---|---|---|
 | `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
-| `/v1/completions` | Supported, single prompt | On the regular gRPC pool, `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. On a static P/D gRPC pool only a single token-id prompt (`list[int]`) is accepted — text prompts are rejected with `400`. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/completions` | Supported, single prompt | On the regular gRPC pool, `prompt` may be `str`, `list[int]`, or single-element `list[str]` / `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. `logprobs` (0–20), `prompt_logprobs`, `logprob_token_ids`, `return_tokens_as_token_ids`, `echo`, and `echo` + `max_tokens: 0` are served on the regular gRPC pool. On a static P/D gRPC pool only a single token-id prompt (`list[int]`) is accepted — text prompts are rejected with `400`. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `return_hidden_states`, `documents`) are rejected with `400`. |
 | `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
 | `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
 | `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
@@ -52,10 +52,46 @@ with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internall
 `return_token_ids` gates whether the reply writes `choices[].token_ids`; chat
 responses never carry them. Streaming emits every id even from frames whose
 text is empty. The non-streaming choice also carries `prompt_token_ids` (the
-client's ids) under the same flag; streaming never echoes prompt ids, matching
-vLLM HTTP where that happens only under `echo`.
+client's ids) under the same flag; streaming carries the prompt ids in the
+separate `prompt_token_ids` field on the first echo chunk only, when `echo`
+and `return_token_ids` are both set — `token_ids` holds generated ids only,
+matching vLLM HTTP.
 
-`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`,
+`logprobs` maps onto the proto `ResponseOptions` (`output_logprobs` plus a
+top-N or `logprob_token_ids` candidate selection; `prompt_logprobs`, explicit
+or implied by `echo` + `logprobs`, onto `prompt_logprobs` + candidates, with
+`-1` selecting all candidates per prompt position), and
+the reply rebuilds OpenAI `logprobs` per sequence (`tokens`,
+`token_logprobs`, `top_logprobs`, `text_offset`, `-inf` clamped to `-9999`,
+first prompt position `null`). An explicit `prompt_logprobs` stands alone
+on the non-streaming path, matching vLLM: the prompt entries go to the
+separate `choices[].prompt_logprobs` field, echo or not, in vLLM's array
+shape — one entry per prompt position, `null` first, then a map from
+token id to `{logprob, rank, decoded_token}`. They merge in
+front of `choices[].logprobs` only under `echo` when output logprobs were
+requested; with echo but no `logprobs` request, `choices[].logprobs` stays
+null. Without echo,
+`choices[].logprobs` holds output entries only, with `text_offset`
+relative to the generated text.
+Streaming still requires `logprobs` and `echo`, and rejects an explicit
+value above 0 (or `-1`) with 400, following vLLM;
+only 0 is allowed there, asking for the sampled token per prompt
+position with no extra candidates. `logprobs` is
+0–20; vLLM's `-1` (all tokens) is not a valid value here — the field is
+an unsigned count, so `-1` fails request parsing with 400. `echo` prefixes the prompt text and shifts
+`text_offset`; `echo` + `max_tokens: 0` answers with the prompt only, the one
+token the engine had to generate being dropped. Known difference from vLLM
+HTTP: that answer reports empty `token_ids` and 0 completion tokens here,
+while vLLM reports the hidden generated token and usage 1 — a maintainer
+call, left as is. Logprobs and echo live on
+the regular-pool path only, as a deliberate Stage 2 scope choice: the
+gRPC P/D route still rejects them with 400. The P/D decode path shares
+the regular pool's response code — per-sequence accumulator included —
+so enabling them there is follow-up work (threading the completion
+options through the P/D preparation and dropping the guard), not a
+response-layer rewrite.
+
+`suffix`, `best_of`, `n > 1`, `json_schema`,
 `return_hidden_states`, `documents`, negative prompt ids, and unknown
 passthrough keys return 400 instead of being dropped.
 
