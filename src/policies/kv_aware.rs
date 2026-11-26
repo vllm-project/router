@@ -1242,14 +1242,9 @@ impl KvAwarePolicy {
 
     /// Build the policy in active mode: planned requests get a peer fetch
     /// grant, at most `max_inflight_per_source` at a time per source worker.
-    /// Starts enabled; see [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled).
-    pub fn with_peer_fetch(self, max_inflight_per_source: usize) -> Self {
-        self.with_shared_peer_fetch(max_inflight_per_source, Arc::new(AtomicBool::new(true)))
-    }
-
-    /// [`with_peer_fetch`](Self::with_peer_fetch) with a kill switch flag
-    /// owned by the caller. Every policy built with the same flag is enabled
-    /// and disabled together; the flag's current value applies from the start.
+    /// `enabled` is the kill switch flag, owned by the caller: every policy
+    /// built with the same flag is enabled and disabled together, and the
+    /// flag's current value applies from the start.
     pub(crate) fn with_shared_peer_fetch(
         mut self,
         max_inflight_per_source: usize,
@@ -1282,12 +1277,15 @@ impl KvAwarePolicy {
     /// shared: a policy built by a `PolicyRegistry` stores to the registry's
     /// flag, which flips every active policy that registry built (see
     /// `PolicyRegistry::set_peer_fetch_enabled`). A policy that was not built
-    /// active stays shadow, because its planner was not built with the
-    /// capability requirement active mode forces.
-    pub fn set_peer_fetch_enabled(&self, enabled: bool) -> bool {
+    /// active has no peer fetch state, so it stays as built and this returns
+    /// `false`. Test-only: production uses
+    /// `PolicyRegistry::set_peer_fetch_enabled_if_active`.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn set_peer_fetch_enabled(&self, enabled: bool) -> bool {
         match &self.peer_fetch {
             Some(state) => {
-                state.enabled.store(enabled, Ordering::Release);
+                super::store_peer_fetch_enabled(&state.enabled, enabled);
                 enabled
             }
             None => false,
@@ -5987,7 +5985,7 @@ mod tests {
         max_inflight: usize,
     ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
         let (policy, workers, targets) = transfer_fixture(true);
-        let policy = policy.with_peer_fetch(max_inflight);
+        let policy = policy.with_shared_peer_fetch(max_inflight, Arc::new(AtomicBool::new(true)));
         set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
         (policy, workers, targets)
     }
@@ -6011,7 +6009,7 @@ mod tests {
     #[test]
     fn grpc_destination_plans_but_takes_no_slot() {
         let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
-        let policy = policy.with_peer_fetch(4);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
         set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
         let receipt = select(&policy, &workers);
         assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
@@ -6053,7 +6051,7 @@ mod tests {
     /// records, applied through the public API.
     fn planned_grant_fixture() -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
         let (policy, workers, _) = transfer_fixture(true);
-        let policy = policy.with_peer_fetch(4);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
         policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
         policy.apply_peer_lookup("http://b", Some(&engine_record("engine-b", "fp", 5700)));
         (policy, workers)
@@ -6213,7 +6211,7 @@ mod tests {
     #[test]
     fn register_worker_binds_generation_and_record_together() {
         let (policy, workers, targets) = transfer_fixture(true);
-        let policy = policy.with_peer_fetch(4);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
         let mut info = peer_info(&[(0, engine_record("engine-a", "fp", 5600))]);
         info.cache_key = Some(CacheKey {
             model: Arc::from("m"),
@@ -6676,7 +6674,7 @@ mod tests {
             let policy = crate::policies::PolicyFactory::apply_peer_fetch_config(
                 base,
                 Some(&transfer_block(mode)),
-                None,
+                &Arc::new(AtomicBool::new(true)),
             );
             let mut sequence = Vec::new();
             for _ in 0..3 {

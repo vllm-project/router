@@ -1188,7 +1188,8 @@ pub enum PeerFetchMode {
     Shadow,
     /// Plans are acted on: the request sent to the destination carries
     /// `kv_transfer_params` so its engine fetches the prefix from the source.
-    /// Can be switched back to shadow at runtime (`KvAwarePolicy::set_peer_fetch_enabled`).
+    /// Can be switched back to shadow at runtime (`POST /peer_fetch`, via
+    /// `PolicyRegistry::set_peer_fetch_enabled_if_active`).
     Active,
 }
 

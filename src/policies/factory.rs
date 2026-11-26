@@ -68,10 +68,13 @@ impl PolicyFactory {
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
+                // Only the PD stage policies come through here, and validation
+                // rejects a non-off peer_fetch block for them, so this flag is
+                // never consulted; the registry passes its shared one instead.
                 Arc::new(Self::apply_peer_fetch_config(
                     policy,
                     peer_fetch.as_deref(),
-                    None,
+                    &Arc::new(AtomicBool::new(true)),
                 ))
             }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
@@ -88,13 +91,13 @@ impl PolicyFactory {
     /// config asks for it. Shared by the factory and the registry. With no
     /// block or `mode: off` the policy is returned untouched.
     ///
-    /// In active mode, `peer_fetch_enabled` is the kill switch flag to share
-    /// (the registry passes its own so one switch covers every policy it
-    /// builds); `None` gives the policy a flag of its own.
+    /// In active mode the policy shares `peer_fetch_enabled`, the kill switch
+    /// flag: the registry passes its own so one switch covers every policy it
+    /// builds.
     pub(crate) fn apply_peer_fetch_config(
         policy: KvAwarePolicy,
         config: Option<&PeerFetchConfig>,
-        peer_fetch_enabled: Option<&Arc<AtomicBool>>,
+        peer_fetch_enabled: &Arc<AtomicBool>,
     ) -> KvAwarePolicy {
         let Some(config) = config.filter(|c| c.mode != PeerFetchMode::Off) else {
             return policy;
@@ -119,12 +122,10 @@ impl PolicyFactory {
         }));
         policy.register_static_capabilities(capabilities);
         if config.mode == PeerFetchMode::Active {
-            return match peer_fetch_enabled {
-                Some(flag) => {
-                    policy.with_shared_peer_fetch(config.max_inflight_per_source, Arc::clone(flag))
-                }
-                None => policy.with_peer_fetch(config.max_inflight_per_source),
-            };
+            return policy.with_shared_peer_fetch(
+                config.max_inflight_per_source,
+                Arc::clone(peer_fetch_enabled),
+            );
         }
         policy
     }

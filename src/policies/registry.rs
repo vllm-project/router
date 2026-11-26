@@ -248,7 +248,7 @@ impl PolicyRegistry {
             "kv_aware" => Arc::new(PolicyFactory::apply_peer_fetch_config(
                 KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
                 self.peer_fetch.as_deref(),
-                Some(&self.peer_fetch_enabled),
+                &self.peer_fetch_enabled,
             )),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
@@ -306,7 +306,7 @@ impl PolicyRegistry {
                 })
                 .with_shared_affinity(Arc::clone(kv_affinity_table)),
                 peer_fetch.as_deref(),
-                Some(peer_fetch_enabled),
+                peer_fetch_enabled,
             )),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
@@ -333,7 +333,8 @@ impl PolicyRegistry {
     /// shared by every active-mode `kv_aware` policy this registry built or
     /// will build, so it takes effect for selections made after the call;
     /// in-flight fetches finish normally. Policies not built active are
-    /// unaffected. Returns the resulting status.
+    /// unaffected. Returns the resulting status. Test-only: production uses
+    /// [`set_peer_fetch_enabled_if_active`](Self::set_peer_fetch_enabled_if_active).
     #[cfg(test)]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn set_peer_fetch_enabled(&self, enabled: bool) -> PeerFetchStatus {
@@ -341,15 +342,14 @@ impl PolicyRegistry {
             .peer_fetch_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.peer_fetch_enabled.store(enabled, Ordering::Release);
+        super::store_peer_fetch_enabled(&self.peer_fetch_enabled, enabled);
         self.peer_fetch_status()
     }
 
-    /// [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled), but only
-    /// when at least one policy is in active mode; `None` (flag unchanged)
-    /// otherwise. On success it also sets the
-    /// `vllm_router_peer_fetch_enabled` gauge and logs the new
-    /// state at warn. The check, the store, the status, the gauge and the
+    /// Set the kill switch, but only when at least one policy is in active
+    /// mode; `None` (flag unchanged) otherwise. The store, the
+    /// `vllm_router_peer_fetch_enabled` gauge and the warn log go through
+    /// [`store_peer_fetch_enabled`](super::store_peer_fetch_enabled). The check, the store, the status, the gauge and the
     /// log happen under one lock, so concurrent callers are applied one after
     /// the other and the gauge always matches the flag.
     pub(crate) fn set_peer_fetch_enabled_if_active(
@@ -363,19 +363,8 @@ impl PolicyRegistry {
         if self.peer_fetch_status().policies.is_empty() {
             return None;
         }
-        self.peer_fetch_enabled.store(enabled, Ordering::Release);
-        let status = self.peer_fetch_status();
-        crate::metrics::RouterMetrics::set_peer_fetch_enabled(status.enabled);
-        warn!(
-            enabled = status.enabled,
-            "KV transfer peer fetch {} for all active-mode kv_aware policies",
-            if status.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-        Some(status)
+        super::store_peer_fetch_enabled(&self.peer_fetch_enabled, enabled);
+        Some(self.peer_fetch_status())
     }
 
     /// The kill switch flag and every distinct active-mode `kv_aware`

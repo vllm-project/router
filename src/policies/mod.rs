@@ -38,6 +38,7 @@ pub use kv_aware::{
     SelectionError, SlotManager, StagePick, TemperaturePicker, TieredMatchProvider,
     TransferCredits, WorkerTokenInputs,
 };
+pub(crate) use peer_fetch::store_peer_fetch_enabled;
 #[cfg(test)]
 pub(crate) use peer_fetch::PeerFetchLimiter;
 pub(crate) use peer_fetch::PeerFetchRules;
