@@ -90,7 +90,7 @@ pub fn init_metrics() {
     describe_counter!(
         "vllm_router_peer_fetch_requests_total",
         "Active-mode peer fetch requests: sent with peer fetch params, or why not \
-         (no_peer_endpoint, inflight_cap, grpc_destination, registration_changed, \
+         (no_peer_endpoint, untrusted_endpoint, inflight_cap, grpc_destination, registration_changed, \
          client_params_present, prompt_logprobs, invalid_body)"
     );
     describe_gauge!(

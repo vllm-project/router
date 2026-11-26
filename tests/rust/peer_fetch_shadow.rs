@@ -1186,6 +1186,40 @@ async fn s16_source_without_an_address_is_not_fetched_from() {
     fx.finish().await;
 }
 
+/// 16b: a source whose engine reports a side-channel host that is not its
+/// worker URL's host is planned but never fetched from. The reported address
+/// is unverified, so without an operator pin for that host the request goes
+/// out unchanged and is counted as `untrusted_endpoint`, and no source slot is
+/// taken.
+#[tokio::test]
+async fn s16b_untrusted_side_channel_host_is_not_fetched_from() {
+    let (fx, prompt) = active_fixture(
+        35,
+        Options::new(&[("a", "m"), ("b", "m")]).active(&[
+            ("a", PeerLookupMock::new("fp").host("10.255.0.9")),
+            ("b", PeerLookupMock::new("fp")),
+        ]),
+    )
+    .await;
+    let source_url = fx.mock("a").url.clone();
+
+    let ((status, plans), sent) =
+        request_outcomes_of(outcomes_of(fx.complete(&prompt, None))).await;
+    assert_eq!(status, 200);
+    assert_eq!(plans, outcomes(&[("planned", 1)]));
+    assert_eq!(sent, outcomes(&[("untrusted_endpoint", 1)]));
+    let b_bodies = fx.mock("b").bodies();
+    assert_eq!(b_bodies.len(), 1);
+    assert!(b_bodies[0].get("kv_transfer_params").is_none());
+    let policy = kv_policy(&fx);
+    let kv = policy
+        .as_any()
+        .downcast_ref::<KvAwarePolicy>()
+        .expect("kv_aware policy");
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
+    fx.finish().await;
+}
+
 /// 17: the fetch address follows the source's current record. The source first
 /// reports R1 and a planned request is sent with R1's engine id and port. The
 /// engine then reports R2 (new engine id and port, same layout fingerprint) and

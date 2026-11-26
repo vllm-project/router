@@ -98,6 +98,8 @@ pub struct PeerLookupMock {
     /// Report this engine id and side-channel port instead of the defaults
     /// (`<instance>-rank<rank>` and [`peer_port`]).
     pub address: Option<(String, u16)>,
+    /// Report this side-channel host instead of [`PEER_HOST`].
+    pub host: Option<String>,
 }
 
 impl PeerLookupMock {
@@ -107,7 +109,15 @@ impl PeerLookupMock {
             enabled: true,
             invalid: false,
             address: None,
+            host: None,
         }
+    }
+
+    /// Report `host` as the side-channel host, e.g. one that is not the
+    /// worker URL's host.
+    pub fn host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_owned());
+        self
     }
 
     /// Report `engine_id` and `port`, as an engine that restarted would.
@@ -629,7 +639,7 @@ async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
         entry["peer_lookup"] = json!({
             "enabled": peer.enabled,
             "engine_id": engine_id,
-            "side_channel_host": PEER_HOST,
+            "side_channel_host": peer.host.as_deref().unwrap_or(PEER_HOST),
             "side_channel_port": if peer.invalid { 0 } else { u32::from(port) },
             "tp_size": 1, "dcp_size": 1, "pp_size": 1,
             "connector": "nixl",

@@ -2164,6 +2164,7 @@ mod tests {
                 connector: " ".to_string(),
                 connector_version: "1".to_string(),
                 layout_fingerprint: "fp".to_string(),
+                side_channel_host: None,
             },
         )])
     }

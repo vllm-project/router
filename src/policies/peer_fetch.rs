@@ -138,6 +138,21 @@ impl From<&PeerLookupRecord> for PeerEndpoint {
     }
 }
 
+/// A host as compared by the side-channel trust check: trimmed, lowercase, and
+/// without IPv6 brackets.
+pub(crate) fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// The normalized host of a worker URL (scheme optional, `@rank` suffix and
+/// port ignored), or `None` when it has no host.
+pub(crate) fn host_of(worker_url: &str) -> Option<String> {
+    crate::kv_index::discovery::worker_host(worker_url).map(|host| normalize_host(&host))
+}
+
 /// Store the peer fetch kill switch and keep the
 /// `vllm_router_peer_fetch_enabled` gauge and the warn log in step with it.
 /// Every writer of the flag goes through here so the gauge always matches.
@@ -356,7 +371,7 @@ impl PeerFetchCostPath {
 }
 
 /// Active-mode outcome for a planned request: the `outcome` label on
-/// `vllm_router_peer_fetch_requests_total`. The policy records the four
+/// `vllm_router_peer_fetch_requests_total`. The policy records the
 /// outcomes that stop a fetch grant; the HTTP send path records the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerFetchRequestOutcome {
@@ -368,6 +383,9 @@ pub(crate) enum PeerFetchRequestOutcome {
     RegistrationChanged,
     /// The source has no fetch address.
     NoPeerEndpoint,
+    /// The source's reported side-channel host is neither its worker URL's
+    /// host nor the host the operator pinned for it.
+    UntrustedEndpoint,
     /// The source is at its in-flight fetch cap.
     InflightCap,
     /// The client already sent `kv_transfer_params`.
@@ -385,6 +403,7 @@ impl PeerFetchRequestOutcome {
             Self::GrpcDestination => "grpc_destination",
             Self::RegistrationChanged => "registration_changed",
             Self::NoPeerEndpoint => "no_peer_endpoint",
+            Self::UntrustedEndpoint => "untrusted_endpoint",
             Self::InflightCap => "inflight_cap",
             Self::ClientParamsPresent => "client_params_present",
             Self::PromptLogprobs => "prompt_logprobs",
@@ -1661,6 +1680,7 @@ mod tests {
                 connector: connector.into(),
                 connector_version: "1".into(),
                 layout_fingerprint: "fp".into(),
+                side_channel_host: None,
             })
             .unwrap()
         };
@@ -1740,6 +1760,7 @@ mod tests {
             PeerFetchRequestOutcome::GrpcDestination,
             PeerFetchRequestOutcome::RegistrationChanged,
             PeerFetchRequestOutcome::NoPeerEndpoint,
+            PeerFetchRequestOutcome::UntrustedEndpoint,
             PeerFetchRequestOutcome::InflightCap,
             PeerFetchRequestOutcome::ClientParamsPresent,
             PeerFetchRequestOutcome::PromptLogprobs,
@@ -1755,6 +1776,7 @@ mod tests {
                 "grpc_destination",
                 "registration_changed",
                 "no_peer_endpoint",
+                "untrusted_endpoint",
                 "inflight_cap",
                 "client_params_present",
                 "prompt_logprobs",
@@ -1844,6 +1866,22 @@ mod tests {
     #[test]
     fn zero_cap_admits_nothing() {
         assert!(PeerFetchLimiter::new(0).try_acquire("a").is_none());
+    }
+
+    #[test]
+    fn hosts_compare_without_case_brackets_port_or_rank() {
+        assert_eq!(normalize_host(" Worker-A "), "worker-a");
+        assert_eq!(normalize_host("[2001:DB8::1]"), "2001:db8::1");
+        assert_eq!(host_of("http://Worker-A:8000").as_deref(), Some("worker-a"));
+        assert_eq!(
+            host_of("http://[2001:db8::1]:8000@3").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(host_of("10.0.0.1:8000").as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            host_of("grpc://10.0.0.1:50051").as_deref(),
+            Some("10.0.0.1")
+        );
     }
 
     #[test]

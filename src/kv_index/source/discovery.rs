@@ -1421,7 +1421,7 @@ fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String>
 }
 
 /// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
-fn worker_host(worker_url: &str) -> Option<String> {
+pub(crate) fn worker_host(worker_url: &str) -> Option<String> {
     let (worker_url, _) = split_worker_rank(worker_url);
     let with_scheme = if worker_url.contains("://") {
         worker_url.to_string()

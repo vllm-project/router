@@ -1289,6 +1289,11 @@ pub struct StaticTransferCapability {
     pub connector_version: String,
     /// Operator-chosen label; equal labels mean compatible KV layouts.
     pub layout_fingerprint: String,
+    /// Active mode: the side-channel host this worker's engine may report, for
+    /// a side channel on another address than the worker URL (e.g. a separate
+    /// NIC). Without it, the reported host must be the worker URL's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_channel_host: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1305,6 +1310,13 @@ impl StaticTransferCapability {
             if value.trim().is_empty() {
                 return Err(format!("{name} is empty"));
             }
+        }
+        if self
+            .side_channel_host
+            .as_deref()
+            .is_some_and(|host| host.trim().is_empty())
+        {
+            return Err("side_channel_host is empty".into());
         }
         Ok(())
     }

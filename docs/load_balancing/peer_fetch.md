@@ -146,6 +146,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Destination is a gRPC worker | `grpc_destination` |
 | Source or destination registration changed since planning | `registration_changed` |
 | Source has no engine-reported peer address | `no_peer_endpoint` |
+| Source's reported side-channel host is not trusted (see **Trust** below) | `untrusted_endpoint` |
 | Source already has `max_inflight_per_source` fetches in flight | `inflight_cap` |
 | Client sent its own `kv_transfer_params` | `client_params_present` |
 | Client set `prompt_logprobs` or `prompt_logprob_token_ids` on a path that did not skip planning (the proxy path); the normal path skips earlier, see above | `prompt_logprobs` |
@@ -154,13 +155,13 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.
-- *Static:* `--peer-fetch-capability WORKER_URL=JSON` (repeatable) gives a capability only. It is the only way to set `peer_fetch.capabilities`: the router reads no config file, and the Python launcher has no peer fetch options. A static entry wins over the engine's capability for the same worker, but the router still stores the address from the engine's `peer_lookup` record. In active mode a static source is fetchable when its engine reports that address, and ends as `no_peer_endpoint` when it does not. Example:
+- *Static:* `--peer-fetch-capability WORKER_URL=JSON` (repeatable) gives a capability only. It is the only way to set `peer_fetch.capabilities`: the router reads no config file, and the Python launcher has no peer fetch options. A static entry wins over the engine's capability for the same worker, but the router still stores the address from the engine's `peer_lookup` record. In active mode a static source is fetchable when its engine reports that address and the address passes the trust check below, and ends as `no_peer_endpoint` when it reports none. Example:
 
   ```bash
-  --peer-fetch-capability 'http://10.0.0.1:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"llama70b-fp8-tp8-b16"}'
+  --peer-fetch-capability 'http://10.0.0.1:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"llama70b-fp8-tp8-b16","side_channel_host":"192.168.7.1"}'
   ```
 
-  `can_export` and `can_import` default to `true`. The flag needs `--policy kv_aware` and `--peer-fetch-mode shadow` or `active`; an unknown key, an empty field or a repeated worker URL fails at startup.
+  `can_export` and `can_import` default to `true`. `side_channel_host` is optional and only used by the trust check. The flag needs `--policy kv_aware` and `--peer-fetch-mode shadow` or `active`; an unknown key, an empty field or a repeated worker URL fails at startup.
 
 **The `peer_lookup` record.** `/kv_event_sources` returns a JSON object keyed by DP rank as a string (`"0"`, `"1"`, ...). A key that is not a number is skipped without a warning. Each rank's entry may carry a `peer_lookup` object. The router attaches to a worker the record of the worker's own DP rank, or of rank `"0"` when the worker has no DP rank.
 
@@ -210,6 +211,12 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 - A changed record is picked up only when the worker is removed and added again.
 
 **Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if both the source and the destination still have the record and registration the planner saw, and it uses the address from that record. Otherwise the outcome is `registration_changed` and the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
+
+**Trust.** The router does not verify the side-channel address an engine reports, and in active mode the destination engine connects to it. So a grant requires the reported `side_channel_host` to be one the operator vouches for:
+- by default, the host of the source's registered worker URL (`http://10.0.0.1:8000@2` gives `10.0.0.1`);
+- when the operator pinned one for that worker with `"side_channel_host"` in `--peer-fetch-capability`, that host instead. With a pin, the worker URL's host no longer qualifies.
+
+Hosts are compared without case, IPv6 brackets, port or DP-rank suffix; DNS names are compared as written, not resolved. The port and `engine_id` are not checked. A failed check is counted as `untrusted_endpoint`, takes no source slot, is logged at `WARN`, and the request is sent unchanged. Shadow mode never sends an address, so it is unaffected. Deployments whose side channel uses a different network interface than the worker URL must pin that host, or active mode sends no fetches.
 
 **Kill switch.** `POST /peer_fetch` with `{"enabled": false}` stops peer fetches on every active-mode `kv_aware` policy of the router at once; `{"enabled": true}` resumes them.
 - Routing, planning and the `planned` count on `vllm_router_peer_fetch_plans_total` continue as before. A planned request is sent without `kv_transfer_params` and is not counted on `vllm_router_peer_fetch_requests_total`, as in shadow mode.
@@ -261,7 +268,7 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 | Metric | Labels | Meaning |
 |---|---|---|
 | `vllm_router_peer_fetch_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
-| `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
+| `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `untrusted_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
 | `vllm_router_peer_fetch_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
 | `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, for the peer whose outcome is reported; peers that reach the cost rule and are passed over leave no sample |
 | `vllm_router_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /peer_fetch` |

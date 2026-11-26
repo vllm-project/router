@@ -116,7 +116,7 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--peer-fetch-us-per-token` | `f64` | `5.0` | — | — | Estimated transfer cost in microseconds per token. |
 | `--peer-fetch-ignore-capability` | `flag` | `false` | — | — | Shadow mode only: plan without checking worker capability, to measure what peer fetch would save once capabilities are declared. Rejected in active mode. |
 | `--peer-fetch-max-inflight-per-source` | `usize` | `4` | — | — | Most peer fetches allowed at once against one source worker in `active` mode. Must be greater than 0. |
-| `--peer-fetch-capability` | `string (repeatable)` | `[]` | — | — | Declared peer-fetch capability as `WORKER_URL=JSON` (`connector`, `connector_version`, `layout_fingerprint`, optional `can_export`/`can_import`); repeatable, one entry per worker. Needs `--peer-fetch-mode shadow` or `active`. |
+| `--peer-fetch-capability` | `string (repeatable)` | `[]` | — | — | Declared peer-fetch capability as `WORKER_URL=JSON` (`connector`, `connector_version`, `layout_fingerprint`, optional `can_export`/`can_import`, and an optional `side_channel_host` that active mode trusts instead of the worker URL's host); repeatable, one entry per worker. Needs `--peer-fetch-mode shadow` or `active`. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |

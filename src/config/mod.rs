@@ -122,6 +122,13 @@ mod static_transfer_capability_tests {
         assert!(!table["http://b:8000"].can_export);
         assert_eq!(table["http://b:8000"].layout_fingerprint, "fp");
         assert!(parse_static_transfer_capabilities(&[]).unwrap().is_empty());
+        assert_eq!(table["http://a:8000"].side_channel_host, None);
+
+        let pinned = parse_static_transfer_capabilities(&[r#"http://a:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"fp","side_channel_host":"192.168.7.1"}"#.to_owned()]).unwrap();
+        assert_eq!(
+            pinned["http://a:8000"].side_channel_host.as_deref(),
+            Some("192.168.7.1")
+        );
     }
 
     #[test]
@@ -141,6 +148,11 @@ mod static_transfer_capability_tests {
                 r#"http://a:8000={"connector":" ","connector_version":"1","layout_fingerprint":"fp"}"#
                     .to_owned(),
                 "connector is empty",
+            ),
+            (
+                r#"http://a:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"fp","side_channel_host":"  "}"#
+                    .to_owned(),
+                "side_channel_host is empty",
             ),
         ] {
             let error = parse_static_transfer_capabilities(std::slice::from_ref(&spec))

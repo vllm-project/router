@@ -1131,6 +1131,10 @@ pub struct KvAwarePolicy {
     /// capability/endpoint pair. A capability without an endpoint can be
     /// planned but not fetched.
     peer_regs: DashMap<String, Arc<PeerRegistration>>,
+    /// Side-channel hosts the operator pinned per worker URL (normalized).
+    /// Static config only: engine records never set one, and a pin outlives
+    /// unregister like the static capability it came with.
+    trusted_hosts: DashMap<String, Arc<str>>,
     /// Source of `PeerRegistration::epoch`; starts at 1.
     next_peer_epoch: AtomicU64,
     /// Source of `PeerFetchPlan::plan_id`; starts at 1 so 0 means unassigned.
@@ -1234,6 +1238,7 @@ impl KvAwarePolicy {
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
             peer_regs: DashMap::new(),
+            trusted_hosts: DashMap::new(),
             next_peer_epoch: AtomicU64::new(1),
             next_transfer_plan_id: AtomicU64::new(1),
             peer_fetch: None,
@@ -1423,10 +1428,25 @@ impl KvAwarePolicy {
     /// table keep whatever they had.
     pub fn register_static_capabilities(
         &self,
-        capabilities: impl IntoIterator<Item = (String, TransferCapability)>,
+        capabilities: impl IntoIterator<Item = (String, (TransferCapability, Option<Arc<str>>))>,
     ) {
-        for (url, capability) in capabilities {
+        for (url, (capability, pin)) in capabilities {
+            if let Some(pin) = pin {
+                self.trusted_hosts.insert(url.clone(), pin);
+            }
             self.register_transfer_capability(url, capability);
+        }
+    }
+
+    /// Whether `endpoint` may be handed to a destination as the fetch source
+    /// for `source_url`. The engine's reported address is not verified, so it
+    /// must be the host the operator pinned for that worker or, without a pin,
+    /// the host of the worker URL the operator registered.
+    fn endpoint_is_trusted(&self, source_url: &str, endpoint: &PeerEndpoint) -> bool {
+        let reported = super::peer_fetch::normalize_host(&endpoint.host);
+        match self.trusted_hosts.get(source_url) {
+            Some(pin) => *reported == **pin,
+            None => super::peer_fetch::host_of(source_url).is_some_and(|host| host == reported),
         }
     }
 
@@ -1956,6 +1976,16 @@ impl KvAwarePolicy {
             PeerFetchRequestOutcome::NoPeerEndpoint.record();
             return None;
         };
+        if !self.endpoint_is_trusted(planned.source.url, &endpoint) {
+            PeerFetchRequestOutcome::UntrustedEndpoint.record();
+            tracing::warn!(
+                plan_id = transfer.plan_id,
+                source = planned.source.url,
+                host = %endpoint.host,
+                "peer fetch skipped: reported side-channel host is not trusted for this worker"
+            );
+            return None;
+        }
         let Some(permit) = state.limiter.try_acquire(planned.source.url) else {
             PeerFetchRequestOutcome::InflightCap.record();
             return None;
@@ -5959,6 +5989,12 @@ mod tests {
         policy.peer_regs.iter().any(|reg| reg.engine_owned)
     }
 
+    /// Pin `url`'s side-channel host, as `--peer-fetch-capability` would, so a
+    /// fixture address that is not the worker URL's host passes the trust check.
+    fn pin_host(policy: &KvAwarePolicy, url: &str, host: &str) {
+        policy.trusted_hosts.insert(url.to_owned(), Arc::from(host));
+    }
+
     /// Replace only the endpoint of `url`'s record, with a new `Arc` and epoch.
     fn set_endpoint(policy: &KvAwarePolicy, url: &str, endpoint: Option<PeerEndpoint>) {
         let current = policy.peer_regs.get(url).map(|reg| Arc::clone(&reg));
@@ -5987,6 +6023,7 @@ mod tests {
         let (policy, workers, targets) = transfer_fixture(true);
         let policy = policy.with_shared_peer_fetch(max_inflight, Arc::new(AtomicBool::new(true)));
         set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
+        pin_host(&policy, "http://a", "10.0.0.1");
         (policy, workers, targets)
     }
 
@@ -6113,6 +6150,7 @@ mod tests {
         let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
         policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
         policy.apply_peer_lookup("http://b", Some(&engine_record("engine-b", "fp", 5700)));
+        pin_host(&policy, "http://a", "10.0.0.5");
         (policy, workers)
     }
 
@@ -6352,6 +6390,117 @@ mod tests {
         let fetching = select(&policy, &workers);
         assert_eq!(fetching.worker_index, skipped.worker_index);
         assert!(fetching.peer_fetch.is_some());
+    }
+
+    /// Active policy over two workers at real hosts, with source `a` reporting
+    /// a side channel on `reported_host`.
+    fn trust_fixture(reported_host: &str) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let (policy, workers, _) =
+            transfer_fixture_with_urls(true, ["http://10.0.0.1:8000", "http://10.0.0.2:8000"]);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
+        set_endpoint(
+            &policy,
+            "http://10.0.0.1:8000",
+            Some(PeerEndpoint {
+                host: Arc::from(reported_host),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        (policy, workers)
+    }
+
+    /// Select once and return the grant (if any), the source's slots and the
+    /// `untrusted_endpoint` count.
+    fn trust_outcome(
+        policy: &KvAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+    ) -> (Option<PeerFetchGrant>, usize, u64) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let receipt = select(policy, workers);
+        assert!(policy.last_transfer_plan().is_some(), "the pair is planned");
+        (
+            receipt.peer_fetch,
+            policy.peer_fetch_inflight("http://10.0.0.1:8000"),
+            outcome_count(&handle, REQUESTS_TOTAL, "untrusted_endpoint"),
+        )
+    }
+
+    #[test]
+    fn grant_needs_the_reported_host_to_be_the_worker_url_host() {
+        let (policy, workers) = trust_fixture("10.0.0.1");
+        let (grant, slots, untrusted) = trust_outcome(&policy, &workers);
+        assert_eq!(&*grant.expect("grant").endpoint.host, "10.0.0.1");
+        assert_eq!((slots, untrusted), (1, 0));
+
+        let (policy, workers) = trust_fixture("10.0.0.9");
+        let (grant, slots, untrusted) = trust_outcome(&policy, &workers);
+        assert!(grant.is_none());
+        assert_eq!((slots, untrusted), (0, 1));
+    }
+
+    #[test]
+    fn a_pinned_host_replaces_the_worker_url_host() {
+        let pinned = |reported: &str, pin: &str| {
+            let (policy, workers) = trust_fixture(reported);
+            // Through the production path: a static capability with a pin.
+            policy.register_static_capabilities([(
+                "http://10.0.0.1:8000".to_owned(),
+                (capability("fp"), Some(Arc::from(pin))),
+            )]);
+            trust_outcome(&policy, &workers)
+        };
+        // A side channel on another NIC, pinned by the operator: fetched.
+        let (grant, slots, untrusted) = pinned("192.168.7.1", "192.168.7.1");
+        assert!(grant.is_some());
+        assert_eq!((slots, untrusted), (1, 0));
+        // With a pin, the worker URL's host is no longer enough.
+        let (grant, slots, untrusted) = pinned("10.0.0.1", "192.168.7.1");
+        assert!(grant.is_none());
+        assert_eq!((slots, untrusted), (0, 1));
+    }
+
+    #[test]
+    fn a_pin_survives_unregister() {
+        let (policy, _) = trust_fixture("192.168.7.1");
+        policy.register_static_capabilities([(
+            "http://10.0.0.1:8000".to_owned(),
+            (capability("fp"), Some(Arc::from("192.168.7.1"))),
+        )]);
+        policy.unregister_target("http://10.0.0.1:8000");
+        assert_eq!(
+            policy
+                .trusted_hosts
+                .get("http://10.0.0.1:8000")
+                .as_deref()
+                .map(|h| &**h),
+            Some("192.168.7.1")
+        );
+    }
+
+    #[test]
+    fn shadow_mode_ignores_an_untrusted_host() {
+        let (policy, workers, _) =
+            transfer_fixture_with_urls(true, ["http://10.0.0.1:8000", "http://10.0.0.2:8000"]);
+        set_endpoint(
+            &policy,
+            "http://10.0.0.1:8000",
+            Some(PeerEndpoint {
+                host: Arc::from("10.0.0.9"),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(
+            outcome_count(&handle, REQUESTS_TOTAL, "untrusted_endpoint"),
+            0
+        );
     }
 
     #[test]
@@ -6711,6 +6860,7 @@ mod tests {
                 connector: "nixl".into(),
                 connector_version: "1".into(),
                 layout_fingerprint: "fp".into(),
+                side_channel_host: None,
             },
         )]);
         for (mode, expected) in [(Shadow, true), (Off, false)] {

@@ -1,9 +1,11 @@
 //! Turns the operator-declared capability table (`StaticTransferCapability`,
-//! defined and validated in `config`) into planner [`TransferCapability`]s.
+//! defined and validated in `config`) into planner [`TransferCapability`]s,
+//! each with the side-channel host the operator pinned for that worker.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::peer_fetch::TransferCapability;
+use super::peer_fetch::{normalize_host, TransferCapability};
 use crate::config::types::StaticTransferCapability;
 use crate::config::validate_static_transfer_capabilities;
 
@@ -22,17 +24,27 @@ impl TryFrom<&StaticTransferCapability> for TransferCapability {
     }
 }
 
+/// One worker's declared capability and its pinned side-channel host
+/// (normalized by [`normalize_host`]), if any.
+pub type StaticCapability = (TransferCapability, Option<Arc<str>>);
+
 /// Convert a whole `worker_url -> capability` table, failing on the first
 /// invalid entry with the worker named.
 pub fn parse_static_capabilities(
     table: &HashMap<String, StaticTransferCapability>,
-) -> Result<HashMap<String, TransferCapability>, String> {
+) -> Result<HashMap<String, StaticCapability>, String> {
     validate_static_transfer_capabilities(table)?;
     table
         .iter()
         .map(|(url, config)| {
             TransferCapability::try_from(config)
-                .map(|capability| (url.clone(), capability))
+                .map(|capability| {
+                    let pin = config
+                        .side_channel_host
+                        .as_deref()
+                        .map(|host| Arc::from(normalize_host(host)));
+                    (url.clone(), (capability, pin))
+                })
                 .map_err(|error| format!("peer_fetch capability for {url}: {error}"))
         })
         .collect()
@@ -50,6 +62,7 @@ mod tests {
             connector: "nixl".into(),
             connector_version: "1".into(),
             layout_fingerprint: fingerprint.into(),
+            side_channel_host: None,
         }
     }
 
@@ -84,8 +97,8 @@ mod tests {
             ("http://c".to_string(), entry("fp2")),
         ]);
         let parsed = parse_static_capabilities(&table).unwrap();
-        assert!(parsed["http://a"].can_send_to(&parsed["http://b"]));
-        assert!(!parsed["http://a"].can_send_to(&parsed["http://c"]));
+        assert!(parsed["http://a"].0.can_send_to(&parsed["http://b"].0));
+        assert!(!parsed["http://a"].0.can_send_to(&parsed["http://c"].0));
 
         let mut import_only = entry("fp1");
         import_only.can_export = false;
@@ -94,7 +107,20 @@ mod tests {
             ("http://b".to_string(), entry("fp1")),
         ]))
         .unwrap();
-        assert!(!parsed["http://a"].can_send_to(&parsed["http://b"]));
-        assert!(parsed["http://b"].can_send_to(&parsed["http://a"]));
+        assert!(!parsed["http://a"].0.can_send_to(&parsed["http://b"].0));
+        assert!(parsed["http://b"].0.can_send_to(&parsed["http://a"].0));
+    }
+
+    #[test]
+    fn a_pinned_side_channel_host_is_normalized() {
+        let mut pinned = entry("fp");
+        pinned.side_channel_host = Some(" [2001:DB8::1] ".into());
+        let parsed = parse_static_capabilities(&HashMap::from([
+            ("http://a".to_owned(), pinned),
+            ("http://b".to_owned(), entry("fp")),
+        ]))
+        .unwrap();
+        assert_eq!(parsed["http://a"].1.as_deref(), Some("2001:db8::1"));
+        assert_eq!(parsed["http://b"].1, None);
     }
 }
