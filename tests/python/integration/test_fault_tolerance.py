@@ -5,10 +5,12 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_worker_crash_reroute_with_retries(router_manager, mock_workers):
+def test_worker_crash_reroute_with_retries(router_manager, mock_worker_manager):
     # Start one healthy and one that will crash on first request
-    _, [ok_url], _ = mock_workers(n=1)
-    _, [crash_url], _ = mock_workers(n=1, args=["--crash-on-request"])
+    _, [ok_url], _ = mock_worker_manager.start_workers(n=1)
+    _, [crash_url], _ = mock_worker_manager.start_workers(
+        n=1, args=["--crash-on-request"]
+    )
     rh = router_manager.start_router(
         worker_urls=[crash_url, ok_url],
         policy="round_robin",
@@ -31,4 +33,4 @@ def test_worker_crash_reroute_with_retries(router_manager, mock_workers):
         timeout=5,
     )
     assert r.status_code == 200
-    # mock_workers fixture handles cleanup
+    # mock_worker_manager fixture handles cleanup

@@ -7,8 +7,8 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_round_robin_distribution(mock_workers, router_manager):
-    procs, urls, ids = mock_workers(n=3)
+def test_round_robin_distribution(mock_worker_manager, router_manager):
+    procs, urls, ids = mock_worker_manager.start_workers(n=3)
 
     rh = router_manager.start_router(worker_urls=urls, policy="round_robin")
 

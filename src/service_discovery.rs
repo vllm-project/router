@@ -601,6 +601,7 @@ async fn remove_worker_from_router(
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};

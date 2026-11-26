@@ -1,15 +1,26 @@
-use super::completion_route::{placement_eligibility, prepare_completion_route, CompletionRoute};
-use super::program_adapter::ProgramCompletion;
-use crate::backend::preprocess::{prepare_completion_direct_inputs, prepare_http_kv_inputs};
+use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
+use super::program_adapter::{
+    prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
+};
+use crate::backend::health::check_grpc_health_within;
+use crate::backend::preprocess::{
+    http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
+};
+use crate::backend::token_count::{
+    client_token_ids_fingerprint, exact_prompt_tokens_from_json, prepared_chat_fingerprint,
+};
 use crate::backend::{
     stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer},
     PrepareError,
 };
 use crate::config::types::RetryConfig;
+use crate::core::worker::worker_get;
+use crate::core::worker::UNLABELED_WORKER_MODEL_ID;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
+use crate::kv_index::discovery::inferred_lora_name;
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -20,8 +31,9 @@ use crate::policies::{
     PolicyRegistry,
 };
 use crate::program_scheduling::{
-    BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
-    ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
+    ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
+    ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
+    VllmMetricsObservationProvider,
 };
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -215,6 +227,7 @@ impl Drop for LoadTrackedBody {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn hold_load_until_body_done(
     response: Response,
     worker: Arc<dyn Worker>,
@@ -269,6 +282,8 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
+    request_body: Option<serde_json::Value>,
 }
 
 struct SelectedWorker {
@@ -295,7 +310,7 @@ pub struct Router {
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     kv_index_supervisor: Option<Arc<crate::kv_index::KvIndexSupervisor>>,
-    _kv_signal_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    kv_reconcile_handle: Option<tokio::task::JoinHandle<()>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
     _program_observation_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_targets_cache: Mutex<HashMap<String, ProgramTargetCacheEntry>>,
@@ -311,12 +326,68 @@ struct ProgramTargetCacheEntry {
 const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
 const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
-const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedProgramModelPool {
     scheduler_key: String,
     registry_model: Option<String>,
+}
+
+enum ProgramIdentityLookup<'a> {
+    ResolveOnAdmission,
+    Resolved(Option<&'a ProgramIdentity>),
+}
+
+#[derive(Clone, Copy)]
+struct ProgramTokenEvidence {
+    prepared: Option<TokenFacts>,
+    observable: bool,
+}
+
+struct ProgramArrival<'a> {
+    identity: ProgramIdentityLookup<'a>,
+    tokens: ProgramTokenEvidence,
+}
+
+/// Deadline of the startup wait and `add_worker`: probes and retry sleeps
+/// stop at the worker startup timeout.
+struct StartupBudget {
+    start: Instant,
+    startup: Duration,
+    interval: Duration,
+}
+
+impl StartupBudget {
+    fn new(startup_timeout_secs: u64, check_interval_secs: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            startup: Duration::from_secs(startup_timeout_secs),
+            interval: Duration::from_secs(check_interval_secs),
+        }
+    }
+
+    /// Time left before the startup timeout.
+    fn remaining(&self) -> Duration {
+        self.startup.saturating_sub(self.start.elapsed())
+    }
+
+    /// Timeout for a probe that may take up to `cap`.
+    fn probe(&self, cap: Duration) -> Duration {
+        cap.min(self.remaining())
+    }
+
+    /// Sleep before the next probe.
+    fn backoff(&self) -> Duration {
+        self.interval.min(self.remaining())
+    }
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        if let Some(task) = &self.kv_reconcile_handle {
+            task.abort();
+        }
+    }
 }
 
 impl Router {
@@ -334,11 +405,9 @@ impl Router {
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
-                crate::kv_index::KvIndexSupervisor::new_http_full_attention(
-                    ctx.client.clone(),
-                    crate::kv_index::HashMode::Sha256,
-                );
+                crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -352,9 +421,25 @@ impl Router {
             None
         };
         let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        // HTTP pools are transparent proxies unless exact text counting is
+        // enabled; only then does the Router tokenize, so only then are the
+        // encoding caches relevant (and the warning below wrong).
+        let exact_text_tokenization =
+            ctx.router_config
+                .program_scheduling
+                .as_ref()
+                .is_some_and(|config| {
+                    config.token_count_mode.uses_prepared_facts()
+                        && !config.exact_text_endpoints.is_empty()
+                });
         let frontend = if pool_kind == Some(crate::backend::WorkerPoolKind::Http) {
-            crate::backend::frontend::warn_ignored_encoding_caches();
-            crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            if exact_text_tokenization {
+                crate::backend::EngineFrontend::from_env(request_timeout)
+                    .map_err(|error| format!("tokenizer cache: {error}"))?
+            } else {
+                crate::backend::frontend::warn_ignored_encoding_caches();
+                crate::backend::EngineFrontend::with_request_timeout(request_timeout)
+            }
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
@@ -365,6 +450,7 @@ impl Router {
                 &worker_urls,
                 ctx.router_config.worker_startup_timeout_secs,
                 ctx.router_config.worker_startup_check_interval_secs,
+                ctx.router_config.api_key.as_deref(),
             )
             .await?;
         }
@@ -404,34 +490,48 @@ impl Router {
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
+        let worker_api_key: Option<Arc<str>> = ctx.router_config.api_key.as_deref().map(Arc::from);
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if let Some((supervisor, mut signals)) = pending_kv_supervisor {
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
+        let kv_index_supervisor = if let Some((supervisor, signals)) = pending_kv_supervisor {
+            drop(signals);
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added_with_models(worker_url).await {
+                    Ok(discovery) => {
+                        kv_worker_info.insert(worker_url.clone(), discovery);
                     }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
                 }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
-            } else {
-                (None, None)
-            };
+            }
+            Some(supervisor)
+        } else {
+            None
+        };
         for url in &worker_urls {
-            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
-            // For now, create worker without model_id
+            let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
+            // KV-aware placement distinguishes base aliases from adapter names.
+            // Other policies retain the original unlabeled worker behavior.
+            let labels = if kv_aware_ops(default_policy.as_ref()).is_some() {
+                let base_models = kv_worker_info
+                    .get(&base_url)
+                    .filter(|_| dp_rank.is_none())
+                    .and_then(|(_, models)| models.clone());
+                crate::kv_index::discovery::served_model_labels(
+                    &ctx.client,
+                    &base_url,
+                    ctx.router_config.api_key.as_deref(),
+                    dp_rank,
+                    base_models,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
             let worker_arc: Arc<dyn Worker> = if dp_size > 1 {
-                let (base_url, dp_rank) = dp_utils::parse_worker_url(url);
                 Arc::new(
                     DPAwareWorker::new(
                         base_url,
@@ -439,14 +539,18 @@ impl Router {
                         dp_size,
                         WorkerType::Regular,
                     )
+                    .with_labels(labels)
                     .with_circuit_breaker_config(core_cb_config.clone())
-                    .with_health_config(health_config.clone()),
+                    .with_health_config(health_config.clone())
+                    .with_worker_api_key(worker_api_key.clone()),
                 )
             } else {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
+                        .with_labels(labels)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
+                        .with_health_config(health_config.clone())
+                        .with_worker_api_key(worker_api_key.clone()),
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
@@ -457,7 +561,9 @@ impl Router {
                 });
                 kv_aware.register_worker(
                     worker_arc.as_ref(),
-                    kv_worker_info.get(worker_arc.base_url()),
+                    kv_worker_info
+                        .get(worker_arc.base_url())
+                        .map(|(info, _)| info),
                     provider,
                 );
             }
@@ -523,6 +629,23 @@ impl Router {
             .as_ref()
             .map(ProgramSchedulerConfig::from)
             .map(ProgramScheduler::new)
+            .inspect(|scheduler| {
+                scheduler.publish_token_count_mode();
+                if scheduler.exact_text_enabled() {
+                    let tokenizer_override = std::env::var("VLLM_ROUTER_TOKENIZER").unwrap_or_default();
+                    let model_override = std::env::var("VLLM_ROUTER_MODEL").unwrap_or_default();
+                    if tokenizer_override.is_empty() && model_override.is_empty() {
+                        warn!(
+                            event = "exact_text_tokenizer_unset",
+                            "Program scheduling will tokenize HTTP text for exact facts, but neither \
+                             VLLM_ROUTER_TOKENIZER nor VLLM_ROUTER_MODEL is set; request-model \
+                             resolution may download from Hugging Face. Point \
+                             VLLM_ROUTER_TOKENIZER at the deployed model directory so the Router \
+                             count matches the Engine's chat template."
+                        );
+                    }
+                }
+            })
             .map(Arc::new);
         let program_observation_handle = program_scheduler.as_ref().map(|scheduler| {
             let scheduler = scheduler.clone();
@@ -530,10 +653,12 @@ impl Router {
             let provider = VllmMetricsObservationProvider::new(
                 ctx.client.clone(),
                 ctx.router_config.api_key.clone(),
-            );
+            )
+            .with_metrics_base_urls(scheduler.metrics_base_urls());
             Arc::new(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(scheduler.metrics_interval());
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_failed = std::collections::BTreeSet::new();
                 loop {
                     interval.tick().await;
                     Self::sync_program_targets_from_registry(&scheduler, &worker_registry);
@@ -543,13 +668,32 @@ impl Router {
                     }
                     let epoch = scheduler.begin_observation(&targets);
                     let (observations, failures) = provider.observe(&targets).await;
-                    for failure in failures {
-                        warn!(
-                            base_url = failure.base_url,
-                            error = failure.error,
-                            "Program scheduling backend observation failed"
+                    let failed_now = failures
+                        .iter()
+                        .map(|failure| failure.base_url.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for failure in &failures {
+                        if last_failed.contains(&failure.base_url) {
+                            debug!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation still failing"
+                            );
+                        } else {
+                            warn!(
+                                base_url = failure.base_url,
+                                error = failure.error,
+                                "Program scheduling backend observation failed"
+                            );
+                        }
+                    }
+                    for recovered in last_failed.difference(&failed_now) {
+                        info!(
+                            base_url = recovered,
+                            "Program scheduling backend observation recovered"
                         );
                     }
+                    last_failed = failed_now;
                     scheduler.apply_observations(epoch, observations);
                     scheduler.tick();
                     if let Some((path, revision, snapshot)) =
@@ -605,6 +749,35 @@ impl Router {
             }))
         });
 
+        let kv_reconcile_handle = kv_index_supervisor.as_ref().map(|supervisor| {
+            let supervisor = Arc::downgrade(supervisor);
+            let workers = ctx.worker_registry.clone();
+            let policies = ctx.policy_registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::kv_index::discovery::CONTROL_TIMEOUT).await;
+                    let Some(supervisor) = supervisor.upgrade() else {
+                        break;
+                    };
+                    let registrations = supervisor.refresh_discovered_workers().await;
+                    if registrations.is_empty() {
+                        continue;
+                    }
+                    for worker in workers.get_by_type(&WorkerType::Regular) {
+                        let Some(registration) = registrations.get(worker.base_url()) else {
+                            continue;
+                        };
+                        Self::attach_kv_provider(
+                            &policies,
+                            worker.as_ref(),
+                            registration.info.as_ref(),
+                            registration.provider.clone(),
+                        );
+                    }
+                }
+            })
+        });
+
         Ok(Router {
             epd: ctx
                 .router_config
@@ -630,7 +803,7 @@ impl Router {
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
             kv_index_supervisor,
-            _kv_signal_handle: kv_signal_handle,
+            kv_reconcile_handle,
             program_scheduler,
             _program_observation_handle: program_observation_handle,
             program_targets_cache: Mutex::new(HashMap::new()),
@@ -643,11 +816,17 @@ impl Router {
         self.frontend.pin_test_token_ids(token_ids);
     }
 
-    async fn discover_kv_worker(&self, worker_url: &str) -> Option<crate::kv_index::WorkerKvInfo> {
+    pub(crate) async fn discover_kv_worker(
+        &self,
+        worker_url: &str,
+    ) -> Option<(
+        crate::kv_index::WorkerKvInfo,
+        Option<std::collections::HashSet<String>>,
+    )> {
         let supervisor = self.kv_index_supervisor.as_ref()?;
         let policy = self.policy_registry.get_default_policy();
         kv_aware_ops(policy.as_ref())?;
-        match supervisor.on_worker_added(worker_url).await {
+        match supervisor.on_worker_added_with_models(worker_url).await {
             Ok(info) => Some(info),
             Err(error) => {
                 warn!(
@@ -660,30 +839,65 @@ impl Router {
         }
     }
 
-    fn register_kv_target(
+    pub(crate) fn register_kv_target(
         &self,
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
-            return;
-        };
         let provider = self
             .kv_index_supervisor
             .as_ref()
             .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        Self::attach_kv_provider(&self.policy_registry, worker, info, provider);
     }
 
-    fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
-        if let Some(supervisor) = &self.kv_index_supervisor {
-            supervisor.on_worker_removed(worker_url);
-        }
-        let policy = self.policy_registry.get_default_policy();
+    fn attach_kv_provider(
+        policies: &PolicyRegistry,
+        worker: &dyn Worker,
+        info: Option<&crate::kv_index::WorkerKvInfo>,
+        provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+    ) {
+        let policy = policies.get_policy_or_default(worker.model_id());
+        let default = policies.get_default_policy();
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
-            for target_url in target_urls {
-                kv_aware.unregister_worker(target_url);
+            kv_aware.register_worker(worker, info, provider.clone());
+        }
+        if !Arc::ptr_eq(&policy, &default) {
+            if let Some(kv_aware) = kv_aware_ops(default.as_ref()) {
+                kv_aware.register_worker(worker, info, provider);
+            }
+        }
+    }
+
+    pub(crate) fn remove_kv_workers(&self, removed: &[Arc<dyn Worker>]) {
+        let Some(first) = removed.first() else { return };
+        let base = first.base_url();
+        // A manager may remove one target while another rank still uses the
+        // same publisher. Retire the source only after its last regular target.
+        if !self
+            .worker_registry
+            .get_by_type(&WorkerType::Regular)
+            .iter()
+            .any(|worker| worker.base_url() == base)
+        {
+            if let Some(supervisor) = &self.kv_index_supervisor {
+                supervisor.on_worker_removed(base);
+            }
+        }
+        for worker in removed {
+            Self::unregister_kv_target(&self.policy_registry, worker.as_ref());
+        }
+    }
+
+    pub(crate) fn unregister_kv_target(policies: &PolicyRegistry, worker: &dyn Worker) {
+        let policy = policies.get_policy_or_default(worker.model_id());
+        let default = policies.get_default_policy();
+        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+            kv_aware.unregister_worker(worker.url());
+        }
+        if !Arc::ptr_eq(&policy, &default) {
+            if let Some(kv_aware) = kv_aware_ops(default.as_ref()) {
+                kv_aware.unregister_worker(worker.url());
             }
         }
     }
@@ -874,25 +1088,48 @@ impl Router {
         !tracked
     }
 
+    /// Whether this request would create a Program completion at all.
+    ///
+    /// Router-side exact counting is a second tokenization, so it must not run
+    /// for identity-free requests: `acquire_program_completion` would discard
+    /// the fact after paying the tokenizer and possible cold model load.
+    fn resolved_program_identity<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        model_pool: &ResolvedProgramModelPool,
+    ) -> Result<Option<ProgramIdentity>, ScheduleError> {
+        let Some(scheduler) = self.program_scheduler.as_ref() else {
+            return Ok(None);
+        };
+        let request = typed_req.extract_program_identity_payload();
+        ProgramIdentity::from_request_with_enable_key(
+            headers,
+            request.as_ref(),
+            Some(&model_pool.scheduler_key),
+            scheduler.enable_key(),
+        )
+    }
+
     async fn acquire_program_completion<T: GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         model_id: Option<&str>,
         endpoint: &str,
+        arrival: &ProgramArrival<'_>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let Some(scheduler) = &self.program_scheduler else {
             return Ok(None);
         };
-        let request = typed_req.extract_program_identity_payload();
         let model_pool = self.resolved_program_model_pool(model_id);
-        let Some(identity) = ProgramIdentity::from_request_with_enable_key(
-            headers,
-            request.as_ref(),
-            Some(&model_pool.scheduler_key),
-            scheduler.enable_key(),
-        )?
-        else {
+        let identity = match arrival.identity {
+            ProgramIdentityLookup::ResolveOnAdmission => {
+                self.resolved_program_identity(headers, typed_req, &model_pool)?
+            }
+            ProgramIdentityLookup::Resolved(identity) => identity.cloned(),
+        };
+        let Some(identity) = identity else {
             return Ok(None);
         };
         let input_text = typed_req.extract_text_for_program_scheduling();
@@ -902,6 +1139,7 @@ impl Router {
             &model_pool,
             endpoint,
             &input_text,
+            arrival.tokens,
         )
         .await
     }
@@ -927,14 +1165,74 @@ impl Router {
         else {
             return Ok(None);
         };
+        let prepared_facts = self.prepared_token_facts(
+            exact_prompt_tokens_from_json(request),
+            None,
+            model_id,
+            &model_pool.scheduler_key,
+            endpoint,
+        );
+        // A transparent proxy only observes Engine usage on the wire: a
+        // streaming body without `stream_options.include_usage` cannot verify
+        // a prepared fact, so exact mode must keep the estimate.
+        let observable = request.is_none_or(|body| {
+            body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
+                || body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
         self.acquire_program_completion_for_identity(
             scheduler,
             identity,
             &model_pool,
             endpoint,
             input_text,
+            ProgramTokenEvidence {
+                prepared: prepared_facts,
+                observable,
+            },
         )
         .await
+    }
+
+    /// Build the pre-dispatch input-token fact for one attempt.
+    ///
+    /// A prepared chat carries the exact IDs the Engine will receive. A
+    /// token-ID prompt already *is* the Engine input, so the client array
+    /// length is the exact fact even on the transparent HTTP path. Every other
+    /// shape returns `None` and keeps the byte estimator.
+    fn prepared_token_facts(
+        &self,
+        typed_exact_tokens: Option<usize>,
+        prepared: Option<&crate::backend::PreparedRequest>,
+        model_id: Option<&str>,
+        model_pool: &str,
+        endpoint: &str,
+    ) -> Option<TokenFacts> {
+        // Explicit `estimated` mode and excluded pools discard the fact, so do
+        // not pay for canonical JSON + SHA-256 (or env lookups) to build it.
+        let Some(scheduler) = &self.program_scheduler else {
+            return None;
+        };
+        if !scheduler.prepared_token_pool_enabled(model_pool) {
+            return None;
+        }
+        if let Some(prepared) = prepared {
+            let tokens = prepared.tokenized.token_ids.len();
+            if tokens > 0 {
+                let fingerprint = prepared_chat_fingerprint(
+                    prepared.request.as_ref(),
+                    prepared.tokenized.encode_backend,
+                );
+                return Some(TokenFacts::prepared_token_ids(tokens, fingerprint));
+            }
+        }
+        let tokens = typed_exact_tokens?;
+        Some(TokenFacts::client_token_ids(
+            tokens,
+            client_token_ids_fingerprint(model_id, model_pool, endpoint),
+        ))
     }
 
     async fn acquire_program_completion_for_identity(
@@ -944,17 +1242,28 @@ impl Router {
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
         input_text: &str,
+        tokens: ProgramTokenEvidence,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
+        );
+        let arrival = ArrivalTokenFacts::new(estimated_context_tokens, tokens.prepared)
+            .with_observability(tokens.observable);
+        let context = scheduler.resolve_arrival_tokens(&model_pool.scheduler_key, arrival);
+        RouterMetrics::record_agent_aware_context_token_fact(
+            &model_pool.scheduler_key,
+            endpoint,
+            context.source().as_str(),
+            context.tokens(),
+            context.fallback().map(|reason| reason.as_str()),
         );
         let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()
             .then(|| input_text.to_string());
         let dispatch = scheduler
-            .acquire_from_snapshot(identity, estimated_context_tokens, targets, routing_text)
+            .acquire_from_snapshot(identity, context, targets, routing_text)
             .await?;
         Ok(Some(ProgramCompletion::new(
             scheduler.clone(),
@@ -978,10 +1287,15 @@ impl Router {
         workers.iter().map(|w| w.url().to_string()).collect()
     }
 
-    pub async fn wait_for_healthy_workers(
+    /// Wait until at least one of `worker_urls` passes its health check.
+    ///
+    /// `api_key` is the bearer token for HTTP health requests. With `None`
+    /// they carry no `Authorization` header.
+    pub(crate) async fn wait_for_healthy_workers(
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
+        api_key: Option<&str>,
     ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
@@ -994,6 +1308,7 @@ impl Router {
             worker_urls,
             worker_startup_timeout_secs,
             worker_startup_check_interval_secs,
+            api_key,
         )
         .await
     }
@@ -1002,6 +1317,7 @@ impl Router {
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
+        api_key: Option<&str>,
     ) -> Result<(), String> {
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
@@ -1035,41 +1351,51 @@ impl Router {
             worker_startup_timeout_secs
         );
 
-        let start_time = std::time::Instant::now();
+        let budget = StartupBudget::new(
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+        );
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let api_key: Option<Arc<str>> = api_key.map(Arc::from);
+        let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
-                error!(
-                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    worker_startup_timeout_secs, unique_hosts_vec
+            if budget.remaining().is_zero() {
+                let message = format!(
+                    "Timeout {}s waiting for hosts {:?} to become healthy (last health check: {:?}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
+                    worker_startup_timeout_secs, unique_hosts_vec, unhealthy_hosts
                 );
-                return Err(format!(
-                    "Timeout {}s waiting for hosts {:?} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    worker_startup_timeout_secs, unique_hosts_vec
-                ));
+                error!("{}", message);
+                return Err(message);
             }
+
+            // No test covers this limit: it shortens a 2 s probe, so a test
+            // would hinge on a sub-second wall-clock bound.
+            let probe_timeout = budget.probe(Duration::from_secs(2));
 
             // Perform health checks only on unique hosts (not per DP rank)
             let mut health_checks = Vec::new();
             for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
                 let url_clone = base_url.clone();
+                let api_key = api_key.clone();
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match crate::backend::check_grpc_health(&url_clone, Duration::from_secs(2))
-                            .await
-                        {
+                        match check_grpc_health_within(&url_clone, probe_timeout).await {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
                     } else {
                         let health_url = format!("{}/health", url_clone);
-                        match client_clone.get(&health_url).send().await {
+                        match worker_get(&client_clone, &health_url, api_key.as_deref())
+                            .timeout(probe_timeout)
+                            .send()
+                            .await
+                        {
                             Ok(res) => {
                                 if res.status().is_success() {
                                     None
@@ -1088,7 +1414,7 @@ impl Router {
             // Wait for all health checks to complete
             let results = futures::future::join_all(health_checks).await;
 
-            let mut unhealthy_hosts = Vec::new();
+            unhealthy_hosts.clear();
             let mut healthy_host_count = 0;
 
             for result in results {
@@ -1121,7 +1447,7 @@ impl Router {
                     unhealthy_hosts.len(),
                     unhealthy_hosts
                 );
-                tokio::time::sleep(Duration::from_secs(worker_startup_check_interval_secs)).await;
+                tokio::time::sleep(budget.backoff()).await;
             }
         }
     }
@@ -1153,6 +1479,10 @@ impl Router {
         }
     }
 
+    /// Send a health check to `worker_url` and relay the answer.
+    ///
+    /// An HTTP check applies no timeout of its own and inherits the client's
+    /// `--request-timeout-secs`. A gRPC check is limited to 2 s.
     pub async fn send_health_check(&self, worker_url: &str) -> Response {
         let health_url = if self.intra_node_data_parallel_size > 1 {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -1172,14 +1502,17 @@ impl Router {
         };
 
         if crate::backend::is_grpc_url(health_url) {
-            return match crate::backend::check_grpc_health(health_url, Duration::from_secs(2)).await
-            {
+            return match check_grpc_health_within(health_url, Duration::from_secs(2)).await {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             };
         }
 
-        let request_builder = self.client.get(format!("{}/health", health_url));
+        let request_builder = worker_get(
+            &self.client,
+            &format!("{}/health", health_url),
+            self.api_key.as_deref(),
+        );
 
         let response = match request_builder.send().await {
             Ok(res) => {
@@ -1326,6 +1659,28 @@ impl Router {
             .collect()
     }
 
+    fn kv_placement_eligibility(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        model: Option<&str>,
+        lora_name: Option<&str>,
+        skip_read: bool,
+    ) -> Option<Vec<bool>> {
+        if skip_read {
+            return Some(vec![false; workers.len()]);
+        }
+        let supervisor = self.kv_index_supervisor.as_ref()?;
+        let model = model?;
+        if lora_name.is_some()
+            || workers
+                .first()
+                .is_none_or(|worker| crate::backend::is_grpc_url(worker.base_url()))
+        {
+            return None;
+        }
+        supervisor.cache_eligible_workers(workers, model)
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
@@ -1404,6 +1759,22 @@ impl Router {
         model_id: Option<&str>,
         raw_body: Option<axum::body::Bytes>,
     ) -> Response {
+        if self.kv_index_supervisor.is_some() {
+            // Check the bytes actually forwarded by the raw completion path.
+            // Typed requests can borrow their passthrough fields without
+            // serializing long prompts or multimodal payloads.
+            let raw_request = raw_body
+                .as_ref()
+                .and_then(|raw| serde_json::from_slice::<serde_json::Value>(raw).ok());
+            let identity = typed_req.affinity_identity();
+            let args = match raw_request.as_ref() {
+                Some(body) => body.get("vllm_xargs"),
+                None => identity.other.and_then(|other| other.get("vllm_xargs")),
+            };
+            if let Some(response) = reject_full_report(true, args) {
+                return response;
+            }
+        }
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let model_id = model_id
@@ -1418,7 +1789,8 @@ impl Router {
                 return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
             }
         };
-        let raw_body = if matches!(pool, Some(crate::backend::WorkerPoolKind::Http)) {
+        let is_http = matches!(pool, Some(crate::backend::WorkerPoolKind::Http));
+        let raw_body = if is_http {
             raw_body
         } else {
             drop(raw_body);
@@ -1437,13 +1809,36 @@ impl Router {
                 .into_response();
         }
 
-        // All-grpc chat: tokenize once, outside policy and retry.
-        // Cache-aware placement uses the same full content/session key as
-        // HTTP. PreparedRequest retains full token IDs for backend dispatch.
-        //
-        // The concrete request comes from `GenerationRequest::grpc_request`
-        // rather than a `serde_json::Value` roundtrip: the only two routes a
-        // gRPC pool admits are exactly the two concrete request types.
+        // Prepare gRPC once before retries. HTTP text preparation is optional:
+        // resolve identity once and gate the extra tokenization by mode, pool
+        // and endpoint. Inject upstream usage only for eligible Program streams;
+        // the response adapter hides it again if the client did not request it.
+        let model_pool = self.resolved_program_model_pool(model_id);
+        let resolve_identity_early = is_http
+            && self.program_scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.prepared_token_pool_enabled(&model_pool.scheduler_key)
+                    && (scheduler.exact_text_endpoint_enabled(route)
+                        || typed_req.exact_input_token_count().is_some())
+            });
+        let resolved_identity;
+        let identity = if resolve_identity_early {
+            resolved_identity =
+                match self.resolved_program_identity(headers, typed_req, &model_pool) {
+                    Ok(identity) => identity,
+                    Err(error) => return Self::schedule_error_response(error),
+                };
+            ProgramIdentityLookup::Resolved(resolved_identity.as_ref())
+        } else {
+            ProgramIdentityLookup::ResolveOnAdmission
+        };
+        let has_resolved_identity = matches!(identity, ProgramIdentityLookup::Resolved(Some(_)));
+        // A resolved identity already passed the HTTP/mode/pool gates above.
+        let exact_text_chat = has_resolved_identity
+            && route == "/v1/chat/completions"
+            && self
+                .program_scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.exact_text_endpoint_enabled(route));
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1459,16 +1854,25 @@ impl Router {
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => {
-                let lowered = match crate::backend::prepare_grpc_completion(completion) {
-                    Ok(lowered) => lowered,
-                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-                };
-                match self
-                    .frontend
-                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-                    .await
-                {
-                    Ok(prepared) => Some(prepared),
+                // Count sequences from the raw prompt, without lowering:
+                // lowering allocates the text or token ids just to count
+                // them, then `prepare_completions` below would lower the
+                // same request again. A batch is rejected before any
+                // tokenization — dispatching more than one sequence is
+                // Stage 3's fan-out — and a tokenizer error can no longer
+                // mask the 400.
+                if completion.prompt.len() != 1 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "gRPC /v1/completions does not support batched prompts yet",
+                    )
+                        .into_response();
+                }
+                match self.frontend.prepare_completions(completion).await {
+                    Ok(mut prepared) => {
+                        // The count check above guarantees exactly one.
+                        Some(prepared.pop().unwrap())
+                    }
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
                     }
@@ -1481,9 +1885,61 @@ impl Router {
                 )
                     .into_response();
             }
+            (Some(crate::backend::WorkerPoolKind::Http), Some(GrpcRequestRef::Chat(chat)))
+                if exact_text_chat =>
+            {
+                let started = Instant::now();
+                match self.frontend.prepare_for_token_count(chat.clone()).await {
+                    Ok(prepared) => {
+                        RouterMetrics::record_agent_aware_token_prepare(
+                            started.elapsed().as_secs_f64(),
+                        );
+                        Some(prepared)
+                    }
+                    Err(error) => {
+                        RouterMetrics::record_agent_aware_token_prepare_failure();
+                        debug!(
+                            event = "exact_text_prepare_failed",
+                            endpoint = route,
+                            error = %error,
+                            "falling back to the byte estimator for Program context tokens"
+                        );
+                        None
+                    }
+                }
+            }
             _ => None,
         };
 
+        // Build the token fact once per request, not per retry attempt. Only
+        // request extra Engine usage when there is an actual fact to verify;
+        // failed optional preparation must leave the HTTP stream untouched.
+        let prepared_facts = self.prepared_token_facts(
+            typed_req.exact_input_token_count(),
+            prepared.as_ref(),
+            model_id,
+            &model_pool.scheduler_key,
+            route,
+        );
+        let injected_body = if is_http
+            && is_stream
+            && !typed_req.settlement_reports_usage()
+            && has_resolved_identity
+            && prepared_facts.is_some()
+        {
+            prepare_stream_usage_body(raw_body.as_deref(), typed_req)
+        } else {
+            None
+        };
+        let arrival = ProgramArrival {
+            identity,
+            tokens: ProgramTokenEvidence {
+                prepared: prepared_facts,
+                observable: !is_http
+                    || typed_req.settlement_reports_usage()
+                    || injected_body.is_some(),
+            },
+        };
         let completion = match (pool, typed_req.grpc_request()) {
             (
                 Some(crate::backend::WorkerPoolKind::Http),
@@ -1503,6 +1959,7 @@ impl Router {
         };
         let text = &text;
         let prepared = &prepared;
+        let injected_body = &injected_body;
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
@@ -1511,7 +1968,17 @@ impl Router {
 
         // KV-aware retries may bypass a target without rewriting its binding.
         let failed_workers = Mutex::new(Vec::new());
-        let (lora_name, cache_salt) = typed_req.cache_identity();
+        let (declared_lora, cache_salt) = typed_req.cache_identity();
+        let cache_read_fallback =
+            kv_aware_ops(self.policy_for_model(model_id).as_ref()).and_then(|_| match completion {
+                Some(completion) => completion.cache_read_fallback,
+                None => serde_json::to_value(typed_req)
+                    .map(|body| http_cache_read_fallback(&body))
+                    .unwrap_or(Some("unsupported_cache_read")),
+            });
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
         let affinity_key = self
             .kv_aware_session_affinity_ttl_secs
             .filter(|_| kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some())
@@ -1532,6 +1999,7 @@ impl Router {
         let http_inputs = &http_inputs;
         let failed_workers = &failed_workers;
         let affinity_key = &affinity_key;
+        let arrival = &arrival;
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -1540,7 +2008,13 @@ impl Router {
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
                 let program_completion = match self
-                    .acquire_program_completion(headers, typed_req, model_id, route)
+                    .acquire_program_completion(
+                        headers,
+                        typed_req,
+                        model_id,
+                        route,
+                        arrival,
+                    )
                     .await
                 {
                     Ok(completion) => completion,
@@ -1552,8 +2026,21 @@ impl Router {
                 let policy = self.policy_for_model(model_id);
                 let kv_ops = kv_aware_ops(policy.as_ref());
                 let workers = self.available_workers(model_id);
+                let lora_name = declared_lora.or_else(|| {
+                    if kv_ops.is_none() || pool == Some(crate::backend::WorkerPoolKind::Grpc) {
+                        return None;
+                    }
+                    inferred_lora_name(&workers, typed_req.get_model()?)
+                });
                 let excluded_workers = failed_workers.lock().clone();
-                let needs_http_input = prepared.is_none()
+                // Router-rendered token IDs are an exact-token fact, not a
+                // replacement for the Engine's own KV-aware input. On an HTTP
+                // pool the policy keeps using the Engine `/tokenize` path even
+                // when exact-text preparation produced IDs; only gRPC dispatch
+                // already owns the token IDs it sends.
+                let prepared_for_kv = prepared.is_some()
+                    && matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc));
+                let needs_http_input = !prepared_for_kv
                     && (kv_ops.is_some() || policy.needs_cache_routing_key());
                 let binding_skips_rpc = needs_http_input && excluded_workers.is_empty()
                     && affinity_key.as_ref().is_some_and(|key| {
@@ -1598,7 +2085,14 @@ impl Router {
                         .await
                         .as_ref()
                 };
-                let request_tokens = if let Some(prepared) = &prepared {
+                let request_tokens = if prepared_for_kv {
+                    let Some(prepared) = prepared.as_ref() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "prepared gRPC input missing before dispatch",
+                        )
+                            .into_response();
+                    };
                     if kv_ops.is_some() {
                         RouterMetrics::record_kv_routing_input("grpc", "prepared");
                     }
@@ -1608,13 +2102,6 @@ impl Router {
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
                 };
-                let eligibility = completion
-                    .and_then(|completion| {
-                        placement_eligibility(
-                            completion,
-                            &workers,
-                        )
-                    });
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -1628,14 +2115,13 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let eligibility = completion
-                        .and_then(|completion| {
-                            placement_eligibility(
-                                completion,
-                                std::slice::from_ref(&worker),
-                            )
-                        });
                     let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                        let eligibility = self.kv_placement_eligibility(
+                            std::slice::from_ref(&worker),
+                            typed_req.get_model(),
+                            lora_name,
+                            cache_read_fallback.is_some(),
+                        );
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
@@ -1648,6 +2134,12 @@ impl Router {
                     });
                     Some(SelectedWorker { worker, kv_receipt })
                 } else {
+                    let eligibility = kv_ops.and_then(|_| self.kv_placement_eligibility(
+                        &workers,
+                        typed_req.get_model(),
+                        lora_name,
+                        cache_read_fallback.is_some(),
+                    ));
                     self.select_worker_for_model(
                         model_id,
                         &workers,
@@ -1701,6 +2193,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            request_body: injected_body.clone(),
                         },
                         program_completion.clone(),
                     )
@@ -1884,6 +2377,7 @@ impl Router {
             completion,
             load,
             prepared,
+            request_body,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -1912,19 +2406,26 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            let engine_observer = program_completion
+                .as_ref()
+                .map(|completion| completion.engine_observer());
             let mut response = self
                 .frontend
-                .dispatch_with_first_output(worker_url, prepared, on_first_output)
+                .dispatch_with_first_output(worker_url, prepared, on_first_output, engine_observer)
                 .await;
+            if let Some(completion) = program_completion {
+                // Settlement follows the true terminal state, including usage
+                // and cancellation, instead of the response header.
+                response = settle_grpc_response(response, is_stream, completion);
+            }
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
-            }
-            if let Some(completion) = &program_completion {
-                completion.finish(response.status().is_success());
             }
             return response;
         }
 
+        let strip_usage = request_body.is_some();
+        let stream_end = StreamEnd::for_http_route(route);
         let (mut request_builder, extracted_dp_rank, request_url) =
             if self.intra_node_data_parallel_size > 1 {
                 let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
@@ -1939,8 +2440,12 @@ impl Router {
                     }
                 };
 
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
+                // Parse the request body (or reuse the usage-injected body).
+                let json_val = match request_body
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| serde_json::to_value(typed_req))
+                {
                     Ok(j) => j,
                     Err(e) => {
                         return (
@@ -1962,7 +2467,9 @@ impl Router {
             } else {
                 let request_url = format!("{}{}", worker_url, route);
                 (
-                    if let Some(completion) = completion {
+                    if let Some(body) = request_body.as_ref() {
+                        self.client.post(&request_url).json(body)
+                    } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
                     } else {
                         self.client.post(&request_url).json(typed_req)
@@ -1980,6 +2487,7 @@ impl Router {
             for (name, value) in &forwarded {
                 if *name != CONTENT_TYPE
                     && *name != CONTENT_LENGTH
+                    && !(strip_usage && *name == http::header::ACCEPT_ENCODING)
                     && !header_utils::TRACE_HEADER_NAMES
                         .iter()
                         .any(|&th| name.as_str().eq_ignore_ascii_case(th))
@@ -1992,6 +2500,12 @@ impl Router {
         // Add X-data-parallel-rank header for DP-aware routing
         if let Some(dp_rank) = extracted_dp_rank {
             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
+        }
+
+        if strip_usage {
+            // The usage filter consumes SSE text. Negotiate an identity body
+            // even when the original client accepts compressed responses.
+            request_builder = request_builder.header(http::header::ACCEPT_ENCODING, "identity");
         }
 
         // Opt-in: VLLM_ROUTER_STAGES=1. HTTP remains a transparent proxy; the
@@ -2029,6 +2543,24 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+
+        if strip_usage
+            && res
+                .headers()
+                .get_all(http::header::CONTENT_ENCODING)
+                .iter()
+                .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            RouterMetrics::record_agent_aware_usage_filter_error();
+            if let Some(completion) = &program_completion {
+                completion.finish(false);
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                "upstream ignored Accept-Encoding: identity for an observed SSE stream",
+            )
+                .into_response();
+        }
 
         if !is_stream {
             // For non-streaming requests, preserve headers
@@ -2072,6 +2604,12 @@ impl Router {
 
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            if strip_usage {
+                // Filtering the injected usage changes the body length. Let
+                // the HTTP server frame the stream instead of forwarding the
+                // upstream length for a body we no longer send verbatim.
+                response_headers.remove(CONTENT_LENGTH);
+            }
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             if stages_on {
@@ -2092,6 +2630,7 @@ impl Router {
             let producer_load = load.clone();
             let producer = tokio::spawn(async move {
                 let mut stream = stream;
+                let mut usage_stripper = strip_usage.then(SseUsageStripper::default);
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
                 while let Some(chunk) = stream.next().await {
@@ -2131,9 +2670,28 @@ impl Router {
                             let has_output = completion_output
                                 .as_mut()
                                 .is_some_and(|observer| observer.observe(&bytes));
+                            let outgoing = match usage_stripper.as_mut() {
+                                Some(stripper) => match stripper.push(&bytes) {
+                                    Ok(Some(bytes)) => bytes,
+                                    Ok(None) => {
+                                        if has_output {
+                                            producer_load.begin_decode();
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        RouterMetrics::record_agent_aware_usage_filter_error();
+                                        warn!(event = "token_fact_usage_filter_failed", error);
+                                        stream_succeeded = false;
+                                        let _ = tx.send(Err(error.to_string()));
+                                        break;
+                                    }
+                                },
+                                None => bytes,
+                            };
                             let sent = match producer_output_frame.as_mut() {
-                                Some(output_frame) => output_frame.send(&tx, bytes, has_output),
-                                None => tx.send(Ok(bytes)).is_ok(),
+                                Some(output_frame) => output_frame.send(&tx, outgoing, has_output),
+                                None => tx.send(Ok(outgoing)).is_ok(),
                             };
                             if !sent {
                                 stream_succeeded = false;
@@ -2150,8 +2708,13 @@ impl Router {
                         }
                     }
                 }
+                if let Some(stripper) = usage_stripper.as_mut().filter(|_| stream_succeeded) {
+                    if let Some(tail) = stripper.finish() {
+                        let _ = tx.send(Ok(tail));
+                    }
+                }
                 if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
+                    completion.finish_http_stream(stream_succeeded, stream_end);
                 }
             });
 
@@ -2213,7 +2776,7 @@ impl Router {
                     }
                 }
                 if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
+                    completion.finish_http_stream(stream_succeeded, stream_end);
                 }
             });
 
@@ -2232,28 +2795,39 @@ impl Router {
         urls.push(worker_url.to_string());
         crate::backend::classify_worker_urls(&urls)?;
 
-        let start_time = std::time::Instant::now();
+        let budget = StartupBudget::new(
+            self.worker_startup_timeout_secs,
+            self.worker_startup_check_interval_secs,
+        );
+        let health_timeout = Duration::from_secs(self.health_config.timeout_secs);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
+            .timeout(health_timeout)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
+        let mut last_health_error = String::from("none");
 
         loop {
-            if start_time.elapsed() > Duration::from_secs(self.worker_startup_timeout_secs) {
-                error!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    self.worker_startup_timeout_secs, worker_url
+            if budget.remaining().is_zero() {
+                let message = format!(
+                    "Timeout {}s waiting for worker {} to become healthy (last health check: {}). Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
+                    self.worker_startup_timeout_secs, worker_url, last_health_error
                 );
-                return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (vllm_router.launch_server) or --worker-startup-timeout-secs (vllm_worker.router) to a larger value",
-                    self.worker_startup_timeout_secs, worker_url
-                ));
+                error!("{}", message);
+                return Err(message);
             }
 
             let health_result = if crate::backend::is_grpc_url(worker_url) {
-                crate::backend::check_grpc_health(worker_url, Duration::from_secs(2)).await
+                // No test covers this limit: it shortens a 2 s probe, so a test
+                // would hinge on a sub-second wall-clock bound.
+                check_grpc_health_within(worker_url, budget.probe(Duration::from_secs(2))).await
             } else {
-                match client.get(format!("{}/health", worker_url)).send().await {
+                let health_url = format!("{}/health", worker_url);
+                match worker_get(&client, &health_url, self.api_key.as_deref())
+                    .timeout(budget.probe(health_timeout))
+                    .send()
+                    .await
+                {
                     Ok(res) if res.status().is_success() => Ok(()),
                     Ok(res) => Err(format!("HTTP health status {}", res.status())),
                     Err(error) => Err(error.to_string()),
@@ -2283,20 +2857,37 @@ impl Router {
                                 continue;
                             }
                             if !kv_discovery_attempted {
-                                kv_info = self.discover_kv_worker(worker_url).await;
+                                kv_info = self
+                                    .discover_kv_worker(worker_url)
+                                    .await
+                                    .map(|(info, _)| info);
                                 kv_discovery_attempted = true;
                             }
                             info!("Added worker: {}", dp_url);
-                            // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
                             let (base_url, dp_rank) = dp_utils::parse_worker_url(dp_url);
+                            let policy = self.policy_registry.get_default_policy();
+                            let labels = if kv_aware_ops(policy.as_ref()).is_some() {
+                                crate::kv_index::discovery::served_model_labels(
+                                    &self.client,
+                                    &base_url,
+                                    self.api_key.as_deref(),
+                                    dp_rank,
+                                    None,
+                                )
+                                .await
+                            } else {
+                                HashMap::new()
+                            };
                             let new_worker = DPAwareWorker::new(
                                 base_url,
                                 dp_rank.unwrap_or(0),
                                 self.intra_node_data_parallel_size,
                                 WorkerType::Regular,
                             )
+                            .with_labels(labels)
                             .with_circuit_breaker_config(self.circuit_breaker_config.clone())
-                            .with_health_config(self.health_config.clone());
+                            .with_health_config(self.health_config.clone())
+                            .with_worker_api_key(worker_api_key.clone());
 
                             let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
@@ -2330,15 +2921,40 @@ impl Router {
                         let kv_info = self.discover_kv_worker(worker_url).await;
                         info!("Added worker: {}", worker_url);
 
-                        // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
+                        // The registered name is what the engine serves, so an
+                        // adapter selected through `model` stays distinguishable
+                        // from a base-model alias.
+                        let policy = self.policy_registry.get_default_policy();
+                        let labels = if kv_aware_ops(policy.as_ref()).is_some() {
+                            let (_, dp_rank) = dp_utils::parse_worker_url(worker_url);
+                            let base_models = kv_info
+                                .as_ref()
+                                .filter(|_| dp_rank.is_none())
+                                .and_then(|(_, models)| models.clone());
+                            crate::kv_index::discovery::served_model_labels(
+                                &self.client,
+                                worker_url,
+                                self.api_key.as_deref(),
+                                dp_rank,
+                                base_models,
+                            )
+                            .await
+                        } else {
+                            HashMap::new()
+                        };
                         let new_worker =
                             BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
+                                .with_labels(labels)
                                 .with_circuit_breaker_config(self.circuit_breaker_config.clone())
-                                .with_health_config(self.health_config.clone());
+                                .with_health_config(self.health_config.clone())
+                                .with_worker_api_key(worker_api_key.clone());
 
                         let worker_arc = Arc::new(new_worker);
                         self.worker_registry.register(worker_arc.clone());
-                        self.register_kv_target(worker_arc.as_ref(), kv_info.as_ref());
+                        self.register_kv_target(
+                            worker_arc.as_ref(),
+                            kv_info.as_ref().map(|(info, _)| info),
+                        );
 
                         // Notify PolicyRegistry about the new worker
                         let model_id = worker_arc.model_id();
@@ -2364,6 +2980,7 @@ impl Router {
                 }
                 Err(e) => {
                     debug!("Worker {} health check pending - error: {}", worker_url, e);
+                    last_health_error = e;
 
                     if !worker_url.starts_with("http://")
                         && !worker_url.starts_with("https://")
@@ -2372,10 +2989,7 @@ impl Router {
                         warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
                     }
 
-                    tokio::time::sleep(Duration::from_secs(
-                        self.worker_startup_check_interval_secs,
-                    ))
-                    .await;
+                    tokio::time::sleep(budget.backoff()).await;
                     continue;
                 }
             }
@@ -2386,7 +3000,7 @@ impl Router {
         if self.intra_node_data_parallel_size > 1 {
             // remove dp-aware workers in a prefix-matching fashion
             // without contacting the remote worker
-            let mut removed_workers: Vec<String> = Vec::new();
+            let mut removed_workers = Vec::new();
             let worker_url_prefix = format!("{}@", worker_url);
 
             // Find and remove all workers with matching prefix
@@ -2397,10 +3011,10 @@ impl Router {
                     // Get model_id before removing
                     let model_id = w.model_id().to_string();
 
-                    if self.worker_registry.remove_by_url(&removed_url).is_some() {
+                    if let Some(removed) = self.worker_registry.remove_by_url(&removed_url) {
                         self.frontend.remove_worker(&removed_url);
                         info!("Removed worker: {}", removed_url);
-                        removed_workers.push(removed_url);
+                        removed_workers.push(removed);
 
                         // Notify PolicyRegistry about the removed worker
                         self.policy_registry.on_worker_removed(&model_id);
@@ -2411,13 +3025,12 @@ impl Router {
             }
 
             RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-            if !removed_workers.is_empty() {
-                self.remove_kv_worker(worker_url, &removed_workers);
-            }
+            self.remove_kv_workers(&removed_workers);
 
             // If any models are using cache aware policy, remove the workers from the tree
             // Check each removed worker's model and get its policy
-            for dp_url in removed_workers.iter() {
+            for removed in &removed_workers {
+                let dp_url = removed.url();
                 if let Some(worker) = self.worker_registry.get_by_url(dp_url) {
                     let model_id = worker.model_id();
                     if let Some(policy) = self.policy_registry.get_policy(model_id) {
@@ -2440,7 +3053,7 @@ impl Router {
                 return;
             };
 
-            if self.worker_registry.remove_by_url(worker_url).is_some() {
+            if let Some(removed) = self.worker_registry.remove_by_url(worker_url) {
                 self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
@@ -2448,7 +3061,7 @@ impl Router {
                 self.policy_registry.on_worker_removed(&model_id);
 
                 RouterMetrics::set_active_workers(self.worker_registry.get_all().len());
-                self.remove_kv_worker(worker_url, &[worker_url.to_string()]);
+                self.remove_kv_workers(std::slice::from_ref(&removed));
             }
 
             // If the model is using cache aware policy, remove the worker from the tree
@@ -2956,6 +3569,10 @@ impl RouterTrait for Router {
         .into_response()
     }
 
+    fn monitors_kv_events(&self) -> bool {
+        self.kv_index_supervisor.is_some()
+    }
+
     fn router_type(&self) -> &'static str {
         "regular"
     }
@@ -2995,6 +3612,11 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
+        if let Some(response) =
+            reject_full_report(self.kv_index_supervisor.is_some(), body.get("vllm_xargs"))
+        {
+            return response;
+        }
         debug!("Transparent proxy: routing {} {} to backend", method, path);
         let start = Instant::now();
 
@@ -3029,7 +3651,11 @@ impl RouterTrait for Router {
         let lora_name = body
             .get("lora_name")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                kv_ops?;
+                inferred_lora_name(&workers, model_id?)
+            });
         let cache_salt = body
             .get("cache_salt")
             .and_then(serde_json::Value::as_str)
@@ -3069,6 +3695,10 @@ impl RouterTrait for Router {
             .as_ref()
             .map(KvRequestTokens::PerWorker)
             .unwrap_or(KvRequestTokens::Shared(None));
+        let cache_read_fallback = kv_ops.and_then(|_| http_cache_read_fallback(&body));
+        if let Some(reason) = cache_read_fallback {
+            RouterMetrics::record_kv_placement_lookup(reason);
+        }
         let program_completion = if *method == Method::POST {
             match self
                 .acquire_program_completion_from_payload(
@@ -3095,25 +3725,39 @@ impl RouterTrait for Router {
                 .filter(|worker| worker.is_available())
                 .map(|worker| {
                     let kv_receipt = kv_ops.and_then(|ops| {
-                        ops.select_worker_with_inputs(
+                        let eligibility = self.kv_placement_eligibility(
+                            std::slice::from_ref(&worker),
+                            model_id,
+                            lora_name,
+                            cache_read_fallback.is_some(),
+                        );
+                        ops.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
                             request_tokens,
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
+                            eligibility.as_deref(),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
                 })
         } else if let Some(ops) = kv_ops {
-            ops.select_worker_with_inputs(
+            let eligibility = self.kv_placement_eligibility(
+                &workers,
+                model_id,
+                lora_name,
+                cache_read_fallback.is_some(),
+            );
+            ops.select_worker_with_qualified_inputs(
                 &workers,
                 request_tokens,
                 lora_name,
                 cache_salt,
                 affinity_key.as_ref(),
                 &[],
+                eligibility.as_deref(),
             )
             .map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
@@ -3343,6 +3987,7 @@ impl RouterTrait for Router {
                     let stream = response.bytes_stream();
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let completion = status.is_success().then_some(program_completion).flatten();
+                    let stream_end = StreamEnd::for_http_route(path);
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let mut stream_ok = true;
@@ -3365,7 +4010,7 @@ impl RouterTrait for Router {
                             }
                         }
                         if let Some(completion) = completion {
-                            completion.finish(stream_ok);
+                            completion.finish_http_stream(stream_ok, stream_end);
                         }
                     });
                     response_builder
@@ -3417,9 +4062,62 @@ impl RouterTrait for Router {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::backend::outcome::EngineUsage;
+    use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn non_kv_policy_does_not_probe_model_metadata_on_worker_add() {
+        use crate::config::{PolicyConfig, RouterConfig};
+        use axum::routing::get;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .fallback(get(move |request: Request| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().push(request.uri().path().to_owned());
+                    StatusCode::NOT_FOUND
+                }
+            }));
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            let app = app.clone();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+        let config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(vec![urls[0].clone()], &ctx).await.unwrap();
+        router.add_worker(&urls[1]).await.unwrap();
+        assert_eq!(router.worker_registry.get_all().len(), 2);
+        assert!(router
+            .worker_registry
+            .get_all()
+            .iter()
+            .all(|worker| worker.model_id() == "unknown"));
+        let paths = requests.lock();
+        assert!(paths.is_empty(), "non-health requests: {paths:?}");
+        for server in servers {
+            server.abort();
+        }
+    }
 
     struct CompletionResponseFixture {
         router: Arc<Router>,
@@ -3515,9 +4213,6 @@ mod tests {
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         assert!(supervisor.match_provider_for_worker(&worker).is_none());
         supervisor.shutdown();
-        if let Some(task) = &router._kv_signal_handle {
-            task.abort();
-        }
         if let Some(task) = &router._load_monitor_handle {
             task.abort();
         }
@@ -3525,26 +4220,19 @@ mod tests {
         let requests = requests.lock();
         // Discovery asks every metadata source before giving up, and none of the
         // probes may carry an Authorization header the operator did not configure.
-        let mut probed: Vec<&str> = requests.iter().map(|(path, _)| path.as_str()).collect();
-        probed.sort_unstable();
-        assert_eq!(
-            probed,
-            [
-                "/get_server_info",
-                "/kv_event_sources",
-                "/metrics",
-                "/server_info"
-            ],
-            "metadata requests: {requests:?}"
-        );
-        for path in ["/get_server_info", "/kv_event_sources"] {
-            assert!(
-                requests.iter().any(|(actual_path, authorization)| {
-                    actual_path == path && authorization.is_none()
-                }),
-                "missing unauthenticated {path}: {requests:?}"
-            );
+        for path in [
+            "/get_server_info",
+            "/kv_event_sources",
+            "/kv_routing_capabilities",
+            "/metrics",
+            "/server_info",
+            "/v1/models",
+        ] {
+            assert!(requests.iter().any(|(actual, _)| actual == path));
         }
+        assert!(requests
+            .iter()
+            .all(|(_, authorization)| authorization.is_none()));
     }
 
     #[tokio::test]
@@ -3569,23 +4257,150 @@ mod tests {
             .expect("invalid static configuration");
         assert!(error.contains("model identity"), "{error}");
     }
+    struct NativePublisher {
+        live: zmq::Socket,
+        replay: zmq::Socket,
+    }
+
+    impl NativePublisher {
+        fn new() -> Self {
+            let context = zmq::Context::new();
+            let socket = |kind| {
+                let socket = context.socket(kind).unwrap();
+                socket.set_linger(0).unwrap();
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+                socket
+            };
+            Self {
+                live: socket(zmq::XPUB),
+                replay: socket(zmq::ROUTER),
+            }
+        }
+
+        fn sources(&self, rank: u32, topic: &str) -> serde_json::Value {
+            serde_json::json!({(rank.to_string()): {
+                "endpoint": self.live.get_last_endpoint().unwrap().unwrap(),
+                "replay_endpoint": self.replay.get_last_endpoint().unwrap().unwrap(),
+                "topic": topic, "publisher": "zmq", "encoding": "msgpack",
+                "schema_version": 1, "enable_kv_cache_events": true
+            }})
+        }
+
+        async fn replay_request(&self, start: u64) -> Vec<Vec<u8>> {
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match self.replay.recv_multipart(zmq::DONTWAIT) {
+                        Ok(request) => break request,
+                        Err(zmq::Error::EAGAIN) => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        Err(error) => panic!("KV replay request: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.last().unwrap(), &start.to_be_bytes());
+            request
+        }
+
+        fn reply(&self, request: &[Vec<u8>], topic: &str, frames: &[(i64, &[u8])]) {
+            for (seq, payload) in frames.iter().copied().chain([(-1, &[][..])]) {
+                self.replay
+                    .send_multipart(
+                        [
+                            request[0].as_slice(),
+                            &[],
+                            if seq == -1 { &[] } else { topic.as_bytes() },
+                            &seq.to_be_bytes(),
+                            payload,
+                        ],
+                        0,
+                    )
+                    .unwrap();
+            }
+        }
+
+        async fn bootstrap(&self, topic: &str) {
+            let mut subscription = None;
+            wait_for_kv(|| {
+                subscription = self.live.recv_bytes(zmq::DONTWAIT).ok();
+                subscription.is_some()
+            })
+            .await;
+            assert_eq!(
+                subscription.unwrap(),
+                [b"\x01".as_slice(), topic.as_bytes()].concat()
+            );
+            let request = self.replay_request(0).await;
+            self.reply(&request, topic, &[]);
+        }
+
+        fn send(&self, topic: &str, seq: i64, payload: &[u8]) {
+            self.live
+                .send_multipart([topic.as_bytes(), &seq.to_be_bytes(), payload], 0)
+                .unwrap();
+        }
+    }
+
+    async fn wait_for_kv(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("KV state did not converge");
+    }
+
+    fn plain_native_layout(
+        model: &str,
+        rank: u32,
+        block_size: u32,
+        topic: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "adapters": [],
+            "ranks": [{
+                "rank": rank, "declared_groups": 1, "model": model, "weight_version": "default",
+                "publisher_topic": topic, "instance_topic": true, "hash_algorithm": "sha256_cbor",
+                "hash_seed": "0", "full_hashes": true, "hash_block_size": block_size,
+                "partial_hash_hits": false, "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+                "prefix_caching": true, "transfer": null,
+                "groups": [{
+                    "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                    "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
+                }]
+            }]
+        })
+    }
+
     #[tokio::test]
     async fn empty_router_retains_static_mapping_for_future_http_add_worker() {
+        for managed in [false, true] {
+            exercise_future_http_worker(managed).await;
+        }
+    }
+
+    async fn exercise_future_http_worker(managed: bool) {
         use crate::config::{PolicyConfig, RouterConfig};
-        use crate::kv_index::{MatchQuery, StorageTier};
+        use crate::kv_index::source::test_support::{event_payload, full_store, gpu_remove};
+        use crate::kv_index::KVEvent;
+        use crate::protocols::worker_spec::WorkerConfigRequest;
+        use crate::routers::router_manager::{RouterId, RouterManager};
         use axum::routing::get;
         use serde_json::json;
 
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let publisher = NativePublisher::new();
+        let topic = "kv/future";
+        let sources = publisher.sources(0, topic);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker = format!("http://{}", listener.local_addr().unwrap());
-        // Discovery endpoints deliberately do not exist: the saved mapping must
-        // supply the source for this later, independently addressed worker.
+        // The later worker has no discovery endpoints.
         let app = axum::Router::new().route("/health", get(|| async { "ok" }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = RouterConfig {
+            enable_igw: managed,
             policy: PolicyConfig::KvAware {
                 router_temperature: 0.0,
                 kv_penalty_host: 0.8,
@@ -3593,8 +4408,10 @@ mod tests {
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Box::new(
                     serde_json::from_value(json!({&worker: {
-                        "endpoints": [publisher.get_last_endpoint().unwrap().unwrap()],
-                        "block_size": 8, "model": "future-model", "topic": "kv/future"
+                        "endpoints": [sources["0"]["endpoint"]],
+                        "replay_endpoints": [sources["0"]["replay_endpoint"]],
+                        "block_size": 8, "model": "future-model",
+                        "hybrid": plain_native_layout("future-model", 0, 8, topic)
                     }}))
                     .unwrap(),
                 ),
@@ -3605,106 +4422,217 @@ mod tests {
         let ctx = Arc::new(
             crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
         );
-        let router = Router::new(vec![], &ctx).await.unwrap();
-        router.add_worker(&worker).await.unwrap();
+        let router = Arc::new(Router::new(vec![], &ctx).await.unwrap());
+        let reconcile = router.kv_reconcile_handle.as_ref().unwrap().abort_handle();
+        let manager = managed.then(|| {
+            let manager = RouterManager::new(
+                ctx.router_config.clone(),
+                ctx.client.clone(),
+                ctx.worker_registry.clone(),
+                ctx.policy_registry.clone(),
+            );
+            manager.register_router(RouterId::new("http-regular".into()), router.clone());
+            manager
+        });
+        if let Some(manager) = &manager {
+            let registration: WorkerConfigRequest = serde_json::from_value(json!({
+                "url": worker, "model_id": "future-model", "labels": {"policy": "kv_aware"}
+            }))
+            .unwrap();
+            manager.add_worker(registration.clone()).await.unwrap();
+            let mut other = registration;
+            other.url = format!("{worker}/other");
+            other.model_id = Some("other-model".into());
+            manager.add_worker(other).await.unwrap();
+        } else {
+            router.add_worker(&worker).await.unwrap();
+        }
         let supervisor = router.kv_index_supervisor.as_ref().unwrap();
         let provider = supervisor.match_provider_for_worker(&worker).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(frame) => {
-                        assert_eq!(frame, b"\x01kv/future");
-                        break;
-                    }
-                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                    Err(error) => panic!("future worker subscription: {error}"),
-                }
+        publisher.bootstrap(topic).await;
+        let store = full_store(&[1; 8], 8, None);
+        let payload = event_payload(1.0, &[KVEvent::BlockStored(store.clone())], Some(0));
+        let lookup = || provider.matches(&[1; 9], 8, None, 0);
+        publisher.send(topic, 0, &payload);
+        wait_for_kv(|| !lookup().is_empty()).await;
+        let hits = lookup();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.instance_id.as_ref(), worker);
+        assert_eq!(hits[0].segments, [(0, 1)]);
+
+        if let Some(manager) = &manager {
+            let target = router.available_workers(Some("future-model"));
+            let other = router.available_workers(Some("other-model"));
+            assert_eq!(target.len(), 1);
+            assert_eq!(other.len(), 1);
+            assert_eq!(target[0].url(), worker);
+            assert_ne!(target[0].url(), other[0].url());
+            let model = ctx.policy_registry.get_policy_or_default("future-model");
+            let default = ctx.policy_registry.get_default_policy();
+            assert!(!Arc::ptr_eq(&model, &default));
+            let prompts = [vec![1; 9]];
+            let remaining = |policy: &Arc<dyn LoadBalancingPolicy>, worker: &dyn Worker| {
+                kv_aware_ops(policy.as_ref())
+                    .unwrap()
+                    .estimate_prefill_work(
+                        &[(worker, &prompts, true)],
+                        &mut crate::policies::PromptHashes::new(),
+                    )[0]
+                .new_prefill_tokens
+            };
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 1);
+                assert_eq!(remaining(policy, other[0].as_ref()), 9);
             }
-        })
-        .await
-        .unwrap();
-        let payload = rmp_serde::to_vec(&(
-            1.0,
-            [json!({
-                "type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
-                "token_ids": vec![1; 8], "block_size": 8, "medium": "GPU",
-                "lora_id": null, "lora_name": null
-            })],
-            0u32,
-        ))
-        .unwrap();
-        publisher
-            .send_multipart([b"kv/future".as_slice(), &0i64.to_be_bytes(), &payload], 0)
-            .unwrap();
-        let query = MatchQuery {
-            group_idx: 0,
-            local_hashes: crate::kv_index::local_block_hash_strings(&[1; 8], 8, None),
-            tiers_of_interest: vec![StorageTier::Device],
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let hits = provider.find_tiered_matches(&query);
-                if !hits.is_empty() {
-                    assert_eq!(hits.len(), 1);
-                    assert_eq!(hits[0].target.instance_id.as_ref(), worker);
-                    assert_eq!(hits[0].segments, [(0, 1)]);
-                    break;
-                }
-                tokio::task::yield_now().await;
+            let removed = event_payload(2.0, &[gpu_remove(Some(0), store.block_hashes)], Some(0));
+            publisher.send(topic, 1, &removed);
+            wait_for_kv(|| lookup().is_empty()).await;
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 9);
             }
-        })
-        .await
-        .unwrap();
+            publisher.send(topic, 2, &payload);
+            wait_for_kv(|| !lookup().is_empty()).await;
+            manager.remove_worker_from_registry(&worker).unwrap();
+            assert!(supervisor.match_provider_for_worker(&worker).is_none());
+            assert!(lookup().is_empty());
+            assert!(router.available_workers(Some("future-model")).is_empty());
+            assert_eq!(router.available_workers(Some("other-model")).len(), 1);
+            for policy in [&model, &default] {
+                assert_eq!(remaining(policy, target[0].as_ref()), 9);
+            }
+        }
         supervisor.shutdown();
         task.abort();
+        drop(manager);
+        drop(router);
+        wait_for_kv(|| reconcile.is_finished()).await;
+    }
+
+    #[test]
+    fn regular_worker_removal_clears_both_policy_bindings() {
+        use crate::kv_index::source::test_support::full_binding;
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let router = create_test_kv_router();
+        let workers: [Arc<dyn Worker>; 2] = ["http://one", "http://two"].map(|url| {
+            Arc::new(
+                BasicWorker::new(url.into(), WorkerType::Regular)
+                    .with_labels(HashMap::from([("model_id".into(), "m".into())])),
+            ) as Arc<dyn Worker>
+        });
+        for worker in &workers {
+            router.worker_registry.register(worker.clone());
+            router
+                .policy_registry
+                .on_worker_added("m", Some("kv_aware"));
+        }
+        let model = router.policy_registry.get_policy("m").unwrap();
+        let default = router.policy_registry.get_default_policy();
+        assert!(!Arc::ptr_eq(&default, &model));
+        let worker = workers[0].as_ref();
+        let target = RoutableTarget {
+            instance_id: "cached-source".into(),
+            dp_rank: 0,
+        };
+        let policies = [
+            kv_aware_policy(default.as_ref()).unwrap(),
+            kv_aware_policy(model.as_ref()).unwrap(),
+        ];
+        for policy in policies {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: "m".into(),
+                    block_size: 4,
+                },
+                Arc::new(full_binding(target.clone(), 4)),
+            );
+            assert_eq!(policy.target_for_worker(worker), target);
+        }
+        router.remove_worker(worker.url());
+        assert_eq!(router.worker_registry.get_by_model_fast("m").len(), 1);
+        for policy in policies {
+            assert_eq!(
+                policy.target_for_worker(worker).instance_id.as_ref(),
+                worker.url()
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_adapter_requires_a_complete_pool_of_base_model_names() {
+        let worker = |url: &str, model: &str, aliases: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorker::new(url.into(), WorkerType::Regular).with_labels(HashMap::from([
+                    ("model_id".into(), model.into()),
+                    ("served_model_aliases".into(), aliases.into()),
+                ])),
+            )
+        };
+        let base = worker("http://known", "base", "alias");
+        let unknown = worker("http://unknown", "unknown", "");
+        let workers = [base.clone(), unknown];
+        assert_eq!(inferred_lora_name(&workers, "other"), None);
+        assert_eq!(
+            inferred_lora_name(std::slice::from_ref(&base), "alias"),
+            None
+        );
+        assert_eq!(inferred_lora_name(&[base], "adapter"), Some("adapter"));
+        let mut router = create_test_kv_router();
+        let (supervisor, _) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
+        router.kv_index_supervisor = Some(Arc::new(supervisor));
+        assert_eq!(
+            router.kv_placement_eligibility(&workers, Some("alias"), None, false),
+            Some(vec![true, false])
+        );
+        assert_eq!(
+            router.kv_placement_eligibility(&workers, Some("other"), None, false),
+            Some(vec![false, false])
+        );
     }
 
     #[tokio::test]
     async fn discovered_http_sources_use_full_attention_admission_through_router_startup_and_add() {
         use crate::config::{PolicyConfig, RouterConfig};
-        use crate::kv_index::{MatchQuery, StorageTier};
+        use crate::kv_index::source::test_support::{event_payload, full_store};
+        use crate::kv_index::{BlockRemoved, KVEvent, StorageTier};
         use axum::{routing::get, Json};
         use serde_json::json;
 
-        for (expected, actual, replayed, empty_start) in
-            [(16u32, 8u32, false, false), (8, 16, true, true)]
-        {
-            let context = zmq::Context::new();
-            let publisher = context.socket(zmq::XPUB).unwrap();
-            publisher.bind("tcp://127.0.0.1:*").unwrap();
-            let replay = context.socket(zmq::ROUTER).unwrap();
-            replay.bind("tcp://127.0.0.1:*").unwrap();
-            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-            let replay_endpoint = replay.get_last_endpoint().unwrap().unwrap();
-            let sources = json!({"3": {
-                "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-                "topic": "kv/router", "publisher": "zmq", "encoding": "msgpack",
-                "schema_version": 1, "enable_kv_cache_events": true
-            }});
+        let topic = "kv/router";
+        for empty_start in [false, true] {
+            let publisher = NativePublisher::new();
+            let sources = publisher.sources(3, topic);
+            let layout = plain_native_layout("router-dense", 3, 8, topic);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let metadata_requests = requests.clone();
             let app = axum::Router::new()
                 .route("/health", get(|| async { "ok" }))
                 .fallback(get(move |request: Request| {
-                    let sources = sources.clone();
-                    let requests = metadata_requests.clone();
+                    let (sources, layout, requests) =
+                        (sources.clone(), layout.clone(), metadata_requests.clone());
                     async move {
                         let authorization = request
                             .headers()
                             .get("authorization")
-                            .map(|value| value.to_str().unwrap().to_owned());
-                        let path = request.uri().path().to_owned();
-                        requests.lock().push((path.clone(), authorization.clone()));
-                        if authorization.as_deref() != Some("Bearer backend-key") {
+                            .and_then(|value| value.to_str().ok());
+                        let path = request.uri().path();
+                        requests
+                            .lock()
+                            .push((path.to_owned(), authorization.map(str::to_owned)));
+                        if authorization != Some("Bearer backend-key") {
                             return StatusCode::UNAUTHORIZED.into_response();
                         }
-                        match path.as_str() {
+                        match path {
                             "/get_server_info" => Json(json!({
                                 "model_id": "router-dense", "instance_id": "router-source",
-                                "kv_block_size": expected
+                                "kv_block_size": 8
                             }))
                             .into_response(),
                             "/kv_event_sources" => Json(sources).into_response(),
+                            "/kv_routing_capabilities" => Json(layout).into_response(),
                             _ => StatusCode::NOT_FOUND.into_response(),
                         }
                     }
@@ -3728,16 +4656,12 @@ mod tests {
             let ctx = Arc::new(
                 crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
             );
-            let router = Router::new(
-                if empty_start {
-                    vec![]
-                } else {
-                    vec![worker.clone()]
-                },
-                &ctx,
-            )
-            .await
-            .unwrap();
+            let urls = if empty_start {
+                vec![]
+            } else {
+                vec![worker.clone()]
+            };
+            let router = Router::new(urls, &ctx).await.unwrap();
             if empty_start {
                 router.add_worker(&worker).await.unwrap();
             }
@@ -3745,157 +4669,70 @@ mod tests {
             let provider = supervisor.match_provider_for_worker(&worker).unwrap();
             {
                 let requests = requests.lock();
-                assert_eq!(requests.len(), 2, "metadata requests: {requests:?}");
-                for path in ["/get_server_info", "/kv_event_sources"] {
+                assert!(requests.iter().all(|(_, authorization)| {
+                    authorization.as_deref() == Some("Bearer backend-key")
+                }));
+                for path in [
+                    "/get_server_info",
+                    "/kv_event_sources",
+                    "/kv_routing_capabilities",
+                    "/v1/models",
+                ] {
                     assert!(
-                        requests.iter().any(|(actual_path, authorization)| {
-                            actual_path == path
-                                && authorization.as_deref() == Some("Bearer backend-key")
-                        }),
+                        requests.iter().any(|(actual, _)| actual == path),
                         "missing authenticated {path}: {requests:?}"
                     );
                 }
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match publisher.recv_bytes(zmq::DONTWAIT) {
-                        Ok(frame) => {
-                            assert_eq!(frame, b"\x01kv/router");
-                            break;
-                        }
-                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                        Err(error) => panic!("Router XPUB subscription: {error}"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            let payload =
-                |hash: u32, token: u32, block_size: u32| {
-                    rmp_serde::to_vec(&(1.0, [json!({
-                "type": "BlockStored", "block_hashes": [hash], "parent_block_hash": null,
-                "token_ids": vec![token; block_size as usize], "block_size": block_size,
-                "medium": "CPU", "lora_id": null, "lora_name": null
-            })], 3u32)).unwrap()
-                };
-            let query = |token| MatchQuery {
-                group_idx: 0,
-                local_hashes: crate::kv_index::local_block_hash_strings(
-                    &vec![token; expected as usize],
-                    expected,
-                    None,
-                ),
-                tiers_of_interest: vec![StorageTier::HostPinned],
+            publisher.bootstrap(topic).await;
+            let mut store = full_store(&[1; 8], 8, None);
+            store.medium = Some("CPU".into());
+            let warm = event_payload(1.0, &[KVEvent::BlockStored(store.clone())], Some(3));
+            let lookup = |token| provider.matches(&[token; 9], 8, None, 3);
+            let check_hit = |token| {
+                let hits = lookup(token);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].target.instance_id.as_ref(), "router-source");
+                assert_eq!(hits[0].target.dp_rank, 3);
+                assert_eq!(hits[0].tier, StorageTier::HostPinned);
+                assert_eq!(hits[0].segments, [(0, 1)]);
             };
-            publisher
-                .send_multipart(
-                    [
-                        b"kv/router".as_slice(),
-                        &0i64.to_be_bytes(),
-                        &payload(1, 1, expected),
-                    ],
-                    0,
-                )
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let hits = provider.find_tiered_matches(&query(1));
-                    if !hits.is_empty() {
-                        assert_eq!(hits.len(), 1);
-                        assert_eq!(hits[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(hits[0].target.dp_rank, 3);
-                        assert_eq!(hits[0].tier, StorageTier::HostPinned);
-                        assert_eq!(hits[0].segments, [(0, 1)]);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            if replayed {
-                let fresh = payload(3, 3, expected);
-                publisher
-                    .send_multipart([b"kv/router".as_slice(), &2i64.to_be_bytes(), &fresh], 0)
-                    .unwrap();
-                let request = tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match replay.recv_multipart(zmq::DONTWAIT) {
-                            Ok(request) => break request,
-                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                            Err(error) => panic!("Router replay: {error}"),
-                        }
-                    }
-                })
-                .await
-                .unwrap();
-                assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
-                for (seq, body) in [(1i64, payload(2, 2, actual)), (2, fresh), (-1, vec![])] {
-                    replay
-                        .send_multipart(
-                            [
-                                request[0].clone(),
-                                vec![],
-                                if seq == -1 {
-                                    vec![]
-                                } else {
-                                    b"kv/router".to_vec()
-                                },
-                                seq.to_be_bytes().to_vec(),
-                                body,
-                            ],
-                            0,
-                        )
-                        .unwrap();
-                }
+            publisher.send(topic, 0, &warm);
+            wait_for_kv(|| !lookup(1).is_empty()).await;
+            check_hit(1);
+
+            if empty_start {
+                let removed = KVEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: store.block_hashes,
+                    medium: Some("CPU".into()),
+                    group_idx: Some(0),
+                    locality: None,
+                    ownership: None,
+                });
+                let remove = event_payload(2.0, &[removed], Some(3));
+                let mut new = full_store(&[3; 8], 8, None);
+                new.medium = Some("CPU".into());
+                let fresh = event_payload(3.0, &[KVEvent::BlockStored(new)], Some(3));
+                publisher.send(topic, 2, &fresh);
+                let request = publisher.replay_request(1).await;
+                assert!(lookup(1).is_empty(), "gap must hide the source");
+                publisher.reply(&request, topic, &[(1, &remove), (2, &fresh)]);
+                wait_for_kv(|| !lookup(3).is_empty()).await;
+                check_hit(3);
+                assert!(lookup(1).is_empty());
             } else {
-                publisher
-                    .send_multipart(
-                        [
-                            b"kv/router".as_slice(),
-                            &1i64.to_be_bytes(),
-                            &payload(2, 2, actual),
-                        ],
-                        0,
-                    )
-                    .unwrap();
+                let mut bad = full_store(&[2; 8], 8, None);
+                bad.group_idx = Some(1);
+                let invalid = event_payload(2.0, &[KVEvent::BlockStored(bad)], Some(3));
+                publisher.send(topic, 1, &invalid);
+                wait_for_kv(|| lookup(1).is_empty()).await;
+                assert!(lookup(2).is_empty());
             }
-            let result = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if replayed {
-                        let fresh = provider.find_tiered_matches(&query(3));
-                        if fresh.is_empty() {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        assert_eq!(fresh.len(), 1);
-                        assert_eq!(fresh[0].target.instance_id.as_ref(), "router-source");
-                        assert_eq!(fresh[0].target.dp_rank, 3);
-                        assert_eq!(fresh[0].tier, StorageTier::HostPinned);
-                        assert_eq!(fresh[0].segments, [(0, 1)]);
-                        assert!(provider.find_tiered_matches(&query(1)).is_empty());
-                        assert!(provider.find_tiered_matches(&query(2)).is_empty());
-                        break true;
-                    }
-                    let old = provider.find_tiered_matches(&query(1));
-                    let new = provider.find_tiered_matches(&query(2));
-                    if old.is_empty() {
-                        assert!(new.is_empty());
-                        break true;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
             supervisor.shutdown();
-            if let Some(task) = &router._kv_signal_handle {
-                task.abort();
-            }
             if let Some(task) = &router._load_monitor_handle {
                 task.abort();
             }
             http_task.abort();
-            assert!(result.is_ok(), "ordinary Router accepted source/event mismatch: source={expected},event={actual},replay={replayed},empty={empty_start}");
         }
     }
 
@@ -4247,13 +5084,20 @@ mod tests {
 
     #[tokio::test]
     async fn completion_registered_source_credits_prepared_alias_and_preserves_raw() {
-        use crate::kv_index::wire::ExternalBlockHash;
-        use crate::kv_index::{BlockStored, IngestionSignal, KVEvent};
+        use crate::kv_index::source::test_support::{event_payload, full_store};
+        use crate::kv_index::KVEvent;
+        const SERVED_ALIAS: &str = "other-alias";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            WorkerType::Regular,
-        ));
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorker::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                WorkerType::Regular,
+            )
+            .with_labels(HashMap::from([(
+                "served_model_aliases".into(),
+                SERVED_ALIAS.into(),
+            )])),
+        );
         let mut router = create_test_kv_router();
         router.worker_registry.register(worker.clone());
         let policy = router.policy_registry.get_default_policy();
@@ -4263,10 +5107,9 @@ mod tests {
             .unwrap();
         let manager = kv.slot_manager().unwrap();
         let target = kv.target_for_worker(worker.as_ref());
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind("tcp://127.0.0.1:*").unwrap();
-        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let publisher = NativePublisher::new();
+        let topic = "kv/completion-alias";
+        let sources = publisher.sources(0, topic);
         let captured = Arc::new(Mutex::new(Vec::new()));
         let bodies = captured.clone();
         let (inflight_manager, inflight_target, inflight_worker) =
@@ -4285,9 +5128,15 @@ mod tests {
                 let source_url = source_url.clone();
                 async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source_url,"kv_block_size":4})) }
             }))
+            .route("/v1/models", axum::routing::get(|| async {
+                Json(serde_json::json!({"data":[{"id":SERVED_ALIAS,"parent":null}]}))
+            }))
             .route("/kv_event_sources", axum::routing::get(move || {
-                let endpoint = endpoint.clone();
-                async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+                let sources = sources.clone();
+                async move { Json(sources) }
+            }))
+            .route("/kv_routing_capabilities", axum::routing::get(move || async move {
+                Json(plain_native_layout("qwen3", 0, 4, topic))
             }))
             .route("/v1/completions", axum::routing::post(move |body: axum::body::Bytes| {
                 let (bodies, manager, target, worker) = (bodies.clone(), inflight_manager.clone(), inflight_target.clone(), inflight_worker.clone());
@@ -4299,70 +5148,34 @@ mod tests {
                 }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new_http_full_attention(
-            Client::new(),
-            crate::kv_index::HashMode::Sha256,
+        let labels = crate::kv_index::discovery::served_model_labels(
+            &Client::new(),
+            worker.url(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            labels.get("served_model_aliases"),
+            worker.metadata().labels.get("served_model_aliases")
         );
+        let (supervisor, _signals) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(Client::new());
         let supervisor = Arc::new(supervisor);
         let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+        let provider = supervisor.match_provider_for_worker(worker.url()).unwrap();
         kv_aware_ops(policy.as_ref()).unwrap().register_worker(
             worker.as_ref(),
             Some(&info),
-            supervisor.match_provider_for_worker(worker.url()),
+            Some(provider.clone()),
         );
         router.kv_index_supervisor = Some(supervisor.clone());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match publisher.recv_bytes(zmq::DONTWAIT) {
-                    Ok(subscription) => {
-                        assert_eq!(subscription, [1]);
-                        break;
-                    }
-                    Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
-                    Err(error) => panic!("subscription handshake: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("subscriber handshake");
-        let event = KVEvent::BlockStored(BlockStored {
-            extra_keys: None,
-            block_hashes: vec![ExternalBlockHash::Int(1), ExternalBlockHash::Int(2)],
-            parent_block_hash: None,
-            token_ids: vec![1, 3, 4, 3, 4, 3, 4, 3],
-            block_size: 4,
-            lora_id: None,
-            medium: Some("GPU".into()),
-            lora_name: None,
-            group_idx: Some(0),
-            kv_cache_spec_kind: Some("full_attention".into()),
-            kv_cache_spec_sliding_window: None,
-            locality: Some("LOCAL".into()),
-            ownership: None,
-            session_id: None,
-        });
-        let payload = rmp_serde::to_vec_named(&(0.0, vec![event], Some(0u32))).unwrap();
-        publisher
-            .send_multipart(
-                [
-                    b"".as_slice(),
-                    0i64.to_be_bytes().as_slice(),
-                    payload.as_slice(),
-                ],
-                0,
-            )
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match signals.recv().await {
-                    Some(IngestionSignal::Advance { last_seq: 0, .. }) => break,
-                    Some(_) => {}
-                    None => panic!("source signal channel closed"),
-                }
-            }
-        })
-        .await
-        .expect("stored prefix applied");
+        publisher.bootstrap(topic).await;
+        let tokens = [1, 3, 4, 3, 4, 3, 4, 3, 4];
+        let event = KVEvent::BlockStored(full_store(&tokens[..8], 4, None));
+        publisher.send(topic, 0, &event_payload(1.0, &[event], Some(0)));
+        wait_for_kv(|| !provider.matches(&tokens, 4, None, 0).is_empty()).await;
         manager.begin_prefill(&target, 7);
         worker.increment_load();
         let raw = bytes::Bytes::from_static(
@@ -4632,6 +5445,7 @@ mod tests {
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
+                    request_body: None,
                 },
                 None,
             )
@@ -4681,13 +5495,11 @@ mod tests {
         warm: usize,
         render_available: bool,
     ) -> HttpKvFixture {
-        use crate::kv_index::{
-            CacheKey, HashMode, KvBlockIndexer, ResidencyOwner, RoutableTarget, StorageTier,
-        };
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::{CacheKey, RoutableTarget};
         use crate::policies::KvAwarePolicy;
         use axum::{extract::OriginalUri, routing::post};
         let router = create_test_kv_router();
-        let index = Arc::new(KvBlockIndexer::new());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
         let fail_first = Arc::new(AtomicBool::new(false));
@@ -4738,12 +5550,13 @@ mod tests {
                 instance_id: Arc::from(format!("worker-{worker_index}")),
                 dp_rank: 0,
             };
+            let index = Arc::new(full_binding(target.clone(), 2));
+            index.begin_empty(0);
             policy.register_target_with_cache_identity(
                 worker.url(),
                 target.clone(),
                 CacheKey {
                     model: Arc::from("model"),
-                    hash_mode: HashMode::Sha256,
                     block_size: 2,
                 },
                 index.clone(),
@@ -4751,22 +5564,7 @@ mod tests {
             if worker_index == warm {
                 worker.increment_load();
                 for (prompt_index, ids) in inputs[warm].iter().enumerate() {
-                    let blocks: Vec<_> = KvAwarePolicy::local_hashes(&ids[..4], 2)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(block, hash)| (Arc::from(format!("{prompt_index}-{block}")), hash))
-                        .collect();
-                    index.store(
-                        0,
-                        ResidencyOwner::Worker {
-                            source: target.instance_id.clone(),
-                            dp_rank: 0,
-                            incarnation: 0,
-                        },
-                        StorageTier::Device,
-                        None,
-                        &blocks,
-                    );
+                    warm_full(&index, prompt_index as u64, &ids[..4]);
                 }
             }
             workers.push(worker);
@@ -5358,6 +6156,126 @@ mod tests {
         router
     }
 
+    #[tokio::test]
+    async fn stream_error_frame_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_grpc_response(response, true, completion);
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
+    }
+
+    #[tokio::test]
+    async fn producer_error_outcome_settles_the_attempt_as_failed() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        completion.engine_observer().record_error();
+        let observed = completion.clone();
+        let chunks = vec![Ok::<_, axum::Error>(axum::body::Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        ))];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_grpc_response(response, true, completion);
+        let _ = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(!observed.finished_success());
+    }
+
+    async fn settlement_scheduler(
+        estimated_tokens: usize,
+    ) -> (
+        Arc<ProgramScheduler>,
+        crate::program_scheduling::ProgramDispatch,
+    ) {
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        let target = crate::program_scheduling::ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let identity = crate::program_scheduling::ProgramIdentity::from_request(
+            None,
+            Some(&serde_json::json!({
+                "vllm_xargs": {"agentic_context": {
+                    "program_id": "program-a",
+                    "expected_resume": true
+                }}
+            })),
+            Some("model-a"),
+        )
+        .unwrap()
+        .unwrap();
+        let dispatch = scheduler
+            .acquire(
+                identity,
+                crate::program_scheduling::ContextTokens::estimated(estimated_tokens),
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        (scheduler, dispatch)
+    }
+
+    fn program_completion(
+        scheduler: &Arc<ProgramScheduler>,
+        dispatch: crate::program_scheduling::ProgramDispatch,
+    ) -> ProgramCompletion {
+        let estimator = Arc::new(crate::token_estimator::MomentumTokenEstimator::default());
+        let (_, calibration) = estimator.estimate(
+            crate::token_estimator::TokenEstimateScope::new("model-a", "/v1/chat/completions"),
+            &"x".repeat(400),
+        );
+        ProgramCompletion::new(scheduler.clone(), dispatch, estimator, calibration)
+    }
+
+    #[tokio::test]
+    async fn streaming_program_attempt_settles_after_the_last_chunk() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        let chunks = vec![
+            Ok::<_, axum::Error>(axum::body::Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            )),
+            Ok(axum::body::Bytes::from(
+                "data: {\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":7}}\n\n",
+            )),
+            Ok(axum::body::Bytes::from("data: [DONE]\n\n")),
+        ];
+        let response = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+        let settled = settle_grpc_response(response, true, completion);
+        let body = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+        // The Engine's own prompt count replaces the arrival estimate.
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 123);
+    }
+
+    #[tokio::test]
+    async fn buffered_program_attempt_settles_at_header_time_with_producer_usage() {
+        let (scheduler, dispatch) = settlement_scheduler(100).await;
+        let completion = program_completion(&scheduler, dispatch);
+        // The gRPC collect path recorded the Engine counts before returning.
+        completion.engine_observer().record_usage(EngineUsage {
+            prompt_tokens: Some(177),
+            completion_tokens: 3,
+        });
+        let response = Response::new(Body::from(
+            "{\"usage\":{\"prompt_tokens\":177,\"completion_tokens\":3}}",
+        ));
+        let settled = settle_grpc_response(response, false, completion);
+        let body = to_bytes(settled.into_body(), 1_000_000).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"prompt_tokens\":177"));
+        // Growth is applied immediately; a smaller estimated observation would
+        // keep the two-observation shrink rule instead.
+        let snapshot = scheduler.diagnostics();
+        assert_eq!(snapshot.ranks[0].programs[0].context_tokens, 177);
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -5388,7 +6306,7 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
@@ -5423,13 +6341,190 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
             program_targets_cache: Mutex::new(HashMap::new()),
             program_token_estimator: Arc::new(MomentumTokenEstimator::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_served_names_keep_transparent_program_fallback() {
+        use axum::{routing::get, Json};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let models_available = Arc::new(AtomicBool::new(true));
+        let available = models_available.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move |headers: HeaderMap| {
+                    let available = available.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer secret");
+                        assert_eq!(headers["X-data-parallel-rank"], "1");
+                        let status = if available.load(Ordering::Relaxed) {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (
+                            status,
+                            Json(serde_json::json!({"data": [
+                                {"id": "adapter", "parent": "base-model"},
+                                {"id": "base-model", "parent": null},
+                                {"id": "served-alias"}
+                            ]})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/get_server_info",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "kv_block_size": 16, "served_model_aliases": ["metadata-alias"]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let labels = crate::kv_index::discovery::served_model_labels(
+            &reqwest::Client::new(),
+            &url,
+            Some("secret"),
+            Some(1),
+            None,
+        )
+        .await;
+        let worker = BasicWorker::new(url.clone(), WorkerType::Regular).with_labels(labels);
+        assert_eq!(worker.model_id(), "unknown");
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "base-model"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "served-alias"
+        ));
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "metadata-alias"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "adapter"
+        ));
+
+        let router = create_test_regular_router();
+        router.worker_registry.register(Arc::new(worker));
+        for name in ["base-model", "served-alias", "adapter"] {
+            let pool = router.resolved_program_model_pool(Some(name));
+            assert_eq!(pool.scheduler_key, PROGRAM_MODEL_POOL_FALLBACK);
+            assert_eq!(router.program_targets_for_model(&pool).len(), 3);
+        }
+        models_available.store(false, Ordering::Relaxed);
+        let labels = crate::kv_index::discovery::served_model_labels(
+            &reqwest::Client::new(),
+            &url,
+            Some("secret"),
+            Some(1),
+            None,
+        )
+        .await;
+        let worker = BasicWorker::new(url, WorkerType::Regular).with_labels(labels);
+        assert!(crate::kv_index::discovery::worker_serves_base_model(
+            &worker,
+            "metadata-alias"
+        ));
+        assert!(!crate::kv_index::discovery::worker_serves_base_model(
+            &worker, "adapter"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn served_model_alias_probe_queries_the_model_list_only_once() {
+        use axum::{routing::get, Json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                get(move || async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Json(serde_json::json!({"data": [{"id": "model"}]}))
+                }),
+            )
+            .route(
+                "/metrics",
+                get(|| async { "vllm:cache_config_info{block_size=\"16\",engine=\"0\"} 1.0\n" }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let labels =
+            crate::kv_index::discovery::served_model_labels(&Client::new(), &url, None, None, None)
+                .await;
+        assert_eq!(labels["served_model_aliases"], "model");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn monitored_routes_reject_full_before_forwarding() {
+        let mut fixture =
+            http_kv_fixture([vec![vec![1, 2, 3, 4]], vec![vec![1, 2, 3, 4]]], 0, true).await;
+        let (supervisor, _signals) =
+            crate::kv_index::KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        fixture.router.kv_index_supervisor = Some(Arc::new(supervisor));
+        let chat = serde_json::json!({
+            "model": "local", "messages": [],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let response = fixture
+            .router
+            .route_typed_request(
+                None,
+                &serde_json::from_value::<ChatCompletionRequest>(chat.clone()).unwrap(),
+                "/v1/chat/completions",
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let completion = serde_json::json!({
+            "model": "local", "prompt": [1, 2, 3, 4],
+            "vllm_xargs": {"kv_cache_report_mode": "full"}
+        });
+        let raw = bytes::Bytes::from(serde_json::to_vec(&completion).unwrap());
+        let response = fixture
+            .router
+            .route_completion_raw(
+                None,
+                Arc::new(serde_json::from_slice(&raw).unwrap()),
+                raw,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(fixture.calls.lock().is_empty());
+
+        fixture.router.kv_index_supervisor = None;
+        let response = fixture
+            .router
+            .route_transparent(None, "/custom", &Method::POST, chat)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!fixture.calls.lock().is_empty());
     }
 
     #[test]
@@ -6016,7 +7111,7 @@ mod tests {
         }))
         .unwrap();
         let completion = CompletionRoute {
-            worker_credit: true,
+            cache_read_fallback: None,
             raw_body: None,
             echo: request.echo,
         };
@@ -6032,6 +7127,7 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    request_body: None,
                 },
                 None,
             )
@@ -6199,7 +7295,7 @@ mod tests {
             )
             .unwrap();
             let completion = CompletionRoute {
-                worker_credit: true,
+                cache_read_fallback: None,
                 raw_body: None,
                 echo,
             };
@@ -6215,6 +7311,7 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        request_body: None,
                     },
                     None,
                 )
@@ -6592,6 +7689,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_identity_is_not_forwarded_on_the_exact_text_path() {
+        let mut router = create_test_regular_router();
+        let config = ProgramSchedulerConfig {
+            token_count_mode: crate::program_scheduling::TokenCountMode::Shadow,
+            exact_text_endpoints: vec!["/v1/chat/completions".to_string()],
+            ..ProgramSchedulerConfig::default()
+        };
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(config)));
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "vllm_xargs": {
+                "agentic_context": {
+                    "program_id": "p",
+                    "parent_program_id": "p"
+                }
+            }
+        }))
+        .unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("parent_program_id must differ from program_id"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn typed_request_cancellation_before_headers_or_during_body_releases_load() {
         use axum::routing::post;
         for (headers_ready, streaming) in [(false, false), (false, true), (true, false)] {
@@ -6674,6 +7804,7 @@ mod tests {
                 async move {
                     let body = if fail_body {
                         Body::from_stream(futures_util::stream::once(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                             Err::<bytes::Bytes, _>(std::io::Error::other("broken backend body"))
                         }))
                     } else {
@@ -6814,7 +7945,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_healthy_workers_empty_list() {
         // Empty list will return error immediately
-        let result = Router::wait_for_healthy_workers(&[], 1, 1).await;
+        let result = Router::wait_for_healthy_workers(&[], 1, 1, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no workers provided"));
     }
@@ -6823,7 +7954,8 @@ mod tests {
     async fn test_wait_for_healthy_workers_invalid_urls() {
         // This test will timeout quickly since the URLs are invalid
         let result =
-            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1).await;
+            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1, None)
+                .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
     }
@@ -6863,7 +7995,7 @@ mod tests {
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             kv_index_supervisor: None,
-            _kv_signal_handle: None,
+            kv_reconcile_handle: None,
             kv_aware_session_affinity_ttl_secs: None,
             program_scheduler: None,
             _program_observation_handle: None,
@@ -7126,7 +8258,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_healthy_workers_all_healthy() {
         let (url, _handle) = start_healthy_mock_server().await;
-        let result = Router::wait_for_healthy_workers(&[url], 5, 1).await;
+        let result = Router::wait_for_healthy_workers(&[url], 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7137,7 +8269,8 @@ mod tests {
         let (healthy_url, _handle) = start_healthy_mock_server().await;
         let unreachable_url = "http://127.0.0.1:1".to_string(); // port 1 is unreachable
 
-        let result = Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1).await;
+        let result =
+            Router::wait_for_healthy_workers(&[healthy_url, unreachable_url], 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7194,7 +8327,7 @@ mod tests {
             .map(|rank| format!("{}@{}", base_url, rank))
             .collect();
 
-        let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1).await;
+        let result = Router::wait_for_healthy_workers(&dp_urls, 5, 1, None).await;
         assert!(result.is_ok());
     }
 
@@ -7220,9 +8353,13 @@ mod tests {
         // ── Step 1: wait_for_healthy_workers (mirrors PdRouterBase::new startup) ──
         // This succeeds because the healthy worker responds immediately,
         // even though the delayed worker is still returning 503.
-        let result =
-            Router::wait_for_healthy_workers(&[healthy_url.clone(), delayed_url.clone()], 10, 1)
-                .await;
+        let result = Router::wait_for_healthy_workers(
+            &[healthy_url.clone(), delayed_url.clone()],
+            10,
+            1,
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "Startup should succeed with at least one healthy worker"
@@ -7287,5 +8424,889 @@ mod tests {
         assert!(registry.revision() > revision_before_recovery);
 
         health_checker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missing_http_usage_stops_injection_and_optional_preparation() {
+        check_missing_http_usage(true).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_http_sse_does_not_disable_usage_injection() {
+        check_missing_http_usage(false).await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_transparent_openai_sse_does_not_disable_verification() {
+        let mut fixture = completion_response_fixture().await;
+        let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig::default()));
+        Arc::get_mut(&mut fixture.router).unwrap().program_scheduler = Some(scheduler.clone());
+        let request = serde_json::json!({
+            "model": "m", "prompt": [1, 2, 3], "add_special_tokens": false,
+            "stream": true, "stream_options": {"include_usage": true},
+            "vllm_xargs": {"agentic_context": {"program_id": "p", "expected_resume": false}}
+        });
+        let delta = "data: {\"choices\":[{\"text\":\"hello\"}]}\n\n";
+        let completed =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\n\ndata: [DONE]\n\n";
+        for sse in [delta, delta, delta, completed] {
+            fixture
+                .responses
+                .send(Response::new(Body::from(sse)))
+                .unwrap();
+            let response = fixture
+                .router
+                .route_transparent(None, "/v1/completions", &Method::POST, request.clone())
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = to_bytes(response.into_body(), 10_000).await.unwrap();
+            assert_eq!(response_body.as_ref(), sse.as_bytes());
+        }
+        let diagnostic = scheduler.diagnostics();
+        assert!(diagnostic.usage_unavailable_model_pools.is_empty());
+        assert_eq!(diagnostic.verified_token_fingerprints, 1);
+    }
+
+    async fn check_missing_http_usage(complete: bool) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                capture.lock().push(body);
+                async move {
+                    let delta = concat!(
+                        "data: ",
+                        r#"{"choices":[{"delta":{"content":"hello"}}]}"#,
+                        "\n\n"
+                    );
+                    let body = if complete {
+                        format!("{delta}data: [DONE]\n\n")
+                    } else {
+                        delta.to_owned()
+                    };
+                    Response::new(Body::from(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = router_pointing_at(address);
+        router.frontend.pin_test_token_ids(vec![1; 10]);
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+            token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
+            exact_text_endpoints: vec!["/v1/chat/completions".into()],
+            ..Default::default()
+        })));
+        let request: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"model":"m",
+                "messages":[{"role":"user","content":"hello"}], "stream":true,
+                "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+            }))
+            .unwrap();
+        for _ in 0..5 {
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.ends_with(b"data: [DONE]\n\n"), complete);
+        }
+        let injected: Vec<_> = captured
+            .lock()
+            .iter()
+            .map(|body| {
+                body.pointer("/stream_options/include_usage")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+            .collect();
+        assert_eq!(
+            injected,
+            if complete {
+                [true, true, true, false, false]
+            } else {
+                [true; 5]
+            }
+        );
+        let diagnostic = router.program_scheduler.as_ref().unwrap().diagnostics();
+        assert_eq!(
+            diagnostic.usage_unavailable_model_pools.len(),
+            if complete { 1 } else { 0 }
+        );
+        assert_eq!(diagnostic.verified_token_fingerprints, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_http_token_preparation_does_not_inject_or_filter_usage() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10}}\n\ndata: [DONE]\n\n";
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                capture.lock().push(body);
+                async move {
+                    Response::builder()
+                        .header(CONTENT_LENGTH, sse.len())
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = router_pointing_at(address);
+        router.frontend.pin_test_token_ids(vec![1; 10]);
+        router.program_scheduler = Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+            exact_text_endpoints: vec!["/v1/chat/completions".into()],
+            ..Default::default()
+        })));
+        // Count preparation rejects this truncation option; the HTTP proxy
+        // still forwards it to the Engine without needing a tokenizer asset.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"m", "messages":[{"role":"user","content":"hello"}],
+            "stream":true, "truncate_prompt_tokens":-1,
+            "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+        }))
+        .unwrap();
+        for _ in 0..4 {
+            let response = router
+                .route_typed_request(None, &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_LENGTH], sse.len().to_string());
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.as_ref(), sse.as_bytes());
+        }
+        for body in captured.lock().iter() {
+            assert!(body.pointer("/stream_options/include_usage").is_none());
+            assert_eq!(body["truncate_prompt_tokens"], -1);
+        }
+        server.abort();
+    }
+
+    /// Helper: start a mock server whose /health returns 200 only for the given
+    /// bearer token, or only without an Authorization header when the key is
+    /// `None`. Anything else gets 401.
+    async fn start_auth_mock_server(
+        api_key: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::header::AUTHORIZATION, routing::get, Router as AxumRouter};
+        use tokio::net::TcpListener;
+
+        let expected = api_key.map(|key| format!("Bearer {key}"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = AxumRouter::new().route(
+            "/health",
+            get(move |headers: HeaderMap| async move {
+                let sent = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+                if sent == expected.as_deref().map(str::as_bytes) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    /// Helper: start a server that accepts connections and never answers.
+    /// Also returns the number of connections it has accepted.
+    async fn start_silent_mock_server() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let handle = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                connections.push(stream);
+            }
+        });
+        (format!("http://{}", addr), accepted, handle)
+    }
+
+    /// Helper: build a regular router over `worker_urls`.
+    async fn start_router(
+        config: crate::config::RouterConfig,
+        worker_urls: Vec<String>,
+    ) -> (Router, Arc<crate::server::AppContext>) {
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(worker_urls, &ctx).await.unwrap();
+        (router, ctx)
+    }
+
+    /// Run the startup wait, add_worker, the periodic check and
+    /// send_health_check against workers that accept only `api_key`.
+    async fn assert_health_checks_pass(api_key: Option<&str>, dp_size: usize) {
+        use crate::config::RouterConfig;
+
+        let (startup_url, startup_server) = start_auth_mock_server(api_key).await;
+        let (added_url, added_server) = start_auth_mock_server(api_key).await;
+        let config = RouterConfig {
+            api_key: api_key.map(str::to_owned),
+            intra_node_data_parallel_size: dp_size,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+
+        let (router, ctx) = start_router(config, vec![startup_url.clone()]).await;
+        router.add_worker(&added_url).await.unwrap();
+
+        for base_url in [&startup_url, &added_url] {
+            for rank in 0..dp_size {
+                let url = if dp_size > 1 {
+                    format!("{base_url}@{rank}")
+                } else {
+                    base_url.clone()
+                };
+                let worker = ctx
+                    .worker_registry
+                    .get_by_url(&url)
+                    .unwrap_or_else(|| panic!("{url} is not registered"));
+                worker.check_health_async().await.unwrap();
+                let response = router.send_health_check(worker.url()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        startup_server.abort();
+        added_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_api_key() {
+        assert_health_checks_pass(Some("worker-key"), 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_no_authorization_without_api_key() {
+        assert_health_checks_pass(None, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_send_api_key_dp_aware() {
+        assert_health_checks_pass(Some("worker-key"), 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_reports_rejected_api_key() {
+        use crate::config::RouterConfig;
+
+        let (url, server) = start_auth_mock_server(Some("worker-key")).await;
+
+        let error =
+            Router::wait_for_healthy_workers(std::slice::from_ref(&url), 1, 1, Some("other-key"))
+                .await
+                .unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        // add_worker reports the rejected key the same way.
+        let config = RouterConfig {
+            api_key: Some("other-key".to_string()),
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![]).await;
+        let error = router.add_worker(&url).await.unwrap_err();
+        assert!(error.contains("401"), "{error}");
+
+        // So does the periodic check.
+        let worker = BasicWorker::new(url, WorkerType::Regular)
+            .with_worker_api_key(Some(Arc::from("other-key")));
+        let error = worker.check_health_async().await.unwrap_err().to_string();
+        assert!(error.contains("401"), "{error}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_filter_preserves_stream_framing_across_token_modes() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::Exact),
+        ] {
+            for (identified, client_usage) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+                let capture = captured.clone();
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                        let capture = capture.clone();
+                        async move {
+                            let include = body.pointer("/stream_options/include_usage")
+                                .and_then(serde_json::Value::as_bool) == Some(true);
+                            *capture.lock() = Some(body);
+                            let mut sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n".to_string();
+                            if include {
+                                sse.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n");
+                            }
+                            sse.push_str("data: [DONE]\n\n");
+                            Response::builder()
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .header(CONTENT_LENGTH, sse.len())
+                                .body(Body::from(sse)).unwrap()
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut router = router_pointing_at(address);
+                router.frontend.pin_test_token_ids(vec![1; 10]);
+                router.program_scheduler = mode.map(|token_count_mode| {
+                    Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    }))
+                });
+                let mut body = serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                if client_usage {
+                    body["stream_options"] = serde_json::json!({"include_usage":true});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let declared = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .map(|value| value.to_str().unwrap().parse::<usize>().unwrap());
+                let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+                let inject = identified
+                    && !client_usage
+                    && mode.is_some_and(|mode| mode.uses_prepared_facts());
+                assert_eq!(
+                    captured
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .pointer("/stream_options/include_usage")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true),
+                    client_usage || inject
+                );
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("hello"));
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                assert_eq!(text.contains("\"usage\""), client_usage);
+                // A changed body must not advertise the upstream byte count;
+                // ordinary streams and explicitly requested usage stay intact.
+                assert_eq!(
+                    declared,
+                    if inject { None } else { Some(bytes.len()) },
+                    "mode={mode:?}, identity={identified}, client_usage={client_usage}"
+                );
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_token_verification_uses_only_engine_prompt_info() {
+        use crate::program_scheduling::{
+            ArrivalTokenFacts, TokenCountMode, TokenFacts, TokenizerFingerprint,
+        };
+        for prompt_info in [None, Some(10), Some(12)] {
+            let scheduler = Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                token_count_mode: TokenCountMode::Exact,
+                ..Default::default()
+            }));
+            let fp = TokenizerFingerprint::from_parts(&["prompt-info"]);
+            let arrival = ArrivalTokenFacts::new(100, Some(TokenFacts::prepared_token_ids(10, fp)));
+            let context = scheduler.resolve_arrival_tokens("model-a", arrival);
+            let identity = ProgramIdentity::from_request(
+                None,
+                Some(&serde_json::json!({"vllm_xargs":{"agentic_context":{
+                    "program_id":"p","expected_resume":true
+                }}})),
+                Some("model-a"),
+            )
+            .unwrap()
+            .unwrap();
+            let target = crate::program_scheduling::ProgramTarget {
+                id: "rank-0".into(),
+                base_url: "grpc://worker".into(),
+                dp_rank: None,
+            };
+            let dispatch = scheduler
+                .acquire(identity, context, &[target], None)
+                .await
+                .unwrap();
+            let completion = program_completion(&scheduler, dispatch);
+            completion.engine_observer().record_usage(EngineUsage {
+                prompt_tokens: prompt_info,
+                completion_tokens: 1,
+            });
+            // The gRPC producer fills wire usage with prepared IDs when the
+            // Engine omitted prompt_info. That fallback is client-visible but
+            // must never become independent verification evidence.
+            let wire = format!("data: {{\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n",prompt_info.unwrap_or(10));
+            let response = Response::new(Body::from(wire.clone()));
+            let response = settle_grpc_response(response, true, completion);
+            let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(bytes.as_ref(), wire.as_bytes());
+            let diagnostic = scheduler.diagnostics();
+            assert_eq!(
+                diagnostic.verified_token_fingerprints,
+                usize::from(prompt_info == Some(10))
+            );
+            assert_eq!(
+                diagnostic.revoked_token_fingerprints,
+                usize::from(prompt_info == Some(12))
+            );
+            assert_eq!(
+                scheduler
+                    .resolve_arrival_tokens("model-a", arrival)
+                    .source()
+                    .is_prepared(),
+                prompt_info == Some(10)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counts_leave_http_kv_inputs_on_engine_preparation() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            TokenCountMode::Estimated,
+            TokenCountMode::Shadow,
+            TokenCountMode::Exact,
+        ] {
+            for identified in [false, true] {
+                let ids = vec![1, 2, 3, 4, 5, 6];
+                let mut fixture = http_kv_fixture([vec![ids.clone()], vec![ids]], 0, true).await;
+                fixture.router.frontend.pin_test_token_ids(vec![9; 100]);
+                fixture.router.program_scheduler =
+                    Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode: mode,
+                        token_count_verification_settlements: 0,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    })));
+                let mut body =
+                    serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}]});
+                if identified {
+                    body["vllm_xargs"] = serde_json::json!({"agentic_context":{"program_id":"p","expected_resume":false}});
+                }
+                let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+                let response = fixture
+                    .router
+                    .route_typed_request(None, &request, "/v1/chat/completions", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 10000).await.unwrap();
+                assert!(
+                    fixture
+                        .calls
+                        .lock()
+                        .iter()
+                        .any(|(_, path, _)| path.ends_with("/render")),
+                    "{mode:?}: skipped Engine input preparation"
+                );
+                let loads = fixture.loads.lock();
+                assert_eq!(loads.len(), 1);
+                assert!(
+                    loads[0].1.active_prefill_tokens <= 6,
+                    "{mode:?}: Router-only 100 IDs leaked into KV routing: {:?}",
+                    loads[0]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_counting_preserves_dp_and_public_headers() {
+        use crate::program_scheduling::TokenCountMode;
+        for mode in [
+            None,
+            Some(TokenCountMode::Estimated),
+            Some(TokenCountMode::Shadow),
+            Some(TokenCountMode::Exact),
+        ] {
+            let (address, server) = spawn_header_echo_backend().await;
+            let mut router = create_test_regular_router();
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(Arc::new(BasicWorker::new(
+                format!("http://{address}@1"),
+                WorkerType::Regular,
+            )));
+            router.intra_node_data_parallel_size = 2;
+            router.frontend.pin_test_token_ids(vec![1; 10]);
+            router.program_scheduler = mode.map(|token_count_mode| {
+                Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                    token_count_mode,
+                    token_count_verification_settlements: 0,
+                    exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                    ..Default::default()
+                }))
+            });
+            let request:ChatCompletionRequest=serde_json::from_value(serde_json::json!({"model":"m","messages":[{"role":"user","content":"hello"}],"vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}})).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+            headers.insert("x-public", "keep".parse().unwrap());
+            let response = router
+                .route_typed_request(Some(&headers), &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 10000).await.unwrap();
+            let echoed: HashMap<String, Vec<String>> = serde_json::from_slice(&body).unwrap();
+            assert_eq!(echoed["x-data-parallel-rank"], vec!["1"]);
+            assert_eq!(echoed["authorization"], vec!["Bearer test-token"]);
+            assert_eq!(echoed["x-public"], vec!["keep"]);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn usage_injection_preserves_raw_completion_options() {
+        for exact in [false, true] {
+            let mut fixture = completion_response_fixture().await;
+            if exact {
+                Arc::get_mut(&mut fixture.router).unwrap().program_scheduler =
+                    Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
+                        ..Default::default()
+                    })));
+            }
+            let raw = bytes::Bytes::from_static(
+                br#"{
+                "model":"m", "prompt":[1,2,3], "add_special_tokens":false,
+                "stream":true, "max_tokens":null,
+                "stream_options":{"include_usage":false,"continuous_usage_stats":true},
+                "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+            }"#,
+            );
+            let request: CompletionRequest = serde_json::from_slice(&raw).unwrap();
+            fixture
+                .responses
+                .send(Response::new(Body::from("data: [DONE]\n\n")))
+                .unwrap();
+            let response = fixture
+                .router
+                .route_completion_raw(None, Arc::new(request), raw, None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 10_000).await.unwrap();
+            let received = fixture.requests.recv().await.unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&received).unwrap();
+            assert_eq!(
+                wire.pointer("/stream_options/continuous_usage_stats"),
+                Some(&serde_json::json!(!exact)),
+                "exact={exact}: injected usage must disable continuous statistics: {wire}"
+            );
+            assert_eq!(
+                wire.get("max_tokens"),
+                Some(&serde_json::Value::Null),
+                "exact={exact}: explicit null must survive forwarding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_usage_preserves_content_deltas_and_client_usage_opt_in() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let app = axum::Router::new().route("/v1/completions", axum::routing::post(
+            move |Json(body): Json<serde_json::Value>| {
+                let include = body.pointer("/stream_options/include_usage") == Some(&serde_json::json!(true));
+                let continuous = body.pointer("/stream_options/continuous_usage_stats") == Some(&serde_json::json!(true));
+                capture.lock().push(body);
+                async move {
+                    let usage = serde_json::json!({"prompt_tokens":3,"completion_tokens":1});
+                    let mut delta = serde_json::json!({"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]});
+                    if include && continuous { delta["usage"] = usage.clone(); }
+                    let mut sse = format!("data: {delta}\n\n");
+                    if include { sse.push_str(&format!("data: {{\"choices\":[],\"usage\":{usage}}}\n\n")); }
+                    sse.push_str("data: [DONE]\n\n");
+                    Response::new(Body::from(sse))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for exact in [false, true] {
+            for client_usage in [false, true] {
+                let mut router = router_pointing_at(address);
+                // Raw completion forwarding is the KV-aware path; ordinary
+                // typed forwarding intentionally drops unknown stream options.
+                router.policy_registry = create_test_kv_router().policy_registry.clone();
+                if exact {
+                    router.program_scheduler = Some(Arc::new(ProgramScheduler::new(
+                        ProgramSchedulerConfig::default(),
+                    )));
+                }
+                let body = serde_json::json!({
+                    "model":"m", "prompt":[1,2,3], "add_special_tokens":false,
+                    "stream":true, "max_tokens":null,
+                    "stream_options":{"include_usage":client_usage,"continuous_usage_stats":true},
+                    "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+                });
+                let raw = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+                let request = Arc::new(serde_json::from_value::<CompletionRequest>(body).unwrap());
+                let response = router.route_completion_raw(None, request, raw, None).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 10_000).await.unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let delta: serde_json::Value = serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap(),
+                )
+                .unwrap();
+                let mut expected = serde_json::json!({"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]});
+                if client_usage {
+                    expected["usage"] =
+                        serde_json::json!({"prompt_tokens":3,"completion_tokens":1});
+                }
+                assert_eq!(
+                    delta, expected,
+                    "exact={exact}, client_usage={client_usage}"
+                );
+                assert_eq!(text.contains("\"usage\""), client_usage);
+                assert!(text.ends_with("data: [DONE]\n\n"));
+                let wire = captured.lock().last().unwrap().clone();
+                assert_eq!(
+                    wire.pointer("/stream_options/include_usage"),
+                    Some(&serde_json::json!(exact || client_usage))
+                );
+                assert_eq!(
+                    wire.pointer("/stream_options/continuous_usage_stats"),
+                    Some(&serde_json::json!(!exact || client_usage))
+                );
+                assert_eq!(wire["max_tokens"], serde_json::Value::Null);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_filter_failure_releases_the_program_attempt() {
+        for encoded in [false, true] {
+            let mut fixture = completion_response_fixture().await;
+            Arc::get_mut(&mut fixture.router).unwrap().program_scheduler =
+                Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                    token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
+                    ..Default::default()
+                })));
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"m", "prompt":[1,2,3], "add_special_tokens":false, "stream":true,
+                "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":true}}
+            }))
+            .unwrap();
+            let mut upstream = Response::builder();
+            if encoded {
+                upstream = upstream.header(http::header::CONTENT_ENCODING, "gzip");
+            }
+            fixture
+                .responses
+                .send(
+                    upstream
+                        .body(Body::from(vec![b'x'; MAX_SSE_LINE_BYTES + 1]))
+                        .unwrap(),
+                )
+                .unwrap();
+            let response = fixture.router.route_completion(None, &request, None).await;
+            if encoded {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(to_bytes(response.into_body(), 2 * MAX_SSE_LINE_BYTES)
+                    .await
+                    .is_err());
+            }
+            let snapshot = fixture
+                .router
+                .program_scheduler
+                .as_ref()
+                .unwrap()
+                .diagnostics();
+            let programs: Vec<_> = snapshot
+                .ranks
+                .iter()
+                .flat_map(|rank| &rank.programs)
+                .collect();
+            assert!(!programs.is_empty());
+            for program in programs {
+                assert_eq!(program.in_flight_requests, 0);
+                assert_eq!(program.segment_served_rounds, 0);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn usage_filter_negotiates_identity_and_preserves_stream_progress() {
+        const PREFIX: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x13\x4a\x49\x2c\x49\xb4\x52\xa8\x56\x4a\xce\xc8\xcf\x4c\x4e\x2d\x56\xb2\x8a\xae\x56\x4a\x49\xcd\x29\x49\x54\xb2\xaa\x56\x4a\xce\xcf\x2b\x49\xcd\x2b\x51\xb2\x52\xca\x48\xcd\xc9\xc9\x37\x50\xaa\xad\x8d\xad\xe5\xe2\x02\x00\x00\x00\xff\xff";
+        const TAIL: &[u8] = b"\x4b\xc1\xd0\x13\xab\xa3\x54\x5a\x9c\x98\x9e\xaa\x64\x55\xad\x54\x50\x94\x9f\x5b\x50\x12\x5f\x92\x9f\x9d\x9a\x57\xac\x64\x65\x68\xa0\xa3\x94\x9c\x9f\x5b\x90\x93\x5a\x92\x99\x9f\x87\x10\xae\x85\x1b\x14\xed\xe2\xef\xe7\x1a\xcb\xc5\x05\x00\x3f\x1c\xa3\xe7\x8b\x00\x00\x00";
+        for exact in [false, true] {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let gate = release.clone();
+            let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |headers: HeaderMap| {
+                let gate = gate.clone();
+                async move {
+                    let identity = headers.get(http::header::ACCEPT_ENCODING).is_some_and(|value| value == "identity");
+                    let first = futures_util::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from_static(if identity {
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"
+                    } else { PREFIX })) });
+                    let rest = futures_util::stream::once(async move {
+                        gate.notified().await;
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(if identity {
+                            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
+                        } else { TAIL }))
+                    });
+                    let mut response = Response::builder().header(CONTENT_TYPE, "text/event-stream");
+                    if !identity { response = response.header(http::header::CONTENT_ENCODING, "gzip"); }
+                    response.body(Body::from_stream(first.chain(rest))).unwrap()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut router = router_pointing_at(address);
+            router.client = reqwest::Client::builder()
+                .no_proxy()
+                .no_gzip()
+                .build()
+                .unwrap();
+            router.frontend.pin_test_token_ids(vec![1; 10]);
+            if exact {
+                router.program_scheduler =
+                    Some(Arc::new(ProgramScheduler::new(ProgramSchedulerConfig {
+                        token_count_mode: crate::program_scheduling::TokenCountMode::Exact,
+                        exact_text_endpoints: vec!["/v1/chat/completions".into()],
+                        ..Default::default()
+                    })));
+            }
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"m", "messages":[{"role":"user","content":"hello"}], "stream":true,
+                "vllm_xargs":{"agentic_context":{"program_id":"p","expected_resume":false}}
+            }))
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            let response = router
+                .route_typed_request(Some(&headers), &request, "/v1/chat/completions", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .contains_key(http::header::CONTENT_ENCODING),
+                !exact
+            );
+            let mut body = response.into_body().into_data_stream();
+            let first = tokio::time::timeout(Duration::from_millis(200), body.next()).await;
+            let progressed = matches!(first, Ok(Some(Ok(_))));
+            release.notify_one();
+            while let Some(chunk) = body.next().await {
+                chunk.unwrap();
+            }
+            server.abort();
+            assert!(progressed, "exact={exact}: enabling exact counting buffered a complete gzip SSE event until the end of generation");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_probes_at_health_check_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+        use std::sync::atomic::Ordering;
+
+        let (startup_url, startup_server) = start_healthy_mock_server().await;
+        let (silent_url, probes, silent_server) = start_silent_mock_server().await;
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 30,
+            worker_startup_check_interval_secs: 1,
+            health_check: HealthCheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![startup_url]).await;
+
+        // Wall-clock: the second probe starts about 2 s in. A probe that waited
+        // for the startup timeout would still be the only one when add_worker returns.
+        let second_probe = async {
+            while probes.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::select! {
+            _ = second_probe => {}
+            result = router.add_worker(&silent_url) => {
+                panic!("add_worker returned before a second probe: {result:?}")
+            }
+        }
+
+        startup_server.abort();
+        silent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_health_waits_stop_at_startup_timeout() {
+        use crate::config::{HealthCheckConfig, RouterConfig};
+
+        let (silent_url, _probes, silent_server) = start_silent_mock_server().await;
+        let limit = Duration::from_secs(10);
+
+        // Startup wait: the check interval exceeds the startup timeout.
+        tokio::time::timeout(
+            limit,
+            Router::wait_for_healthy_workers(std::slice::from_ref(&silent_url), 1, 30, None),
+        )
+        .await
+        .expect("the startup wait outlived the startup timeout")
+        .unwrap_err();
+
+        // add_worker: the health check timeout and the check interval both exceed it.
+        let config = RouterConfig {
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 30,
+            health_check: HealthCheckConfig {
+                timeout_secs: 30,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (router, _ctx) = start_router(config, vec![]).await;
+        tokio::time::timeout(limit, router.add_worker(&silent_url))
+            .await
+            .expect("add_worker outlived the startup timeout")
+            .unwrap_err();
+
+        silent_server.abort();
     }
 }

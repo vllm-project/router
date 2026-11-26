@@ -47,11 +47,13 @@ def _header_map(payload: dict) -> dict:
 
 
 @pytest.mark.integration
-def test_wasm_middleware_modify_reject_and_path_isolation(router_manager, mock_workers):
+def test_wasm_middleware_modify_reject_and_path_isolation(
+    router_manager, mock_worker_manager
+):
     """Example plugin: set header on chat, reject marker body, skip other routes."""
     wasm_path = _ensure_wasm_component()
     router_bin = _router_bin()
-    _, urls, _ = mock_workers(n=1)
+    _, urls, _ = mock_worker_manager.start_workers(n=1)
 
     rh = router_manager.start_router(
         worker_urls=urls,

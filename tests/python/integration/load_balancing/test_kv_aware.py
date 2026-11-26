@@ -9,8 +9,8 @@ pools, on both HTTP and gRPC workers. CPU only, with a local tokenizer; no
 policy/scorer/index hooks or pinned token IDs.
 """
 
-import concurrent.futures
 import collections
+import concurrent.futures
 import json
 import time
 
@@ -161,7 +161,7 @@ def kv_scenario(kv_workers, kv_st_runtime, kv_tokenizer, router_manager):
             },
         )
         for worker in workers:
-            if worker.block_size and worker.model and worker.events_enabled:
+            if worker.block_size and worker.model and worker.events is not None:
                 worker.wait_subscribed()
         scenario = KvScenario(workers, router.url)
         scenarios.append(scenario)
@@ -189,31 +189,35 @@ def test_kv_aware_cache_events_change_routing(kv_scenario, invalidation):
         assert st.choose() is a
 
     if invalidation == "restart":
-        # A lower sequence signals restart; repeating the initial 0 is a
-        # duplicate, so first advance this publisher beyond 0.
-        st.publish_applied(a, [cached])
+        # Advance past the initial sequence so the new publisher lifetime
+        # starts at an unmistakably lower sequence.
+        st.publish_applied(a, [])
 
+    remove = {
+        "type": "BlockRemoved",
+        "medium": "GPU",
+        "group_idx": 0,
+        "block_hashes": cached["block_hashes"],
+    }
+    sequence = None
     if invalidation == "remove":
-        events = [
-            {
-                "type": "BlockRemoved",
-                "medium": "device",
-                "block_hashes": cached["block_hashes"],
-            }
-        ]
-        sequence = None
+        events = [remove]
     elif invalidation == "clear":
         events = [{"type": "AllBlocksCleared"}]
-        sequence = None
-    elif invalidation == "malformed":
-        a.publish([{"type": "UnknownEvent"}])
-        # Observe the invalidation before sending a fresh valid batch, so a
-        # subsequent sequence gap cannot mask a broken malformed decoder.
-        st.wait_choice(b)
-        events, sequence = [], None
-    else:
+    elif invalidation == "gap":
+        # Deliver the eviction only to replay. The next live batch reveals
+        # the missing sequence and must recover its eviction before use.
+        a.publish([remove], live=False)
         events = []
-        sequence = a.sequence + 1 if invalidation == "gap" else 0
+    elif invalidation == "malformed":
+        bad_seq = a.publish([{"type": "UnknownEvent"}], replay=False)
+        # An incomplete replay keeps the invalid source hidden. Supply the
+        # valid batch only after the route reflects that invalidation.
+        st.wait_stable(b)
+        a.publish([remove], sequence=bad_seq, live=False)
+        events = []
+    else:
+        events, sequence = [], 0
     st.publish_applied(a, events, sequence=sequence)
     # B still has valid cache: there is no cold-tie expectation after eviction.
     for _ in range(5):
@@ -221,7 +225,7 @@ def test_kv_aware_cache_events_change_routing(kv_scenario, invalidation):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("tier", ["host", "external", "disk"])
+@pytest.mark.parametrize("tier", ["host", "disk"])
 @pytest.mark.parametrize("credit,expected", [(0.8, "b"), (0.2, "a")])
 def test_kv_aware_transfer_credit(kv_scenario, tier, credit, expected):
     st = kv_scenario(extra={f"kv_penalty_{tier}": credit})
@@ -230,18 +234,25 @@ def test_kv_aware_transfer_credit(kv_scenario, tier, credit, expected):
     st.publish_applied(a, [a.store(tokens[:8])])
     st.publish_applied(
         b,
-        [
-            b.store(
-                tokens[:16],
-                medium=tier,
-                ownership="shared-pool" if tier == "external" else None,
-            )
-        ],
+        [b.store(tokens[:16], medium=tier)],
     )
     # GPU A: q=9. Transfer B: ceil(17-16*.8)=5, or ceil(17-16*.2)=14.
     winner = a if expected == "a" else b
     for _ in range(5):
         assert st.choose() is winner
+
+
+@pytest.mark.integration
+def test_kv_aware_shared_pool_events_do_not_credit_the_worker(kv_scenario):
+    st = kv_scenario(extra={"kv_penalty_external": 0.8})
+    tokens = st.tokens()
+    a, b = st.workers
+    st.publish_applied(a, [a.store(tokens[:8])])
+    # The vLLM worker stream cannot attest to shared-pool residency. Even a
+    # longer prefix at a high credit rate must not be attributed to B.
+    st.publish_applied(b, [b.store(tokens[:16], ownership="TRANSFERRED")])
+    for _ in range(5):
+        assert st.choose() is a
 
 
 @pytest.mark.integration
@@ -271,7 +282,7 @@ def test_kv_aware_only_credits_connected_tier_continuation(kv_scenario, connecte
     host = b.store(
         tokens[4:12],
         medium="host",
-        parent=(device["block_hashes"][-1] if connected else b"missing-parent"),
+        parent=(device["block_hashes"][-1] if connected else b"\x11" * 32),
     )
     st.publish_applied(b, [device, host])
     # A q=9; connected B q=ceil(17-4-8*.8)=7; orphaned B q=13.
@@ -434,7 +445,12 @@ def test_kv_aware_prefill_decode_and_finish_change_routing(kv_scenario):
 @pytest.mark.integration
 @pytest.mark.parametrize("namespace", ["cache_salt", "lora"])
 def test_kv_aware_cache_namespace_isolation(kv_scenario, namespace):
-    st = kv_scenario()
+    options = (
+        [{}, {"adapters": {"adapter-b": "test/adapter-b"}}]
+        if namespace == "lora"
+        else None
+    )
+    st = kv_scenario(worker_options=options)
     tokens = st.tokens()
     a, b = st.workers
     st.publish_applied(b, [b.store(tokens[:14])])
@@ -488,8 +504,8 @@ def test_kv_aware_positive_temperature_samples_equal_cost_workers(kv_scenario):
 #
 # Synchronization and assertion are deliberately separate. Publishing is
 # acknowledged through the router's own telemetry: it exports
-# `vllm_router_pd_credited_prefix_tokens_total`, so the test republishes until a
-# probe's decision reports the expected credited tokens. That is an apply ack,
+# `vllm_router_pd_credited_prefix_tokens_total`, so the test probes until the
+# decision reports the expected credited tokens. That is an apply ack,
 # not a routing guess: no pick is inspected to decide whether to continue.
 # The assertion is then a fixed sample that must all pick the credited worker.
 # With credit disabled the ack itself fails, and a tie would still only pass the
@@ -502,16 +518,10 @@ PD_PROMPT_TOKENS = [index + 1 for index in range(17)]
 # batch is applied the winner is deterministic; without credit it is a tie.
 PD_PREFIX_A = PD_PROMPT_TOKENS[:14]
 PD_PREFIX_B = PD_PROMPT_TOKENS[:12]
-# Publish replay and the fixed settle that follows each attempt.
-PD_REPLAYS = 3
-PD_SETTLE = 0.2
 # Fixed sample size: a uniform tie passes it with probability 2**-PD_SAMPLE.
 PD_SAMPLE = 10
 # Counter the router increments by the credited prefix tokens of a decision.
 PD_CREDIT_METRIC = "vllm_router_pd_credited_prefix_tokens_total"
-# Counter that only moves once a decision used a verified worker identity.
-PD_DECISIONS_METRIC = "vllm_router_prefix_routing_decisions_total"
-PD_VERIFIED_OUTCOME = 'stage="prefill",outcome="prefix_cost"'
 
 
 def _pd_post(base: str, path: str, payload: dict, timeout: float = 30):
@@ -569,21 +579,6 @@ def _pd_kv_status(url: str) -> dict:
         return {}
 
 
-def _pd_publish(url: str, tokens, rounds: int = PD_REPLAYS) -> None:
-    """Publish a prefix. This is synchronization only, never an assertion.
-
-    The subscriber handshake is awaited first (PUB drops frames for a peer that
-    is still joining), then the batch is replayed because BlockStored is
-    idempotent, and a fixed settle follows so the index can apply it. No
-    routing result is inspected here.
-    """
-    _pd_subscribe(url)
-    for _ in range(rounds):
-        _pd_store(url, tokens)
-        time.sleep(0.05)
-    time.sleep(PD_SETTLE)
-
-
 def _pd_probe(router_url: str, prefill_urls, content: str):
     """One completion probe: the prefill that served it, plus the reply."""
     before = {url: _pd_served(url) for url in prefill_urls}
@@ -599,17 +594,15 @@ def _pd_probe(router_url: str, prefill_urls, content: str):
     raise AssertionError(f"no prefill worker served the probe: {loads}")
 
 
-def _pd_metric(prom_url: str, name: str, contains: str = "") -> float:
-    """Sum one Prometheus counter (optionally only matching lines)."""
+def _pd_credited_tokens(prom_url: str) -> float:
+    """Credited prefix tokens the router has reported so far."""
     try:
         text = requests.get(f"{prom_url}/metrics", timeout=2).text
     except requests.RequestException:
         return 0.0
     total = 0.0
     for line in text.splitlines():
-        if not line.startswith(name):
-            continue
-        if contains and contains not in line:
+        if not line.startswith(PD_CREDIT_METRIC):
             continue
         try:
             total += float(line.rsplit(" ", 1)[-1])
@@ -618,39 +611,14 @@ def _pd_metric(prom_url: str, name: str, contains: str = "") -> float:
     return total
 
 
-def _pd_credited_tokens(prom_url: str) -> float:
-    """Credited prefix tokens the router has reported so far."""
-    return _pd_metric(prom_url, PD_CREDIT_METRIC)
-
-
-def _pd_wait_verified_identity(prom_url: str, probe, timeout: float = 20.0) -> None:
-    """Wait until a prefill decision used a verified worker identity.
-
-    ``PdKvState`` binds workers on a background tick (1 s refresh, 3 s control
-    timeout) and denies placement credit until the binding exists, so a credit
-    ack issued straight after `start_router` can race it. The decision counter
-    moves to ``prefix_cost`` only once the identity is verified, so this blocks
-    on telemetry and not on a routing guess.
-    """
-    before = _pd_metric(prom_url, PD_DECISIONS_METRIC, PD_VERIFIED_OUTCOME)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        probe()
-        if _pd_metric(prom_url, PD_DECISIONS_METRIC, PD_VERIFIED_OUTCOME) > before:
-            return
-        time.sleep(0.2)
-    raise AssertionError("router never reported a verified prefill identity")
-
-
-def _pd_publish_until_credit(
+def _pd_wait_credit(
     prom_url: str,
     publish,
     probe,
-    tokens,
-    attempts: int = 5,
+    expected: int,
     status=None,
 ) -> None:
-    """Publish until the router reports ``len(tokens)`` credited prefix tokens.
+    """Publish one incremental store and await its credited prefix.
 
     This is the apply acknowledgement: the router increments
     ``PD_CREDIT_METRIC`` by the credited tokens of each prefill decision, so a
@@ -658,16 +626,17 @@ def _pd_publish_until_credit(
     probe's own pick is not consulted, and once the ack lands the sample below
     is fixed and retry-free.
     """
-    for _ in range(attempts):
-        publish()
+    publish()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
         before = _pd_credited_tokens(prom_url)
         probe()
-        if _pd_credited_tokens(prom_url) - before >= len(tokens):
+        if _pd_credited_tokens(prom_url) - before >= expected:
             return
         time.sleep(0.05)
     detail = status() if status is not None else "n/a"
     raise AssertionError(
-        f"router never credited {len(tokens)} prefix tokens; "
+        f"router never credited {expected} prefix tokens; "
         f"{PD_CREDIT_METRIC}={_pd_credited_tokens(prom_url)}; mock={detail}"
     )
 
@@ -702,28 +671,25 @@ def test_kv_aware_pd_http_prefill_follows_prefix_credit(
     )
 
     prom = f"http://127.0.0.1:{router.prometheus_port}"
-    # Bindings land on a background tick; wait for a verified identity before
-    # the credit ack, otherwise the ack races the refresh and reads 0.
-    _pd_wait_verified_identity(
-        prom, lambda: _pd_probe(router.url, prefill_urls, PROMPT)
-    )
+    for url in prefill_urls:
+        _pd_subscribe(url)
     # B holds the shorter prefix, so a cold tie cannot reach B by luck: without
     # its batch every pick would be uniform, and the sample would catch it.
-    _pd_publish_until_credit(
+    _pd_wait_credit(
         prom,
-        lambda: _pd_publish(prefill_urls[1], PD_PREFIX_B),
+        lambda: _pd_store(prefill_urls[1], PD_PREFIX_B),
         lambda: _pd_probe(router.url, prefill_urls, PROMPT),
-        PD_PREFIX_B,
+        len(PD_PREFIX_B),
         status=lambda: {url: _pd_kv_status(url) for url in prefill_urls},
     )
     _pd_assert_picks(router.url, prefill_urls, prefill_urls[1])
 
     # A holds the longer prefix of the same prompt and must win every pick.
-    _pd_publish_until_credit(
+    _pd_wait_credit(
         prom,
-        lambda: _pd_publish(prefill_urls[0], PD_PREFIX_A),
+        lambda: _pd_store(prefill_urls[0], PD_PREFIX_A),
         lambda: _pd_probe(router.url, prefill_urls, PROMPT),
-        PD_PREFIX_A,
+        len(PD_PREFIX_A),
         status=lambda: {url: _pd_kv_status(url) for url in prefill_urls},
     )
     response = _pd_assert_picks(router.url, prefill_urls, prefill_urls[0])
@@ -759,20 +725,6 @@ def _pd_grpc_assert_picks(router_url: str, prefill, expected, sample: int = PD_S
     return response
 
 
-def _pd_grpc_publish(worker, tokens, rounds: int = PD_REPLAYS) -> None:
-    """Publish a prefix on a gRPC worker. Synchronization only, no assertion.
-
-    The subscriber handshake is already done by ``wait_subscribed``, but the
-    index applies batches asynchronously; replaying the batch with a fixed
-    settle keeps the sample below free of that race without retrying on a
-    routing result.
-    """
-    for _ in range(rounds):
-        worker.publish([worker.store(tokens)])
-        time.sleep(0.05)
-    time.sleep(PD_SETTLE)
-
-
 @pytest.mark.integration
 def test_kv_aware_pd_grpc_prefill_follows_prefix_credit(
     kv_workers, kv_st_runtime, kv_tokenizer, router_manager
@@ -803,22 +755,19 @@ def test_kv_aware_pd_grpc_prefill_follows_prefix_credit(
     # `wait_subscribed` covers the subscriber handshake; the credit counter is
     # the apply ack for the batch itself, and the samples are the assertions.
     prom = f"http://127.0.0.1:{router.prometheus_port}"
-    _pd_wait_verified_identity(
-        prom, lambda: _pd_grpc_probe(router.url, prefill, PROMPT)
-    )
-    _pd_publish_until_credit(
+    _pd_wait_credit(
         prom,
-        lambda: _pd_grpc_publish(prefill[1], PD_PREFIX_B),
+        lambda: prefill[1].publish([prefill[1].store(PD_PREFIX_B)]),
         lambda: _pd_grpc_probe(router.url, prefill, PROMPT),
-        PD_PREFIX_B,
+        len(PD_PREFIX_B),
     )
     _pd_grpc_assert_picks(router.url, prefill, 1)
 
-    _pd_publish_until_credit(
+    _pd_wait_credit(
         prom,
-        lambda: _pd_grpc_publish(prefill[0], PD_PREFIX_A),
+        lambda: prefill[0].publish([prefill[0].store(PD_PREFIX_A)]),
         lambda: _pd_grpc_probe(router.url, prefill, PROMPT),
-        PD_PREFIX_A,
+        len(PD_PREFIX_A),
     )
     response = _pd_grpc_assert_picks(router.url, prefill, 0)
     assert response.json()["choices"][0]["message"]["content"] in {
