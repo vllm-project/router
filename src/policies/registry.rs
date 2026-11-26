@@ -9,7 +9,7 @@ use super::{
     KvAwarePolicy, LoadBalancingPolicy, PolicyFactory, PowerOfTwoPolicy, RandomPolicy,
     RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
-use crate::config::types::{PeerFetchConfig, PolicyConfig};
+use crate::config::types::PolicyConfig;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,15 +39,10 @@ pub struct PolicyRegistry {
     /// bounding affinity state across models.
     kv_affinity_table: Arc<KvAffinityTable>,
 
-    /// `peer_fetch` block of the main `kv_aware` policy config, applied to
-    /// hint-created `kv_aware` policies. `None` when the main policy is not
-    /// `kv_aware` or has no block.
-    peer_fetch: Option<Arc<PeerFetchConfig>>,
-
     /// Active-mode peer fetch kill switch, shared by every active-mode
-    /// `kv_aware` policy this registry builds (the default policy and
-    /// hint-created ones), so one store flips all of them, including
-    /// policies created later. Starts enabled.
+    /// `kv_aware` policy this registry builds, so one store flips all of them.
+    /// Only the main policy can be built active: hint-created `kv_aware`
+    /// policies get no planner. Starts enabled.
     peer_fetch_enabled: Arc<AtomicBool>,
 
     /// Serializes kill switch writers, so a write and the status it returns
@@ -93,13 +88,6 @@ impl PolicyRegistry {
             &kv_affinity_table,
             &peer_fetch_enabled,
         );
-        let peer_fetch = match &default_policy_config {
-            PolicyConfig::KvAware { peer_fetch, .. } => {
-                peer_fetch.as_deref().cloned().map(Arc::new)
-            }
-            _ => None,
-        };
-
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
@@ -107,7 +95,6 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
-            peer_fetch,
             peer_fetch_enabled,
             peer_fetch_lock: Arc::new(Mutex::new(())),
         }
@@ -245,11 +232,13 @@ impl PolicyRegistry {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
-            "kv_aware" => Arc::new(PolicyFactory::apply_peer_fetch_config(
+            // No peer fetch planner: workers that get this policy from their
+            // `policy` label are registered without KV discovery, so they have
+            // no cache identity and a planner could only ever report
+            // `unverified_identity`. Peer fetch covers the main policy only.
+            "kv_aware" => Arc::new(
                 KvAwarePolicy::default().with_shared_affinity(Arc::clone(&self.kv_affinity_table)),
-                self.peer_fetch.as_deref(),
-                &self.peer_fetch_enabled,
-            )),
+            ),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
             "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
@@ -566,27 +555,75 @@ mod tests {
     }
 
     #[test]
-    fn hint_created_kv_aware_inherits_main_shadow_planner() {
-        use crate::config::types::PeerFetchMode::{Off, Shadow};
+    fn hint_created_kv_aware_gets_no_planner() {
+        use crate::config::types::PeerFetchMode::{Active, Off, Shadow};
         let block = |mode| crate::config::types::PeerFetchConfig {
             mode,
             ..Default::default()
         };
-        let cases = [
-            (kv_aware_main(Some(block(Shadow))), true),
-            (kv_aware_main(Some(block(Off))), false),
-            (kv_aware_main(None), false),
-            (PolicyConfig::RoundRobin, false),
-        ];
-        for (main, expect_planner) in cases {
+        for main in [
+            kv_aware_main(Some(block(Shadow))),
+            kv_aware_main(Some(block(Active))),
+            kv_aware_main(Some(block(Off))),
+            kv_aware_main(None),
+            PolicyConfig::RoundRobin,
+        ] {
             let registry = PolicyRegistry::new(main);
             let policy = registry.on_worker_added("m", Some("kv_aware"));
             let policy = policy
                 .as_any()
                 .downcast_ref::<KvAwarePolicy>()
                 .expect("kv_aware policy");
-            assert_eq!(policy.has_transfer_planner(), expect_planner);
+            assert!(!policy.has_transfer_planner());
+            assert!(!policy.is_peer_fetch_active_mode());
         }
+    }
+
+    /// The case from the review: a shadow block on the main policy, a worker
+    /// that picks `kv_aware` through its label, and a selection with tokens.
+    /// That worker has no cache identity, so a planner would report
+    /// `unverified_identity` for every such selection; there must be none.
+    #[test]
+    fn hint_created_kv_aware_records_no_unverified_identity() {
+        use crate::core::{BasicWorker, Worker, WorkerType};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+
+        let registry =
+            PolicyRegistry::new(kv_aware_main(Some(crate::config::types::PeerFetchConfig {
+                mode: crate::config::types::PeerFetchMode::Shadow,
+                ..Default::default()
+            })));
+        let policy = registry.on_worker_added("m", Some("kv_aware"));
+        let kv = policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .expect("kv_aware policy");
+        assert!(!kv.has_transfer_planner());
+
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+            .iter()
+            .map(|url| {
+                let worker: Arc<dyn Worker> =
+                    Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular));
+                crate::policies::KvAwareOps::register_worker(kv, worker.as_ref(), None, None);
+                worker
+            })
+            .collect();
+        let ids: Vec<u32> = (0..2000).collect();
+        kv.select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .expect("a worker");
+        // No planner, so no `plans_total` sample at all, in particular no
+        // `unverified_identity`. (Routing's own decision counter may still use
+        // that label; it is not a planner outcome.)
+        let rendered = handle.render();
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("vllm_router_peer_fetch_plans_total")),
+            "{rendered}"
+        );
     }
 
     fn active_block() -> crate::config::types::PeerFetchConfig {
@@ -604,41 +641,34 @@ mod tests {
     }
 
     #[test]
-    fn peer_fetch_flag_is_shared_by_default_and_hint_created_policies() {
+    fn peer_fetch_flag_covers_the_default_policy_not_hint_created_ones() {
         let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
         let default = registry.get_default_policy();
         let hinted = registry.on_worker_added("hinted", Some("kv_aware"));
         assert!(!Arc::ptr_eq(&default, &hinted));
         assert!(kv(&default).peer_fetch_enabled());
-        assert!(kv(&hinted).peer_fetch_enabled());
+        assert!(!kv(&hinted).has_transfer_planner());
+        assert!(!kv(&hinted).peer_fetch_enabled());
 
         let status = registry.set_peer_fetch_enabled(false);
         assert!(!status.enabled);
         assert!(!kv(&default).peer_fetch_enabled());
-        assert!(!kv(&hinted).peer_fetch_enabled());
+        // Only the default instance is listed; the hinted one has no planner.
+        assert_eq!(status.policies.len(), 1);
+        assert!(status.policies[0].default);
 
-        // A policy's own setter stores to the same shared flag.
-        assert!(kv(&hinted).set_peer_fetch_enabled(true));
-        assert!(kv(&default).peer_fetch_enabled());
+        // The default policy's own setter stores to the same shared flag.
+        assert!(kv(&default).set_peer_fetch_enabled(true));
         assert!(registry.peer_fetch_status().enabled);
-    }
-
-    #[test]
-    fn hint_created_policy_after_disable_starts_disabled() {
-        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
-        registry.set_peer_fetch_enabled(false);
-        let late = registry.on_worker_added("late", Some("kv_aware"));
-        assert!(kv(&late).is_peer_fetch_active_mode());
-        assert!(!kv(&late).peer_fetch_enabled());
-
-        registry.set_peer_fetch_enabled(true);
-        assert!(kv(&late).peer_fetch_enabled());
+        // A policy without peer fetch state cannot be switched on.
+        assert!(!kv(&hinted).set_peer_fetch_enabled(true));
     }
 
     #[test]
     fn peer_fetch_status_lists_each_active_instance_once() {
         let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
-        // Two models share the default instance; one has its own.
+        // Two models share the default instance; one has its own, which has no
+        // planner and is therefore not listed.
         registry.on_worker_added("m2", None);
         registry.on_worker_added("m1", None);
         registry.on_worker_added("m1", None);
@@ -652,16 +682,10 @@ mod tests {
             status,
             PeerFetchStatus {
                 enabled: true,
-                policies: vec![
-                    PeerFetchPolicyStatus {
-                        models: vec!["m1".into(), "m2".into()],
-                        default: true,
-                    },
-                    PeerFetchPolicyStatus {
-                        models: vec!["own".into()],
-                        default: false,
-                    },
-                ],
+                policies: vec![PeerFetchPolicyStatus {
+                    models: vec!["m1".into(), "m2".into()],
+                    default: true,
+                },],
             }
         );
     }

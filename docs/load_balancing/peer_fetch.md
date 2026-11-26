@@ -137,7 +137,7 @@ Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measur
 | `shadow` | `true` | shared cache identity only | counted, request unchanged |
 | `active` | `false` (`true` is rejected at startup) | same as default shadow | counted; then see below |
 
-A default shadow run makes the plans active mode would make, so its rate predicts active mode. `--peer-fetch-ignore-capability` answers a different question: how much peer fetch would save once every worker declares a compatible capability. The router logs a warning each time it builds a policy with it set: at startup, and again for each `kv_aware` policy created later from a worker's policy hint. Without it, `plans_total{outcome="incompatible"}` shows how often the capability check decided the outcome. It is counted once per selection, and only when no peer failed a later check (3 to 7, see "Which reason is reported"), so it undercounts the selections the check blocked.
+A default shadow run makes the plans active mode would make, so its rate predicts active mode. `--peer-fetch-ignore-capability` answers a different question: how much peer fetch would save once every worker declares a compatible capability. The router logs a warning at startup when it is set. Without it, `plans_total{outcome="incompatible"}` shows how often the capability check decided the outcome. It is counted once per selection, and only when no peer failed a later check (3 to 7, see "Which reason is reported"), so it undercounts the selections the check blocked.
 
 In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method ends at `session_binding` (when it already has a session binding) or `missing_tokens` in `plans_total`, and never takes a source slot.
 
@@ -262,6 +262,7 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 **Not supported.**
 - Prefill/decode (PD) routing: any mode other than `off` is rejected at startup.
 - gRPC workers with `active`: rejected at startup. A gRPC worker discovered later is never asked to fetch.
+- `kv_aware` policies created from a worker's `policy` label get no planner; peer fetch covers the main policy only. Those workers are registered without KV discovery, so they have no cache identity to plan with.
 
 ## Metrics
 
