@@ -1,6 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{parser::ValueSource, ArgAction, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
@@ -107,6 +107,10 @@ Examples:
 
 "#)]
 struct CliArgs {
+    /// Path to a JSON or YAML router configuration file.
+    /// Explicit CLI flags override matching file values.
+    #[arg(long)]
+    config: Option<String>,
     /// E+PD or E/P/D encoder orchestration as JSON (encoder_urls, consumer_zmq_addrs).
     #[arg(long)]
     epd_config: Option<String>,
@@ -714,51 +718,460 @@ impl CliArgs {
         })
     }
 
-    /// Create ServerConfig from CLI args and RouterConfig
-    fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
-        // Create service discovery config if enabled
-        let service_discovery_config = if self.service_discovery {
-            Some(ServiceDiscoveryConfig {
-                enabled: true,
-                selector: Self::parse_selector(&self.selector),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                // HTTP service discovery only supports the vLLM PD router.
-                pd_mode: self.vllm_pd_disaggregation,
-                prefill_selector: Self::parse_selector(&self.prefill_selector),
-                decode_selector: Self::parse_selector(&self.decode_selector),
-                bootstrap_port_annotation: "vllm.ai/bootstrap-port".to_string(),
-            })
-        } else {
-            None
+    /// Resolve `RouterConfig` from CLI flags alone or a `--config` file with explicit CLI overrides.
+    fn resolve_router_config(
+        &self,
+        matches: &clap::ArgMatches,
+        prefill_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<RouterConfig> {
+        let Some(config_path) = &self.config else {
+            return self.to_router_config(prefill_urls);
         };
+        let mut config = RouterConfig::from_file(config_path)?;
+        self.apply_cli_overrides(&mut config, matches, prefill_urls)?;
+        Ok(config)
+    }
 
-        // Create Prometheus config
-        let prometheus_config = Some(PrometheusConfig {
-            port: self.prometheus_port,
-            host: self.prometheus_host.clone(),
-        });
+    fn apply_cli_overrides(
+        &self,
+        config: &mut RouterConfig,
+        matches: &clap::ArgMatches,
+        prefill_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<()> {
+        let has_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
-        ServerConfig {
-            host: self.host.clone(),
-            port: self.port,
-            router_config,
-            max_payload_size: self.max_payload_size,
-            wasm_middleware: self.wasm_middleware.clone(),
-            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
-            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
-            log_dir: self.log_dir.clone(),
-            log_level: Some(self.log_level.clone()),
-            service_discovery_config,
-            prometheus_config,
-            request_timeout_secs: self.request_timeout_secs,
-            pool_idle_timeout_secs: self.pool_idle_timeout_secs,
-            request_id_headers: if self.request_id_headers.is_empty() {
+        self.apply_mode_overrides(config, &has_cli, prefill_urls)?;
+        self.apply_kv_event_overrides(config, &has_cli)?;
+
+        if has_cli("policy") {
+            config.policy = self.parse_policy(&self.policy);
+        }
+        self.apply_policy_param_overrides(config, &has_cli);
+
+        if has_cli("host") {
+            config.host = self.host.clone();
+        }
+        if has_cli("port") {
+            config.port = self.port;
+        }
+        if has_cli("max_payload_size") {
+            config.max_payload_size = self.max_payload_size;
+        }
+        if has_cli("request_timeout_secs") {
+            config.request_timeout_secs = self.request_timeout_secs;
+        }
+        if has_cli("worker_startup_timeout_secs") {
+            config.worker_startup_timeout_secs = self.worker_startup_timeout_secs;
+        }
+        if has_cli("worker_startup_check_interval") {
+            config.worker_startup_check_interval_secs = self.worker_startup_check_interval;
+        }
+        if has_cli("intra_node_data_parallel_size") {
+            config.intra_node_data_parallel_size = self.intra_node_data_parallel_size;
+        }
+        if has_cli("api_key") {
+            config.api_key = self.api_key.clone();
+        }
+        if has_cli("api_key_validation_urls") {
+            config.api_key_validation_urls = self.api_key_validation_urls.clone();
+        } else if config.api_key_validation_urls.is_empty() {
+            if let Ok(raw_urls) = std::env::var("API_KEY_VALIDATION_URLS") {
+                config.api_key_validation_urls = raw_urls
+                    .split(',')
+                    .map(|url| url.trim().to_string())
+                    .filter(|url| !url.is_empty())
+                    .collect();
+            }
+        }
+        if has_cli("log_dir") {
+            config.log_dir = self.log_dir.clone();
+        }
+        if has_cli("log_level") {
+            config.log_level = Some(self.log_level.clone());
+        }
+        if has_cli("request_id_headers") {
+            config.request_id_headers = if self.request_id_headers.is_empty() {
                 None
             } else {
                 Some(self.request_id_headers.clone())
-            },
+            };
+        }
+        if has_cli("max_concurrent_requests") {
+            config.max_concurrent_requests = self.max_concurrent_requests;
+        }
+        if has_cli("cors_allowed_origins") {
+            config.cors_allowed_origins = self.cors_allowed_origins.clone();
+        }
+        if has_cli("disable_retries") {
+            config.disable_retries = self.disable_retries;
+        }
+        if has_cli("disable_circuit_breaker") {
+            config.disable_circuit_breaker = self.disable_circuit_breaker;
+        }
+        if has_cli("kv_aware_session_affinity_ttl_secs") {
+            config.kv_aware_session_affinity_ttl_secs = self.kv_aware_session_affinity_ttl_secs;
+        }
+        if has_cli("kv_event_strict_recovery") {
+            config.kv_event_strict_recovery = self.kv_event_strict_recovery;
+        }
+        if has_cli("history_backend") {
+            config.history_backend = match self.history_backend.as_str() {
+                "none" => HistoryBackend::None,
+                _ => HistoryBackend::Memory,
+            };
+        }
+        if has_cli("profile") {
+            config.enable_profiling = self.profile;
+        }
+        if has_cli("kv_connector") {
+            config.kv_connector = self.kv_connector;
+        }
+        if has_cli("epd_config") {
+            config.epd = self
+                .epd_config
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|e| ConfigError::ValidationFailed {
+                    reason: format!("Invalid --epd-config: {e}"),
+                })?;
+        }
+        if has_cli("pd_pair") {
+            config.pd_worker_pairs = vllm_router_rs::config::parse_pd_worker_pairs(&self.pd_pair)?;
+        }
+        if has_cli("enable_program_scheduling") || has_cli("program_scheduling_config_json") {
+            config.program_scheduling = ProgramSchedulingConfig::resolve(
+                self.enable_program_scheduling,
+                self.program_scheduling_config_json.as_deref(),
+            )?;
+        }
+
+        self.apply_subconfig_overrides(config, &has_cli);
+        Ok(())
+    }
+
+    fn apply_mode_overrides(
+        &self,
+        config: &mut RouterConfig,
+        has_cli: &dyn Fn(&str) -> bool,
+        prefill_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<()> {
+        if has_cli("enable_igw") && self.enable_igw {
+            config.enable_igw = true;
+            config.mode = RoutingMode::Regular {
+                worker_urls: Vec::new(),
+            };
+            return Ok(());
+        }
+        if has_cli("enable_igw") {
+            config.enable_igw = false;
+        }
+
+        if has_cli("backend") && matches!(self.backend, Backend::Openai) {
+            let worker_urls = if has_cli("worker_urls") {
+                self.worker_urls.clone()
+            } else {
+                match &config.mode {
+                    RoutingMode::Regular { worker_urls } | RoutingMode::OpenAI { worker_urls } => {
+                        worker_urls.clone()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            config.mode = RoutingMode::OpenAI { worker_urls };
+            return Ok(());
+        }
+
+        let pd_cli_requested = (has_cli("vllm_pd_disaggregation") && self.vllm_pd_disaggregation)
+            || !prefill_urls.is_empty()
+            || has_cli("decode")
+            || has_cli("vllm_discovery_address")
+            || has_cli("prefill_policy")
+            || has_cli("decode_policy");
+
+        if pd_cli_requested {
+            let (base_prefill, base_decode, base_p_pol, base_d_pol, base_disc) = match &config.mode
+            {
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: p,
+                    decode_urls: d,
+                    prefill_policy: pp,
+                    decode_policy: dp,
+                    discovery_address: da,
+                } => (p.clone(), d.clone(), pp.clone(), dp.clone(), da.clone()),
+                _ => (Vec::new(), Vec::new(), None, None, None),
+            };
+            config.mode = RoutingMode::VllmPrefillDecode {
+                prefill_urls: if prefill_urls.is_empty() {
+                    base_prefill
+                } else {
+                    prefill_urls
+                },
+                decode_urls: if has_cli("decode") {
+                    self.decode.clone()
+                } else {
+                    base_decode
+                },
+                prefill_policy: self
+                    .prefill_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p))
+                    .or(base_p_pol),
+                decode_policy: self
+                    .decode_policy
+                    .as_ref()
+                    .map(|p| self.parse_policy(p))
+                    .or(base_d_pol),
+                discovery_address: if has_cli("vllm_discovery_address") {
+                    self.vllm_discovery_address.clone()
+                } else {
+                    base_disc
+                },
+            };
+            return Ok(());
+        }
+
+        if has_cli("worker_urls") {
+            match &mut config.mode {
+                RoutingMode::Regular { worker_urls } | RoutingMode::OpenAI { worker_urls } => {
+                    *worker_urls = self.worker_urls.clone();
+                }
+                _ => {
+                    config.mode = RoutingMode::Regular {
+                        worker_urls: self.worker_urls.clone(),
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_kv_event_overrides(
+        &self,
+        config: &mut RouterConfig,
+        has_cli: &dyn Fn(&str) -> bool,
+    ) -> ConfigResult<()> {
+        let has_kv_cli = has_cli("kv_hybrid_layout")
+            || has_cli("kv_event_source")
+            || has_cli("pd_kv_events")
+            || has_cli("kv_event_replay_source")
+            || has_cli("kv_event_topic")
+            || has_cli("kv_event_block_size")
+            || has_cli("kv_event_model");
+        if !has_kv_cli {
+            return Ok(());
+        }
+
+        let kv_sources = vllm_router_rs::config::KvSourceOptions {
+            layout: self.kv_hybrid_layout.as_deref(),
+            publishers: &self.kv_event_source,
+            pd_publishers: &self.pd_kv_events,
+            replay: &self.kv_event_replay_source,
+            topics: &self.kv_event_topic,
+            block_size: self.kv_event_block_size,
+            model: self.kv_event_model.as_deref(),
+        }
+        .load(&config.mode)?;
+
+        if !kv_sources.pd.is_empty() {
+            config.pd_kv_event_sources = kv_sources.pd;
+        }
+        if !kv_sources.regular.is_empty() {
+            if let PolicyConfig::KvAware {
+                static_kv_event_sources,
+                ..
+            } = &mut config.policy
+            {
+                **static_kv_event_sources = kv_sources.regular;
+            } else if !has_cli("policy") {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--kv-event-source and --kv-hybrid-layout require kv_aware policy in regular mode".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_policy_param_overrides(
+        &self,
+        config: &mut RouterConfig,
+        has_cli: &dyn Fn(&str) -> bool,
+    ) {
+        match &mut config.policy {
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if has_cli("cache_threshold") {
+                    *cache_threshold = self.cache_threshold;
+                }
+                if has_cli("balance_abs_threshold") {
+                    *balance_abs_threshold = self.balance_abs_threshold;
+                }
+                if has_cli("balance_rel_threshold") {
+                    *balance_rel_threshold = self.balance_rel_threshold;
+                }
+                if has_cli("eviction_interval") {
+                    *eviction_interval_secs = self.eviction_interval;
+                }
+                if has_cli("max_tree_size") {
+                    *max_tree_size = self.max_tree_size;
+                }
+            }
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                kv_penalty_external,
+                kv_penalty_disk,
+                ..
+            } => {
+                if has_cli("router_temperature") {
+                    *router_temperature = self.router_temperature;
+                }
+                if has_cli("kv_penalty_host") {
+                    *kv_penalty_host = self.kv_penalty_host;
+                }
+                if has_cli("kv_penalty_external") {
+                    *kv_penalty_external = self.kv_penalty_external;
+                }
+                if has_cli("kv_penalty_disk") {
+                    *kv_penalty_disk = self.kv_penalty_disk;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_subconfig_overrides(&self, config: &mut RouterConfig, has_cli: &dyn Fn(&str) -> bool) {
+        if has_cli("retry_max_retries") {
+            config.retry.max_retries = self.retry_max_retries;
+        }
+        if has_cli("retry_initial_backoff_ms") {
+            config.retry.initial_backoff_ms = self.retry_initial_backoff_ms;
+        }
+        if has_cli("retry_max_backoff_ms") {
+            config.retry.max_backoff_ms = self.retry_max_backoff_ms;
+        }
+        if has_cli("retry_backoff_multiplier") {
+            config.retry.backoff_multiplier = self.retry_backoff_multiplier;
+        }
+        if has_cli("retry_jitter_factor") {
+            config.retry.jitter_factor = self.retry_jitter_factor;
+        }
+
+        if has_cli("cb_failure_threshold") {
+            config.circuit_breaker.failure_threshold = self.cb_failure_threshold;
+        }
+        if has_cli("cb_success_threshold") {
+            config.circuit_breaker.success_threshold = self.cb_success_threshold;
+        }
+        if has_cli("cb_timeout_duration_secs") {
+            config.circuit_breaker.timeout_duration_secs = self.cb_timeout_duration_secs;
+        }
+        if has_cli("cb_window_duration_secs") {
+            config.circuit_breaker.window_duration_secs = self.cb_window_duration_secs;
+        }
+
+        if has_cli("health_failure_threshold") {
+            config.health_check.failure_threshold = self.health_failure_threshold;
+        }
+        if has_cli("health_success_threshold") {
+            config.health_check.success_threshold = self.health_success_threshold;
+        }
+        if has_cli("health_check_timeout_secs") {
+            config.health_check.timeout_secs = self.health_check_timeout_secs;
+        }
+        if has_cli("health_check_interval_secs") {
+            config.health_check.check_interval_secs = self.health_check_interval_secs;
+        }
+        if has_cli("health_check_endpoint") {
+            config.health_check.endpoint = self.health_check_endpoint.clone();
+        }
+
+        if has_cli("prometheus_port") || has_cli("prometheus_host") {
+            let metrics = config.metrics.get_or_insert_with(MetricsConfig::default);
+            if has_cli("prometheus_port") {
+                metrics.port = self.prometheus_port;
+            }
+            if has_cli("prometheus_host") {
+                metrics.host = self.prometheus_host.clone();
+            }
+        }
+
+        if has_cli("service_discovery")
+            || has_cli("service_discovery_namespace")
+            || has_cli("service_discovery_port")
+            || has_cli("selector")
+            || has_cli("prefill_selector")
+            || has_cli("decode_selector")
+        {
+            let discovery = config
+                .discovery
+                .get_or_insert_with(DiscoveryConfig::default);
+            if has_cli("service_discovery") {
+                discovery.enabled = self.service_discovery;
+            }
+            if has_cli("service_discovery_namespace") {
+                discovery.namespace = self.service_discovery_namespace.clone();
+            }
+            if has_cli("service_discovery_port") {
+                discovery.port = self.service_discovery_port;
+            }
+            if has_cli("selector") {
+                discovery.selector = Self::parse_selector(&self.selector);
+            }
+            if has_cli("prefill_selector") {
+                discovery.prefill_selector = Self::parse_selector(&self.prefill_selector);
+            }
+            if has_cli("decode_selector") {
+                discovery.decode_selector = Self::parse_selector(&self.decode_selector);
+            }
+        }
+    }
+
+    /// Create ServerConfig from CLI args and resolved RouterConfig
+    fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
+        let service_discovery_config =
+            router_config
+                .discovery
+                .as_ref()
+                .filter(|d| d.enabled)
+                .map(|d| ServiceDiscoveryConfig {
+                    enabled: true,
+                    selector: d.selector.clone(),
+                    check_interval: std::time::Duration::from_secs(d.check_interval_secs),
+                    port: d.port,
+                    namespace: d.namespace.clone(),
+                    // HTTP service discovery only supports the vLLM PD router.
+                    pd_mode: router_config.mode.is_pd_mode(),
+                    prefill_selector: d.prefill_selector.clone(),
+                    decode_selector: d.decode_selector.clone(),
+                    bootstrap_port_annotation: d.bootstrap_port_annotation.clone(),
+                });
+
+        let prometheus_config = router_config.metrics.as_ref().map(|m| PrometheusConfig {
+            port: m.port,
+            host: m.host.clone(),
+        });
+
+        ServerConfig {
+            host: router_config.host.clone(),
+            port: router_config.port,
+            max_payload_size: router_config.max_payload_size,
+            wasm_middleware: self.wasm_middleware.clone(),
+            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
+            log_dir: router_config.log_dir.clone(),
+            log_level: router_config.log_level.clone(),
+            service_discovery_config,
+            prometheus_config,
+            request_timeout_secs: router_config.request_timeout_secs,
+            pool_idle_timeout_secs: self.pool_idle_timeout_secs,
+            request_id_headers: router_config.request_id_headers.clone(),
+            router_config,
             trace_config: if self.enable_trace {
                 Some(TraceConfig {
                     otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
@@ -787,22 +1200,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse CLI arguments with clap using filtered args
     println!("DEBUG: Parsing CLI arguments with clap");
     println!("DEBUG: Filtered args: {:?}", filtered_args);
-    let cli_args = CliArgs::parse_from(filtered_args);
+    let matches = CliArgs::command().get_matches_from(&filtered_args);
+    let cli_args = CliArgs::from_arg_matches(&matches)?;
     println!("DEBUG: CLI args parsed successfully");
-    println!(
-        "DEBUG: vllm_pd_disaggregation: {}",
-        cli_args.vllm_pd_disaggregation
-    );
 
-    // Print startup info
+    // Resolve and validate RouterConfig (from --config file + explicit CLI overrides, or CLI alone)
+    println!("DEBUG: Resolving RouterConfig");
+    let router_config = cli_args.resolve_router_config(&matches, prefill_urls)?;
+    println!("DEBUG: Validating configuration");
+    router_config.validate()?;
+    println!("DEBUG: Configuration validated successfully");
+
+    // Print startup info from the resolved configuration
     println!("VLLM Router starting...");
-    println!("Host: {}:{}", cli_args.host, cli_args.port);
-    let mode_str = if cli_args.enable_igw {
+    println!("Host: {}:{}", router_config.host, router_config.port);
+    let mode_str = if router_config.enable_igw {
         "IGW (Inference Gateway)".to_string()
-    } else if matches!(cli_args.backend, Backend::Openai) {
+    } else if matches!(router_config.mode, RoutingMode::OpenAI { .. }) {
         "OpenAI Backend".to_string()
-    } else if cli_args.vllm_pd_disaggregation {
+    } else if router_config.mode.is_pd_mode() {
         "vLLM PD Disaggregated".to_string()
+    } else if cli_args.config.is_some() {
+        "Regular".to_string()
     } else {
         format!("Regular ({})", cli_args.backend)
     };
@@ -820,31 +1239,24 @@ Provide --worker-urls or PD flags as usual.",
         Backend::Vllm | Backend::Openai => {}
     }
 
-    if !cli_args.enable_igw {
-        println!("Policy: {}", cli_args.policy);
+    if !router_config.enable_igw {
+        println!("Policy: {}", router_config.policy.name());
 
-        if cli_args.vllm_pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {:?}", prefill_urls);
-            println!("Decode nodes: {:?}", cli_args.decode);
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } = &router_config.mode
+        {
+            if !prefill_urls.is_empty() {
+                println!("Prefill nodes: {:?}", prefill_urls);
+                println!("Decode nodes: {:?}", decode_urls);
+            }
         }
     }
 
-    // Convert to RouterConfig
-    println!("DEBUG: Converting to RouterConfig");
-    let router_config = cli_args.to_router_config(prefill_urls)?;
-    println!("DEBUG: RouterConfig created successfully");
-
-    // Validate configuration
-    println!("DEBUG: Validating configuration");
-    router_config.validate()?;
-    println!("DEBUG: Configuration validated successfully");
-
     // Create ServerConfig
     println!("DEBUG: Creating ServerConfig");
-    println!(
-        "DEBUG: CLI host: {}, port: {}",
-        cli_args.host, cli_args.port
-    );
     let server_config = cli_args.to_server_config(router_config);
     println!(
         "DEBUG: ServerConfig created successfully - host: {}, port: {}",
@@ -1122,5 +1534,182 @@ mod tests {
                 "should reject '{bad}'"
             );
         }
+    }
+
+    #[test]
+    fn loads_config_file_without_clobbering_with_cli_defaults() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: regular
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: round_robin
+host: 0.0.0.0
+port: 8080
+log_level: warn
+metrics:
+  port: 29100
+  host: 0.0.0.0
+retry:
+  max_retries: 2
+"#
+        )
+        .unwrap();
+
+        let matches = CliArgs::command()
+            .try_get_matches_from(["vllm-router", "--config", file.path().to_str().unwrap()])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let router_config = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+        router_config.validate().unwrap();
+        let server_config = cli_args.to_server_config(router_config);
+
+        assert_eq!(server_config.host, "0.0.0.0");
+        assert_eq!(server_config.port, 8080);
+        assert_eq!(server_config.log_level.as_deref(), Some("warn"));
+        assert_eq!(
+            server_config.prometheus_config.as_ref().unwrap().port,
+            29100
+        );
+        assert_eq!(
+            server_config.prometheus_config.as_ref().unwrap().host,
+            "0.0.0.0"
+        );
+        assert_eq!(server_config.router_config.retry.max_retries, 2);
+        assert!(matches!(
+            server_config.router_config.policy,
+            PolicyConfig::RoundRobin
+        ));
+    }
+
+    #[test]
+    fn explicit_cli_flags_override_config_file_selectively() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: regular
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: cache_aware
+  cache_threshold: 0.45
+host: 0.0.0.0
+port: 8080
+retry:
+  max_retries: 9
+  initial_backoff_ms: 120
+"#
+        )
+        .unwrap();
+
+        let (prefill_urls, filtered) = split_prefill_args_from_others([
+            "vllm-router".to_string(),
+            "--config".to_string(),
+            file.path().to_str().unwrap().to_string(),
+            "--port".to_string(),
+            "9090".to_string(),
+            "--eviction-interval".to_string(),
+            "45".to_string(),
+            "--retry-max-retries".to_string(),
+            "1".to_string(),
+            "--prometheus-port".to_string(),
+            "29500".to_string(),
+        ])
+        .unwrap();
+
+        let matches = CliArgs::command().try_get_matches_from(&filtered).unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args
+            .resolve_router_config(&matches, prefill_urls)
+            .unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 9090);
+        assert_eq!(cfg.retry.max_retries, 1);
+        assert_eq!(cfg.retry.initial_backoff_ms, 120);
+        assert_eq!(cfg.metrics.as_ref().unwrap().port, 29500);
+        match cfg.policy {
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                eviction_interval_secs,
+                ..
+            } => {
+                assert!((cache_threshold - 0.45).abs() < f32::EPSILON);
+                assert_eq!(eviction_interval_secs, 45);
+            }
+            other => panic!("expected cache_aware, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_pd_overrides_preserve_unspecified_config_fields() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"{{
+  "mode": {{
+    "type": "vllm_prefill_decode",
+    "prefill_urls": [["http://127.0.0.1:8100", 9000]],
+    "decode_urls": ["http://127.0.0.1:8200"],
+    "discovery_address": "127.0.0.1:30001"
+  }},
+  "policy": {{ "type": "power_of_two" }},
+  "port": 4000
+}}"#
+        )
+        .unwrap();
+
+        let (prefill_urls, filtered) = split_prefill_args_from_others([
+            "vllm-router".to_string(),
+            "--config".to_string(),
+            file.path().to_str().unwrap().to_string(),
+            "--decode".to_string(),
+            "http://127.0.0.1:8300".to_string(),
+        ])
+        .unwrap();
+
+        let matches = CliArgs::command().try_get_matches_from(&filtered).unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args
+            .resolve_router_config(&matches, prefill_urls)
+            .unwrap();
+        cfg.validate().unwrap();
+
+        assert_eq!(cfg.port, 4000);
+        match cfg.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                decode_urls,
+                discovery_address,
+                ..
+            } => {
+                assert_eq!(
+                    prefill_urls,
+                    vec![("http://127.0.0.1:8100".to_string(), Some(9000))]
+                );
+                assert_eq!(decode_urls, vec!["http://127.0.0.1:8300".to_string()]);
+                assert_eq!(discovery_address.as_deref(), Some("127.0.0.1:30001"));
+            }
+            other => panic!("expected pd mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_config_file_returns_error() {
+        let matches = CliArgs::command()
+            .try_get_matches_from(["vllm-router", "--config", "/nonexistent/router.yaml"])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        assert!(cli_args.resolve_router_config(&matches, vec![]).is_err());
     }
 }

@@ -50,6 +50,7 @@ width. `f32` and `f64` are floating-point values. Python's `integer` and
 | --- | --- | --- | --- | --- | --- |
 | `--host` | `string` | `127.0.0.1` | `string` | `127.0.0.1` | Address on which the router listens. |
 | `--port` | `u16` | `30000` | `integer` | `30000` | Router HTTP port. |
+| `--config` | `string` | `unset` | — | — | Path to a JSON or YAML router configuration file; explicit CLI flags override file values. |
 | `--help` | `flag` | `n/a` | `flag` | `n/a` | Print help and exit; `-h` is also accepted. Rust `--help` shows long help. |
 | `--version` | `flag` | `n/a` | — | — | Print the Rust binary version and exit; `-V` is also accepted. |
 | `--max-payload-size` | `usize` | `536870912` | `integer` | `536870912` | Maximum request body size in bytes; the default is 512 MiB. |
