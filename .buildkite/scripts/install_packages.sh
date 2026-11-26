@@ -35,8 +35,7 @@ require_sourced() {
 
 install_python_set() {
   local set_name="$1"
-  shift
-  python3 -m pip install --disable-pip-version-check --quiet "$@" \
+  python3 -m pip install --disable-pip-version-check --quiet \
     -r "${root}/requirements/${set_name}.txt"
 }
 
@@ -44,7 +43,7 @@ activate_venv() {
   python3 -m venv /tmp/venv
   # shellcheck disable=SC1091
   source /tmp/venv/bin/activate
-  install_python_set pip --upgrade
+  python3 -m pip install --disable-pip-version-check --quiet --upgrade pip
 }
 
 if [ "$#" -ne 1 ] || [ -z "${1}" ]; then
@@ -112,5 +111,5 @@ if [ "${name}" = "python" ]; then
 elif [ "${name}" = "python-wheel" ]; then
   require_sourced
   activate_venv
-  install_python_set build
+  python3 -m pip install --disable-pip-version-check --quiet build
 fi

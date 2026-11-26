@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from aiohttp import web
+from aiohttp import StreamReader, web
 
 from ..e2e.pd_disagg_vllm import pd_lifecycle
 from ..e2e.pd_disagg_vllm.pd_lifecycle import probe
@@ -16,6 +16,7 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1, 2)):
     calls = []
+    close_timeouts = []
 
     async def handler(request):
         payload = await request.json()
@@ -41,6 +42,7 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
             )
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
+        disconnect = "-disconnect-" in payload["prompt"]
 
         async def chunk(text, reason=None):
             data = {"choices": [{"text": text, "finish_reason": reason}]}
@@ -97,14 +99,25 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
                 following = 'data: {"choices":[{"text":"蓝","finish_reason":null}]}\n\n'.encode()
                 cut = following.index(fragment) + len(fragment)
                 await response.write(first + following[:cut])
-                await asyncio.sleep(0.02)
-                await response.write(following[cut:])
+                if not disconnect:
+                    await asyncio.sleep(0.02)
+                    await response.write(following[cut:])
             else:
                 await chunk("blue", "stop" if fault == "already_done" else None)
             if fault == "truncated":
                 return response
-            # Ensure disconnect can happen while the response is unfinished.
-            await asyncio.sleep(0.02)
+            if disconnect and fault != "already_done":
+                transport = request.transport
+
+                async def wait_for_close():
+                    while transport is not None and not transport.is_closing():
+                        await asyncio.sleep(0.01)
+
+                try:
+                    await asyncio.wait_for(wait_for_close(), 2)
+                except TimeoutError:
+                    close_timeouts.append(payload["prompt"])
+                return response
             await chunk("", "stop")
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, RuntimeError):
@@ -175,10 +188,19 @@ async def exercise(fault=None, output=None, cli=False, fragment=None, levels=(1,
         return result, calls
     finally:
         await runner.cleanup()
+        assert not close_timeouts, f"client did not disconnect: {close_timeouts}"
 
 
 @pytest.mark.parametrize("fragment", [None, b"da", b'{"choices":', b"\xe8"])
-def test_success_and_progress_after_disconnect(fragment):
+def test_success_and_progress_after_disconnect(fragment, monkeypatch):
+    readline = StreamReader.readline
+
+    async def delayed_readline(self):
+        # Exercise a client that cannot consume the first event immediately.
+        await asyncio.sleep(0.05)
+        return await readline(self)
+
+    monkeypatch.setattr(StreamReader, "readline", delayed_readline)
     result, calls = asyncio.run(exercise(fragment=fragment))
     assert result["passed"]
     assert len(calls) == 12
