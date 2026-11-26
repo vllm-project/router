@@ -111,17 +111,32 @@ impl WorkerRegistry {
         // Retire the previous writer before enabling the replacement. Retirement
         // takes the same lock as publication, so an in-progress old write must
         // finish before the new instance publishes its initial/current load.
-        let replaces_same_model = if let Some(previous) = self.get(&worker_id) {
-            previous.set_load_metrics_enabled(false);
-            let same_model = previous.model_id() == worker.model_id();
-            if !same_model {
-                self.remove_model_indexes(&worker_id, previous.as_ref());
-            }
-            self.remove_type_and_connection_indexes(&worker_id, previous.as_ref());
-            same_model
-        } else {
-            false
-        };
+        let worker_type = worker.worker_type();
+        let connection_mode = worker.connection_mode();
+        let (replaces_same_model, replaces_same_type, replaces_same_connection) =
+            if let Some(previous) = self.get(&worker_id) {
+                previous.set_load_metrics_enabled(false);
+                let previous_type = previous.worker_type();
+                let previous_connection = previous.connection_mode();
+                let same_model = previous.model_id() == worker.model_id();
+                let same_type = previous_type == worker_type;
+                let same_connection = previous_connection == connection_mode;
+
+                // Keep unchanged entries visible during load publication. Their
+                // WorkerId will resolve to the new instance once workers is updated.
+                if !same_model {
+                    self.remove_model_indexes(&worker_id, previous.as_ref());
+                }
+                if !same_type {
+                    self.remove_type_index(&worker_id, &previous_type);
+                }
+                if !same_connection {
+                    self.remove_connection_index(&worker_id, &previous_connection);
+                }
+                (same_model, same_type, same_connection)
+            } else {
+                (false, false, false)
+            };
         worker.set_load_metrics_enabled(true);
 
         // Store worker only after its initial metric has been published.
@@ -162,17 +177,19 @@ impl WorkerRegistry {
             }
         }
 
-        // Update type index
-        self.type_workers
-            .entry(worker.worker_type())
-            .or_default()
-            .push(worker_id.clone());
+        if !replaces_same_type {
+            self.type_workers
+                .entry(worker_type)
+                .or_default()
+                .push(worker_id.clone());
+        }
 
-        // Update connection mode index
-        self.connection_workers
-            .entry(worker.connection_mode())
-            .or_default()
-            .push(worker_id.clone());
+        if !replaces_same_connection {
+            self.connection_workers
+                .entry(connection_mode)
+                .or_default()
+                .push(worker_id.clone());
+        }
 
         // Publish the initial state even if no health transition occurs.
         RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
@@ -200,14 +217,15 @@ impl WorkerRegistry {
     }
 
     /// Caller must hold mutation_lock while changing the secondary indexes.
-    fn remove_type_and_connection_indexes(&self, worker_id: &WorkerId, worker: &dyn Worker) {
-        // Remove from type index
-        if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
+    fn remove_type_index(&self, worker_id: &WorkerId, worker_type: &WorkerType) {
+        if let Some(mut type_workers) = self.type_workers.get_mut(worker_type) {
             type_workers.retain(|id| id != worker_id);
         }
+    }
 
-        // Remove from connection mode index
-        if let Some(mut conn_workers) = self.connection_workers.get_mut(&worker.connection_mode()) {
+    /// Caller must hold mutation_lock while changing the secondary indexes.
+    fn remove_connection_index(&self, worker_id: &WorkerId, connection_mode: &ConnectionMode) {
+        if let Some(mut conn_workers) = self.connection_workers.get_mut(connection_mode) {
             conn_workers.retain(|id| id != worker_id);
         }
     }
@@ -226,7 +244,8 @@ impl WorkerRegistry {
             self.url_to_id.remove(worker.url());
 
             self.remove_model_indexes(worker_id, worker.as_ref());
-            self.remove_type_and_connection_indexes(worker_id, worker.as_ref());
+            self.remove_type_index(worker_id, &worker.worker_type());
+            self.remove_connection_index(worker_id, &worker.connection_mode());
             self.registration_order
                 .write()
                 .expect("RwLock for registration_order is poisoned")
