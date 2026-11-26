@@ -292,6 +292,30 @@ Expand the profile for your checkpoint and mode, then replace the object inside 
 </details>
 
 <details>
+<summary>GPU · HY4 Flash</summary>
+
+Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `tencent/Hy4-flash` (BF16).
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 256,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 256, "cache_role": "indexer", "tokens_per_state": "4"},
+    {"kind": "scratch", "block_size": 4, "tokens_per_state": "1"},
+    {"kind": "sliding_window_mla", "block_size": 256, "sliding_window": 512},
+    {"kind": "sliding_window_mla", "block_size": 256, "sliding_window": 512}
+  ]
+}
+```
+
+- For colocated FP8 with five DFly tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, `tail_drop_groups` to `[]`, and `groups[1].block_size` to `16`.
+- For NIXL P/D, use the Prefill worker URL and leave DFly disabled.
+
+</details>
+
+<details>
 <summary>GPU · DeepSeek-V4-Flash-0731</summary>
 
 ```json

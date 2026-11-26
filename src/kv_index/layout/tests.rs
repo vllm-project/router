@@ -1017,7 +1017,7 @@ mod declarations {
             .unwrap();
         assert!(matches!(
             bind_layout(&value, "kv-events"),
-            Err("sparse MLA group must declare tokens_per_state")
+            Err("MLA cache role requires tokens_per_state")
         ));
         value["ranks"][0]["groups"][4]["tokens_per_state"] = ratio;
 
@@ -1027,7 +1027,7 @@ mod declarations {
             assert!(bind_layout(&value, "kv-events").is_err(), "{path}");
             value["ranks"][0]["groups"][path]["tokens_per_state"] = saved;
         }
-        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("indexer");
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("unknown");
         assert!(bind_layout(&value, "kv-events").is_err());
         value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("sparse");
         value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("FullAttentionSpec");
@@ -1035,5 +1035,26 @@ mod declarations {
         value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("CircularBufferSpec");
         value["ranks"][0]["groups"][4]["kind"] = serde_json::json!("full_attention");
         assert!(bind_layout(&value, "kv-events").is_err());
+    }
+
+    #[test]
+    fn mla_indexer_requires_compressed_prefix_evidence() {
+        let mut value = qwen_layout();
+        let group = &mut value["ranks"][0]["groups"][3];
+        group["kind"] = "mla_attention".into();
+        group["spec_type"] = "MLAAttentionSpec".into();
+        group["cache_role"] = "indexer".into();
+        group["tokens_per_state"] = "4".into();
+
+        let binding = bind_layout(&value, "epoch-1").unwrap();
+        assert_eq!(
+            binding.groups[3].kind,
+            GroupRule::CompressedFullAttention {
+                tokens_per_state: 4
+            }
+        );
+
+        value["ranks"][0]["groups"][3]["tokens_per_state"] = serde_json::Value::Null;
+        assert!(bind_layout(&value, "epoch-1").is_err());
     }
 }
