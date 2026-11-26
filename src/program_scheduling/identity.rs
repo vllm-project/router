@@ -14,7 +14,7 @@ use crate::request_identity::{
     canonical_context, context_string, framework_identity_headers, identity_from_parts,
     normalized_agent_component, read_nonempty_header, scoped_program_id, IdentityError,
     IdentitySource, StableIdentity, CLAUDE_SESSION_HEADER, CODEX_SESSION_HEADER,
-    GENERIC_SESSION_HEADER, MAX_IDENTITY_COMPONENT_BYTES,
+    DSH_SESSION_HEADER, GENERIC_SESSION_HEADER, MAX_IDENTITY_COMPONENT_BYTES,
 };
 
 const MAX_PLACEMENT_HASH_KEY_BYTES: usize = 512;
@@ -93,6 +93,7 @@ impl ProgramIdentity {
                     [
                         CLAUDE_SESSION_HEADER,
                         CODEX_SESSION_HEADER,
+                        DSH_SESSION_HEADER,
                         GENERIC_SESSION_HEADER,
                     ]
                     .iter()
@@ -370,6 +371,7 @@ fn consistent_hash_request_key(headers: Option<&HeaderMap>, request: Option<&Jso
         for name in [
             CLAUDE_SESSION_HEADER,
             CODEX_SESSION_HEADER,
+            DSH_SESSION_HEADER,
             GENERIC_SESSION_HEADER,
         ] {
             if let Ok(Some(value)) = read_nonempty_header(headers, name) {
@@ -586,7 +588,7 @@ mod tests {
     use super::*;
     use crate::request_identity::{
         resolve_stable_identity, CLAUDE_AGENT_HEADER, CODEX_THREAD_HEADER,
-        MAX_AGENTIC_CONTEXT_BYTES,
+        DSH_SESSION_HEADER, DSH_USER_HEADER, MAX_AGENTIC_CONTEXT_BYTES,
     };
 
     #[test]
@@ -641,6 +643,23 @@ mod tests {
             "header:x-session-id:session-d"
         );
         assert!(identity.expected_resume());
+
+        let mut dsh_headers = HeaderMap::new();
+        dsh_headers.insert(DSH_SESSION_HEADER, "dsh-session".parse().unwrap());
+        dsh_headers.insert(DSH_USER_HEADER, "anon-user".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&dsh_headers), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.program_id(), "dsh-session:lead");
+        assert_eq!(identity.session_id(), Some("dsh-session"));
+        assert_eq!(identity.placement_key(), "dsh-session");
+        assert_eq!(
+            identity.placement_hash_key(),
+            "header:x-deepseek-harness-session-id:dsh-session"
+        );
+        assert!(identity.expected_resume());
+        assert_ne!(identity.agent_id(), Some("anon-user"));
+        assert_eq!(identity.agent_id(), None);
     }
 
     #[test]

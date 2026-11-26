@@ -4163,6 +4163,14 @@ mod tests {
         let key = affinity_from_request(Some(&codex), None, "model").unwrap();
         assert_eq!(key.identity, "codex-session:worker");
 
+        let mut dsh = header_map("x-deepseek-harness-session-id", "dsh-session");
+        dsh.insert("x-deepseek-harness-user-id", "anon-user".parse().unwrap());
+        let key = affinity_from_request(Some(&dsh), None, "model").unwrap();
+        assert_eq!(
+            (key.source, key.identity.as_str()),
+            ("framework_header", "dsh-session:lead")
+        );
+
         let body = serde_json::json!({"session_id": "body-session"});
         let key = affinity_from_request(
             Some(&header_map("x-session-id", "generic-session")),

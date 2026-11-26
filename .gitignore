@@ -61,3 +61,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 uv.lock
+
+# Local vLLM rust checkout for offline cargo path patches
+.deps/

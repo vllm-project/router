@@ -11,10 +11,12 @@ use tracing::debug;
 
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
 pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
+    "x-deepseek-harness-session-id",
+    "x-claude-code-session-id",
     "x-session-id",
     "x-user-id",
     "x-tenant-id",
-    "x-correlation-id", // per-session — check before per-request
+    "x-correlation-id",
     "x-request-id",
     "x-trace-id",
 ];
@@ -22,7 +24,7 @@ pub(crate) const SESSION_HEADER_NAMES: &[&str] = &[
 /// Extract hash key with priority: HTTP headers > body fields > request content hash
 ///
 /// Priority order:
-/// 1. HTTP Headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// 1. HTTP Headers: x-deepseek-harness-session-id, x-claude-code-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user field (OpenAI format)
 /// 4. Body: session_id (legacy)
@@ -64,7 +66,8 @@ pub(crate) fn extract_hash_key(
 /// release the session.
 ///
 /// Lookup order mirrors [`extract_hash_key`]:
-/// 1. HTTP headers: x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
+/// Lookup order mirrors [`extract_hash_key`]:
+/// 1. HTTP headers: x-deepseek-harness-session-id, x-claude-code-session-id, x-session-id, x-user-id, x-tenant-id, x-correlation-id, x-request-id, x-trace-id
 /// 2. Body: session_params.session_id (nested)
 /// 3. Body: user (OpenAI format)
 /// 4. Body: session_id (legacy)
@@ -422,6 +425,18 @@ mod tests {
         // x-session-id has higher priority than x-request-id
         let key = extract_hash_key_from_headers(&headers).unwrap();
         assert_eq!(key, "header:x-session-id:sess-1");
+    }
+
+    #[test]
+    fn test_dsh_session_header_beats_generic_session() {
+        let mut headers = HashMap::new();
+        headers.insert("x-session-id".to_string(), "generic".to_string());
+        headers.insert(
+            "x-deepseek-harness-session-id".to_string(),
+            "dsh-sess".to_string(),
+        );
+        let key = extract_hash_key_from_headers(&headers).unwrap();
+        assert_eq!(key, "header:x-deepseek-harness-session-id:dsh-sess");
     }
 
     #[test]

@@ -9,7 +9,7 @@ Library users configure Program scheduling through `RouterConfig.program_schedul
 | Value | Behavior |
 |---|---|
 | `vllm_xargs.agentic_context` | Default. Only the canonical body object enables Program scheduling. |
-| `auto` | Also accepts `agent_hint`, Claude Code Headers, Codex/OpenCode Headers, and `x-session-id`. |
+| `auto` | Also accepts `agent_hint`, Claude Code Headers, Codex/OpenCode Headers, DeepSeek Harness Headers, and `x-session-id`. |
 
 The default is a strict per-request opt-in contract, not a claim that existing agents already emit this field. Program scheduling can retain requests and change admission, pause, resume, and capacity accounting, so requests without the configured metadata must remain on the native request-level path. AgentInfer adapters and [replay transport](https://github.com/openJiuwen-ai/agent-infer/blob/f764c9a7c387eef632defa96fb3ccae6f654c0f9/agentinfer/agentbench/replay/transport.py#L198-L204) currently inject `vllm_xargs.agentic_context`; other harnesses need an equivalent integration. This follows the general pattern of Dynamo's [`nvext.agent_hints`](https://docs.nvidia.com/dynamo/dev/agents/agent-hints), which defines an extensible serving-hint envelope even though its documented [Claude Code, Codex, and OpenCode integrations](https://docs.nvidia.com/dynamo/dev/agents/agent-harnesses) primarily emit session headers. Deployments that intentionally want those identity-only compatibility inputs to opt in can select `auto`; the canonical context still has precedence when several sources are present.
 
@@ -164,7 +164,7 @@ classification cardinality, and rollout validation.
 
 `program_id` is stable for one Program generation. `parent_program_id` and `root_program_id` form a model-scoped parent forest that supports multi-level agent trees but does not grant scheduling privilege. An omitted first `step_id` becomes zero; a later omitted value becomes the previous observed value plus one.
 
-On a `grpc://` pool the canonical `vllm_xargs.agentic_context` payload is accepted as router-plane metadata: the scheduler reads it before dispatch and the proto conversion does not forward it to the Engine. Header-based identity (Claude Code/Codex/generic schemas) works on both pool kinds.
+On a `grpc://` pool the canonical `vllm_xargs.agentic_context` payload is accepted as router-plane metadata: the scheduler reads it before dispatch and the proto conversion does not forward it to the Engine. Header-based identity (Claude Code/Codex/DeepSeek Harness/generic schemas) works on both pool kinds.
 
 `request_id`, `priority`, `deadline_seconds`, `expected_output_length`, and `kv_retention_ttl_seconds` are request-scoped. They are retained with exactly one RequestPool entry; dispatch transfers them only to that exact in-flight request, and completion or cancellation drops them. Priority affects resume ordering, deadline overrides the force-resume wait, expected output length replaces the default output allowance in capacity demand, and KV-retention TTL replaces the automatic acting TTL after that request completes.
 
@@ -283,7 +283,7 @@ Exactness covers only the input IDs sent to the Engine. Future output length, th
 
 ## Compatibility identity inputs
 
-`auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; the generic schema uses `x-session-id`. Recognized schemas are not mixed.
+`auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; DeepSeek Harness (`dsh`) uses `x-deepseek-harness-session-id` (and may also send `x-deepseek-harness-user-id`, which is not part of Program identity); the generic schema uses `x-session-id`. Recognized schemas are not mixed.
 
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 

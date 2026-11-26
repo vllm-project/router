@@ -6,6 +6,38 @@ KV across tool calls. It applies to native, non-PD HTTP routing. In vLLM PD
 mode, workflow prediction may run in `shadow` mode for observation, but
 `active` return-time prediction is not supported.
 
+## Header-based harnesses (Codex / Claude Code / DeepSeek Harness)
+
+When `program_scheduling_enable_key` is `auto`, the Router also opts in from
+well-known harness headers (no `vllm_xargs.agentic_context` required). Schemas
+are mutually exclusive; the first matching session header wins:
+
+| Harness | Session header | Agent / thread header | Parent header |
+| --- | --- | --- | --- |
+| Claude Code | `x-claude-code-session-id` | `x-claude-code-agent-id` | `x-claude-code-parent-agent-id` |
+| Codex / OpenCode | `session-id` | `thread-id` | — |
+| DeepSeek Harness (`dsh`) | `x-deepseek-harness-session-id` | — (Program uses `:lead`) | — |
+| Generic | `x-session-id` | — | — |
+
+The official DeepSeek API adapter (`@deepseek-ai/dsh-llm-deepseek`) already
+attaches `x-deepseek-harness-session-id` (and `x-deepseek-harness-user-id`) on
+model calls that have a harness session. The Router treats the session id as
+the Program placement key and defaults the agent component to `lead`.
+`x-deepseek-harness-user-id` is ignored for Program identity so anonymous
+install ids never fragment affinity.
+
+When dsh reaches the Router through a **custom** OpenAI-compatible provider
+(`llm-pi-ai`), those headers are not added by default. Either:
+
+- inject them in a `llm-pi-ai/request-headers` contributor using
+  `request.sessionId`, or
+- fall back to the generic `x-session-id` schema with the same value.
+
+For workflow TTL prediction (`expected_resume`, `step_id`,
+`workflow_profile_id`, …) prefer the canonical `vllm_xargs.agentic_context`
+body below; header identity alone is enough for sticky Program scheduling and
+KV-aware affinity.
+
 The Router measures the interval from one successful model request completing
 to the next request for the same Program arriving. The agent does not send that
 interval, a predicted TTL, or prefill-cost coefficients. It supplies stable
