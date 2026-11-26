@@ -15,7 +15,7 @@ use std::sync::{
 };
 use vllm_router_rs::{
     config::{ConfigValidator, PolicyConfig, RouterConfig, RoutingMode},
-    core::Worker,
+    core::{BasicWorker, Worker, WorkerType},
     policies::{LoadBalancingPolicy, PolicyFactory, RequestHeaders},
     protocols::spec::{CompletionRequest, GenerationRequest},
     routers::{http::vllm_pd_router::VllmPDRouter, RouterTrait},
@@ -1651,4 +1651,110 @@ async fn capacity_wait_timeout_returns_no_feasible_when_last_prefill_leaves_whil
         body_text.contains("No feasible registered P/D pair"),
         "expected no-feasible 503 after last prefill left during timeout wait, got: {body_text}"
     );
+}
+
+async fn run_same_url_incarnation_replacement_test(
+    remove_first: bool,
+    probe_status: Option<StatusCode>,
+) {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let retired = registry.get_by_url(&p0_url).expect("p0 worker registered");
+    let replacement: Arc<dyn Worker> = Arc::new(
+        BasicWorker::new(
+            p0_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_labels(std::collections::HashMap::from([(
+            "incarnation".to_string(),
+            "replacement".to_string(),
+        )])),
+    );
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let reg = registry.clone();
+    let rep_for_hook = Arc::clone(&replacement);
+    let url_for_hook = p0_url.clone();
+    let replaced = Arc::new(AtomicBool::new(false));
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        if !replaced.swap(true, Ordering::SeqCst) {
+            if remove_first {
+                assert!(reg.remove_by_url(&url_for_hook).is_some());
+            }
+            reg.register(Arc::clone(&rep_for_hook));
+        }
+        probe_status
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-incarnation"),
+    );
+    let r = Arc::new(r);
+    let r_req = Arc::clone(&r);
+    let body = completion_body("incarnation-replace", &[41, 42, 43], true, false);
+    let req = tokio::spawn(async move { send_completion(&r_req, Some(&headers), body).await });
+
+    let entered_wait =
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified()).await;
+    if entered_wait.is_err() {
+        release.notify_one();
+        let (status, _, resp_body) = req.await.unwrap();
+        panic!(
+            "request did not reach prefill dispatch; status={status}, body={}",
+            String::from_utf8_lossy(&resp_body)
+        );
+    }
+
+    let retired_load = retired.load();
+    let replacement_load = replacement.load();
+    release.notify_one();
+
+    let (status, _, resp_body) = req.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected same-URL replacement to succeed after re-selection, got: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(retired_load, 0, "cold dispatch charged the retired worker");
+    assert_eq!(
+        replacement_load, 1,
+        "cold dispatch did not charge the replacement worker"
+    );
+    assert_eq!(replacement.load(), 0);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial selection + re-selection on incarnation change: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_replaced_at_same_url_during_warm_probe() {
+    run_same_url_incarnation_replacement_test(true, Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_overwritten_in_place_at_same_url() {
+    run_same_url_incarnation_replacement_test(false, Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+}
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_is_replaced_at_same_url_during_probe() {
+    run_same_url_incarnation_replacement_test(true, None).await;
 }

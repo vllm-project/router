@@ -1627,12 +1627,15 @@ impl VllmPDRouter {
                 }
             }
         }
-        // If the warm attempt carried a P over after awaiting probes, verify it
-        // is still live before reserving a permit. When it left or became
-        // unhealthy in the meantime, refresh candidates and re-select once;
-        // the normal live path still spends a single selection.
+        // If the warm attempt carried a P over after awaiting probes, verify that
+        // exact worker incarnation is still live before reserving a permit. When
+        // it left, became unhealthy, or was replaced at the same URL in the
+        // meantime, refresh candidates and re-select once; the normal live path
+        // still spends a single selection.
         let selected = match selected {
-            Some((prefill_id, prefill_worker)) if self.program_prefill_is_live(&prefill_id) => {
+            Some((prefill_id, prefill_worker))
+                if self.program_prefill_is_live(&prefill_id, &prefill_worker) =>
+            {
                 Some((prefill_id, prefill_worker))
             }
             Some(_) => {
@@ -1667,7 +1670,8 @@ impl VllmPDRouter {
                 return Some(pd_program_adapter::error_response(error));
             }
         };
-        if !self.program_targets_are_live(&prefill_id, &target_id) {
+        if !self.program_targets_are_live(&prefill_id, &prefill_worker, &target_id, &decode_worker)
+        {
             return Some(program_unavailable(
                 &completion,
                 "PD target changed while waiting for prefill capacity",
@@ -1810,8 +1814,8 @@ impl VllmPDRouter {
             .filter(|index| *index < workers.len())
     }
 
-    /// Check whether a bound Program prefill target is still present and available.
-    fn program_prefill_is_live(&self, prefill_id: &str) -> bool {
+    /// Check whether a bound Program prefill worker incarnation is still live and available.
+    fn program_prefill_is_live(&self, prefill_id: &str, prefill_worker: &Arc<dyn Worker>) -> bool {
         if self.use_discovery {
             self.service_registry
                 .get_prefill_instances()
@@ -1823,16 +1827,23 @@ impl VllmPDRouter {
                 .get_prefill_workers()
                 .iter()
                 .any(|worker| {
-                    worker.is_available()
+                    Arc::ptr_eq(worker, prefill_worker)
+                        && worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == prefill_id
                 })
         }
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
-    /// registration or a removed worker must not receive the dispatch.
-    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
-        let prefill_live = self.program_prefill_is_live(prefill_id);
+    /// registration, replaced incarnation, or removed worker must not receive the dispatch.
+    fn program_targets_are_live(
+        &self,
+        prefill_id: &str,
+        prefill_worker: &Arc<dyn Worker>,
+        decode_id: &str,
+        decode_worker: &Arc<dyn Worker>,
+    ) -> bool {
+        let prefill_live = self.program_prefill_is_live(prefill_id, prefill_worker);
         let decode_live = if self.use_discovery {
             pd_program_adapter::discovered_decode_instance_by_id(
                 &self.service_registry,
@@ -1846,7 +1857,8 @@ impl VllmPDRouter {
                 .get_decode_workers()
                 .iter()
                 .any(|worker| {
-                    worker.is_available()
+                    Arc::ptr_eq(worker, decode_worker)
+                        && worker.is_available()
                         && pd_program_adapter::worker_target(worker).id == decode_id
                 })
         };

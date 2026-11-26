@@ -624,13 +624,19 @@ async fn local_prefix(
 /// Fully separate from native PD: unsupported exact-token/capability requests use
 /// the native two-stage path.
 ///
-fn prefill_target_is_live(runtime: &PdProgramRuntime, prefill_id: &str) -> bool {
+fn prefill_target_is_live(
+    runtime: &PdProgramRuntime,
+    prefill_id: &str,
+    prefill_worker: &Arc<dyn Worker>,
+) -> bool {
     runtime
         .worker_registry
         .get_prefill_workers()
         .iter()
         .any(|worker| {
-            worker.is_available() && pd_program_adapter::worker_target(worker).id == prefill_id
+            Arc::ptr_eq(worker, prefill_worker)
+                && worker.is_available()
+                && pd_program_adapter::worker_target(worker).id == prefill_id
         })
 }
 
@@ -705,7 +711,7 @@ pub(super) async fn execute(
             return None;
         }
     };
-    if !prefill_target_is_live(runtime, &p.id) {
+    if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
         warm_remote.invalidate_target(&p.base_url, p.dp_rank);
         return None;
     }
@@ -848,7 +854,7 @@ pub(super) async fn execute(
             }
         }
     }
-    if route != PdPath::LocalAppend && !prefill_target_is_live(runtime, &p.id) {
+    if route != PdPath::LocalAppend && !prefill_target_is_live(runtime, &p.id, prefill_worker) {
         warm_remote.invalidate_target(&p.base_url, p.dp_rank);
         return None;
     }
@@ -870,21 +876,21 @@ pub(super) async fn execute(
             let permit = match runtime.reserve_prefill_until(&p.id, deadline).await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    if !prefill_target_is_live(runtime, &p.id) {
+                    if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
                         warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                         return Err(ExecuteError::Reselect);
                     }
                     return Err(ExecuteError::Failed("P capacity timeout".into()));
                 }
             };
-            if !prefill_target_is_live(runtime, &p.id) {
+            if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                 return Err(ExecuteError::Reselect);
             }
             let current_pe = warm_remote
                 .identify(client, p, headers, topology_revision)
                 .await;
-            if !prefill_target_is_live(runtime, &p.id) {
+            if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                 return Err(ExecuteError::Reselect);
             }
