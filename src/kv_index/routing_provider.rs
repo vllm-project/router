@@ -377,34 +377,53 @@ mod tests {
 
     #[test]
     fn image_prefix_matches_native_events_without_aliasing_equal_token_ids() {
+        // Independent vLLM sha256_cbor goldens for image positions 60 and -4.
+        check_image_prefix(
+            "",
+            [
+                "702e3c6a2d000b3eb7efba64ac0d2faecbc18c68da6e7b43bbf3a61dfcc4d110",
+                "0ade0d242ddfcfc955a0bdc7a83168cf2cce2c9b3543a93320e976c369e01ca7",
+            ],
+        );
+        check_image_prefix(
+            "content:",
+            [
+                "6521a2f6cff15637a5767844512eb22531d85a1834d4ad81fa398c5d601895f7",
+                "8e23a619de5fe86153b8ed771642bd6ad6e326a11ff920a45c889d9617411d76",
+            ],
+        );
+    }
+
+    fn check_image_prefix(namespace: &str, block_hashes: [&str; 2]) {
         use crate::kv_index::source::test_support::{event_batch, full_binding, full_store};
         use crate::kv_index::wire::{ExternalBlockHash, KVEvent};
 
-        let hash = "4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993";
-        let same_image = ImagePrefix::new(hash, 60, 8, 129).unwrap();
-        let other_image = ImagePrefix::new(&"a".repeat(64), 60, 8, 129).unwrap();
+        let digest = "4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993";
+        let hash = format!("{namespace}{digest}");
+        let same_image = ImagePrefix::new(&hash, 60, 8, 129).unwrap();
+        let other_hash = format!("{namespace}{}", "a".repeat(64));
+        let other_image = ImagePrefix::new(&other_hash, 60, 8, 129).unwrap();
         let tokens: Vec<u32> = (0..129).collect();
         let identical_ids = tokens.clone();
         let text_ids = tokens.clone();
         let mut store = full_store(&tokens[..128], 64, None);
-        // Independent vLLM sha256_cbor goldens for image positions 60 and -4.
-        store.block_hashes = [
-            "702e3c6a2d000b3eb7efba64ac0d2faecbc18c68da6e7b43bbf3a61dfcc4d110",
-            "0ade0d242ddfcfc955a0bdc7a83168cf2cce2c9b3543a93320e976c369e01ca7",
-        ]
-        .map(|hex| {
-            ExternalBlockHash::Bytes(
-                (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                    .collect(),
-            )
-        })
-        .into();
+        store.block_hashes = block_hashes
+            .map(|hex| {
+                ExternalBlockHash::Bytes(
+                    (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect(),
+                )
+            })
+            .into();
         store.extra_keys = Some(
             [60, -4]
                 .map(|offset| {
-                    rmpv::Value::Array(vec![rmpv::Value::Array(vec![hash.into(), offset.into()])])
+                    rmpv::Value::Array(vec![rmpv::Value::Array(vec![
+                        hash.as_str().into(),
+                        offset.into(),
+                    ])])
                 })
                 .into(),
         );

@@ -1773,6 +1773,11 @@ mod tests {
             }
         });
         assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
+        let digest = "a".repeat(64);
+        rendered["features"]["mm_hashes"]["image"][0] = json!(format!("uuid:{digest}"));
+        assert!(super::http_rendered_image(&rendered).is_err());
+        rendered["features"]["mm_hashes"]["image"][0] = json!(format!("content:{digest}"));
+        assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
         rendered["features"]["mm_placeholders"]["image"][0]["length"] = json!(3);
         assert!(super::http_rendered_image(&rendered).is_err());
     }

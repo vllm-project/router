@@ -37,7 +37,8 @@ impl ImagePrefix {
 }
 
 pub(crate) fn is_image_hash(hash: &str) -> bool {
-    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    let digest = hash.strip_prefix("content:").unwrap_or(hash);
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
