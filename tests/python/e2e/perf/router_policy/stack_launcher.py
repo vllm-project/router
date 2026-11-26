@@ -24,7 +24,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -34,22 +33,19 @@ from uuid import uuid4
 import httpx
 import yaml
 
-SCENARIO_DIR = Path(__file__).resolve().parent
-if str(SCENARIO_DIR) not in sys.path:
-    sys.path.insert(0, str(SCENARIO_DIR))
-
-from case_loader import (  # noqa: E402
+from tests.python.e2e.perf.router_policy.case_loader import (
     RouterPolicyCase,
     cell_run_suffix,
     load_router_policy_case,
     prepare_trace,
 )
-from tests.python.e2e.perf.binaries import preflight_router_bin  # noqa: E402
-from log_summary import (  # noqa: E402
+from tests.python.e2e.perf.binaries import preflight_router_bin
+from tests.python.e2e.perf.router_policy.log_summary import (
+    ReplayValidator,
     print_failure_diagnostics,
     write_calibration,
 )
-from tests.python.helpers.process import (  # noqa: E402
+from tests.python.helpers.process import (
     RunningProc,
     launch_router,
     launch_worker,
@@ -193,10 +189,6 @@ def interrupted(*_):
     if _active is not None:
         cleanup(_active)
     raise SystemExit(130)
-
-
-signal.signal(signal.SIGTERM, interrupted)
-signal.signal(signal.SIGINT, interrupted)
 
 
 # Outside the usual ephemeral range, so vLLM's own bind(0) calls during
@@ -580,6 +572,7 @@ def snapshot(run: RouterPolicyStack, dest: Path):
 def run_router_policy_cell(
     case_file: Path,
     *,
+    replay_validator: ReplayValidator,
     concurrency: int | None = None,
     out_dir: Path | None = None,
     run_suffix: str | None = None,
@@ -609,14 +602,19 @@ def run_router_policy_cell(
     )
     run = open_cell(case, out_dir=out_dir)
     _active = run
+    previous_handlers = {}
     try:
-        _run_cell(run)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, interrupted)
+        _run_cell(run, replay_validator=replay_validator)
     finally:
         _active = None
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     return run.out
 
 
-def _run_cell(run: RouterPolicyStack) -> None:
+def _run_cell(run: RouterPolicyStack, *, replay_validator: ReplayValidator) -> None:
     case = run.case
     settle = float(os.environ.get("AGENTX_PORT_SETTLE_SEC", "2"))
     if settle > 0:
@@ -826,6 +824,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
         cleanup(run)
         write_calibration(
             run,
+            replay_validator=replay_validator,
             result_dir=result,
             replay_rc=replay_rc,
             wall_seconds=time.monotonic() - started,

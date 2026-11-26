@@ -10,16 +10,25 @@ import statistics
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
-from case_loader import cell_run_suffix, router_policy_result_path
-from tests.python.e2e.perf.result_metadata import add_missing_metadata
-from tests.python.e2e.perf.router_policy.test_router_policy_scenarios import (
-    validate_replay,
+from tests.python.e2e.perf.router_policy.case_loader import (
+    cell_run_suffix,
+    router_policy_result_path,
 )
+from tests.python.e2e.perf.result_metadata import add_missing_metadata
 
 if TYPE_CHECKING:
-    from stack_launcher import RouterPolicyStack
+    from tests.python.e2e.perf.router_policy.stack_launcher import RouterPolicyStack
+
+
+class ReplayValidator(Protocol):
+    """Validate replay rows before publishing a cell's measurements."""
+
+    def __call__(
+        self, result_dir: Path, rows: list[dict[str, Any]], *, task_num: int
+    ) -> dict[str, Any]: ...
+
 
 METRIC = re.compile(r"^([a-zA-Z0-9_:]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$")
 PROM_SAMPLE = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)(?:\s+\S+)?")
@@ -450,6 +459,7 @@ def _jct_quantiles(result_dir: Path, ok_rows: list[dict[str, Any]]) -> dict[str,
 def write_calibration(
     run: RouterPolicyStack,
     *,
+    replay_validator: ReplayValidator,
     result_dir: Path,
     replay_rc: int | None,
     wall_seconds: float,
@@ -540,7 +550,7 @@ def write_calibration(
         ),
         "prefill": _prefill_metrics(run),
         "router_policy_checks": _router_policy_checks(run),
-        "replay_validation": validate_replay(result_dir, rows, task_num=case.task_num),
+        "replay_validation": replay_validator(result_dir, rows, task_num=case.task_num),
     }
     missing_metrics = [
         metric

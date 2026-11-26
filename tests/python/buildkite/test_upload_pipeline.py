@@ -1,17 +1,26 @@
 """CPU checks for hardware retry expansion in the test pipeline uploader."""
 
 import copy
-import sys
+import importlib.util
 from pathlib import Path
 
 import pytest
 import yaml
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / ".buildkite" / "scripts"))
-import upload_pipeline  # noqa: E402
+ROOT = Path(__file__).parents[3]
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
+
+
+@pytest.fixture
+def upload_pipeline():
+    path = ROOT / ".buildkite/scripts/upload_pipeline.py"
+    spec = importlib.util.spec_from_file_location(
+        "router_pipeline_uploader_under_test", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _leaf_steps(steps):
@@ -27,7 +36,7 @@ def _leaf_steps(steps):
 @pytest.mark.parametrize(
     "name", ["test-ready.yml", "test-merge.yml", "test-nightly.yml"]
 )
-def test_render_inherits_shared_hardware_retry(name):
+def test_render_inherits_shared_hardware_retry(name, upload_pipeline):
     path = ROOT / ".buildkite" / name
     source = yaml.safe_load(path.read_text(encoding="utf-8"))
     rendered = yaml.safe_load(upload_pipeline.render(path))
@@ -66,7 +75,7 @@ def test_render_inherits_shared_hardware_retry(name):
         {"automatic": [{"exit_status": 1, "limit": 3}]},
     ],
 )
-def test_step_retry_replaces_the_entire_preset(override):
+def test_step_retry_replaces_the_entire_preset(override, upload_pipeline):
     steps = [
         {"command": "echo override", "mirror_hardwares": "l4_4", "retry": override}
     ]
@@ -76,7 +85,7 @@ def test_step_retry_replaces_the_entire_preset(override):
     assert steps == original
 
 
-def test_shared_retry_is_copied_for_each_job():
+def test_shared_retry_is_copied_for_each_job(upload_pipeline):
     presets = upload_pipeline.load_presets()
     expected = copy.deepcopy(presets["l4_4"]["retry"])
     expanded = upload_pipeline.expand_steps(
@@ -91,7 +100,9 @@ def test_shared_retry_is_copied_for_each_job():
     assert all(preset["retry"] == expected for preset in presets.values())
 
 
-def test_changing_the_shared_policy_updates_all_hardware_jobs(tmp_path, monkeypatch):
+def test_changing_the_shared_policy_updates_all_hardware_jobs(
+    tmp_path, monkeypatch, upload_pipeline
+):
     registry = yaml.safe_load(upload_pipeline.HARDWARE_PATH.read_text(encoding="utf-8"))
     registry["x-hardware-retry"]["automatic"][0]["limit"] = 3
     path = tmp_path / "hardware.yml"
@@ -105,7 +116,7 @@ def test_changing_the_shared_policy_updates_all_hardware_jobs(tmp_path, monkeypa
     assert all(step["retry"]["automatic"][0]["limit"] == 3 for step in hardware_jobs)
 
 
-def test_command_list_keeps_step_env_and_runtime_hf_token_export():
+def test_command_list_keeps_step_env_and_runtime_hf_token_export(upload_pipeline):
     commands = ["pytest rust_grpc", "pytest python_http"]
     env = {"PERF_STACK_TIMEOUT": "1800", "PERF_WORKER_STARTUP_TIMEOUT": "1800"}
     source = {"mirror_hardwares": "h100_2", "command": commands, "env": env}

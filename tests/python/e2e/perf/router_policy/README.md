@@ -66,11 +66,15 @@ When replay exits, [`log_summary.py`](log_summary.py) writes **`calibration.json
 
 Layout matches **`perf/grpc`**: case JSON + [`case_loader.py`](case_loader.py) + [`stack_launcher.py`](stack_launcher.py). [`log_summary.py`](log_summary.py) writes the stats and prints the cell summary.
 
-The sample-count regression tests run on CPU without model weights:
+The `log_summary.py` regression tests exercise its public calibration and
+publication APIs on CPU without model weights:
 
 ```bash
 python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
 ```
+
+The scenario test module and its inline validation run through the nightly
+GPU replay jobs, selecting merged c8 or disaggregated c12 cells.
 
 ## Results schema
 

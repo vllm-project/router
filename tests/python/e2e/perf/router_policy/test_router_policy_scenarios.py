@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-SCENARIO_DIR = Path(__file__).resolve().parent
-if str(SCENARIO_DIR) not in sys.path:
-    sys.path.insert(0, str(SCENARIO_DIR))
 
-from case_loader import (  # noqa: E402
+from tests.python.e2e.perf.router_policy.case_loader import (
     case_at_concurrency,
     cell_output_dir,
     cell_run_suffix,
     load_case,
     router_policy_result_path,
 )
+from tests.python.e2e.perf.router_policy.stack_launcher import run_router_policy_cell
 
 
 def _identity(value: Any, label: str) -> str:
@@ -159,14 +156,12 @@ def validate_replay(
 
 
 def _run_cell(case_file: Path, concurrency: int) -> Path:
-    # log_summary imports the validators, so load the launcher only when running.
-    from stack_launcher import run_router_policy_cell
-
     case = case_at_concurrency(load_case(case_file), concurrency)
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
     cell_out = run_router_policy_cell(
         case_file,
+        replay_validator=validate_replay,
         concurrency=concurrency,
         out_dir=out,
         run_suffix=run_suffix,

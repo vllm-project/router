@@ -20,20 +20,34 @@ from tests.python.e2e.perf.router_policy.stack_launcher import (
 )
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
-SUITE = Path(case_loader.__file__).resolve().parent
+SUITE = Path(__file__).parents[1] / "e2e/perf/router_policy"
 
 
 @pytest.fixture(
-    params=sorted((SUITE / "cases").glob("*.json")), ids=lambda path: path.stem
+    params=(
+        "pd_merge_cache_aware",
+        "pd_merge_kv_aware",
+        "pd_merge_kv_aware_affinity",
+        "pd_disagg_cache_aware",
+        "pd_disagg_kv_aware",
+        "pd_disagg_round_robin",
+    )
 )
 def worker_case(request, monkeypatch, tmp_path):
-    monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
+    package = tmp_path / "vllm"
+    package.mkdir()
+    (package / "vllm-rs").touch()
+    monkeypatch.setitem(
+        sys.modules, "vllm", SimpleNamespace(__file__=str(package / "__init__.py"))
+    )
     monkeypatch.setattr(
         case_loader,
         "packaged_replay_agentx_yaml",
         lambda trace_type: tmp_path / "replay.yaml",
     )
-    return case_loader.load_router_policy_case(request.param)
+    return case_loader.load_router_policy_case(
+        SUITE / "cases" / f"{request.param}.json"
+    )
 
 
 def test_router_policy_workers_use_portable_kv_hashes(worker_case):
@@ -154,7 +168,7 @@ def test_agentx_slice_matches_pd_cases():
         case = json.loads((SUITE / "cases" / filename).read_text(encoding="utf-8"))
         assert case["runtime"]["trace_type"] == "agentX"
         assert case["runtime"]["trace_sha256"] == extract_agentx_ci.TRACE_SHA256
-        assert (case_loader._repo_root() / case["runtime"]["trace_path"]) == trace
+        assert (SUITE.parents[4] / case["runtime"]["trace_path"]) == trace
         assert (
             case["workers"]["per_worker"]["max_model_len"]
             == extract_agentx_ci.MAX_MODEL_LEN
@@ -208,7 +222,12 @@ def test_replay_uses_the_matching_adapter_template(
         "agentinfer",
         SimpleNamespace(__file__=str(package / "__init__.py")),
     )
-    monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
+    vllm_package = tmp_path / "vllm"
+    vllm_package.mkdir()
+    (vllm_package / "vllm-rs").touch()
+    monkeypatch.setitem(
+        sys.modules, "vllm", SimpleNamespace(__file__=str(vllm_package / "__init__.py"))
+    )
     case = case_loader.load_router_policy_case(SUITE / "cases" / f"{scenario}.json")
     assert case.replay_config.name == template
     run = SimpleNamespace(

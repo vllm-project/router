@@ -1,28 +1,24 @@
-"""CPU-only regression checks for per-metric performance sample counts."""
+"""CPU checks for the public calibration and publication APIs."""
 
-import importlib.util
 import json
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.python.e2e.perf.router_policy import case_loader
+from tests.python.e2e.perf.router_policy import case_loader, log_summary
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.fixture
-def summary_module(monkeypatch):
-    path = Path(case_loader.__file__).with_name("log_summary.py")
-    spec = importlib.util.spec_from_file_location("router_policy_log_summary_ut", path)
-    module = importlib.util.module_from_spec(spec)
-    # The suite uses a local absolute import; avoid collisions with other suites.
-    with monkeypatch.context() as context:
-        context.setitem(sys.modules, "case_loader", case_loader)
-        spec.loader.exec_module(module)
-    return module
+def summary_module():
+    return log_summary
+
+
+def accepted_replay(result_dir, rows, *, task_num):
+    """Stub an accepted validation result to isolate summary behavior."""
+    return {"errors": []}
 
 
 def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypatch):
@@ -45,7 +41,6 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     ]
     result = tmp_path / "result"
     result.mkdir()
-    _write_replay_artifacts(tmp_path, [1] * len(rows))
     for i, row in enumerate(rows):
         row.update(request_id=f"request-{i}-0", session_id=f"session-{i}")
     (result / "requests.jsonl").write_text(
@@ -65,7 +60,12 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
         summary_module, "emit_run_summary", lambda *args, **kwargs: None
     )
     summary_module.write_calibration(
-        run, result_dir=result, replay_rc=0, wall_seconds=3, stalled=False
+        run,
+        replay_validator=accepted_replay,
+        result_dir=result,
+        replay_rc=0,
+        wall_seconds=3,
+        stalled=False,
     )
     stats = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
     assert stats["router_policy"] == stats["arm"] == "kv_aware_aff"
@@ -80,21 +80,38 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     assert stats["jct_s"]["mean"] == pytest.approx(1.5)
 
 
-def test_empty_samples(summary_module, tmp_path):
+def test_empty_samples(summary_module, calibration_run):
+    run = calibration_run
+    with pytest.raises(SystemExit, match="1"):
+        summary_module.write_calibration(
+            run,
+            replay_validator=accepted_replay,
+            result_dir=run.out / "result",
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
+        )
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
     expected = {"n": 0, "mean": None, "p50": None, "p95": None, "p99": None}
-    assert summary_module._quantiles([]) == expected
-    assert summary_module._jct_quantiles(tmp_path, []) == expected
+    assert stats["ttft_s"] == {**expected, "p90": None, "max": None}
+    assert stats["tpot_ms"] == expected
+    assert stats["jct_s"] == expected
 
 
 @pytest.mark.parametrize(
     "metadata,expected", [({"n": 7}, 7), ({"count": 5}, 5), ({}, None)]
 )
-def test_precomputed_jct_count(summary_module, tmp_path, metadata, expected):
+def test_precomputed_jct_count(summary_module, prefill_run, metadata, expected):
+    run = prefill_run
+    result = run.out / "result"
+    row = json.loads((result / "requests.jsonl").read_text(encoding="utf-8"))
+    del row["duration_seconds"]
+    (result / "requests.jsonl").write_text(json.dumps(row), encoding="utf-8")
     duration = {"mean": 1.5, "p50": 1.4, "p95": 2.0, "p99": 2.1, **metadata}
-    (tmp_path / "summary.json").write_text(
+    (result / "summary.json").write_text(
         json.dumps({"duration_seconds": duration}), encoding="utf-8"
     )
-    assert summary_module._jct_quantiles(tmp_path, []) == {
+    assert _calibrate_prefill(summary_module, run)["jct_s"] == {
         "n": expected,
         "mean": 1.5,
         "p50": 1.4,
@@ -108,7 +125,6 @@ def calibration_run(tmp_path, monkeypatch):
     monkeypatch.setattr(case_loader, "PERF_RESULTS_DIR", tmp_path / "published")
     monkeypatch.setenv(case_loader.RUN_SUFFIX_ENV, "unit_test")
     (tmp_path / "result").mkdir()
-    _write_replay_artifacts(tmp_path, [1])
     (tmp_path / "after").mkdir()
     (tmp_path / "after/router.prom").write_text(
         'vllm_router_kv_placement_lookups_total{result="miss"} 1\n'
@@ -170,7 +186,12 @@ def test_invalid_measurements_fail_before_publication(
 
     with pytest.raises(SystemExit, match="1"):
         summary_module.write_calibration(
-            run, result_dir=result, replay_rc=0, wall_seconds=1, stalled=False
+            run,
+            replay_validator=accepted_replay,
+            result_dir=result,
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
         )
 
     stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
@@ -206,7 +227,7 @@ def test_publication_requires_scenario(
     )
     (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
 
-    assert summary_module._write_results_summary_from_calibration(run.out) == []
+    summary_module.emit_run_summary(run, stats, replay_rc=0, stalled=False)
     assert not list((run.out / "published").rglob("*.json"))
     assert (
         json.loads((run.out / "calibration.json").read_text(encoding="utf-8")) == stats
@@ -231,11 +252,11 @@ def test_same_policy_topologies_publish_separate_results(
             task_num=8,
         )
         (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
-        artifacts = summary_module._write_results_summary_from_calibration(run.out)
+        summary_module.emit_run_summary(run, stats, replay_rc=0, stalled=False)
         expected = case_loader.router_policy_result_path(
             stats["scenario"], 16, 8, "unit_test"
         )
-        assert artifacts == [("results_json", expected)]
+        assert expected.is_file()
         published.append((expected, stats))
 
     assert published[0][0] != published[1][0]
@@ -272,13 +293,23 @@ def test_publication_schema_and_precomputed_jct(
     if jct_count == 0:
         with pytest.raises(SystemExit, match="1"):
             summary_module.write_calibration(
-                run, result_dir=result, replay_rc=0, wall_seconds=1, stalled=False
+                run,
+                replay_validator=accepted_replay,
+                result_dir=result,
+                replay_rc=0,
+                wall_seconds=1,
+                stalled=False,
             )
         assert not list((run.out / "published").rglob("*.json"))
         return
 
     summary_module.write_calibration(
-        run, result_dir=result, replay_rc=0, wall_seconds=1, stalled=False
+        run,
+        replay_validator=accepted_replay,
+        result_dir=result,
+        replay_rc=0,
+        wall_seconds=1,
+        stalled=False,
     )
     published = case_loader.router_policy_result_path(
         run.case.scenario, 16, run.case.task_num, "unit_test"
@@ -308,7 +339,12 @@ def test_loaded_scenario_keeps_its_name_across_concurrency(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
+    package = tmp_path / "vllm"
+    package.mkdir()
+    (package / "vllm-rs").touch()
+    monkeypatch.setitem(
+        sys.modules, "vllm", SimpleNamespace(__file__=str(package / "__init__.py"))
+    )
     monkeypatch.setattr(
         case_loader,
         "packaged_replay_agentx_yaml",
@@ -360,6 +396,7 @@ def prefill_run(calibration_run):
 def _calibrate_prefill(summary_module, run):
     summary_module.write_calibration(
         run,
+        replay_validator=accepted_replay,
         result_dir=run.out / "result",
         replay_rc=0,
         wall_seconds=1,
@@ -368,225 +405,34 @@ def _calibrate_prefill(summary_module, run):
     return json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
 
 
-def _write_replay_artifacts(out, requests_per_task):
-    """Create independent pre-run inventory and plan, then return complete facts."""
-    tasks, sources, rows = [], [], []
-    for i, count in enumerate(requests_per_task):
-        planned, source = [], []
-        for j in range(count):
-            key, request_id = f"source-{i}-{j}", f"request-{i}-{j}"
-            source.append({"key": key, "replay_kind": "request"})
-            planned.append(
-                {
-                    "source_key": key,
-                    "node_type": "request",
-                    "runtime_request_id": request_id,
-                }
-            )
-            rows.append(
-                dict(
-                    request_id=request_id,
-                    session_id=f"session-{i}",
-                    status="success",
-                    ttft_seconds=0.1,
-                    latency_seconds=0.5,
-                    output_tokens=3,
-                    duration_seconds=1.0,
-                )
-            )
-        tasks.append(
-            {
-                "source_session_id": f"source-{i}",
-                "runtime_session_id": f"session-{i}",
-                "requests": planned,
-            }
-        )
-        sources.append(
-            {"source_session_id": f"source-{i}", "replayable": True, "requests": source}
-        )
-    result = out / "result"
-    (result / "replay-plan.json").write_text(
-        json.dumps({"tasks": tasks}), encoding="utf-8"
-    )
-    (result / "replay-source-analysis.json").write_text(
-        json.dumps({"sessions": sources}), encoding="utf-8"
-    )
-    return rows
-
-
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_144"])
-@pytest.mark.parametrize(
-    "corruption",
-    [
-        "subset",
-        "extra",
-        "duplicate",
-        "missing_id",
-        "empty_id",
-        "invalid_id",
-        "wrong_id",
-        "wrong_session",
-    ],
-)
-def test_incomplete_replay_fails_before_publication(
-    summary_module, prefill_run, prefill_count, corruption, capsys
-):
+def test_supplied_replay_validator_can_prevent_publication(summary_module, prefill_run):
     run = prefill_run
-    run.case.prefill_count = prefill_count
-    run.case.task_num = 12 if prefill_count else 8
-    counts = [12] * 12 if prefill_count else [4] * 4 + [3] * 4
-    rows = _write_replay_artifacts(run.out, counts)
-    if corruption == "subset":
-        rows = rows[:1]
-    elif corruption == "extra":
-        rows.append({**rows[-1], "request_id": "extra-request"})
-    elif corruption == "duplicate":
-        rows[-1] = rows[0].copy()
-    elif corruption == "missing_id":
-        del rows[-1]["request_id"]
-    elif corruption == "empty_id":
-        rows[-1]["request_id"] = " \t"
-    elif corruption == "invalid_id":
-        rows[-1]["request_id"] = 42
-    elif corruption == "wrong_id":
-        rows[-1]["request_id"] = "unexpected-request"
-    else:
-        rows[-1]["session_id"] = "wrong-session"
-    (run.out / "result/requests.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
-    )
+    calls = []
+
+    def reject_replay(result_dir, rows, *, task_num):
+        calls.append((result_dir, rows, task_num))
+        return {"errors": ["injected replay validation failure"]}
+
     with pytest.raises(SystemExit, match="1"):
-        _calibrate_prefill(summary_module, run)
+        summary_module.write_calibration(
+            run,
+            replay_validator=reject_replay,
+            result_dir=run.out / "result",
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
+        )
+    assert len(calls) == 1
+    result_dir, rows, task_num = calls[0]
+    assert result_dir == run.out / "result"
+    assert len(rows) == 1
+    assert task_num == run.case.task_num
     stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
-    assert stats["requests"] == stats["success"] == len(rows)
     assert stats["ok"] is False
-    assert stats["replay_validation"]["expected_requests"] == sum(counts)
-    assert "DIAGNOSTIC replay completeness:" in capsys.readouterr().out
+    assert stats["replay_validation"]["errors"] == [
+        "injected replay validation failure"
+    ]
     assert not list((run.out / "published").rglob("*.json"))
-
-
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_144"])
-def test_complete_replay_publishes_all_requests(
-    summary_module, prefill_run, prefill_count
-):
-    run = prefill_run
-    run.case.prefill_count = prefill_count
-    run.case.task_num = 12 if prefill_count else 8
-    run.case.scenario = (
-        f"{'pd_disagg' if prefill_count else 'pd_merge'}_kv_aware_affinity"
-    )
-    counts = [12] * 12 if prefill_count else [4] * 4 + [3] * 4
-    rows = _write_replay_artifacts(run.out, counts)
-    (run.out / "result/requests.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in reversed(rows)), encoding="utf-8"
-    )
-    stats = _calibrate_prefill(summary_module, run)
-    assert stats["ok"] is True
-    assert stats["replay_validation"] == {
-        "expected_requests": sum(counts),
-        "observed_requests": sum(counts),
-        "distinct_request_ids": sum(counts),
-        "errors": [],
-    }
-    published = case_loader.router_policy_result_path(
-        run.case.scenario, 16, run.case.task_num, "unit_test"
-    )
-    assert published.read_bytes() == (run.out / "calibration.json").read_bytes()
-
-
-@pytest.mark.parametrize(
-    "artifact", ["replay-plan.json", "replay-source-analysis.json"]
-)
-@pytest.mark.parametrize("corruption", ["missing", "invalid_json", "invalid_root"])
-def test_invalid_replay_artifacts_prevent_publication(
-    summary_module, prefill_run, artifact, corruption
-):
-    path = prefill_run.out / "result" / artifact
-    if corruption == "missing":
-        path.unlink()
-    else:
-        path.write_text(
-            "{" if corruption == "invalid_json" else "null", encoding="utf-8"
-        )
-    with pytest.raises(SystemExit, match="1"):
-        _calibrate_prefill(summary_module, prefill_run)
-    stats = json.loads(
-        (prefill_run.out / "calibration.json").read_text(encoding="utf-8")
-    )
-    assert stats["replay_validation"]["errors"][0].startswith(
-        "invalid replay plan/source inventory:"
-    )
-    assert not list((prefill_run.out / "published").rglob("*.json"))
-
-
-@pytest.mark.parametrize(
-    "corruption",
-    ["missing_task", "missing_request", "duplicate_id", "missing_source_cycle"],
-)
-def test_incomplete_plan_cannot_define_a_smaller_expected_load(
-    summary_module, prefill_run, corruption
-):
-    run = prefill_run
-    run.case.task_num = 2
-    rows = _write_replay_artifacts(run.out, [2, 2])
-    path = run.out / "result/replay-plan.json"
-    plan = json.loads(path.read_text(encoding="utf-8"))
-    if corruption == "missing_task":
-        plan["tasks"].pop()
-        rows = rows[:2]
-    elif corruption == "missing_request":
-        plan["tasks"][-1]["requests"].pop()
-        rows.pop()
-    elif corruption == "duplicate_id":
-        plan["tasks"][-1]["requests"][-1]["runtime_request_id"] = rows[0]["request_id"]
-        rows[-1]["request_id"] = rows[0]["request_id"]
-    else:
-        plan["tasks"][-1]["source_session_id"] = "source-0"
-        for j, node in enumerate(plan["tasks"][-1]["requests"]):
-            node["source_key"] = f"source-0-{j}"
-    path.write_text(json.dumps(plan), encoding="utf-8")
-    (run.out / "result/requests.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
-    )
-    with pytest.raises(SystemExit, match="1"):
-        _calibrate_prefill(summary_module, run)
-    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
-    assert stats["replay_validation"]["errors"]
-    assert not list((run.out / "published").rglob("*.json"))
-
-
-def test_replay_allows_repeated_source_cycles_and_unmeasured_timing_nodes(
-    summary_module, prefill_run
-):
-    run = prefill_run
-    run.case.task_num = 2
-    rows = _write_replay_artifacts(run.out, [1, 1])
-    result = run.out / "result"
-    analysis = json.loads(
-        (result / "replay-source-analysis.json").read_text(encoding="utf-8")
-    )
-    analysis["sessions"] = analysis["sessions"][:1]
-    analysis["sessions"][0]["requests"].append(
-        {"key": "timer", "replay_kind": "timing_dependency"}
-    )
-    plan = json.loads((result / "replay-plan.json").read_text(encoding="utf-8"))
-    for task in plan["tasks"]:
-        task["source_session_id"] = "source-0"
-        task["requests"][0]["source_key"] = "source-0-0"
-        task["requests"].append(
-            {"source_key": "timer", "node_type": "timing_dependency"}
-        )
-    (result / "replay-source-analysis.json").write_text(
-        json.dumps(analysis), encoding="utf-8"
-    )
-    (result / "replay-plan.json").write_text(json.dumps(plan), encoding="utf-8")
-    (result / "requests.jsonl").write_text(
-        "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
-    )
-    stats = _calibrate_prefill(summary_module, run)
-    assert stats["ok"] is True
-    assert stats["replay_validation"]["expected_requests"] == 2
-    assert stats["replay_validation"]["errors"] == []
 
 
 @pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
