@@ -107,8 +107,20 @@ pub fn init_metrics() {
         "Estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
     );
     describe_counter!(
+        "vllm_router_kv_source_recovery_events_total",
+        "KV event source recovery events by mode and reason"
+    );
+    describe_counter!(
+        "vllm_router_kv_replay_outcomes_total",
+        "KV event replay attempts aggregated by outcome"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
+    );
+    describe_counter!(
+        "vllm_router_prefix_routing_decisions_total",
+        "Prefix routing decisions by policy, stage and outcome"
     );
     describe_counter!("vllm_router_cache_hits_total", "Total cache hits");
     describe_counter!("vllm_router_cache_misses_total", "Total cache misses");
@@ -224,6 +236,63 @@ pub fn init_metrics() {
         describe_histogram!(name, description);
     }
 
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_facts_total",
+        "Applied Program context-token fact sources by model pool and endpoint"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_context_token_fact_tokens",
+        "Applied Program context-token counts by fact source"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_fallbacks_total",
+        "Prepared context-token facts not applied, by fallback reason"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_shadow_total",
+        "Admission counterfactuals recorded by shadow token-count mode"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_context_token_observation_delta_ratio",
+        "Relative difference between prepared and Engine-observed prompt tokens"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_revocations_total",
+        "Tokenizer fingerprints revoked after an Engine disagreement"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_revoked_fingerprints",
+        "Fingerprints currently revoked in the bounded scheduler map"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_pool_saturated",
+        "Whether exact token facts are saturated off for a model pool"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_context_token_unobserved_total",
+        "Prepared facts settled without an Engine prompt count to reconcile"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_usage_unavailable",
+        "Whether optional token facts were disabled after missing Engine usage"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_usage_filter_errors_total",
+        "Injected-usage streams rejected for oversized lines or unsupported encoding"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_context_token_mode",
+        "Active Program context-token count mode (1 for the selected mode)"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_token_prepare_seconds",
+        "Router-side text tokenization time for prepared exact facts"
+    );
+    describe_counter!(
+        "vllm_router_agent_aware_token_prepare_failures_total",
+        "Prepared exact facts skipped because Router-side text preparation failed"
+    );
+
     // PD-specific metrics
     describe_counter!(
         "vllm_router_pd_requests_total",
@@ -256,6 +325,30 @@ pub fn init_metrics() {
     describe_histogram!(
         "vllm_router_pd_request_duration_seconds",
         "PD request duration by route"
+    );
+    for (name, help) in [
+        (
+            "vllm_router_pd_prefill_decisions_total",
+            "Prefill routing decisions by fallback reason",
+        ),
+        (
+            "vllm_router_pd_credited_prefix_tokens_total",
+            "Prefix tokens credited by Prefill routing",
+        ),
+        (
+            "vllm_router_pd_affinity_decisions_total",
+            "P/D affinity decisions by stage and outcome",
+        ),
+        (
+            "vllm_router_pd_decode_commit_total",
+            "Decode commitment outcomes after Prefill",
+        ),
+    ] {
+        describe_counter!(name, help);
+    }
+    describe_histogram!(
+        "vllm_router_pd_new_prefill_tokens",
+        "Uncached prompt tokens estimated at Prefill admission"
     );
 
     // Service discovery metrics
@@ -450,9 +543,6 @@ pub fn init_metrics() {
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
-    // Initialize metric descriptions
-    init_metrics();
-
     let duration_matcher = Matcher::Suffix(String::from("duration_seconds"));
     let duration_bucket = [
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
@@ -474,6 +564,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    init_metrics();
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -538,6 +629,7 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         "vllm_router_agent_aware_admission_used_tokens",
         "vllm_router_agent_aware_admission_required_tokens",
         "vllm_router_agent_aware_admission_growth_reserve_tokens",
+        "vllm_router_pd_new_prefill_tokens",
     ] {
         builder = set(builder, name, TOKEN_BUCKETS);
     }
@@ -578,6 +670,32 @@ pub(crate) struct AgentAwareAdmissionMetrics {
     pub(crate) observation_age: Option<Duration>,
 }
 
+/// Keep each lookup result bound to the current stage's recorder.
+#[derive(Default)]
+pub(crate) struct PlacementLookups {
+    counters: smallvec::SmallVec<[(&'static str, metrics::Counter); 2]>,
+}
+
+impl PlacementLookups {
+    pub(crate) fn record(&mut self, result: &'static str) {
+        self.record_count(result, 1);
+    }
+
+    pub(crate) fn record_count(&mut self, result: &'static str, count: u64) {
+        if let Some((_, counter)) = self.counters.iter().find(|(label, _)| *label == result) {
+            counter.increment(count);
+        } else {
+            let counter = kv_placement_lookup_counter(result);
+            counter.increment(count);
+            self.counters.push((result, counter));
+        }
+    }
+}
+
+fn kv_placement_lookup_counter(result: &'static str) -> metrics::Counter {
+    counter!("vllm_router_kv_placement_lookups_total", "result" => result)
+}
+
 pub struct RouterMetrics;
 
 pub struct TokenizerMetrics;
@@ -595,7 +713,7 @@ impl RouterMetrics {
     }
 
     pub fn record_kv_placement_lookup(result: &'static str) {
-        counter!("vllm_router_kv_placement_lookups_total", "result" => result).increment(1);
+        kv_placement_lookup_counter(result).increment(1);
     }
     pub fn record_peer_fetch_plan(outcome: &'static str) {
         counter!("vllm_router_peer_fetch_plans_total", "outcome" => outcome).increment(1);
@@ -617,6 +735,20 @@ impl RouterMetrics {
     pub fn record_peer_fetch_estimated_cost_ms(path: &'static str, cost_ms: f64) {
         histogram!("vllm_router_peer_fetch_estimated_cost_ms", "path" => path).record(cost_ms);
     }
+
+    pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {
+        counter!("vllm_router_kv_source_recovery_events_total",
+            "mode" => if strict { "strict" } else { "compatible" },
+            "reason" => reason)
+        .increment(1);
+    }
+
+    pub fn record_kv_replay_outcome(outcome: &'static str) {
+        counter!("vllm_router_kv_replay_outcomes_total",
+            "outcome" => outcome)
+        .increment(1);
+    }
+
     pub fn record_kv_routing_input(transport: &'static str, result: &'static str) {
         counter!("vllm_router_kv_routing_inputs_total", "transport" => transport, "result" => result).increment(1);
     }
@@ -1022,6 +1154,119 @@ impl RouterMetrics {
         .record(tokens as f64);
     }
 
+    pub fn record_agent_aware_context_token_fact(
+        model_pool: &str,
+        endpoint: &str,
+        source: &'static str,
+        tokens: usize,
+        fallback: Option<&'static str>,
+    ) {
+        counter!(
+            "vllm_router_agent_aware_context_token_facts_total",
+            "model_pool" => model_pool.to_string(),
+            "endpoint" => endpoint.to_string(),
+            "source" => source
+        )
+        .increment(1);
+        histogram!(
+            "vllm_router_agent_aware_context_token_fact_tokens",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
+        )
+        .record(tokens as f64);
+        if let Some(fallback) = fallback {
+            counter!(
+                "vllm_router_agent_aware_context_token_fallbacks_total",
+                "model_pool" => model_pool.to_string(),
+                "reason" => fallback
+            )
+            .increment(1);
+        }
+    }
+
+    pub fn record_agent_aware_context_token_shadow(target: &str, outcome: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_shadow_total",
+            "target" => target.to_string(),
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
+
+    pub fn record_agent_aware_context_token_observation_delta(
+        model_pool: &str,
+        source: &'static str,
+        delta_tokens: i64,
+        observed_tokens: usize,
+    ) {
+        let ratio = if observed_tokens == 0 {
+            0.0
+        } else {
+            delta_tokens as f64 / observed_tokens as f64
+        };
+        histogram!(
+            "vllm_router_agent_aware_context_token_observation_delta_ratio",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
+        )
+        .record(ratio);
+    }
+
+    pub fn record_agent_aware_context_token_revocation(reason: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_revocations_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_revoked(count: usize) {
+        gauge!("vllm_router_agent_aware_context_token_revoked_fingerprints").set(count as f64);
+    }
+
+    pub fn set_agent_aware_context_token_pool_saturated(model_pool: &str, saturated: bool) {
+        gauge!(
+            "vllm_router_agent_aware_context_token_pool_saturated",
+            "model_pool" => model_pool.to_string()
+        )
+        .set(if saturated { 1.0 } else { 0.0 });
+    }
+
+    pub fn record_agent_aware_context_token_unobserved(model_pool: &str, source: &'static str) {
+        counter!(
+            "vllm_router_agent_aware_context_token_unobserved_total",
+            "model_pool" => model_pool.to_string(),
+            "source" => source
+        )
+        .increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_usage_unavailable(model_pool: &str) {
+        gauge!("vllm_router_agent_aware_context_token_usage_unavailable", "model_pool" => model_pool.to_string()).set(1.0);
+    }
+
+    pub fn record_agent_aware_usage_filter_error() {
+        counter!("vllm_router_agent_aware_usage_filter_errors_total").increment(1);
+    }
+
+    pub fn record_agent_aware_token_prepare(seconds: f64) {
+        histogram!("vllm_router_agent_aware_token_prepare_seconds").record(seconds);
+    }
+
+    pub fn record_agent_aware_token_prepare_failure() {
+        counter!("vllm_router_agent_aware_token_prepare_failures_total").increment(1);
+    }
+
+    pub fn set_agent_aware_context_token_mode(mode: &'static str) {
+        for candidate in ["estimated", "shadow", "exact"] {
+            gauge!(
+                "vllm_router_agent_aware_context_token_mode",
+                "mode" => candidate
+            )
+            .set(if candidate == mode { 1.0 } else { 0.0 });
+        }
+    }
+
     pub(crate) fn record_agent_aware_admission(target: &str, sample: AgentAwareAdmissionMetrics) {
         let record = |name, value| {
             histogram!(name, "target" => target.to_string()).record(value);
@@ -1384,6 +1629,27 @@ impl TokenizerMetrics {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn publishes_routing_metric_descriptions_and_buckets() {
+        let recorder = set_program_scheduling_buckets(PrometheusBuilder::new()).build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            init_metrics();
+            RouterMetrics::record_prefix_routing_decision("kv_aware", "regular", "hit");
+            RouterMetrics::record_pd_kv_decision(Some(256), Some(16), None);
+        });
+        let rendered = recorder.handle().render();
+        for name in [
+            "vllm_router_prefix_routing_decisions_total",
+            "vllm_router_pd_credited_prefix_tokens_total",
+        ] {
+            assert!(rendered.contains(&format!("# HELP {name} ")), "{rendered}");
+        }
+        assert!(
+            rendered.contains("vllm_router_pd_new_prefill_tokens_bucket"),
+            "{rendered}"
+        );
+    }
 
     // ============= PrometheusConfig Tests =============
 

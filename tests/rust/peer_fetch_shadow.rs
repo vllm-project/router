@@ -612,31 +612,33 @@ async fn s4_excluded_longest_peer_falls_back_to_eligible_busy_peer() {
     fx.finish().await;
 }
 
-/// 5: the source holds 100 device blocks plus 25 External blocks, 280 queued
+/// 5: the source holds 100 device blocks plus 25 Disk blocks, 280 queued
 /// tokens and 4 active requests; the destination is idle -> `cost_rule`.
 ///
-/// P = 2000 tokens (125 blocks). External is the owner domain, not a medium: the
-/// mock publishes the second copy with `ownership: "pool"`, which the router
-/// indexes as `StorageTier::External`. The router credits it at 0.6, so A's
-/// work for P is 2000 - (100 + 25 * 0.6) * 16 = 160 tokens (the test waits for
-/// exactly that, which proves the External tier was indexed).
+/// P = 2000 tokens (125 blocks). The second copy is on disk (`medium:
+/// STORAGE`, `StorageTier::Disk`), which routing credits at 0.3 and the planner
+/// never transfers. (A shared-pool copy, `ownership` set, is not indexed at all,
+/// so it cannot model this case.) The final block is never credited (the last
+/// prompt token must be recomputed), so A's work for P is
+/// 2000 - (100 * 16 + 24 * 16 * 0.3) = 285 tokens (the test waits for exactly
+/// that, which proves the Disk copy was indexed).
 /// Four held requests (1600 cached + 70 tail) charge A 70 tokens each (70 j^2 <
-/// 1670), leaving 4 active and 280 queued. For P: A = (160 + 280) * 5 = 2200 >
+/// 1670), leaving 4 active and 280 queued. For P: A = (285 + 280) * 5 = 2825 >
 /// B = 2000, so B is picked.
 /// Only the 100 device blocks are transferable: transfer 5 + 1600 * 0.005 = 13
-/// ms, fetch 13 + 400 * 0.05 = 33 ms, wait 280 * 0.05 + 160 * 0.05 = 22 ms.
-/// Fetching loses, so `cost_rule` (design: fetch 33 ms against wait 22 ms).
+/// ms, fetch 13 + 400 * 0.05 = 33 ms, wait 280 * 0.05 + 285 * 0.05 = 28.25 ms.
+/// Fetching loses, so `cost_rule` (fetch 33 ms against wait 28.25 ms).
 #[tokio::test]
-async fn s5_external_tier_makes_waiting_cheaper_than_fetching() {
+async fn s5_disk_tier_makes_waiting_cheaper_than_fetching() {
     let mut fx = Fixture::start(Options::new(&[("a", "m"), ("b", "m")])).await;
     let prompt = seq(5, 2000);
     fx.mock("a")
         .store_prefix(&prompt, 100, Residency::Device)
         .await;
     fx.mock("a")
-        .store_prefix(&prompt, 125, Residency::External)
+        .store_prefix(&prompt, 125, Residency::Disk)
         .await;
-    fx.converge(&prompt, "a", 160).await;
+    fx.converge(&prompt, "a", 285).await;
     fx.make_busy("a", &prompt[..1600], 70, 4).await;
 
     let b_before = fx.mock("b").completions();
@@ -646,7 +648,7 @@ async fn s5_external_tier_makes_waiting_cheaper_than_fetching() {
     assert_eq!(delta, outcomes(&[("cost_rule", 1)]));
     // The estimates survive the failed rule; nothing is saved because no plan
     // was made.
-    assert_cost_observations(&costs, &[("cost:fetch", 1, 33.0), ("cost:wait", 1, 22.0)]);
+    assert_cost_observations(&costs, &[("cost:fetch", 1, 33.0), ("cost:wait", 1, 28.25)]);
     assert_eq!(fx.mock("b").completions() - b_before, 1, "B was the pick");
     fx.finish().await;
 }
@@ -717,17 +719,16 @@ async fn s7_session_binding_skips_the_planner() {
     fx.finish().await;
 }
 
-/// 9 (stretch): a lost event batch, then recovery.
+/// 9 (stretch): a lost event batch is recovered by replay.
 ///
-/// The mock consumes one sequence number without publishing it and then
-/// publishes an unrelated store, so the router's subscriber sees a gap with no
-/// replay endpoint. It must drop everything it believed about A (credit is never
-/// kept across an unrecoverable gap). Republishing the prefix after the gap is a
-/// fresh observation and restores the credit. There is no replay
-/// endpoint in the mock, so this exercises the invalidate-and-relearn path, not
-/// replay itself.
+/// The mock consumes one sequence number without sending it on the live socket
+/// (an empty batch lost on the wire) and then publishes an unrelated store, so
+/// the router's subscriber sees a gap. The router suspends the source, asks the
+/// mock's replay endpoint for the missed sequence, and resumes. The prefix
+/// credit learned before the gap survives, and the store sent after the gap is
+/// applied (its single block is credited).
 #[tokio::test]
-async fn s9_gap_invalidates_then_republish_recovers() {
+async fn s9_gap_is_recovered_by_replay() {
     let fx = Fixture::start(Options::new(&[("a", "m"), ("b", "m")])).await;
     let prompt = seq(9, 1700);
     fx.mock("a")
@@ -737,16 +738,13 @@ async fn s9_gap_invalidates_then_republish_recovers() {
 
     // Lose a batch: the next one arrives with seq + 2.
     fx.mock("a").skip_seq().await;
-    let unrelated = seq(19, 16);
+    let unrelated = seq(19, 32);
     fx.mock("a")
         .store_prefix(&unrelated, 1, Residency::Device)
         .await;
-    // The prefix credit is gone (both workers cold: full 1700 tokens of work).
-    fx.converge_work(&prompt, 1700).await;
-
-    fx.mock("a")
-        .store_prefix(&prompt, 100, Residency::Device)
-        .await;
+    // The batch after the gap lands only once replay has filled the gap: one
+    // 16-token block credited out of 32.
+    fx.converge(&unrelated, "a", 16).await;
     fx.converge(&prompt, "a", 100).await;
     fx.finish().await;
 }

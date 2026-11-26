@@ -632,7 +632,6 @@ fn plan_from_source(
 mod tests {
     use super::*;
     use crate::config::types::{PeerFetchConfig, PeerFetchMode};
-    use crate::kv_index::{HashMode, Locality};
     use crate::policies::kv_aware::{LoadSample, Scorer};
 
     fn target(name: &str) -> RoutableTarget {
@@ -647,14 +646,12 @@ mod tests {
             target: t.clone(),
             tier,
             segments: segments.to_vec(),
-            locality: Locality::Local,
         }
     }
 
     fn key(model: &str) -> CacheKey {
         CacheKey {
             model: Arc::from(model),
-            hash_mode: HashMode::Sha256,
             block_size: 16,
         }
     }

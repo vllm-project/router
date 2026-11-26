@@ -6,6 +6,8 @@
 //! * `GET /health` -> 200
 //! * `GET /get_server_info` -> `{model_id, instance_id, kv_block_size}`
 //! * `GET /server_info?config_format=json` -> native vLLM shape (model, block size)
+//! * `GET /kv_routing_capabilities` -> a plain `sha256_cbor` full-attention layout
+//!   for the DP rank (hash seed `"0"`), which the router needs before it subscribes
 //! * `GET /kv_event_sources` -> one `zmq`/`msgpack`/`schema_version: 1` entry for the DP rank,
 //!   with an optional `peer_lookup` object ([`KvEventMockConfig::peer_lookup`])
 //! * `POST /v1/completions` and `POST /v1/chat/completions` -> OpenAI-style replies
@@ -35,10 +37,11 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
+use vllm_router_rs::kv_index::request_hash::BlockKeyGenerator;
 use vllm_router_rs::kv_index::wire::{
     AllBlocksCleared, BlockRemoved, BlockStored, ExternalBlockHash, KVEvent,
 };
@@ -129,7 +132,8 @@ pub fn peer_port(dp_rank: u32) -> u16 {
 #[derive(Debug, Clone)]
 pub struct StoredPrefix {
     pub residency: Residency,
-    pub hashes: Vec<u64>,
+    /// Engine block hashes (`sha256_cbor`, seed 0), as published.
+    pub hashes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +168,7 @@ struct MockState {
     /// The `peer_lookup` record served now; starts as `config.peer_lookup`.
     peer_lookup: Mutex<Option<PeerLookupMock>>,
     endpoint: String,
+    replay_endpoint: String,
     /// `false` while held requests must wait; `true` releases them.
     release: watch::Sender<bool>,
     held_inflight: AtomicUsize,
@@ -190,13 +195,10 @@ pub struct KvEventMock {
     state: Arc<MockState>,
     commands: mpsc::Sender<Command>,
     subscribed: Arc<AtomicBool>,
-    next_hash: AtomicU64,
     prefixes: Mutex<Vec<StoredPrefix>>,
     server: tokio::task::JoinHandle<()>,
     publisher: Option<std::thread::JoinHandle<()>>,
 }
-
-static HASH_BASE: AtomicU64 = AtomicU64::new(1);
 
 impl KvEventMock {
     pub async fn start(config: KvEventMockConfig) -> Self {
@@ -210,12 +212,22 @@ impl KvEventMock {
             .get_last_endpoint()
             .expect("endpoint")
             .expect("utf8 endpoint");
+        // The router requires a replay ROUTER per rank before it accepts the
+        // cache contract; it asks it for missed batches.
+        let replay = context.socket(zmq::ROUTER).expect("router socket");
+        replay.set_linger(0).expect("linger");
+        replay.bind("tcp://127.0.0.1:*").expect("bind replay");
+        let replay_endpoint = replay
+            .get_last_endpoint()
+            .expect("endpoint")
+            .expect("utf8 endpoint");
 
         let (release, _) = watch::channel(false);
         let state = Arc::new(MockState {
             config: config.clone(),
             peer_lookup: Mutex::new(config.peer_lookup.clone()),
             endpoint,
+            replay_endpoint,
             release,
             held_inflight: AtomicUsize::new(0),
             completions: AtomicUsize::new(0),
@@ -229,7 +241,7 @@ impl KvEventMock {
             let (topic, rank, subscribed) =
                 (config.topic.clone(), config.dp_rank, subscribed.clone());
             std::thread::spawn(move || {
-                run_publisher(context, socket, command_rx, topic, rank, subscribed)
+                run_publisher(context, socket, replay, command_rx, topic, rank, subscribed)
             })
         };
 
@@ -238,6 +250,7 @@ impl KvEventMock {
             .route("/get_server_info", get(get_server_info))
             .route("/server_info", get(native_server_info))
             .route("/kv_event_sources", get(kv_event_sources))
+            .route("/kv_routing_capabilities", get(kv_routing_capabilities))
             .route("/v1/completions", post(completions))
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
@@ -254,7 +267,6 @@ impl KvEventMock {
             state,
             commands,
             subscribed,
-            next_hash: AtomicU64::new(HASH_BASE.fetch_add(1, Ordering::Relaxed) << 32),
             prefixes: Mutex::new(Vec::new()),
             server,
             publisher: Some(publisher),
@@ -316,12 +328,20 @@ impl KvEventMock {
             blocks * block_size,
             tokens.len()
         );
-        let hashes: Vec<u64> = (0..blocks)
-            .map(|_| self.next_hash.fetch_add(1, Ordering::Relaxed))
+        // The router hashes prompts with the layout's contract, so the mock
+        // must publish the same engine hashes for the blocks to match.
+        let hashes: Vec<Vec<u8>> = BlockKeyGenerator::new(block_size, 0)
+            .generate_block_keys(&tokens[..blocks * block_size])
+            .into_iter()
+            .map(|hash| hash.to_vec())
             .collect();
         self.send(vec![KVEvent::BlockStored(BlockStored {
             extra_keys: None,
-            block_hashes: hashes.iter().copied().map(ExternalBlockHash::Int).collect(),
+            block_hashes: hashes
+                .iter()
+                .cloned()
+                .map(ExternalBlockHash::Bytes)
+                .collect(),
             parent_block_hash: None,
             token_ids: tokens[..blocks * block_size].to_vec(),
             block_size: self.block_size(),
@@ -333,7 +353,7 @@ impl KvEventMock {
             kv_cache_spec_sliding_window: None,
             locality: Some(residency.locality().into()),
             ownership: residency.ownership(),
-            session_id: None,
+            lookahead_token_ids: None,
         })])
         .await;
         let stored = StoredPrefix { residency, hashes };
@@ -347,8 +367,8 @@ impl KvEventMock {
             block_hashes: stored
                 .hashes
                 .iter()
-                .copied()
-                .map(ExternalBlockHash::Int)
+                .cloned()
+                .map(ExternalBlockHash::Bytes)
                 .collect(),
             medium: Some(stored.residency.medium().into()),
             group_idx: Some(0),
@@ -439,6 +459,7 @@ impl Drop for KvEventMock {
 fn run_publisher(
     _context: zmq::Context,
     socket: zmq::Socket,
+    replay: zmq::Socket,
     commands: mpsc::Receiver<Command>,
     topic: String,
     dp_rank: u32,
@@ -446,11 +467,46 @@ fn run_publisher(
 ) {
     let subscribe_frame = [b"\x01".as_slice(), topic.as_bytes()].concat();
     let mut seq: i64 = 0;
+    // Every batch, published or skipped, so a replay request can be answered.
+    let mut history: Vec<(i64, Vec<u8>)> = Vec::new();
     loop {
         while let Ok(frame) = socket.recv_bytes(zmq::DONTWAIT) {
             if frame == subscribe_frame {
                 subscribed.store(true, Ordering::Release);
             }
+        }
+        // Replay protocol: `[peer, "", start_seq (u64 BE)]` in; each stored
+        // batch from `start_seq` as `[peer, "", topic, seq, payload]`, then
+        // `[peer, "", "", -1, ""]` to end the replay.
+        while let Ok(request) = replay.recv_multipart(zmq::DONTWAIT) {
+            let [peer, _, start] = request.as_slice() else {
+                continue;
+            };
+            let start = <[u8; 8]>::try_from(start.as_slice())
+                .map(|bytes| u64::from_be_bytes(bytes) as i64)
+                .unwrap_or(0);
+            for (batch_seq, payload) in history.iter().filter(|(s, _)| *s >= start) {
+                let _ = replay.send_multipart(
+                    [
+                        peer.as_slice(),
+                        b"",
+                        topic.as_bytes(),
+                        batch_seq.to_be_bytes().as_slice(),
+                        payload.as_slice(),
+                    ],
+                    0,
+                );
+            }
+            let _ = replay.send_multipart(
+                [
+                    peer.as_slice(),
+                    b"",
+                    b"",
+                    (-1_i64).to_be_bytes().as_slice(),
+                    b"",
+                ],
+                0,
+            );
         }
         match commands.recv_timeout(Duration::from_millis(2)) {
             Ok(Command::Publish { events, done }) => {
@@ -470,10 +526,17 @@ fn run_publisher(
                         0,
                     )
                     .expect("publish batch");
+                history.push((seq, payload));
                 seq += 1;
                 let _ = done.send(());
             }
             Ok(Command::SkipSeq { done }) => {
+                // Lost on the wire, not by the engine: the live socket never
+                // sends it, but replay can, as a real engine's buffer would.
+                let empty: Vec<KVEvent> = Vec::new();
+                let payload = rmp_serde::to_vec_named(&(0.0_f64, empty, Some(dp_rank)))
+                    .expect("encode batch");
+                history.push((seq, payload));
                 seq += 1;
                 let _ = done.send(());
             }
@@ -498,9 +561,32 @@ async fn native_server_info(State(state): State<Arc<MockState>>) -> Json<Value> 
     }}))
 }
 
+/// The cache contract the router verifies before it subscribes: one plain
+/// full-attention group hashed with `sha256_cbor`, seed `"0"`.
+async fn kv_routing_capabilities(State(state): State<Arc<MockState>>) -> Json<Value> {
+    let block_size = state.config.block_size;
+    Json(json!({
+        "schema_version": 1, "adapters": [],
+        "ranks": [{
+            "rank": state.config.dp_rank, "declared_groups": 1,
+            "model": state.config.model, "weight_version": "default",
+            "publisher_topic": state.config.topic, "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
+            "hash_block_size": block_size, "partial_hash_hits": false,
+            "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+            "prefix_caching": true, "transfer": null,
+            "groups": [{
+                "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
+            }]
+        }]
+    }))
+}
+
 async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
     let mut entry = json!({
         "endpoint": state.endpoint,
+        "replay_endpoint": state.replay_endpoint,
         "topic": state.config.topic,
         "publisher": "zmq",
         "encoding": "msgpack",
