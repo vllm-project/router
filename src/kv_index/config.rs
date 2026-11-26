@@ -360,11 +360,14 @@ impl StaticKvEventSources {
     }
 }
 
-fn is_valid_pd_kv_endpoint(endpoint: &str) -> bool {
-    crate::kv_index::canonical_endpoint(endpoint).is_ok()
-        || endpoint
-            .strip_prefix("ipc://")
-            .is_some_and(|path| !path.is_empty())
+fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint
+        .strip_prefix("ipc://")
+        .is_some_and(|path| !path.is_empty())
+    {
+        return Ok(());
+    }
+    crate::kv_index::canonical_endpoint(endpoint).map(|_| ())
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
@@ -536,11 +539,10 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .iter()
                     .chain(sources.replay_endpoints.iter().flatten())
                 {
-                    if !is_valid_pd_kv_endpoint(endpoint) {
+                    if let Err(reason) = validate_pd_kv_endpoint(endpoint) {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
-                                "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
-                                 a reachable ZMQ address (tcp://HOST:PORT or ipc://PATH)"
+                                "pd_kv_event_sources['{url}'] endpoint '{endpoint}' is invalid: {reason}"
                             ),
                         });
                     }
