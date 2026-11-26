@@ -14,9 +14,29 @@ type RequestLog = watch::Receiver<Vec<(String, StatusCode)>>;
 pub(super) async fn start_admin_auth_mock_server(
     api_key: Option<&str>,
 ) -> (String, JoinHandle<()>, RequestLog) {
+    start_worker_auth_mock_server(api_key, api_key).await
+}
+
+/// P/D health remains anonymous while its administrative endpoints require a key.
+pub(super) async fn start_pd_admin_auth_mock_server(
+    api_key: Option<&str>,
+) -> (String, JoinHandle<()>, RequestLog) {
+    start_worker_auth_mock_server(api_key, None).await
+}
+
+async fn start_worker_auth_mock_server(
+    api_key: Option<&str>,
+    health_api_key: Option<&str>,
+) -> (String, JoinHandle<()>, RequestLog) {
     let expected = api_key.map(|key| format!("Bearer {key}"));
+    let health_expected = health_api_key.map(|key| format!("Bearer {key}"));
     let (recorded, requests) = watch::channel(Vec::new());
     let authorize = move |req: Request, next: Next| {
+        let expected = if req.uri().path() == "/health" {
+            &health_expected
+        } else {
+            &expected
+        };
         let authorized = req
             .headers()
             .get_all(AUTHORIZATION)

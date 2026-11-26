@@ -270,6 +270,10 @@ has tracing support.
 
 Regular HTTP worker health checks and the regular and P/D admin requests
 (`POST /flush_cache` and `GET /get_load`) send the configured bearer token.
+P/D admin requests, including background load polling, send it only to worker
+base URLs configured at startup and their DP ranks. Removing and re-registering
+one of those addresses retains its authorization. Other discovered or registered
+addresses receive no shared credential.
 A cache flush sends one POST per worker base URL, even when several DP ranks
 or P/D roles share it. Load polling requires a worker that serves `/get_load`.
 

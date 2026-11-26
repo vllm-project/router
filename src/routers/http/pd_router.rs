@@ -563,6 +563,43 @@ impl Worker for PolicyWorker {
     }
 }
 
+/// Administrative probes may send the shared key only to configured transports.
+/// Registry membership and dynamic registration do not extend that trust set.
+#[derive(Clone, Default)]
+struct PdAdminAuth {
+    api_key: Option<Arc<str>>,
+    configured_urls: Arc<HashSet<String>>,
+}
+
+impl std::fmt::Debug for PdAdminAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PdAdminAuth").finish_non_exhaustive()
+    }
+}
+
+impl PdAdminAuth {
+    fn new<'a>(api_key: Option<&str>, urls: impl Iterator<Item = &'a str>) -> Self {
+        Self {
+            api_key: api_key.map(Arc::from),
+            configured_urls: Arc::new(
+                urls.map(|url| {
+                    crate::backend::strip_dp_suffix(url)
+                        .trim_end_matches('/')
+                        .to_owned()
+                })
+                .collect(),
+            ),
+        }
+    }
+
+    fn key_for(&self, url: &str) -> Option<&str> {
+        self.api_key.as_deref().filter(|_| {
+            self.configured_urls
+                .contains(crate::backend::strip_dp_suffix(url).trim_end_matches('/'))
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
     pub(super) kv_state: Option<Arc<PdKvState>>,
@@ -575,6 +612,7 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     api_key: Option<String>,
+    admin_auth: PdAdminAuth,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -1211,6 +1249,13 @@ impl PdRouterBase {
         decode_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        let admin_auth = PdAdminAuth::new(
+            ctx.router_config.api_key.as_deref(),
+            prefill_urls
+                .iter()
+                .map(|(url, _)| url.as_str())
+                .chain(decode_urls.iter().map(String::as_str)),
+        );
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
@@ -1312,7 +1357,7 @@ impl PdRouterBase {
                     .collect();
                 let monitor_interval = ctx.router_config.worker_startup_check_interval_secs;
                 let monitor_client = ctx.client.clone();
-                let monitor_api_key = ctx.router_config.api_key.clone();
+                let monitor_auth = admin_auth.clone();
                 let prefill_policy_clone = Arc::clone(&prefill_policy);
                 let decode_policy_clone = Arc::clone(&decode_policy);
 
@@ -1322,7 +1367,7 @@ impl PdRouterBase {
                         tx,
                         monitor_interval,
                         monitor_client,
-                        monitor_api_key,
+                        monitor_auth,
                         prefill_policy_clone,
                         decode_policy_clone,
                     )
@@ -1374,6 +1419,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             api_key: ctx.router_config.api_key.clone(),
+            admin_auth,
             circuit_breaker_config: core_cb_config,
             dp_size: fallback_dp_size,
         })
@@ -1385,7 +1431,7 @@ impl PdRouterBase {
         tx: tokio::sync::watch::Sender<HashMap<String, isize>>,
         interval_secs: u64,
         client: Client,
-        api_key: Option<String>,
+        admin_auth: PdAdminAuth,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
         decode_policy: Arc<dyn LoadBalancingPolicy>,
     ) {
@@ -1396,7 +1442,7 @@ impl PdRouterBase {
                 .iter()
                 .map(|url| {
                     let client = client.clone();
-                    let api_key = api_key.as_deref();
+                    let api_key = admin_auth.key_for(url);
                     let url = url.clone();
                     async move {
                         let load = get_worker_load(&client, &url, api_key).await.unwrap_or(0);
@@ -1750,7 +1796,8 @@ impl PdRouterBase {
                 let outcome = match outcomes.entry(base_url) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => entry.insert(
-                        flush_worker_cache(&self.client, base_url, self.api_key.as_deref()).await,
+                        flush_worker_cache(&self.client, base_url, self.admin_auth.key_for(url))
+                            .await,
                     ),
                 };
                 match outcome {
@@ -1785,7 +1832,13 @@ impl PdRouterBase {
         // Process prefill workers
         let prefill_urls = self.get_prefill_worker_urls();
         for worker_url in prefill_urls {
-            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
+            match get_worker_load(
+                &self.client,
+                &worker_url,
+                self.admin_auth.key_for(&worker_url),
+            )
+            .await
+            {
                 Some(load) => {
                     loads.insert(format!("prefill_{}", worker_url), load);
                 }
@@ -1798,7 +1851,13 @@ impl PdRouterBase {
         // Process decode workers
         let decode_urls = self.get_decode_worker_urls();
         for worker_url in decode_urls {
-            match get_worker_load(&self.client, &worker_url, self.api_key.as_deref()).await {
+            match get_worker_load(
+                &self.client,
+                &worker_url,
+                self.admin_auth.key_for(&worker_url),
+            )
+            .await
+            {
                 Some(load) => {
                     loads.insert(format!("decode_{}", worker_url), load);
                 }
@@ -1875,7 +1934,9 @@ impl PdRouterBase {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerFactory, WorkerType};
-    use crate::routers::test_support::start_admin_auth_mock_server;
+    use crate::routers::test_support::{
+        start_admin_auth_mock_server, start_pd_admin_auth_mock_server,
+    };
 
     fn create_test_pd_router() -> PdRouterBase {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1893,6 +1954,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            admin_auth: PdAdminAuth::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size: 1,
         }
@@ -1914,6 +1976,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             api_key: None,
+            admin_auth: PdAdminAuth::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             dp_size,
         }
@@ -1925,77 +1988,125 @@ mod tests {
         Box::new(worker)
     }
 
-    fn pd_router_with_api_key(api_key: &str) -> PdRouterBase {
-        PdRouterBase {
-            api_key: Some(api_key.to_owned()),
-            ..create_test_pd_router()
-        }
-    }
-
     #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_send_api_key() {
         let (prefill_url, prefill_server, prefill_requests) =
-            start_admin_auth_mock_server(Some("worker-key")).await;
+            start_pd_admin_auth_mock_server(Some("worker-key")).await;
         let (decode_url, decode_server, decode_requests) =
-            start_admin_auth_mock_server(Some("worker-key")).await;
-        let router = pd_router_with_api_key("worker-key");
-        for rank in 0..2 {
-            router.worker_registry.register(Arc::new(DPAwareWorker::new(
-                prefill_url.clone(),
-                rank,
-                2,
-                WorkerType::Prefill {
-                    bootstrap_port: Some(9000),
+            start_pd_admin_auth_mock_server(Some("worker-key")).await;
+        let (discovered_url, discovered_server, discovered_requests) =
+            start_pd_admin_auth_mock_server(None).await;
+        let ctx = Arc::new(
+            crate::server::AppContext::new(
+                crate::config::RouterConfig {
+                    api_key: Some("worker-key".into()),
+                    policy: crate::config::PolicyConfig::PowerOfTwo {
+                        load_check_interval_secs: 60,
+                    },
+                    intra_node_data_parallel_size: 2,
+                    worker_startup_timeout_secs: 5,
+                    worker_startup_check_interval_secs: 1,
+                    ..Default::default()
                 },
-            )));
-        }
+                Client::new(),
+                10,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        );
+        // Registry membership alone must not authorize the shared credential,
+        // including for the constructor's background load-monitor snapshot.
+        ctx.worker_registry.register(Arc::new(DPAwareWorker::new(
+            discovered_url.clone(),
+            0,
+            2,
+            WorkerType::Decode,
+        )));
+        let router = PdRouterBase::new(
+            vec![(prefill_url.clone(), Some(9000))],
+            vec![decode_url.clone()],
+            &ctx,
+        )
+        .await
+        .unwrap();
         router
-            .worker_registry
-            .register(Arc::from(create_test_worker(
-                decode_url.clone(),
-                WorkerType::Decode,
-                true,
-            )));
+            .remove_prefill_server(&format!("{prefill_url}@1"))
+            .await
+            .unwrap();
+        router
+            .add_prefill_server(format!("{prefill_url}@1"), Some(9000))
+            .await
+            .unwrap();
+        router
+            .add_decode_server(format!("{discovered_url}@1"))
+            .await
+            .unwrap();
 
         let flush = router.flush_cache().await;
         assert_eq!(flush.status(), StatusCode::OK, "flush_cache");
-        for requests in [&prefill_requests, &decode_requests] {
-            assert_eq!(
-                *requests.borrow(),
-                [("/flush_cache".into(), StatusCode::OK)]
-            );
+        for requests in [&prefill_requests, &decode_requests, &discovered_requests] {
+            let flushes: Vec<_> = requests
+                .borrow()
+                .iter()
+                .filter(|(path, _)| path == "/flush_cache")
+                .cloned()
+                .collect();
+            assert_eq!(flushes, [("/flush_cache".into(), StatusCode::OK)]);
         }
+
         let loads = router.get_worker_loads().await;
         assert_eq!(loads.status(), StatusCode::OK, "get_loads");
         let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
             .await
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        for rank in 0..2 {
-            assert_eq!(
-                payload["loads"][format!("prefill_{prefill_url}@{rank}")],
-                7,
-                "{payload}"
-            );
+        for (role, url) in [
+            ("prefill", &prefill_url),
+            ("decode", &decode_url),
+            ("decode", &discovered_url),
+        ] {
+            for rank in 0..2 {
+                assert_eq!(
+                    payload["loads"][format!("{role}_{url}@{rank}")],
+                    7,
+                    "{payload}"
+                );
+            }
         }
-        assert_eq!(
-            payload["loads"][format!("decode_{decode_url}")],
-            7,
-            "{payload}"
-        );
         assert!(
             payload["errors"].as_array().unwrap().is_empty(),
             "{payload}"
         );
 
+        let mut monitored = router.worker_loads.as_ref().clone();
+        let batch = tokio::time::timeout(
+            Duration::from_secs(2),
+            monitored.wait_for(|loads| loads.len() == 5),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert!(
+            batch.values().all(|load| *load == 7),
+            "background load probes must use the same credential scope: {batch:?}"
+        );
+        router.load_monitor_handle.as_ref().unwrap().abort();
+
         prefill_server.abort();
         decode_server.abort();
+        discovered_server.abort();
     }
 
     #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_fail_without_matching_api_key() {
         let (url, server, requests) = start_admin_auth_mock_server(Some("worker-key")).await;
-        let router = pd_router_with_api_key("other-key");
+        let router = PdRouterBase {
+            api_key: Some("other-key".into()),
+            admin_auth: PdAdminAuth::new(Some("other-key"), [url.as_str()].into_iter()),
+            ..create_test_pd_router()
+        };
         let roles = [
             WorkerType::Prefill {
                 bootstrap_port: None,
