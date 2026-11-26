@@ -442,13 +442,18 @@ pub(crate) struct PeerFetchPlannerInput<'a> {
     pub cost_params: &'a CostParams,
 }
 
-/// What the planner returns: the plan or skip, plus the cost estimate whenever
-/// the cost rule was evaluated for the peer whose result is returned (the
-/// planned peer, or the peer whose `CostRule` skip is reported). `None` for
-/// skips that happen before the cost rule.
+/// What the planner returns: every qualifying source's plan or a skip, plus
+/// the cost estimate whenever the cost rule was evaluated for the peer whose
+/// result is reported (the top-ranked planned source, or the peer whose
+/// `CostRule` skip is reported). `None` for skips that happen before the cost
+/// rule.
+///
+/// The plans are in rank order and never empty: index 0 is the plan for the
+/// best-ranked source, and the rest are fallbacks for a grant that cannot use
+/// the sources before them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PeerFetchOutcome {
-    pub result: Result<PeerFetchPlan, PeerFetchSkip>,
+    pub result: Result<Vec<PeerFetchPlan>, PeerFetchSkip>,
     pub estimate: Option<CostEstimate>,
 }
 
@@ -541,10 +546,11 @@ pub(crate) fn plan_transfer(
 
     // Rank every peer that shares the destination's identity: largest prefix
     // of the destination's prompt first, then the less loaded peer, then the
-    // lower position. Each one is then checked in that order and the first
+    // lower position. Each one is then checked in that order and every one
     // that clears every check is planned, so a peer that cannot serve
     // (excluded, incompatible, idle, too expensive) never hides a shorter one
-    // that can.
+    // that can. The grant tries the plans in this order and falls back to the
+    // next when a send-time check fails for the one before it.
     let mut peers: Vec<(usize, u32)> = (0..count)
         .filter(|&pos| pos != dest && input.peers[pos].cache_key == Some(dest_key))
         .map(|pos| {
@@ -571,10 +577,18 @@ pub(crate) fn plan_transfer(
     // the next usable holder was rejected.
     let mut first_skip: Option<(PeerFetchSkip, Option<CostEstimate>)> = None;
     let mut first_usable_skip: Option<(PeerFetchSkip, Option<CostEstimate>)> = None;
+    let mut plans = Vec::new();
+    // The top source's estimate, which is the one reported.
+    let mut top_estimate = None;
     for (src, src_prefix) in peers {
         let outcome = plan_from_source(input, policy, src, src_prefix, dest_prefix, block_size);
         match outcome.result {
-            Ok(_) => return outcome,
+            Ok(mut qualifying) => {
+                if plans.is_empty() {
+                    top_estimate = outcome.estimate;
+                }
+                plans.append(&mut qualifying);
+            }
             Err(skip) => {
                 first_skip.get_or_insert((skip, outcome.estimate));
                 if !matches!(
@@ -585,6 +599,12 @@ pub(crate) fn plan_transfer(
                 }
             }
         }
+    }
+    if !plans.is_empty() {
+        return PeerFetchOutcome {
+            result: Ok(plans),
+            estimate: top_estimate,
+        };
     }
     match first_usable_skip.or(first_skip) {
         Some((skip, estimate)) => PeerFetchOutcome {
@@ -730,7 +750,7 @@ fn plan_from_source(
         estimated_destination_queue_ms: cost.dest_queue_ms,
     };
     PeerFetchOutcome {
-        result: Ok(plan),
+        result: Ok(vec![plan]),
         estimate: Some(cost),
     }
 }
@@ -889,7 +909,7 @@ mod tests {
         }
 
         fn plan(&self, policy: &PeerFetchRules) -> Result<PeerFetchPlan, PeerFetchSkip> {
-            self.outcome(policy).result
+            self.outcome(policy).result.map(top_plan)
         }
 
         fn outcome(&self, policy: &PeerFetchRules) -> PeerFetchOutcome {
@@ -1372,6 +1392,7 @@ mod tests {
                 &enabled(),
             )
             .result
+            .map(top_plan)
             .unwrap()
             .source
         };
@@ -1409,6 +1430,7 @@ mod tests {
             &enabled(),
         )
         .result
+        .map(top_plan)
         .unwrap();
         assert_eq!(plan.source, targets[2]);
         assert_eq!(plan.blocks, (0, 100));
@@ -1480,7 +1502,12 @@ mod tests {
 
     /// Position 0 is the picked destination; the rest are peers.
     fn plan_many(peers: &[Peer], policy: &PeerFetchRules) -> Result<PeerFetchPlan, PeerFetchSkip> {
-        plan_many_outcome(peers, policy).result
+        plan_many_outcome(peers, policy).result.map(top_plan)
+    }
+
+    /// The best-ranked source's plan, with the fallbacks dropped.
+    fn top_plan(plans: Vec<PeerFetchPlan>) -> PeerFetchPlan {
+        plans.into_iter().next().expect("plans are never empty")
     }
 
     fn plan_many_outcome(peers: &[Peer], policy: &PeerFetchRules) -> PeerFetchOutcome {
@@ -1587,6 +1614,87 @@ mod tests {
         assert_eq!(
             plan_many(&peers, &enabled()),
             Err(PeerFetchSkip::SourceExcluded)
+        );
+    }
+
+    /// Source targets of a successful outcome, in rank order.
+    fn sources(outcome: &PeerFetchOutcome) -> Vec<RoutableTarget> {
+        outcome
+            .result
+            .as_ref()
+            .expect("plans")
+            .iter()
+            .map(|plan| plan.source.clone())
+            .collect()
+    }
+
+    #[test]
+    fn every_qualifying_source_is_planned_in_rank_order() {
+        // Longest prefix first, then the less loaded of two equal holders.
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("short", &[(StorageTier::Device, (0, 80))], BUSY),
+            peer("long", &[(StorageTier::Device, (0, 100))], (9, 10_000)),
+            peer("equal", &[(StorageTier::Device, (0, 100))], (5, 10_000)),
+        ];
+        let outcome = plan_many_outcome(&peers, &enabled());
+        assert_eq!(
+            sources(&outcome),
+            [target("equal"), target("long"), target("short")]
+        );
+        let plans = outcome.result.as_ref().unwrap();
+        assert!(plans.iter().all(|plan| plan.destination == target("dest")));
+        assert_eq!(plans[2].blocks, (0, 80));
+        // The estimate is the top source's, and its plan is the single-source
+        // answer.
+        let alone = plan_many_outcome(
+            &[
+                peer("dest", &[], (0, 0)),
+                peer("equal", &[(StorageTier::Device, (0, 100))], (5, 10_000)),
+            ],
+            &enabled(),
+        );
+        assert_eq!(outcome.estimate, alone.estimate);
+        assert_eq!(plans[0], alone.result.unwrap()[0]);
+    }
+
+    #[test]
+    fn sources_that_fail_a_check_are_left_out_of_the_plans() {
+        let policy = PeerFetchRules {
+            require_capability: true,
+            ..enabled()
+        };
+        let mut dest = peer("dest", &[], (0, 0));
+        dest.cap = Some(cap(true, true, "a"));
+        let ok = |name: &str, blocks, load| {
+            let mut p = peer(name, &[(StorageTier::Device, (0, blocks))], load);
+            p.cap = Some(cap(true, true, "a"));
+            p
+        };
+        let first = ok("first", 100, BUSY);
+        let mut excluded = ok("excluded", 99, BUSY);
+        excluded.excluded = true;
+        let mut incompatible = ok("incompatible", 98, BUSY);
+        incompatible.cap = Some(cap(true, true, "other-layout"));
+        // Waiting on this holder (nothing queued) beats fetching from it.
+        let cheap_to_wait = ok("cheap_to_wait", 97, (1, 0));
+        let last = ok("last", 80, BUSY);
+        let outcome = plan_many_outcome(
+            &[dest, first, excluded, incompatible, cheap_to_wait, last],
+            &policy,
+        );
+        assert_eq!(sources(&outcome), [target("first"), target("last")]);
+    }
+
+    #[test]
+    fn a_single_qualifying_source_yields_one_plan() {
+        let peers = [
+            peer("dest", &[], (0, 0)),
+            peer("only", &[(StorageTier::Device, (0, 100))], BUSY),
+        ];
+        assert_eq!(
+            sources(&plan_many_outcome(&peers, &enabled())),
+            [target("only")]
         );
     }
 

@@ -28,13 +28,13 @@ sequenceDiagram
     R->>P: 3. picked worker, peers, loads, destination's index hits
     P->>P: 4. rank peers that share the destination's cache identity
     P->>P: 5. run the gates on each peer in rank order
-    P-->>R: 6. plan, or the skip reason
-    R->>R: 7. count vllm_router_peer_fetch_plans_total{outcome}
+    P-->>R: 6. a plan for every peer that passes (best first), or the skip reason
+    R->>R: 7. count vllm_router_peer_fetch_plans_total{outcome} (once, for the best plan)
     alt shadow mode, or no plan
         R->>D: 8a. request, unchanged
     else active mode and a plan
-        R->>R: 8b. look up the source's peer address, take an in-flight slot
-        R->>D: 9. request + kv_transfer_params (source address)
+        R->>R: 8b. check the destination, then try the planned sources in rank order: look up the first source's peer address and take an in-flight slot, falling back to the next source if a check fails
+        R->>D: 9. request + kv_transfer_params (granted source's address)
         D->>S: 10. peer lookup and KV read (engine to engine)
         R->>R: 11. count vllm_router_peer_fetch_requests_total{outcome}
     end
@@ -82,7 +82,7 @@ The transparent proxy path (`route_transparent`) does not run the `prompt_logpro
 | 6 | Nothing left to credit (the last prompt token is never credited) | `prefix_too_short` |
 | 7 | Cost rule fails (below) | `cost_rule` |
 
-The first peer that passes all seven is planned (`planned`).
+Every peer that passes all seven is planned, in rank order, and the request is counted once as `planned`. The best-ranked plan is the one that is counted, estimated and reported (the saved-time and cost metrics, and the `KV transfer plan` DEBUG log, which also carries `candidate_sources`, the number of plans); the others are fallbacks for active mode, all sharing the request's plan id.
 
 **Which reason is reported when no peer passes.** One request produces one outcome. The planner reports the reason of the highest-ranked peer, but prefers a peer that failed an ordinary check (3 to 7) over one that failed 1 or 2. A retry exclusion or a layout mismatch on the longest holder says less about lost transfers than why the next usable holder was rejected. So the counter answers "why did the best *usable* peer not qualify", not "why did the longest holder not qualify".
 
@@ -139,12 +139,13 @@ Points 1, 2 and 4 all favour `planned`. Calibrate the constants against a measur
 
 A default shadow run makes the plans active mode would make, so its rate predicts active mode. `--peer-fetch-ignore-capability` answers a different question: how much peer fetch would save once every worker declares a compatible capability. The router logs a warning at startup when it is set. Without it, `plans_total{outcome="incompatible"}` shows how often the capability check decided the outcome. It is counted once per selection, and only when no peer failed a later check (3 to 7, see "Which reason is reported"), so it undercounts the selections the check blocked.
 
-In `active` mode a planned request goes through these checks, in order. Each failure is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method ends at `session_binding` (when it already has a session binding) or `missing_tokens` in `plans_total`, and never takes a source slot.
+In `active` mode a planned request goes through these checks, in order. Each failure that ends the attempt is counted on `vllm_router_peer_fetch_requests_total{outcome}` and the request is sent unchanged; a source-level failure ends it only when no other planned source can be granted (see **Source fallback**). The request-level checks (gRPC destination, destination registration) run once and run before any source is tried, so a failure there takes no slot on any source. The source-level checks (the source's registration, `no_peer_endpoint`, `untrusted_endpoint`, `inflight_cap`) run per planned source in rank order, and the first source that passes all four is granted. Only POST requests reach these checks: the router reads token ids only from POST bodies, so any other method ends at `session_binding` (when it already has a session binding) or `missing_tokens` in `plans_total`, and never takes a source slot.
 
 | Check | Outcome |
 |---|---|
 | Destination is a gRPC worker | `grpc_destination` |
-| Source or destination registration changed since planning | `registration_changed` |
+| Destination registration changed since planning (checked before the sources) | `registration_changed` |
+| Source registration changed since planning | `registration_changed` |
 | Source has no engine-reported peer address | `no_peer_endpoint` |
 | Source's reported side-channel host is not trusted (see **Trust** below) | `untrusted_endpoint` |
 | Source already has `max_inflight_per_source` fetches in flight | `inflight_cap` |
@@ -152,6 +153,8 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 | Client set `prompt_logprobs` or `prompt_logprob_token_ids` on a path that did not skip planning (the proxy path); the normal path skips earlier, see above | `prompt_logprobs` |
 | Body is not a JSON object | `invalid_body` |
 | Otherwise | `sent` |
+
+**Source fallback.** If the best-ranked source fails a source-level check, the next planned source is tried, and so on down the ranking; the first that passes is granted and its address is sent. The source-level labels are recorded only when no planned source could be granted, and the one recorded is the best-ranked source's failure. A request that falls back to a lower-ranked source therefore records none of them, and a request with a single planned source reports exactly the failure of that source. Only a source that passed the planner is a candidate: a peer the planner rejected is never tried. A source passed over takes no slot. The lower-ranked sources are checked against the registrations the planner saw, like the best one; a source the router cannot match to a worker in the selection snapshot is left out, while a source that is matched but has no registration is kept and fails as `no_peer_endpoint`. Each grant that uses a source other than the best is logged at `DEBUG` with its rank and URL.
 
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.
@@ -210,13 +213,13 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 - Discovery reads the record when a worker is added. When it finds no valid record, the worker gets no address and any engine-reported capability it had is removed. A static capability is kept.
 - A changed record is picked up only when the worker is removed and added again.
 
-**Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if both the source and the destination still have the record and registration the planner saw, and it uses the address from that record. Otherwise the outcome is `registration_changed` and the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
+**Registration binding.** The planner checks a source's layout against the record it read. Discovery can replace a worker's record (new engine id, port or layout) for the same URL after the planner read it. So the grant fetches only if the destination and the granted source still have the record and registration the planner saw, and it uses the address from that record. The destination is checked first; a source whose registration changed is passed over for the next source (see **Source fallback**). `registration_changed` is recorded when the destination changed, or when no source can be granted and the best-ranked source's failure is a changed registration. In either case the request is sent unchanged, never with the old cache credit. Re-polling an identical record does not count as a change.
 
 **Trust.** The router does not verify the side-channel address an engine reports, and in active mode the destination engine connects to it. So a grant requires the reported `side_channel_host` to be one the operator vouches for:
 - by default, the host of the source's registered worker URL (`http://10.0.0.1:8000@2` gives `10.0.0.1`);
 - when the operator pinned one for that worker with `"side_channel_host"` in `--peer-fetch-capability`, that host instead. With a pin, the worker URL's host no longer qualifies.
 
-Hosts are compared without case, IPv6 brackets, port or DP-rank suffix; DNS names are compared as written, not resolved. The port and `engine_id` are not checked. A failed check is counted as `untrusted_endpoint`, takes no source slot, is logged at `WARN`, and the request is sent unchanged. Shadow mode never sends an address, so it is unaffected. Deployments whose side channel uses a different network interface than the worker URL must pin that host, or active mode sends no fetches.
+Hosts are compared without case, IPv6 brackets, port or DP-rank suffix; DNS names are compared as written, not resolved. The port and `engine_id` are not checked. A failed check is logged at `WARN` for every source that is tried and fails it (sources after the granted one are never checked), takes no source slot, and falls back to the next planned source. When no source can be granted, the best-ranked source's failure is counted as `untrusted_endpoint` if it was the trust check, and the request is sent unchanged. Shadow mode never sends an address, so it is unaffected. Deployments whose side channel uses a different network interface than the worker URL must pin that host, or active mode sends no fetches.
 
 **Kill switch.** `POST /peer_fetch` with `{"enabled": false}` stops peer fetches on every active-mode `kv_aware` policy of the router at once; `{"enabled": true}` resumes them.
 - Routing, planning and the `planned` count on `vllm_router_peer_fetch_plans_total` continue as before. A planned request is sent without `kv_transfer_params` and is not counted on `vllm_router_peer_fetch_requests_total`, as in shadow mode.
@@ -269,7 +272,7 @@ Each successful `POST` is logged at `WARN` with the new state and sets `vllm_rou
 | Metric | Labels | Meaning |
 |---|---|---|
 | `vllm_router_peer_fetch_plans_total` | `outcome` | One per selection: `planned` or a skip label from the tables above |
-| `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request: `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `untrusted_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
-| `vllm_router_peer_fetch_estimated_saved_ms` | none | `saved_ms` of each planned transfer |
-| `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, for the peer whose outcome is reported; peers that reach the cost rule and are passed over leave no sample |
+| `vllm_router_peer_fetch_requests_total` | `outcome` | Active mode only, one per planned request (the source-level labels only when no planned source could be granted, and then the best-ranked source's): `sent`, `grpc_destination`, `registration_changed`, `no_peer_endpoint`, `untrusted_endpoint`, `inflight_cap`, `client_params_present`, `prompt_logprobs`, `invalid_body` |
+| `vllm_router_peer_fetch_estimated_saved_ms` | none | `saved_ms` of each planned transfer (the best-ranked source's) |
+| `vllm_router_peer_fetch_estimated_cost_ms` | `path` = `fetch` or `wait` | Both estimates, for the peer whose outcome is reported (the best-ranked source when planned); peers that reach the cost rule and are passed over leave no sample |
 | `vllm_router_peer_fetch_enabled` | none | Gauge: 1 while the kill switch lets active-mode policies fetch, 0 while it stops them. Set at startup when the main policy is in active mode, and on each successful `POST /peer_fetch` |
