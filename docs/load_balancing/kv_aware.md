@@ -318,7 +318,7 @@ Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `t
 <details>
 <summary>Ascend · HY4 Flash</summary>
 
-Use the HY4 Flash vLLM-Ascend image over HTTP.
+Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/HY4-Flash.html).
 
 ```json
 {
