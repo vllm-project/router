@@ -9,7 +9,7 @@ A high-performance and light-weight request forwarding system for vLLM large sca
 
 - **Core Architecture**: Request routing framework and async processing patterns
 - **Load Balancing**: Multiple algorithms (cache-aware, power of two, consistent hashing, random, round robin)
-- **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads (Claude Code, Codex/OpenCode, DeepSeek Harness, and generic session headers)
+- **Program Scheduling**: Optional Program identity, RequestPool admission, Progress-TTL, and Global Queue placement for agent workloads
 - **Prefill-Decode Disaggregation**: Specialized routing for separated processing phases
 - **Service Discovery**: Kubernetes-native worker management and health monitoring
 - **Enterprise Features**: Circuit breakers, retry logic, metrics collection
