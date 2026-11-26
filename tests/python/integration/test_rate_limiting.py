@@ -7,10 +7,10 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_rate_limit_and_queue(router_manager, mock_workers):
+def test_rate_limit_and_queue(router_manager, mock_worker_manager):
     # Add latency to ensure requests overlap and trigger rate limiting
     # Without latency, requests may complete too fast to trigger concurrency limits
-    _, urls, _ = mock_workers(n=1, args=["--latency-ms", "100"])
+    _, urls, _ = mock_worker_manager.start_workers(n=1, args=["--latency-ms", "100"])
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="round_robin",
@@ -46,9 +46,11 @@ def test_rate_limit_and_queue(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_rate_limit_queue_and_timeout(router_manager, mock_workers):
+def test_rate_limit_queue_and_timeout(router_manager, mock_worker_manager):
     # Slow backend: ~2s per request ensures queue wait > timeout
-    _, urls, _ = mock_workers(n=1, args=["--latency-ms", "2000"])  # 2.0s per request
+    _, urls, _ = mock_worker_manager.start_workers(
+        n=1, args=["--latency-ms", "2000"]
+    )  # 2.0s per request
 
     # Allow 1 concurrent, queue up to 1, with 1s queue timeout
     rh = router_manager.start_router(
@@ -94,14 +96,14 @@ def test_rate_limit_queue_and_timeout(router_manager, mock_workers):
 
 
 @pytest.mark.integration
-def test_rate_limit_429_carries_retry_after(router_manager, mock_workers):
+def test_rate_limit_429_carries_retry_after(router_manager, mock_worker_manager):
     """A throttled request must come back with a Retry-After hint.
 
     OpenAI-compatible SDKs treat a 429 without the header as non-retryable and
     surface it to the caller instead of backing off, which turns a transient
     queue-full into a hard failure.
     """
-    _, urls, _ = mock_workers(n=1, args=["--latency-ms", "100"])
+    _, urls, _ = mock_worker_manager.start_workers(n=1, args=["--latency-ms", "100"])
     rh = router_manager.start_router(
         worker_urls=urls,
         policy="round_robin",
