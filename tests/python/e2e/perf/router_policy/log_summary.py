@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, Any
 
 from case_loader import cell_run_suffix, router_policy_result_path
 from tests.python.e2e.perf.result_metadata import add_missing_metadata
-from tests.python.e2e.perf.router_policy.replay_validation import validate_replay
+from tests.python.e2e.perf.router_policy.test_router_policy_scenarios import (
+    validate_replay,
+)
 
 if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack

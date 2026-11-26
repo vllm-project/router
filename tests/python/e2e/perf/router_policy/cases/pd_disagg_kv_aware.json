@@ -2,14 +2,14 @@
   "id": "pd_disagg_kv_aware",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
-    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-ci-8x8.jsonl",
+    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-ci-12x12.jsonl",
     "trace_type": "agentX",
-    "trace_sha256": "6a3c73b69834017dd4a75000a15c87b3668a94a5ab674ea0ddf3e9f0c2d9437c",
+    "trace_sha256": "faf79824c90ddb72774a6f5f018f67821f26c48743cd5171cfbcfe9e00855537",
     "endpoint": "/v1/completions"
   },
   "benchmark_params": {
-    "task-num": 8,
-    "max-concurrency": [8],
+    "task-num": 12,
+    "max-concurrency": [12],
     "gap_scale": 0.002,
     "max_inflight": 1,
     "task_stagger": 0

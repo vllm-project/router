@@ -414,7 +414,7 @@ def _write_replay_artifacts(out, requests_per_task):
     return rows
 
 
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_64"])
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_144"])
 @pytest.mark.parametrize(
     "corruption",
     [
@@ -433,8 +433,8 @@ def test_incomplete_replay_fails_before_publication(
 ):
     run = prefill_run
     run.case.prefill_count = prefill_count
-    run.case.task_num = 8
-    counts = [8] * 8 if prefill_count else [4] * 4 + [3] * 4
+    run.case.task_num = 12 if prefill_count else 8
+    counts = [12] * 12 if prefill_count else [4] * 4 + [3] * 4
     rows = _write_replay_artifacts(run.out, counts)
     if corruption == "subset":
         rows = rows[:1]
@@ -465,17 +465,17 @@ def test_incomplete_replay_fails_before_publication(
     assert not list((run.out / "published").rglob("*.json"))
 
 
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_64"])
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["tracelab_28", "agentx_144"])
 def test_complete_replay_publishes_all_requests(
     summary_module, prefill_run, prefill_count
 ):
     run = prefill_run
     run.case.prefill_count = prefill_count
-    run.case.task_num = 8
+    run.case.task_num = 12 if prefill_count else 8
     run.case.scenario = (
         f"{'pd_disagg' if prefill_count else 'pd_merge'}_kv_aware_affinity"
     )
-    counts = [8] * 8 if prefill_count else [4] * 4 + [3] * 4
+    counts = [12] * 12 if prefill_count else [4] * 4 + [3] * 4
     rows = _write_replay_artifacts(run.out, counts)
     (run.out / "result/requests.jsonl").write_text(
         "\n".join(json.dumps(row) for row in reversed(rows)), encoding="utf-8"
@@ -489,7 +489,7 @@ def test_complete_replay_publishes_all_requests(
         "errors": [],
     }
     published = case_loader.router_policy_result_path(
-        run.case.scenario, 16, 8, "unit_test"
+        run.case.scenario, 16, run.case.task_num, "unit_test"
     )
     assert published.read_bytes() == (run.out / "calibration.json").read_bytes()
 

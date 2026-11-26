@@ -1,17 +1,18 @@
 # router_policy — TraceLab and AgentX cold replay, router policy × concurrency
 
-Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` is `[8]`; pytest collects one cell per scenario, such as `pd_merge_cache_aware/c8`:
+Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` is `[8]` for merged cases and `[12]` for PD cases; pytest collects one cell per scenario, such as `pd_merge_cache_aware/c8` or `pd_disagg_cache_aware/c12`:
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
 - **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
-- **`benchmark_params`** — `max-concurrency` (`[8]`), task-num, and the rest of the replay settings. pytest requires **all** replay requests to succeed and match the complete replay plan.
+- **`benchmark_params`** — `max-concurrency`, task-num, and the rest of the replay settings. pytest requires **all** replay requests to succeed and match the complete replay plan.
 
-All six scenarios use eight replay sessions with serial requests within each
-session. `c8` denotes the configured session-concurrency limit; the request
-concurrency is at most eight and can be lower because of trace gaps and
-completed sessions. The workload no longer includes `c16` or `c32` cells.
+Merged scenarios use eight replay sessions at `c8`; PD scenarios use twelve
+sessions at `c12`. Requests within each session are serial. These labels denote
+the configured session-concurrency limit; request concurrency is at most eight
+or twelve respectively and can be lower because of trace gaps and completed
+sessions. The workload includes no `c16` or `c32` cells.
 
 Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
 
@@ -108,7 +109,7 @@ Before publication, `replay_validation` checks the persisted requests against
 AgentInfer's `result/replay-source-analysis.json` and `result/replay-plan.json`,
 which are written before measured requests start. Each planned task must contain
 all measured request keys from its source session. The configured task count,
-runtime session IDs, and request IDs must be valid; the pinned eight-session
+runtime session IDs, and request IDs must be valid; the pinned
 cases must cover their complete source cycle. Only `request` nodes are counted;
 timing dependencies do not generate measured request rows.
 
@@ -117,7 +118,7 @@ match the planned `(session_id, request_id)` pairs. Missing or extra rows, wrong
 IDs, duplicates, and missing or malformed plan/source artifacts fail the cell
 and prevent dashboard publication. Expected counts come from the source
 inventory and selected plan, independently of `requests.jsonl` or its summary.
-The bundled workloads require 28 TraceLab requests or 64 AgentX requests; a
+The bundled workloads require 28 TraceLab requests or 144 AgentX requests; a
 TraceLab URL override is checked against its own inventory and plan. Counts and
 failure reasons are recorded in `replay_validation` in `calibration.json`.
 
@@ -176,7 +177,7 @@ The router policy steps in [`.buildkite/test-nightly.yml`](../../../../../.build
 run on `l4_4` (four L4 GPUs per job).
 
 - `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged scenarios.
-- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c8` and runs
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c12` and runs
   `cache_aware`, `kv_aware`, and `round_robin` sequentially in one four-GPU job.
   The three scenarios share a 180-minute timeout and artifact upload. This
   increases the previous 90-minute budget; the total runtime still needs
@@ -189,13 +190,13 @@ to the number of prefill workers. The remaining workers decode. Merged cases
 use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker
 and use no CPU offload. Merged cases use `max_model_len=32768`; PD cases use
 `max_model_len=65536` for the pinned AgentX requests (maximum input plus output
-65,339 tokens). For the configured BF16 Qwen3-4B model, one full 64K sequence
+65,181 tokens). For the configured BF16 Qwen3-4B model, one full 64K sequence
 uses 9 GiB of KV, within the per-worker KV allocation.
 
 The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
 router. Merged cases use `data/tracelab-ci-uniform-28.jsonl` (eight sessions,
-28 requests). The three PD cases share `data/agentx-ci-8x8.jsonl` (eight sessions,
-eight turns each, 64 requests) with `trace_type=agentX`, `/v1/completions`,
+28 requests). The three PD cases share `data/agentx-ci-12x12.jsonl` (twelve sessions,
+twelve turns each, 144 requests) with `trace_type=agentX`, `/v1/completions`,
 and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
 token-ID replay settings. See [data provenance and reproduction](data/README.md).
 
@@ -209,7 +210,7 @@ before GPU processes start. Local pytest runs use the same setup.
 Run the three PD scenarios in an environment with four supported CUDA GPUs.
 
 ```bash
-python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c8'
+python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c12'
 ```
 
 Earlier TraceLab runs of cache-aware and KV-aware affinity passed on two L20
