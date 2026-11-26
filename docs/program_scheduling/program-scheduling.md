@@ -82,7 +82,7 @@ Identity-free requests do not create Program state, enter RequestPool, or trigge
 
 ## Configuration reference
 
-All fields below belong to `program_scheduling`. Values omitted from the JSON object use the listed defaults.
+All fields below belong to `program_scheduling`. The table lists JSON defaults. For both `max_active_programs_per_target` and `admission_waiting_request_threshold`, omission or explicit zero selects automatic sizing. Regular mode resolves these to 64 and 1 respectively. PD mode resolves each automatic value to `clamp(2 × pd.max_prefill_requests_per_target, 4, 64)`. Explicit positive values are used directly.
 
 | Parameter | Default | Effect on scheduling |
 |---|---:|---|
@@ -94,9 +94,9 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
-| `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
+| `max_active_programs_per_target` | `0` (auto) | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
-| `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. `0` disables this waiting gate. |
+| `admission_waiting_request_threshold` | `0` (auto) | Blocks ordinary admission or resume when the native vLLM waiting count reaches the resolved threshold. All supported threshold values keep this check enabled. |
 | `queue_timeout_seconds` | `600.0` | Sets the maximum time a retained request may remain in the Router RequestPool. A request-scoped deadline can shorten, but not extend, this limit. |
 | `force_resume_timeout_seconds` | `300.0` | Sets the fallback and upper bound for the workload-derived force-resume deadline that prevents starvation. The actual deadline may be shorter based on queued work and measured request throughput. |
 | `paused_retention_ttl_seconds` | `1800.0` | Releases an idle paused Program generation after this retention period so stale Program state and logical capacity do not persist indefinitely. |
@@ -183,6 +183,8 @@ The built-in values remain backward-compatible defaults. When Program scheduling
 
 For `x = uncached_prompt_tokens / 1000`, the cold-prefill estimate is `prefill_seconds = intercept_seconds + linear_seconds_per_1k_tokens * x + quadratic_seconds_per_1k_tokens_squared * x^2`. Progress-TTL includes mixed-batch decode interference as `cache_miss_impact_seconds = prefill_seconds * (2 - decode_throughput_alpha)`.
 
+Once the continuity window is full, the automatic TTL search considers durations up to `min(max_acting_ttl_seconds, cache_miss_impact_seconds)`. It fits the observed return intervals and selects the duration with the highest estimated utility. Zero is a candidate even when the upper bound is positive.
+
 | `prefill_cost_model` field | Unit | Constraint | Default |
 |---|---|---|---:|
 | `intercept_seconds` | seconds | finite and >= 0 | `0.06600061907132926` |
@@ -200,41 +202,19 @@ For batch size `B` and the sum of full Program contexts `C`, aggregate decode th
 
 ## Performance tuning workflow
 
-Program scheduling improves an HBM-only deployment by retaining reusable Program KV across short tool calls while limiting how many Programs concurrently own logical capacity. Tune it as a sequence of controlled checks: first establish that the baseline has meaningful KV pressure, then verify that scheduling improves token-weighted cache reuse, and only then adjust admission if protection reduces useful backend concurrency too much.
+Start with the [Program tuning skill](../../.agents/skills/program-ttl-tuning/SKILL.md) for the ordered procedure. The [Ascend A3 example](ascend-a3-deepseek-v4-flash.md) follows one workload from a two-turn identity check to a deployment recommendation.
 
 ### Establish a comparable pressure point
 
-Use the same task population, concurrency, sampling settings, model, engine configuration, and DP layout for the baseline and candidate. Replay is preferred because it fixes request dependencies and tool-call intervals. For a live, non-replay comparison, confirm that the completed-task set and total input/output token counts remain close. A large workload difference makes job-completion time incomparable, although throughput can still be reported with that limitation.
-
-Measure prompt-token reuse as `vllm:prompt_tokens_cached_total / vllm:prompt_tokens_total` from the backend metrics. These counters describe the cached portion of the prompt-token workload actually served. Do not substitute `vllm:prefix_cache_queries_total` and `vllm:prefix_cache_hits_total`, which describe prefix-cache lookup accounting and need not match end-to-end prompt-token accounting. If the native baseline already has nearly perfect token cache reuse, the experiment does not exercise the intended mechanism. Increase concurrency or reduce available KV capacity until eviction pressure is visible. A baseline around 80% token cache hit has been useful for controlled evaluation, but it is an experimental pressure point rather than a production target.
-
-Check that the workload contains reuse opportunities before tuning the policy. From a replay `requests.jsonl`, compare completion-to-next-request intervals for each Program with the calibrated cold-prefill or cache-miss impact for its context size. Progress-TTL is most useful when many Programs return from tool calls before recomputing their context would have been cheaper. A workload dominated by long tool calls should naturally produce short or zero automatic TTLs and is primarily a non-regression case.
+Prompt-token hit rate is the sum of worker increases in `vllm:prompt_tokens_cached_total` divided by the sum of increases in `vllm:prompt_tokens_total` over the same run. The `vllm:prefix_cache_queries_total` and `vllm:prefix_cache_hits_total` series count cache lookups. Use the token measure to compare the prompt workload served.
 
 ### Verify KV protection before tuning admission
 
-First compare the baseline and candidate token cache-hit ratio. If it does not improve:
-
-- Confirm that `vllm_router_agent_aware_request_interval_seconds` and `vllm_router_agent_aware_cache_miss_impact_seconds` describe the expected short-tool-call regime.
-- Inspect `vllm_router_agent_aware_armed_ttl_seconds`. A predominance of zero TTLs can mean that the continuity window has not matured, the tool gaps are too long, or the prefill/decode calibration understates recomputation cost.
-- Check `vllm_router_agent_aware_transitions_total` for TTL and `max_segment_yield` pauses. A Program that was not paused but returns with a very low cache hit should also produce `unexpected_cache_discontinuity`; that points to backend eviction or insufficient logical growth reserve rather than an overly short Router TTL.
-- Compare `vllm_router_agent_aware_context_growth_tokens`, the observed shared-prefix tokens, and the configured capacity. Repeatedly exhausting the reserved growth segment before the next request can erase the expected continuity benefit.
-- Use `binding_only: true` as an A/B diagnostic when necessary. It preserves Program-to-Rank affinity while bypassing RequestPool admission and Progress-TTL, separating affinity gains from admission/retention behavior.
-
-Do not lengthen TTL or loosen fairness limits solely to increase cache hit. Validate that the retained KV reduces cold-prefill work and improves the end-to-end objective without starving other Programs.
+The [symptom table](../../.agents/skills/program-ttl-tuning/SKILL.md#5-symptom-to-first-knob) connects TTL, pause and queue observations to the next check. The [engine boundary](#engine-kv-control-boundary) describes which KV operations the Router controls.
 
 ### Diagnose throughput or job-completion regressions
 
-If token cache hit improves but throughput and job completion time regress, admission is probably suppressing useful backend concurrency more than the avoided recomputation is worth. Inspect these signals together:
-
-- `vllm_router_agent_aware_rank_queue_size` and `vllm_router_agent_aware_queue_wait_seconds` for Router-side retention;
-- `vllm_router_agent_aware_rank_active_programs` for the admitted Program set;
-- admission used, required, growth-reserve, capacity-pressure, and projected-pressure metrics for the committed decisions;
-- backend running/waiting requests and `capacity_accounting_source` for each Rank;
-- fitted decode throughput and cold-prefill coefficients for the exact model, accelerator, parallel layout, engine version, and serving configuration.
-
-Common causes are an underestimated shared prefix, an oversized growth reserve, a token capacity that does not match one DP Rank, stale backend observations, or prefill/decode coefficients calibrated on a different deployment. Correct observation and calibration errors before changing watermarks or waiting gates. Then adjust one admission control at a time and repeat the same trace; simultaneous changes make cache-retention gains indistinguishable from concurrency changes.
-
-Report absolute and relative results for job completion time, request throughput/latency, prompt-token cache hit, completed tasks, input/output tokens, cross-Rank migrations, queue-time distribution, and force-resume or maximum-segment-yield events. A higher cache-hit ratio by itself is an intermediate mechanism result, not sufficient evidence of an end-to-end improvement.
+Compare completed tasks and tail latency at normal concurrency using the [controlled comparisons](../../.agents/skills/program-ttl-tuning/SKILL.md#8-ablations-to-run-before-claiming-a-gain).
 
 ## Engine KV-control boundary
 
@@ -294,7 +274,7 @@ future offline seed. File serialization and replacement occur outside the
 scheduler mutex.
 
 In V0, `off` and `shadow` are the only modes. Shadow predictions are visible in
-structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
+structured logs, `/scheduling/diagnostics`, and bounded-cardinality metrics,
 but real decisions continue to use the existing rank-level fitted TTL and
 `decode_buffer_tokens` fallback. Activation requires a separate rollout after
 calibration has been evaluated.

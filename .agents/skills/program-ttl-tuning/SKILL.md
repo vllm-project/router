@@ -59,17 +59,11 @@ record the result as a non-regression case rather than a failed experiment.
 
 ## Facts that drive most decisions
 
-1. The automatic acting TTL is bounded by
-   `min(max_acting_ttl_seconds, cache_miss_impact_seconds)`, where the impact is
-   the calibrated cold-prefill cost for the uncached prefix multiplied by
-   `(2 - prefill_cost_model.decode_throughput_alpha)`. Once the continuity window
-   is mature, the interval fit selects the TTL with the best estimated utility
-   within that bound; it can select a smaller TTL or zero even when the bound is positive.
-   Raising `max_acting_ttl_seconds` alone has no effect while the impact cap
-   binds, and a higher cap does not guarantee a longer selected TTL.
-2. Before `stats_window_size` samples accumulate, the automatic TTL is `0` and
-   the growth reserve is `0`. A cold Router therefore pauses on the first tool
-   gap.
+1. Before raising the TTL cap, check the fitted TTL against the
+   [calibrated cache-miss impact](../../../docs/program_scheduling/program-scheduling.md#offline-calibration-models).
+   A higher cap can still yield a short or zero fitted TTL.
+2. Check [window maturity](../../../docs/program_scheduling/program-scheduling.md#configuration-reference) before
+   interpreting early pauses in a cold run.
 3. Progress-TTL controls Router admission and logical token reservations to
    reduce competing KV demand across tool gaps. It does not pin physical KV
    blocks or execute engine eviction, offload, or prefetch. An engine can still
@@ -80,8 +74,8 @@ record the result as a non-regression case rather than a failed experiment.
 
 ## 1. Preconditions
 
-Do not tune before all three hold; a violation invalidates every later
-comparison.
+Verify identity and comparability before tuning. Record baseline pressure at the
+operating point where the deployment decision will be made.
 
 ### 1.1 Program identity reaches the Router
 
@@ -102,9 +96,9 @@ curl -s "<router-url>/scheduling/diagnostics" |
 grep -c program_admit "<router-log>"     # expect >= 1
 ```
 
-Zero `program_admit` events mean the metrics will be identical for both arms and
-say nothing about the algorithm. Confirm `--intra-node-data-parallel-size`
-equals the engine's data-parallel size, otherwise the per-Rank view is wrong.
+On a shared Router, verify your own session in diagnostics using the
+[two-turn probe](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#verify-two-turns-from-the-actual-client).
+Match `--intra-node-data-parallel-size` to the engine layout.
 
 ### 1.2 A comparable baseline exists
 
@@ -129,13 +123,12 @@ equals the engine's data-parallel size, otherwise the per-Rank view is wrong.
 
 ### 1.3 The baseline has eviction pressure
 
-Measure `vllm:prompt_tokens_cached_total / vllm:prompt_tokens_total` on the
-baseline. Aim for roughly 80–88%: above ~95% there is nothing to protect, below
-~75% both arms sit near timeouts and the measurement is noisy. Adjust
-concurrency or KV capacity until the band is hit.
+Measure the baseline token hit rate from counter increases across workers.
+For a controlled pressure sweep, roughly 80–88% is a useful starting point.
+For a deployment decision, keep normal concurrency and capacity and compare
+task completion and tail latency even when the baseline falls outside the band.
 
-Do not use `vllm:prefix_cache_queries_total` / `vllm:prefix_cache_hits_total`;
-they describe lookup accounting, not served prompt tokens.
+Use the [prompt-token metric definition](../../../docs/program_scheduling/program-scheduling.md#establish-a-comparable-pressure-point).
 
 ## 2. Three quantities to measure first
 
@@ -230,30 +223,27 @@ record the workload as outside the target bands rather than forcing eviction.
 Calibrate `prefill_cost_model` and `decode_throughput_model` on the target
 deployment with the AgentInfer calibration tooling listed under References.
 Keep the fit-quality evidence; a prefill fit below R² ≈ 0.98 is not usable.
-Write all seven fields explicitly, otherwise startup reports
-`program_scheduling_reference_calibration` and the reference coefficients
-silently drive TTL decisions.
+Check the [coefficient mapping and startup warning](../../../docs/program_scheduling/program-scheduling.md#offline-calibration-models)
+when verifying the deployed profile.
 
-Idle-engine calibration systematically understates recomputation cost: queueing,
-chunked-prefill contention, and preemption are not exercised. Understated cost
-shrinks the fitted TTL to seconds, so every tool gap pauses. Two remedies,
-either acceptable if recorded in the report:
-
-- calibrate against a loaded engine with representative concurrency, or
-- fit the coefficients from a baseline-arm request log (the Program arm's Router
-  queue time contaminates client-side TTFT, so it must not be the source).
+Run the AgentInfer measurement commands on an otherwise idle worker. At normal
+concurrency, compare their predictions with native-baseline engine timings.
+The [A3 baseline fitting recipe](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#calibrate-the-cost-models-from-engine-timings)
+shows how to refit under load when request-level prefill timing and decode batch
+observations are available.
 
 `prefill_cost_model.decode_throughput_alpha` is configured within
 `prefill_cost_model`, separately from the fitted coefficients, and is not
-produced by calibration. Keep 0.15 unless a single sweep of 0.10 / 0.15 / 0.25
-is part of the experiment.
+produced by calibration. Keep the configured value unless a separate sweep
+of this field is part of the experiment.
 
 ### 3.5 Pressure point
 
 On the baseline arm, sweep a few concurrency values with a small task subset and
 pick the value that lands the token cache hit in the 80–88% band. The band is a
-heuristic for workloads capable of high reuse at low pressure; if the workload
-cannot reach it, record a non-regression result instead of forcing eviction.
+heuristic for workloads capable of high reuse at low pressure. If the workload
+cannot reach it, record the observed pressure and use the normal-concurrency
+comparison in section 8 for the deployment decision.
 Each probe needs its own result directory, and probe runs are not evidence:
 restart both the Router and engines before the recorded arms, following section
 1.2. Freeze concurrency here.
@@ -266,48 +256,48 @@ changes dominate everything.
 
 ### 4.1 Capacity and admission
 
-| Field | Default | Guidance |
-|---|---:|---|
-| `token_capacity_per_dp_rank` | `null` (count guard only) | One scalar for all Ranks: start with `floor(0.95 * smallest rank log capacity)`; see section 3.1. Recheck it when persistent queueing or INFO `unexpected_cache_discontinuity` events appear, but neither alone proves a capacity error |
-| `max_active_programs_per_target` | `64` | Scale with concurrency: about `CC / dp * 1.2`. Leaving it at a value sized for a smaller run makes the count guard bind before token admission |
-| `high_watermark_ratio` / `low_watermark_ratio` | `1.0` / `1.0` | Keep 1.0 when capacity already carries the 0.95 discount |
-| `admission_waiting_request_threshold` | `1` | Backend waiting-queue ceiling: ordinary admission/resume blocks when `waiting >= threshold`; `0` disables the gate. Raising it relaxes backpressure and can worsen backend queueing. Increase only when evidence shows the gate suppresses useful concurrency, not in response to a request avalanche |
-| `decode_buffer_tokens` | `100` | Raise toward the p95 output length when harnesses omit `expected_output_length` |
+| Field | Guidance |
+|---|---|
+| `token_capacity_per_dp_rank` | One scalar for all Ranks: start with `floor(0.95 * smallest rank log capacity)`; see section 3.1. Recheck it when persistent queueing or INFO `unexpected_cache_discontinuity` events appear, but neither alone proves a capacity error |
+| `max_active_programs_per_target` | Scale with concurrency: about `CC / dp * 1.2`. Leaving it at a value sized for a smaller run makes the count guard bind before token admission |
+| `high_watermark_ratio` / `low_watermark_ratio` | Keep 1.0 when capacity already carries the 0.95 discount |
+| `admission_waiting_request_threshold` | Omission and zero both select the [mode-specific threshold](../../../docs/program_scheduling/program-scheduling.md#configuration-reference). On this internal-DP path, one waiting backend request then blocks ordinary admission or resume. Raise the threshold only if this gate blocks useful concurrency and the backend has headroom. |
+| `decode_buffer_tokens` | Raise toward the p95 output length when harnesses omit `expected_output_length` |
 
 ### 4.2 Queue timeouts and Program lifetime
 
-| Field | Default | Guidance |
-|---|---:|---|
-| `queue_timeout_seconds` | `600` | Must stay well below the client's own timeout. A multi-minute pool timeout shows up as a TTFT tail, not as engine queueing |
-| `force_resume_timeout_seconds` | `300` | Anti-starvation bound; keep it below the task timeout and above normal queueing |
-| `paused_retention_ttl_seconds` | `1800` | About 1–2x the p95 task duration |
+| Field | Guidance |
+|---|---|
+| `queue_timeout_seconds` | Must stay well below the client's own timeout. A multi-minute pool timeout shows up as a TTFT tail, not as engine queueing |
+| `force_resume_timeout_seconds` | Anti-starvation bound; keep it below the task timeout and above normal queueing |
+| `paused_retention_ttl_seconds` | About 1–2x the p95 task duration |
 
 ### 4.3 Progress-TTL
 
-| Field | Default | Guidance |
-|---|---:|---|
-| `max_acting_ttl_seconds` | `10` | Only a bound. Change it after, not before, the cost model is trustworthy |
-| `stats_window_size` | `100` | Lower it for short experiments; otherwise the first minutes run with TTL = 0 |
-| `prefill_cost_model.*` | reference values | Calibrated values determine cache-miss impact; a non-zero TTL also requires a mature interval window and a useful fitted candidate |
-| `prefill_cost_model.decode_throughput_alpha` | `0.15` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
-| request-level `kv_retention_ttl_seconds` | unset | Overrides the computed TTL without the impact cap on this internal-DP path. Use for the controlled retention diagnostic in section 5; measure queueing and end-to-end cost before keeping an override |
+| Field | Guidance |
+|---|---|
+| `max_acting_ttl_seconds` | Only a bound. Change it after, not before, the cost model is trustworthy |
+| `stats_window_size` | Check the valid sample count before shortening the window for a brief experiment. |
+| `prefill_cost_model.*` | Calibrated values determine cache-miss impact; a non-zero TTL also requires a mature interval window and a useful fitted candidate |
+| `prefill_cost_model.decode_throughput_alpha` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
+| request-level `kv_retention_ttl_seconds` | Overrides the computed TTL without the impact cap on this internal-DP path. Use for the controlled retention diagnostic in section 5; measure queueing and end-to-end cost before keeping an override |
 
 ### 4.4 Placement
 
-| Field | Default | Guidance |
-|---|---:|---|
-| `binding_strategy` | `consistent_hash` | Keep it; most measurable benefit comes from returning to the same Rank |
-| `global_queue` | `false` | Enable only when the in-flight ratio is high enough that cross-Rank moves buy capacity. At low pressure they only destroy per-Rank prefix cache |
-| `cross_rank_headroom_ratio` | `1.2` | Raise to make migration rarer when `global_queue` is on |
-| `binding_only` | `false` | Set `true` for the affinity-only diagnostic arm |
+| Field | Guidance |
+|---|---|
+| `binding_strategy` | Start with the default and measure the benefit of returning to the same Rank |
+| `global_queue` | Enable only when the in-flight ratio is high enough that cross-Rank moves buy capacity. At low pressure they only destroy per-Rank prefix cache |
+| `cross_rank_headroom_ratio` | Raise to make migration rarer when `global_queue` is on |
+| `binding_only` | Set `true` for the affinity-only diagnostic arm |
 
 ### 4.5 Fairness and isolation
 
-| Field | Default | Guidance |
-|---|---:|---|
-| `resume_order` | `mru` | `fcfs` is a fairness experiment, not a fix for low hit rate |
-| `max_segment_rounds` | `14` | Lower under heavy contention; raise if segment yields dominate the transition counters |
-| `enable_batch_gain_admission` | `true` | Turn off only to isolate another variable |
+| Field | Guidance |
+|---|---|
+| `resume_order` | `fcfs` is a fairness experiment, not a fix for low hit rate |
+| `max_segment_rounds` | Lower under heavy contention; raise if segment yields dominate the transition counters |
+| `enable_batch_gain_admission` | Turn off only to isolate another variable |
 
 ## 5. Symptom to first knob
 
@@ -316,7 +306,7 @@ Mechanism side, use `vllm_router_agent_aware_*` Prometheus metrics,
 
 | Observation | Likely cause | First change |
 |---|---|---|
-| `armed_ttl_seconds` near zero | window not matured, gaps longer than TTL, or understated cost | let the run reach maturity, then lower `stats_window_size`, then recalibrate |
+| Short TTLs in the `vllm_router_agent_aware_armed_ttl_seconds` histogram | Incomplete continuity window, long return gaps, or underestimated recomputation cost | In `/scheduling/diagnostics`, check `ranks[].rolling.continuity_window_complete` and `ranks[].rolling.fitted_acting_ttl_seconds`. Compare the mature fit with observed return gaps and engine timings before changing the window or cost model. |
 | many `max_segment_yield` pauses | one Program consumes full segments | raise `max_segment_rounds`, or lower `force_resume_timeout_seconds` |
 | `unexpected_cache_discontinuity` (Router INFO log event) | explicitly reported cached tokens fall below the continuity threshold relative to the previous context within one placement; this alone does not prove physical eviction | inspect the log's `cached_prompt_tokens`, `previous_context_tokens`, and `cache_hit_vs_previous_context`; check whether the request prefix changed and correlate with backend cache pressure before changing capacity or concurrency |
 | `capacity_accounting_source` falls back (diagnostics) | missing engine labels or stale observations | verify per-engine metric labels, single API server per worker, idle run before traffic |
@@ -434,8 +424,7 @@ queueing, task completion, and end-to-end cost.
 ## References
 
 - [`docs/program_scheduling/program-scheduling.md`](../../../docs/program_scheduling/program-scheduling.md) —
-  configuration reference, calibration models, request metadata, and the
-  upstream tuning workflow.
+  configuration reference, calibration models, request metadata and metric definitions.
 - [PR #286](https://github.com/vllm-project/router/pull/286) — Program-level
   Progress-TTL.
 - [AgentInfer calibration tooling](https://github.com/openJiuwen-ai/agent-infer/tree/main/tools/calibration)

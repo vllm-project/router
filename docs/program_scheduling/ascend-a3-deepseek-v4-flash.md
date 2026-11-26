@@ -58,6 +58,18 @@ print(fit_file("decode-points.json", fit_decode))
 
 </details>
 
+### Launch the comparison modes
+
+Use the native `--policy cache_aware` command as the baseline. Keep the worker endpoints and DP layout the same in all runs. For the two Program modes, add these arguments to the native command, using the calibration JSON from the preceding step:
+
+```diff
+  --policy cache_aware
++ --enable-program-scheduling
++ --program-scheduling-config-json "$(jq -c --argjson binding "$BINDING_ONLY" '.binding_only = $binding' program-scheduling.json)"
+```
+
+Set `BINDING_ONLY=true` for affinity only and `BINDING_ONLY=false` for full scheduling. The optional C0 control uses the full-scheduling command with a per-request TTL override, shown below.
+
 ### Verify two turns from the actual client
 
 Send two turns through the **actual client** to the Router's `/v1/chat/completions`. Save each outgoing body and take a diagnostics snapshot immediately after each response. If the entry expires first, capture it while the request is in flight. The first body's scheduling fields are shown below. Change `request_id` to `r2` and `step_id` to `2` for the second turn. Use a fresh session ID for each probe.
