@@ -105,7 +105,7 @@ impl ProgramScheduler {
         }
         let arrived_at = Instant::now();
         let expected_resume = identity.expected_resume();
-        let (handle, pending_output_prediction) = {
+        let (handle, pending_output_prediction, return_time_keys) = {
             let mut state = self.state.lock();
             // Resolution happens before acquiring this lock; a settlement may
             // have revoked the fingerprint in the meantime.
@@ -209,6 +209,17 @@ impl ProgramScheduler {
                 arrived_at,
                 routing_text.as_deref(),
             );
+            // Snapshot after assigning the arrival's explicit or inferred step, while
+            // holding the lock. Queuing and later arrivals must not change these keys.
+            let return_time_keys = if self.config.prediction_profile.mode != PredictionMode::Off {
+                super::return_time::keys_for_decision(
+                    &state.decisions[&reference],
+                    identity.model_pool(),
+                    &self.config.prediction_profile,
+                )
+            } else {
+                Vec::new()
+            };
             let mut pending_output_prediction = None;
             if self.config.prediction_profile.mode != PredictionMode::Off {
                 let keys = output_length::keys_for_request(&identity);
@@ -318,17 +329,21 @@ impl ProgramScheduler {
             } else {
                 self.run_request_arrival_decisions(&mut state, arrived_at);
             }
-            (handle, pending_output_prediction)
+            (handle, pending_output_prediction, return_time_keys)
         };
         let mut guard = AdmissionGuard::new(self, handle);
         let mut pending_output_prediction = pending_output_prediction;
+        let mut return_time_keys = return_time_keys;
         let deadline = arrived_at + self.config.queue_timeout;
         loop {
             let wait_handle = guard.handle().clone();
             let notified = wait_handle.notified();
             if let Some(mut dispatch) = self.claim_dispatch(guard.handle()) {
-                dispatch
-                    .attach_prediction_context(expected_resume, pending_output_prediction.take());
+                dispatch.attach_prediction_context(
+                    expected_resume,
+                    pending_output_prediction.take(),
+                    std::mem::take(&mut return_time_keys),
+                );
                 guard.disarm();
                 return Ok(dispatch);
             }
@@ -2272,6 +2287,8 @@ mod tests {
         assert_ne!(first.attempt_id(), retry.attempt_id());
         assert!(!retry.expected_resume());
         assert!(retry.pending_output_prediction().is_some());
+        assert!(!first.return_time_keys().is_empty());
+        assert_eq!(retry.return_time_keys(), first.return_time_keys());
         scheduler.complete(&first, false, false, Some(20), None);
         assert!(scheduler.dispatch_is_current(&retry));
         pd_observe(&scheduler, 0.95);

@@ -15,7 +15,7 @@ completed sessions. The workload no longer includes `c16` or `c32` cells.
 
 Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
 
-Worker and router processes use [`perf/process.py`](../process.py), the same launch path as `perf/grpc`.
+Worker and router processes use [`helpers/process.py`](../../../helpers/process.py), the same launch path as `perf/grpc`.
 
 ## Run
 
@@ -48,7 +48,7 @@ Before replay, the cell runner **removes `result/`** if it already exists. The c
 
 **Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
-Worker and router processes are started with `perf/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
+Worker and router processes are started with `helpers/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
 
 All six scenarios use the same vLLM 0.30.0 KV-event contract described in the
 [KV-aware worker requirements](https://github.com/vllm-project/router/blob/main/docs/load_balancing/kv_aware.md#worker-requirements).
