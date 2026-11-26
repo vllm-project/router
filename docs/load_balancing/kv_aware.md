@@ -316,28 +316,6 @@ Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `t
 </details>
 
 <details>
-<summary>Ascend · HY4 Flash</summary>
-
-Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/HY4-Flash.html).
-
-```json
-{
-  "rank": 0,
-  "hash_block_size": 64,
-  "speculative_tokens": 0,
-  "declared_groups": 1,
-  "groups": [
-    {"kind": "mla_attention", "block_size": 64, "cache_role": "sparse", "tokens_per_state": "1"}
-  ]
-}
-```
-
-- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, and `tail_drop_groups` to `[]`.
-- For P/D, use the Prefill worker URL and set `--kv-connector mooncake-v2`.
-
-</details>
-
-<details>
 <summary>GPU · DeepSeek-V4-Flash-0731</summary>
 
 ```json
@@ -534,6 +512,28 @@ Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe
   ]
 }
 ```
+
+</details>
+
+<details>
+<summary>Ascend A5 · HY4 Flash</summary>
+
+Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/HY4-Flash.html).
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 64,
+  "speculative_tokens": 0,
+  "declared_groups": 1,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 64, "cache_role": "sparse", "tokens_per_state": "1"}
+  ]
+}
+```
+
+- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, and `tail_drop_groups` to `[]`.
+- For P/D, use the Prefill worker URL and set `--kv-connector mooncake-v2`.
 
 </details>
 
