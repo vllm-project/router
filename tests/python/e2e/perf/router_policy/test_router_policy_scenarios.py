@@ -31,6 +31,8 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
         run_suffix=run_suffix,
     )
     stats = json.loads((cell_out / "calibration.json").read_text(encoding="utf-8"))
+    errors = stats["router_policy_checks"]["errors"]
+    assert not errors, "\n".join(errors)
     summary = router_policy_result_path(
         stats["scenario"], stats["concurrency"], stats["task_num"], run_suffix
     )

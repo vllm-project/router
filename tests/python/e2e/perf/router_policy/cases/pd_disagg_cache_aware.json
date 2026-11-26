@@ -9,11 +9,7 @@
   },
   "benchmark_params": {
     "task-num": 8,
-    "max-concurrency": [
-      8,
-      16,
-      32
-    ],
+    "max-concurrency": [8],
     "gap_scale": 0.002,
     "max_inflight": 1,
     "task_stagger": 0

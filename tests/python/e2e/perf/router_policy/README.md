@@ -1,12 +1,17 @@
 # router_policy — TraceLab and AgentX cold replay, router policy × concurrency
 
-Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` lists 8, 16, and 32; pytest expands those into cells `pd_merge_cache_aware/c16` and so on:
+Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` is `[8]`; pytest collects one cell per scenario, such as `pd_merge_cache_aware/c8`:
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
 - **`workers`** — engine count and per-worker serve args (KV, max_model_len, optional `gpu_memory_utilization`, optional `kv_cache_metrics` / `kv_cache_metrics_sample` → vLLM `--kv-cache-metrics`, …)
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
-- **`benchmark_params`** — `max-concurrency` (8, 16, 32), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
+- **`benchmark_params`** — `max-concurrency` (`[8]`), task-num, and the rest of the replay settings. pytest asserts **all** replay rows in `requests.jsonl` are `success` (no fixed request count)
+
+All six scenarios use eight replay sessions with serial requests within each
+session. `c8` denotes the configured session-concurrency limit; the request
+concurrency is at most eight and can be lower because of trace gaps and
+completed sessions. The workload no longer includes `c16` or `c32` cells.
 
 Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
 
@@ -25,7 +30,7 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -v
 One concurrency / policy. `-sv` shows worker, router, and replay lines on stderr:
 
 ```bash
-pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'pd_merge_kv_aware/c16'
+pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -k 'pd_merge_kv_aware/c8'
 ```
 
 ## Artifacts layout
@@ -88,13 +93,65 @@ requests successful still fails if no valid TPOT samples remain (for example,
 all outputs have at most one token) or JCT durations are unavailable. Its
 `calibration.json` is retained for diagnosis.
 
+Both merged and disaggregated `kv_aware` / `kv_aware_aff` cells also validate
+router activity from the existing `after/router.prom` snapshot, scraped from
+the router's dedicated Prometheus port after replay. Each cell starts a fresh
+router, so these counters belong to that cell. The runner checks snapshot HTTP
+status codes before saving metrics.
+
+- Index liveness requires a nonzero
+  `vllm_router_kv_placement_lookups_total{result="hit"}` or `result="miss"`.
+  `index_unavailable`, `missing_tokens`, other fallback results, and nonzero
+  `vllm_router_kv_routing_inputs_total` alone do not prove a verified index was
+  queried. A miss is valid activity; a cache hit is not required.
+- Disaggregated affinity cells require a nonzero
+  `vllm_router_pd_affinity_decisions_total{stage="decode",outcome="bind"}` or
+  `outcome="sticky_hit"`. Decisions from the Prefill stage do not qualify.
+- Merged affinity cells use the existing regular-router metric instead:
+  `vllm_router_prefix_routing_decisions_total{policy="kv_aware",stage="regular",outcome="sticky_hit"}`.
+  Merged routing has no separate Decode-stage affinity counter.
+- `cache_aware` cells skip both checks.
+
+Counts and diagnostic errors are recorded in `router_policy_checks`. Missing,
+zero, or invalid required counters fail the cell before dashboard publication,
+even if every request succeeded. Index failures point to KV event subscriptions
+and the engine's `sha256_cbor` discovery contract (see #493). These are functional
+activity checks, with no latency thresholds or baseline comparisons. No extra
+replay requests or metric scrapes are added.
+
+The `prefill` block reports interval metrics computed once in
+`write_calibration()` from the existing `before/` and `after/` Prometheus
+snapshots. PD cells include only workers before `workers.prefill_count`;
+merged cells include all workers, which also perform Prefill.
+
+| Field | Meaning |
+| --- | --- |
+| `prefill.prefix_cache_hit_rate` | Sum of Prefill `prefix_cache_hits_total` deltas divided by the sum of `prefix_cache_queries_total` deltas. Worker percentages are not averaged. |
+| `prefill.new_prompt_tokens` | Sum of Prefill `prompt_tokens_by_source_total{source="local_compute"}` deltas, the actual locally computed prompt tokens. |
+| `prefill.new_prompt_tokens_max_mean` | Maximum per-worker new prompt tokens divided by their mean. |
+| `prefill.workers` | Worker indices and individual token-counter deltas, including new prompt tokens per worker. |
+| `prefill.unavailable_metrics` | Fields unavailable because a counter is missing, invalid, or reset between snapshots. |
+
+Counter label series are summed within each worker. The `local_cache_hit` and
+`external_kv_transfer` source series are excluded from locally computed tokens.
+The counter definitions follow [vLLM 0.30.0](https://github.com/vllm-project/vllm/blob/v0.30.0/vllm/v1/metrics/stats.py).
+An aggregate is `null` if any contributing worker is unavailable. Zero counters
+stay zero; a hit rate with no queries or skew with no new tokens is `null`.
+These fields are report-only and do not add performance thresholds or affect
+the existing latency-validation gate. The result publisher copies the same
+`calibration.json`, including this block, without recomputing any metrics.
+
+The historical `cache_hit_rate` field remains the cumulative, all-worker cache
+lookup ratio. The new `prefill.prefix_cache_hit_rate` uses Prefill interval
+counters.
+
 ## Buildkite nightly (L3)
 
 Two steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
 run on `l4_4` (four L4 GPUs).
 
-- `router-policy-perf-e2e` selects `pd_merge and c16` and runs the three merged scenarios.
-- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c16` and runs the three
+- `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged scenarios.
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c8` and runs the three
   disaggregated scenarios. Failures in either step fail the Buildkite build.
 
 The PD cases use two prefill workers and two decode workers, each on its own
@@ -123,7 +180,7 @@ before GPU processes start. Local pytest runs use the same setup.
 Run the three PD scenarios in an environment with four supported CUDA GPUs.
 
 ```bash
-python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c16'
+python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c8'
 ```
 
 Earlier TraceLab runs of cache-aware and KV-aware affinity passed on two L20

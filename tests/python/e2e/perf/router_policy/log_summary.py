@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from stack_launcher import RouterPolicyStack
 
 METRIC = re.compile(r"^([a-zA-Z0-9_:]+)(\{[^}]*\})?\s+([0-9.eE+-]+)$")
+PROM_SAMPLE = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)(?:\s+\S+)?")
+PROM_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+PREFILL_COUNTERS = {
+    "vllm:prefix_cache_hits_total": "prefix_cache_hits",
+    "vllm:prefix_cache_queries_total": "prefix_cache_queries",
+    "vllm:prompt_tokens_by_source_total": "new_prompt_tokens",
+}
 
 
 def print_artifacts(
@@ -100,6 +107,9 @@ def emit_run_summary(
                     + ", ".join(stats["missing_latency_metrics"]),
                     flush=True,
                 )
+            elif stats.get("router_policy_checks", {}).get("errors"):
+                for error in stats["router_policy_checks"]["errors"]:
+                    print(f"DIAGNOSTIC {error}", flush=True)
             elif stalled or stats["success"] != stats["requests"]:
                 print(
                     "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
@@ -131,6 +141,173 @@ def sum_metric(path, name):
         if match and match.group(1) == name:
             total += float(match.group(3))
     return total
+
+
+def _prefill_counters(path: Path) -> dict[str, float | None]:
+    """Read token counters, preserving missing or invalid samples as unknown."""
+
+    counters: dict[str, float | None] = dict.fromkeys(PREFILL_COUNTERS.values())
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return counters
+    invalid: set[str] = set()
+    for line in lines:
+        match = PROM_SAMPLE.fullmatch(line.strip())
+        if not match or match[1] not in PREFILL_COUNTERS:
+            continue
+        field = PREFILL_COUNTERS[match[1]]
+        if field == "new_prompt_tokens":
+            labels = dict(PROM_LABEL.findall(match[2] or ""))
+            if labels.get("source") != "local_compute":
+                continue
+        try:
+            value = float(match[3])
+        except ValueError:
+            invalid.add(field)
+            continue
+        total = (counters[field] or 0.0) + value
+        if not math.isfinite(value) or value < 0 or not math.isfinite(total):
+            invalid.add(field)
+            continue
+        counters[field] = total
+    for field in invalid:
+        counters[field] = None
+    return counters
+
+
+def _prefill_metrics(run: RouterPolicyStack) -> dict[str, Any]:
+    """Summarize interval counters for Prefill workers (all workers when merged)."""
+
+    worker_count = run.case.prefill_count or run.case.worker_count
+    workers: list[dict[str, Any]] = []
+    unavailable: list[str] = []
+    for i in range(worker_count):
+        before = _prefill_counters(run.out / "before" / f"engine{i}.prom")
+        after = _prefill_counters(run.out / "after" / f"engine{i}.prom")
+        worker: dict[str, Any] = {"worker_index": i}
+        for field in PREFILL_COUNTERS.values():
+            start, end = before[field], after[field]
+            if start is None or end is None or end < start:
+                worker[field] = None
+                unavailable.append(f"engine{i}.{field}")
+            else:
+                worker[field] = end - start
+        workers.append(worker)
+
+    def total(field: str) -> float | None:
+        values = [worker[field] for worker in workers]
+        if not values or any(value is None for value in values):
+            return None
+        value = sum(values)
+        if not math.isfinite(value):
+            unavailable.append(field)
+            return None
+        return value
+
+    hits = total("prefix_cache_hits")
+    queries = total("prefix_cache_queries")
+    new_tokens = total("new_prompt_tokens")
+    hit_rate = None
+    if hits is not None and queries is not None:
+        if hits > queries:
+            unavailable.append("prefix_cache_hit_rate")
+        elif queries > 0:
+            hit_rate = hits / queries
+    skew = None
+    if new_tokens:
+        skew = max(worker["new_prompt_tokens"] for worker in workers) / (
+            new_tokens / len(workers)
+        )
+    return {
+        "prefix_cache_hit_rate": hit_rate,
+        "new_prompt_tokens": new_tokens,
+        "new_prompt_tokens_max_mean": skew,
+        "workers": workers,
+        "unavailable_metrics": unavailable,
+    }
+
+
+def _router_policy_checks(run: RouterPolicyStack) -> dict[str, Any]:
+    """Check index/affinity activity from the final snapshot of this cell's router."""
+
+    checks: dict[str, Any] = {"errors": []}
+    if run.case.policy not in {"kv_aware", "kv_aware_aff"}:
+        return checks
+    placement_metric = "vllm_router_kv_placement_lookups_total"
+    selectors = {
+        "hit": (placement_metric, {"result": "hit"}),
+        "miss": (placement_metric, {"result": "miss"}),
+    }
+    if run.case.policy == "kv_aware_aff":
+        if run.case.prefill_count:
+            affinity_metric = "vllm_router_pd_affinity_decisions_total"
+            affinity_labels = {"stage": "decode"}
+            outcomes = ("bind", "sticky_hit")
+        else:
+            affinity_metric = "vllm_router_prefix_routing_decisions_total"
+            affinity_labels = {"policy": "kv_aware", "stage": "regular"}
+            outcomes = ("sticky_hit",)
+        selectors.update(
+            {
+                outcome: (affinity_metric, {**affinity_labels, "outcome": outcome})
+                for outcome in outcomes
+            }
+        )
+
+    counters: dict[str, float | None] = dict.fromkeys(selectors, 0.0)
+    snapshot = run.out / "after/router.prom"
+    lines = (
+        snapshot.read_text(encoding="utf-8").splitlines() if snapshot.is_file() else []
+    )
+    for line in lines:
+        match = PROM_SAMPLE.fullmatch(line.strip())
+        if not match:
+            continue
+        labels = dict(PROM_LABEL.findall(match[2] or ""))
+        for field, (name, required) in selectors.items():
+            if match[1] != name or any(labels.get(k) != v for k, v in required.items()):
+                continue
+            if counters[field] is None:
+                continue
+            try:
+                value = float(match[3])
+            except ValueError:
+                value = math.nan
+            total = counters[field] + value
+            counters[field] = (
+                total
+                if value >= 0 and math.isfinite(value) and math.isfinite(total)
+                else None
+            )
+
+    def active(fields):
+        values = [counters[field] for field in fields]
+        return all(value is not None for value in values) and any(
+            value > 0 for value in values
+        )
+
+    checks["placement_lookups"] = {field: counters[field] for field in ("hit", "miss")}
+    if not active(("hit", "miss")):
+        checks["errors"].append(
+            "kv_aware ran with zero KV placement lookups against a verified index "
+            "(or invalid counters) — check that the router has active KV event "
+            "subscriptions and the engine publishes the sha256_cbor contract "
+            f"(see #493); snapshot={snapshot}"
+        )
+    if run.case.policy == "kv_aware_aff":
+        checks["affinity"] = {
+            "metric": affinity_metric,
+            "stage": affinity_labels["stage"],
+            **{outcome: counters[outcome] for outcome in outcomes},
+        }
+        if not active(outcomes):
+            checks["errors"].append(
+                f"kv_aware_aff ran with no active {affinity_labels['stage']} affinity "
+                f"decisions: require nonzero {' or '.join(outcomes)} in {affinity_metric}; "
+                f"check session identity and affinity configuration; snapshot={snapshot}"
+            )
+    return checks
 
 
 def pct(values, p):
@@ -355,6 +532,8 @@ def write_calibration(
                 for i in range(case.worker_count)
             ),
         ),
+        "prefill": _prefill_metrics(run),
+        "router_policy_checks": _router_policy_checks(run),
     }
     missing_metrics = [
         metric
@@ -370,6 +549,8 @@ def write_calibration(
     if missing_metrics:
         stats["ok"] = False
         stats["missing_latency_metrics"] = missing_metrics
+    if stats["router_policy_checks"]["errors"]:
+        stats["ok"] = False
     stats = add_missing_metadata(
         stats,
         {

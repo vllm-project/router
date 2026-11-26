@@ -558,16 +558,18 @@ def _require_resolved_kv_events(run: RouterPolicyStack) -> None:
             raise RuntimeError(f"{label} still advertises port 0: {unresolved}")
 
 
-def snapshot(run: RouterPolicyStack, dest):
+def snapshot(run: RouterPolicyStack, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
     ports = run.ports
-    for i in range(run.case.worker_count):
-        (dest / f"engine{i}.prom").write_text(
-            run.clients.get(f"http://127.0.0.1:{ports['http'][i]}/metrics").text
-        )
-    (dest / "router.prom").write_text(
-        run.clients.get(f"http://127.0.0.1:{ports['metrics']}/metrics").text
-    )
+    endpoints = {
+        f"engine{i}.prom": f"http://127.0.0.1:{ports['http'][i]}/metrics"
+        for i in range(run.case.worker_count)
+    }
+    endpoints["router.prom"] = f"http://127.0.0.1:{ports['metrics']}/metrics"
+    for filename, url in endpoints.items():
+        response = run.clients.get(url)
+        response.raise_for_status()
+        (dest / filename).write_text(response.text, encoding="utf-8")
 
 
 def run_router_policy_cell(

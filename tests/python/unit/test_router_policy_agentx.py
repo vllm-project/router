@@ -7,14 +7,51 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 import yaml
 
 from tests.python.e2e.perf.router_policy import case_loader
 from tests.python.e2e.perf.router_policy.data.extract_agentx_ci import extract
-from tests.python.e2e.perf.router_policy.stack_launcher import runtime_config
+from tests.python.e2e.perf.router_policy.stack_launcher import runtime_config, snapshot
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 SUITE = Path(case_loader.__file__).resolve().parent
+
+
+@pytest.mark.parametrize("router_status", [200, 503])
+def test_snapshot_uses_router_metrics_port_and_checks_http_status(
+    tmp_path, router_status
+):
+    requests = []
+
+    def handle(request):
+        requests.append(str(request.url))
+        if request.url.port == 30001:
+            return httpx.Response(router_status, text="router metrics\n")
+        return httpx.Response(200, text="worker metrics\n")
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        run = SimpleNamespace(
+            case=SimpleNamespace(worker_count=1),
+            clients=client,
+            ports={"router": 30000, "metrics": 30001, "http": [30002]},
+        )
+        if router_status == 200:
+            snapshot(run, tmp_path)
+            assert (tmp_path / "router.prom").read_text(
+                encoding="utf-8"
+            ) == "router metrics\n"
+            assert (tmp_path / "engine0.prom").read_text(
+                encoding="utf-8"
+            ) == "worker metrics\n"
+        else:
+            with pytest.raises(httpx.HTTPStatusError):
+                snapshot(run, tmp_path)
+            assert not (tmp_path / "router.prom").exists()
+    assert requests == [
+        "http://127.0.0.1:30002/metrics",
+        "http://127.0.0.1:30001/metrics",
+    ]
 
 
 def test_agentx_slice_matches_manifest_and_pd_cases():
@@ -107,7 +144,7 @@ def test_replay_uses_the_matching_adapter_template(
     )
     monkeypatch.setattr(case_loader, "_vllm_rs_bin", lambda: "vllm-rs")
     case = case_loader.load_router_policy_case(
-        SUITE / "cases" / f"{scenario}.json", concurrency=16
+        SUITE / "cases" / f"{scenario}.json", concurrency=8
     )
     assert case.replay_config.name == template
     run = SimpleNamespace(
