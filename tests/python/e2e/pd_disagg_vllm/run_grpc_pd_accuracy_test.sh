@@ -210,10 +210,13 @@ launch_worker() {
   local events_args=()
   kv=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$role")
   if [[ "$GRPC_PD_POLICY" == "kv_aware_affinity" ]]; then
-    events_args=(--kv-events-config "$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:%s"}' "$events_port")")
+    local kv_topic
+    kv_topic="$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')"
+    events_args=(--kv-events-config "$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:%s","topic":"%s","replay_endpoint":"tcp://127.0.0.1:%s","buffer_steps":10000}' "$events_port" "$kv_topic" "$((events_port + 1))")")
   fi
   echo "launch ${name} gpus=${gpus} dp=${INTRA_NODE_DP_SIZE} http=${http} grpc=${grpc} side=${side} role=${role}"
   CUDA_VISIBLE_DEVICES="$gpus" \
+    VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 \
     VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1 \
     VLLM_NIXL_SIDE_CHANNEL_PORT="$side" \
     UCX_TLS="$UCX_TLS" \
@@ -230,6 +233,7 @@ launch_worker() {
       --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
       --enforce-eager \
       --enable-prefix-caching \
+      --prefix-caching-hash-algo sha256_cbor \
       --disable-hybrid-kv-cache-manager \
       --served-model-name "$SERVED_MODEL" \
       --kv-transfer-config "$kv" \
