@@ -1012,6 +1012,21 @@ struct PlannedPeer<'a> {
     registration: Option<Arc<PeerRegistration>>,
 }
 
+/// What `plan_transfer_for_pick` plans from: the selection snapshot plus the
+/// picked position.
+struct PlanInputs<'a, 'w> {
+    planner: &'a dyn PeerFetchPlanner,
+    workers: &'w [Arc<dyn Worker>],
+    plan: &'a SelectionPlan,
+    candidates: &'a [CandidateView<'a>],
+    /// Index of the picked candidate.
+    position: usize,
+    /// The pick came from a session binding, so no transfer is planned.
+    used_binding: bool,
+    /// Whether the candidate at an index is excluded as a source.
+    excluded: &'a dyn Fn(usize) -> bool,
+}
+
 /// Active-mode state: the per-source cap and the runtime kill switch.
 #[derive(Debug)]
 struct PeerFetchState {
@@ -1656,15 +1671,15 @@ impl KvAwarePolicy {
                     PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PromptLogprobs).record();
                     return None;
                 }
-                self.plan_transfer_for_pick(
+                self.plan_transfer_for_pick(PlanInputs {
                     planner,
                     workers,
-                    &plan,
-                    &candidates,
+                    plan: &plan,
+                    candidates: &candidates,
                     position,
                     used_binding,
-                    &excluded,
-                )
+                    excluded: &excluded,
+                })
             });
             #[cfg(test)]
             {
@@ -1821,17 +1836,19 @@ impl KvAwarePolicy {
     /// `selection_lock`); records the outcome and never touches routing. In
     /// shadow mode the plan is only reported; in active mode the caller turns it
     /// into a fetch grant, revalidating the returned `PlannedPeers`.
-    #[allow(clippy::too_many_arguments)]
     fn plan_transfer_for_pick<'w>(
         &self,
-        planner: &dyn PeerFetchPlanner,
-        workers: &'w [Arc<dyn Worker>],
-        plan: &SelectionPlan,
-        candidates: &[CandidateView<'_>],
-        position: usize,
-        used_binding: bool,
-        excluded: &dyn Fn(usize) -> bool,
+        inputs: PlanInputs<'_, 'w>,
     ) -> Option<(PeerFetchPlan, PlannedPeers<'w>)> {
+        let PlanInputs {
+            planner,
+            workers,
+            plan,
+            candidates,
+            position,
+            used_binding,
+            excluded,
+        } = inputs;
         let mut registrations: Vec<Option<Arc<PeerRegistration>>> = Vec::new();
         let outcome = if used_binding {
             PeerFetchOutcome::skip(PeerFetchSkip::SessionBinding)
@@ -6014,15 +6031,15 @@ mod tests {
             .position(|&index| workers[index].url() == destination_url)
             .expect("destination");
         policy
-            .plan_transfer_for_pick(
-                policy.transfer_planner.as_deref().expect("planner"),
+            .plan_transfer_for_pick(PlanInputs {
+                planner: policy.transfer_planner.as_deref().expect("planner"),
                 workers,
-                &plan,
-                &candidates,
+                plan: &plan,
+                candidates: &candidates,
                 position,
-                false,
-                &|_| false,
-            )
+                used_binding: false,
+                excluded: &|_| false,
+            })
             .expect("plan")
     }
 
