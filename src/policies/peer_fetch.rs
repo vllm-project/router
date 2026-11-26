@@ -18,7 +18,7 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
-use super::kv_aware::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
+use super::kv_cost::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
 use crate::config::types::{peer_fetch_cost_constants_valid, PeerFetchConfig, PeerFetchMode};
 use crate::kv_index::{CacheKey, PeerLookupRecord, RoutableTarget, StorageTier, TierMatch};
 
@@ -715,7 +715,7 @@ fn plan_from_source(
     }
 
     // Never credit the final prompt token, matching `credited_tokens` in
-    // kv_aware.rs.
+    // kv_cost.rs.
     let bs = u64::from(block_size);
     let dest_cached = u64::from(dest_prefix) * bs;
     let credited = (u64::from(missing_blocks) * bs).min(
@@ -760,7 +760,8 @@ fn plan_from_source(
 mod tests {
     use super::*;
     use crate::config::types::{PeerFetchConfig, PeerFetchMode};
-    use crate::policies::kv_aware::{LoadSample, Scorer};
+    use crate::policies::kv_aware::Scorer;
+    use crate::policies::kv_cost::LoadSample;
 
     fn target(name: &str) -> RoutableTarget {
         RoutableTarget {

@@ -14,6 +14,7 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod kv_cost;
 mod peer_fetch;
 pub mod peer_fetch_capability;
 mod power_of_two;
