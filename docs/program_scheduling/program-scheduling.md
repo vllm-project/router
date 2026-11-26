@@ -82,9 +82,9 @@ Identity-free requests do not create Program state, enter RequestPool, or trigge
 
 ## Configuration reference
 
-All fields below belong to `program_scheduling`. The table lists JSON defaults. For both `max_active_programs_per_target` and `admission_waiting_request_threshold`, omission or explicit zero selects automatic sizing. Regular mode resolves these to 64 and 1 respectively. PD mode resolves each automatic value to `clamp(2 × pd.max_prefill_requests_per_target, 4, 64)`. Explicit positive values are used directly.
+All fields below belong to `program_scheduling`. These defaults apply when prefill and decode run together.
 
-| Parameter | Default | Effect on scheduling |
+| Parameter | Effective default (non-PD) | Effect on scheduling |
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
@@ -94,9 +94,9 @@ All fields below belong to `program_scheduling`. The table lists JSON defaults. 
 | `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
-| `max_active_programs_per_target` | `0` (auto) | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
+| `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
-| `admission_waiting_request_threshold` | `0` (auto) | Blocks ordinary admission or resume when the native vLLM waiting count reaches the resolved threshold. All supported threshold values keep this check enabled. |
+| `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its backend waiting-request count reaches this threshold. |
 | `queue_timeout_seconds` | `600.0` | Sets the maximum time a retained request may remain in the Router RequestPool. A request-scoped deadline can shorten, but not extend, this limit. |
 | `force_resume_timeout_seconds` | `300.0` | Sets the fallback and upper bound for the workload-derived force-resume deadline that prevents starvation. The actual deadline may be shorter based on queued work and measured request throughput. |
 | `paused_retention_ttl_seconds` | `1800.0` | Releases an idle paused Program generation after this retention period so stale Program state and logical capacity do not persist indefinitely. |
@@ -116,6 +116,8 @@ All fields below belong to `program_scheduling`. The table lists JSON defaults. 
 | `decode_throughput_model.fixed_step_seconds` | `0.010635218423115973` | Sets the batch-independent decode-step latency in the throughput surface used to estimate admission batch gain. |
 | `decode_throughput_model.batch_step_seconds_per_request` | `0.0004192803698834784` | Sets the additional decode-step latency contributed by each request in the batch. |
 | `decode_throughput_model.context_step_seconds_per_token` | `1.420458414996201e-7` | Sets the additional decode-step latency contributed by each token in the sum of full Program contexts. |
+
+For `max_active_programs_per_target` and `admission_waiting_request_threshold`, omitting the field or setting it to `0` uses the default shown above. With a waiting threshold of `0`, the gate stays active and blocks ordinary admission or resume to a Rank as soon as one backend request is waiting there.
 
 ## Canonical request metadata
 
