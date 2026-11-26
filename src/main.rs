@@ -741,12 +741,12 @@ impl CliArgs {
         let has_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
         self.apply_mode_overrides(config, &has_cli, prefill_urls)?;
-        self.apply_kv_event_overrides(config, &has_cli)?;
 
         if has_cli("policy") {
             config.policy = self.parse_policy(&self.policy);
         }
         self.apply_policy_param_overrides(config, &has_cli);
+        self.apply_kv_event_overrides(config, &has_cli)?;
 
         if has_cli("host") {
             config.host = self.host.clone();
@@ -931,6 +931,21 @@ impl CliArgs {
             return Ok(());
         }
 
+        if matches!(config.mode, RoutingMode::OpenAI { .. })
+            && has_cli("backend")
+            && !matches!(self.backend, Backend::Openai)
+        {
+            let worker_urls = if has_cli("worker_urls") {
+                self.worker_urls.clone()
+            } else if let RoutingMode::OpenAI { worker_urls } = &config.mode {
+                worker_urls.clone()
+            } else {
+                Vec::new()
+            };
+            config.mode = RoutingMode::Regular { worker_urls };
+            return Ok(());
+        }
+
         if has_cli("worker_urls") {
             match &mut config.mode {
                 RoutingMode::Regular { worker_urls } | RoutingMode::OpenAI { worker_urls } => {
@@ -983,7 +998,7 @@ impl CliArgs {
             } = &mut config.policy
             {
                 **static_kv_event_sources = kv_sources.regular;
-            } else if !has_cli("policy") {
+            } else {
                 return Err(ConfigError::IncompatibleConfig {
                     reason: "--kv-event-source and --kv-hybrid-layout require kv_aware policy in regular mode".to_string(),
                 });
@@ -1711,5 +1726,125 @@ retry:
             .unwrap();
         let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
         assert!(cli_args.resolve_router_config(&matches, vec![]).is_err());
+    }
+
+    #[test]
+    fn cli_policy_kv_aware_and_kv_event_source_override_non_kv_config_file() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: regular
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: round_robin
+"#
+        )
+        .unwrap();
+
+        let matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--policy",
+                "kv_aware",
+                "--kv-event-source",
+                "http://127.0.0.1:8000=tcp://127.0.0.1:5557",
+                "--kv-event-model",
+                "qwen3",
+            ])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+        cfg.validate().unwrap();
+
+        match cfg.policy {
+            PolicyConfig::KvAware {
+                static_kv_event_sources,
+                ..
+            } => {
+                assert!(
+                    static_kv_event_sources.contains_key("http://127.0.0.1:8000"),
+                    "expected static_kv_event_sources to retain CLI --kv-event-source"
+                );
+            }
+            other => panic!("expected kv_aware, got {other:?}"),
+        }
+
+        // Switching a kv_aware config file away to round_robin with --kv-event-source must error.
+        let mut kv_file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            kv_file,
+            r#"
+mode:
+  type: regular
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: kv_aware
+"#
+        )
+        .unwrap();
+        let conflict_matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                kv_file.path().to_str().unwrap(),
+                "--policy",
+                "round_robin",
+                "--kv-event-source",
+                "http://127.0.0.1:8000=tcp://127.0.0.1:5557",
+                "--kv-event-model",
+                "qwen3",
+            ])
+            .unwrap();
+        let conflict_args = CliArgs::from_arg_matches(&conflict_matches).unwrap();
+        assert!(conflict_args
+            .resolve_router_config(&conflict_matches, vec![])
+            .is_err());
+    }
+
+    #[test]
+    fn cli_non_openai_backend_switches_openai_config_file_to_regular() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: openai
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: round_robin
+"#
+        )
+        .unwrap();
+
+        for backend in ["vllm", "trtllm"] {
+            let matches = CliArgs::command()
+                .try_get_matches_from([
+                    "vllm-router",
+                    "--config",
+                    file.path().to_str().unwrap(),
+                    "--backend",
+                    backend,
+                ])
+                .unwrap();
+            let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+            let cfg = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+            cfg.validate().unwrap();
+
+            match cfg.mode {
+                RoutingMode::Regular { worker_urls } => {
+                    assert_eq!(worker_urls, vec!["http://127.0.0.1:8000".to_string()]);
+                }
+                other => panic!("expected regular mode for --backend {backend}, got {other:?}"),
+            }
+        }
     }
 }
