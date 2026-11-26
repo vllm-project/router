@@ -150,6 +150,7 @@ pub fn parse_service(service: &Service) -> Result<ServiceBinding, DiscoveryError
 
 /// Resolve endpoints from the complete current EndpointSlice set for a Service.
 /// Do not pass only the Slice changed by a watch event.
+/// Slices marked for deletion are ignored, even if finalizers keep them in the snapshot.
 ///
 /// Report invalid resources and conflicting targets in diagnostics,
 /// excluding them from the result while retaining unrelated valid endpoints.
@@ -163,6 +164,9 @@ pub fn resolve_endpoints(
         BTreeMap::new();
     let mut diagnostics = BTreeSet::new();
     for slice in slices {
+        if slice.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
         let labels = slice.metadata.labels.as_ref();
         if slice.metadata.namespace.as_deref() != Some(&service.namespace)
             || labels.and_then(|l| l.get(SERVICE_NAME_LABEL)) != Some(&service.name)

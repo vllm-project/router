@@ -339,6 +339,58 @@ mod readiness {
     }
 }
 
+mod slice_lifecycle {
+    use super::*;
+
+    fn deleting_slice(uid: &str, ready: bool) -> EndpointSlice {
+        let mut target = endpoint(uid, "10.0.0.1");
+        target.conditions = Some(EndpointConditions {
+            ready: Some(ready),
+            ..Default::default()
+        });
+        let mut deleting = slice("deleting", 8000, vec![target]);
+        deleting.metadata.deletion_timestamp =
+            Some(serde_json::from_value(json!("2026-11-25T00:00:00Z")).unwrap());
+        deleting.metadata.finalizers = Some(vec!["example.com/cleanup".into()]);
+        deleting
+    }
+
+    #[test]
+    fn skips_deleting_slices_even_when_their_endpoints_are_ready() {
+        let result = resolve(&[deleting_slice("old-pod", true)]);
+        assert!(result.endpoints.is_empty());
+        assert_diagnostics(&result, &[]);
+    }
+
+    #[test]
+    fn deleting_slice_does_not_suppress_a_live_replacement_in_either_order() {
+        let live = slice("live", 8000, vec![endpoint("new-pod", "10.0.0.1")]);
+        for ready in [false, true] {
+            let deleting = deleting_slice("old-pod", ready);
+            let result = resolve(&[deleting.clone(), live.clone()]);
+            assert_eq!(
+                result.endpoints,
+                vec![expected_endpoint("new-pod", "10.0.0.1:8000", "model-a")]
+            );
+            assert_diagnostics(&result, &[]);
+            assert_eq!(result, resolve(&[live.clone(), deleting]));
+        }
+    }
+
+    #[test]
+    fn deleting_slice_does_not_create_a_readiness_conflict_in_either_order() {
+        let deleting = deleting_slice("pod-1", false);
+        let live = slice("live", 8000, vec![endpoint("pod-1", "10.0.0.1")]);
+        let result = resolve(&[deleting.clone(), live.clone()]);
+        assert_eq!(
+            result.endpoints,
+            vec![expected_endpoint("pod-1", "10.0.0.1:8000", "model-a")]
+        );
+        assert_diagnostics(&result, &[]);
+        assert_eq!(result, resolve(&[live, deleting]));
+    }
+}
+
 mod ownership_and_pod_identity {
     use super::*;
 
