@@ -187,6 +187,7 @@
     "model": "Qwen/Qwen3.8-Flash-Next-FP8",
     "local_model_env": "KV_AWARE_HYBRID_QWEN3_8_FLASH_NEXT_FP8_MODEL",
     "worker_count": 2,
+    "worker_health_timeout_sec": 1200,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,
@@ -256,6 +257,7 @@
     "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_FLASH_0731_MODEL",
     "worker_count": 2,
+    "worker_health_timeout_sec": 1200,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,

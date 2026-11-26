@@ -79,6 +79,7 @@ def hybrid_kv_aware_stack(request, tmp_path):
     pd = deployment == "1p1d_nixl"
     worker_count = case["worker_count"]
     assert worker_count == 2, "Hybrid routing probes require two workers"
+    worker_health_timeout = case.get("worker_health_timeout_sec", 600.0)
     engine_params = case["worker_params"].copy()
     tensor_parallel_size = engine_params.get("tensor_parallel_size", 1)
     assert tensor_parallel_size > 0
@@ -210,7 +211,9 @@ def hybrid_kv_aware_stack(request, tmp_path):
                 )
             cleanup.callback(launch.terminate_process, proc)
             try:
-                launch.wait_worker_health(http_url, proc=proc)
+                launch.wait_worker_health(
+                    http_url, timeout=worker_health_timeout, proc=proc
+                )
             except TimeoutError as error:
                 pytest.fail(f"{error}. Worker log: {log_path}")
 
