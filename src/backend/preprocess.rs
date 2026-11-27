@@ -288,9 +288,15 @@ fn cache_read_fallback(
         .or_else(|| (echo && logprobs).then_some("unsupported_prompt_scoring"))
 }
 
-fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
+fn http_kv_input(
+    body: &serde_json::Value,
+    route: &str,
+    allow_image: bool,
+) -> Result<HttpKvInput, &'static str> {
     let image = match body.as_object() {
-        Some(fields) => http_cache_identity_for_render(fields, route == "/v1/chat/completions")?,
+        Some(fields) => {
+            http_cache_identity_for_render(fields, allow_image && route == "/v1/chat/completions")?
+        }
         None => false,
     };
     let path = match route {
@@ -343,12 +349,11 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
 
 /// Whether pricing needs a backend `/render`: a string/chat body does, a
 /// direct token-id input does not.
-pub(crate) fn http_input_requires_render(
-    body: &serde_json::Value,
-    route: &str,
-    render_images: bool,
-) -> bool {
-    matches!(http_kv_input(body, route), Ok(HttpKvInput::Render { image, .. }) if render_images || !image)
+pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) -> bool {
+    matches!(
+        http_kv_input(body, route, true),
+        Ok(HttpKvInput::Render { .. })
+    )
 }
 
 /// Backend-effective prompts, shared by colocated and PD routing policies.
@@ -392,16 +397,10 @@ pub(crate) async fn prepare_http_token_inputs(
     use futures_util::{stream, StreamExt};
     urls.sort();
     urls.dedup();
-    let input = match http_kv_input(body, route) {
+    let input = match http_kv_input(body, route, render_images) {
         Ok(input) => input,
         Err(reason) => return urls.into_iter().map(|url| (url, Err(reason))).collect(),
     };
-    if !render_images && matches!(input, HttpKvInput::Render { image: true, .. }) {
-        return urls
-            .into_iter()
-            .map(|url| (url, Err("multimodal_input")))
-            .collect();
-    }
     if let HttpKvInput::Direct(prompts) = input {
         return urls
             .into_iter()
@@ -1679,7 +1678,7 @@ mod tests {
         ]);
         for (name, request, expected) in cases {
             let body = serde_json::to_value(&request).unwrap();
-            let planned = http_kv_input(&body, "/v1/completions").map(|input| match input {
+            let planned = http_kv_input(&body, "/v1/completions", false).map(|input| match input {
                 HttpKvInput::Direct(prompts) => Some(prompts),
                 HttpKvInput::Render { .. } => None,
             });
@@ -1724,7 +1723,7 @@ mod tests {
         ));
         for ids in [json!([1, 2]), json!([[1, 2], [3, 4]])] {
             let HttpKvInput::Direct(prompts) =
-                http_kv_input(&json!({"input_ids":ids}), "/generate").unwrap()
+                http_kv_input(&json!({"input_ids":ids}), "/generate", false).unwrap()
             else {
                 panic!("native token ids")
             };
@@ -1736,7 +1735,7 @@ mod tests {
             json!({"input_ids":[1], "text":"preferred"}),
             json!({"input_ids":[1], "prompt":"preferred"}),
         ] {
-            assert!(http_kv_input(&body, "/generate").is_err());
+            assert!(http_kv_input(&body, "/generate", false).is_err());
         }
 
         for body in [
@@ -1749,7 +1748,7 @@ mod tests {
             } else {
                 "/v1/chat/completions"
             };
-            let HttpKvInput::Render { .. } = http_kv_input(&body, route).unwrap() else {
+            let HttpKvInput::Render { .. } = http_kv_input(&body, route, false).unwrap() else {
                 panic!("render options")
             };
             assert!(super::http_tokenize_fallback(&body, route).is_none());
@@ -1761,39 +1760,26 @@ mod tests {
     }
 
     #[test]
-    fn single_image_routing_requires_worker_rendered_identity() {
+    fn image_inputs_require_one_worker_identified_image() {
         use serde_json::json;
 
-        let image = json!({"type":"image_url","image_url":{"url":"image"}});
-        let body = json!({"messages":[{"role":"user","content":[image.clone()]}]});
-        assert!(matches!(
-            super::http_kv_input(&body, "/v1/chat/completions"),
-            Ok(super::HttpKvInput::Render { image: true, .. })
-        ));
-        let both = json!({"messages":[{"role":"user","content":[image.clone(),image]}]});
-        assert!(super::http_kv_input(&both, "/v1/chat/completions").is_err());
-
-        let mut rendered = json!({
-            "token_ids":[1,2,3],
-            "features":{
-                "mm_hashes":{"image":["a".repeat(64)]},
-                "mm_placeholders":{"image":[{"offset":1,"length":2}]}
-            }
-        });
-        assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
-        let mut multiple = rendered.clone();
-        multiple["features"]["mm_hashes"]["image"] = json!(["a".repeat(64), "b".repeat(64)]);
-        multiple["features"]["mm_placeholders"]["image"] = json!([
-            {"offset":0,"length":1}, {"offset":1,"length":2}
-        ]);
-        assert!(super::http_rendered_image(&multiple).is_err());
-        let digest = "a".repeat(64);
-        rendered["features"]["mm_hashes"]["image"][0] = json!(format!("uuid:{digest}"));
-        assert!(super::http_rendered_image(&rendered).is_err());
-        rendered["features"]["mm_hashes"]["image"][0] = json!(format!("content:{digest}"));
-        assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
-        rendered["features"]["mm_placeholders"]["image"][0]["length"] = json!(3);
-        assert!(super::http_rendered_image(&rendered).is_err());
+        let rendered = |hashes, placements| {
+            json!({
+                "token_ids":[1,2,3],
+                "features":{
+                    "mm_hashes":{"image":hashes},
+                    "mm_placeholders":{"image":placements}
+                }
+            })
+        };
+        let hash = "a".repeat(64);
+        let placement = json!({"offset":1,"length":1});
+        for (hashes, placements) in [
+            (json!([format!("uuid:{hash}")]), json!([placement])),
+            (json!([hash, hash]), json!([placement, placement])),
+        ] {
+            assert!(super::http_rendered_image(&rendered(hashes, placements)).is_err());
+        }
     }
     use super::*;
     use std::path::{Path, PathBuf};

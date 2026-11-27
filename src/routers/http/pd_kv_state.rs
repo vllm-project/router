@@ -366,8 +366,8 @@ impl PdKvState {
         // and direct token-id prompts price without a `/render` fan-out.
         let decode_expected = (!defer_decode || self.worker_pairs.is_some())
             && kv_aware_ops(decode_policy.as_ref()).is_some();
-        let decode_requires_render = router_prompts.is_none()
-            && http_input_requires_render(request, route, self.render_images);
+        let decode_requires_render =
+            router_prompts.is_none() && http_input_requires_render(request, route);
         let decode_priced_here = decode_expected
             && !decode_requires_render
             && self.all_priceable(decode_workers, request, &allow_credit);
@@ -524,21 +524,14 @@ impl PdKvState {
             .filter_map(|worker| {
                 let result = results.get(worker.base_url())?;
                 match result {
-                    Ok(input) => {
-                        if let ([tokens], Some(image)) =
-                            (input.prompts.as_ref(), input.image.as_ref())
-                        {
-                            hashes.register_image(tokens, image);
-                        }
-                        Some((
-                            worker.as_ref(),
-                            input.prompts.as_ref(),
-                            allow_credit
-                                .get(worker.base_url())
-                                .copied()
-                                .unwrap_or(false),
-                        ))
-                    }
+                    Ok(input) => Some((
+                        worker.as_ref(),
+                        input.prompts.as_ref(),
+                        allow_credit
+                            .get(worker.base_url())
+                            .copied()
+                            .unwrap_or(false),
+                    )),
                     Err(reason) => {
                         crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
                         None
@@ -577,9 +570,7 @@ impl PdKvState {
         let kv = kv_aware_ops(policy.as_ref())?;
         // Same no-render rule as admission: the commit path must not pay a
         // second fan-out for ids that cannot have changed.
-        if router_prompts.is_none()
-            && http_input_requires_render(request, route, self.render_images)
-        {
+        if router_prompts.is_none() && http_input_requires_render(request, route) {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
@@ -642,16 +633,14 @@ mod kv_input_tests {
             .await
             .0
     }
-    #[tokio::test]
-    async fn pd_prices_image_prefill_and_decode_with_the_image_identity() {
-        use crate::backend::preprocess::HttpTokenInput;
+    #[test]
+    fn prefill_prices_the_rendered_image() {
         use crate::kv_index::request_hash::ImagePrefix;
         use crate::kv_index::source::test_support::{
             full_binding, warm_test_image, TEST_IMAGE_HASH,
         };
         use crate::kv_index::{CacheKey, RoutableTarget};
 
-        let state = PdKvState::new(Client::new());
         let policy = KvAwarePolicy::default();
         let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             "http://image-worker".into(),
@@ -675,29 +664,19 @@ mod kv_input_tests {
             binding,
         );
         let workers = [worker];
-        let allow = HashMap::from([(base.clone(), true)]);
-        let results = HashMap::from([(
-            base.clone(),
-            Ok(HttpTokenInput {
-                prompts: Arc::from([(0..129).collect()]),
-                source: "render",
+        let prepared = HashMap::from([(
+            base,
+            PdPrefillInput {
+                prompts: Some(Arc::from([(0..129).collect()])),
                 image: ImagePrefix::new(TEST_IMAGE_HASH, 60, 8, 129),
-            }),
+                work_by_rank: HashMap::new(),
+                allow_credit: true,
+                fallback_reason: None,
+            },
         )]);
-        let prepared = PdKvState::build_prefill_inputs(&json!({}), &allow, results.clone());
         let prefill =
             PdKvState::prefill_work(&policy, &workers, &prepared, &mut PromptHashes::default());
         assert_eq!(prefill[0].2.new_prefill_tokens, 1);
-        let decode = state
-            .decode_context_from_results(
-                &policy,
-                &workers,
-                &allow,
-                &results,
-                &mut PromptHashes::default(),
-            )
-            .unwrap();
-        assert_eq!(decode[&base], 1);
     }
 
     #[tokio::test]

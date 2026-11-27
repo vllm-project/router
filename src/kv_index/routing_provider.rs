@@ -222,8 +222,7 @@ pub struct RequestHashCache<'a> {
     pub(crate) stop_at_gap: bool,
     /// NIXL Decode counts resident pages even when rebuilding the sliding window.
     pub(crate) count_replay_pages: bool,
-    images: HashMap<PromptKey<'a>, (&'a ImagePrefix, Option<usize>), RandomState>,
-    first_text_slot: Option<usize>,
+    images: HashMap<PromptKey<'a>, (&'a ImagePrefix, Vec<PreparedChain>), RandomState>,
     seen: HashMap<PromptKey<'a>, usize, RandomState>,
     prompts: HashMap<&'a [u32], usize, RandomState>,
     prepared: Vec<(&'a [u32], Vec<PreparedChain>)>,
@@ -247,7 +246,7 @@ impl<'a> RequestHashCache<'a> {
     pub(crate) fn register_image(&mut self, tokens: &'a [u32], image: &'a ImagePrefix) {
         self.images
             .entry(PromptKey(tokens))
-            .or_insert((image, None));
+            .or_insert((image, Vec::new()));
     }
 
     pub(crate) fn has_images(&self) -> bool {
@@ -255,31 +254,20 @@ impl<'a> RequestHashCache<'a> {
     }
 
     fn prompt_slot(&mut self, tokens: &'a [u32]) -> usize {
-        if let Some((_, slot)) = self.images.get_mut(&PromptKey(tokens)) {
-            // Equal token IDs can reference different images.
-            return *slot.get_or_insert_with(|| {
-                let slot = self.prepared.len();
-                self.prepared.push((tokens, Vec::new()));
-                slot
-            });
-        }
-        let Some(first_slot) = self.first_text_slot else {
-            let slot = self.prepared.len();
+        let Some(&(first, _)) = self.prepared.first() else {
             self.prepared.push((tokens, Vec::new()));
-            self.first_text_slot = Some(slot);
-            return slot;
+            return 0;
         };
-        let first = self.prepared[first_slot].0;
         if std::ptr::eq(first, tokens) {
-            return first_slot;
+            return 0;
         }
         // Populate the content map only when this request has distinct prompts.
         *self.seen.entry(PromptKey(tokens)).or_insert_with(|| {
             if self.prompts.is_empty() {
                 if first == tokens {
-                    return first_slot;
+                    return 0;
                 }
-                self.prompts.insert(first, first_slot);
+                self.prompts.insert(first, 0);
             }
             *self.prompts.entry(tokens).or_insert_with(|| {
                 let slot = self.prepared.len();
@@ -290,8 +278,13 @@ impl<'a> RequestHashCache<'a> {
     }
 
     pub(crate) fn canonical_prompt(&mut self, tokens: &'a [u32]) -> &'a [u32] {
-        let slot = self.prompt_slot(tokens);
-        self.prepared[slot].0
+        // Equal token IDs can reference different images.
+        if self.images.contains_key(&PromptKey(tokens)) {
+            tokens
+        } else {
+            let slot = self.prompt_slot(tokens);
+            self.prepared[slot].0
+        }
     }
 
     pub(in crate::kv_index) fn pages(
@@ -327,9 +320,15 @@ impl<'a> RequestHashCache<'a> {
         adapter: Option<(&str, &str)>,
         domain_index: &Arc<KvBlockIndexer>,
     ) -> (&[SequenceHash], &mut GroupPages) {
-        let slot = self.prompt_slot(tokens);
-        let image = self.images.get(&PromptKey(tokens)).map(|(image, _)| *image);
-        let (tokens, chains) = &mut self.prepared[slot];
+        let prompt = PromptKey(tokens);
+        let (tokens, image, chains) = if self.images.contains_key(&prompt) {
+            let (image, chains) = self.images.get_mut(&prompt).unwrap();
+            (tokens, Some(*image), chains)
+        } else {
+            let slot = self.prompt_slot(tokens);
+            let (tokens, chains) = &mut self.prepared[slot];
+            (*tokens, None, chains)
+        };
         let index = chains.iter().position(|chain| {
             chain.generator == *generator
                 && chain
@@ -416,6 +415,15 @@ mod tests {
         binding
             .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(store)]))
             .unwrap();
+        for (seq, identity) in ["uuid:client-image", &other_hash].into_iter().enumerate() {
+            let invalid = image_store(identity, block_hashes);
+            binding
+                .apply_batch(
+                    seq as u64 + 1,
+                    &event_batch(vec![KVEvent::BlockStored(invalid)]),
+                )
+                .unwrap();
+        }
         let mut cache = RequestHashCache::default();
         cache.register_image(&tokens, &same_image);
         cache.register_image(&identical_ids, &other_image);

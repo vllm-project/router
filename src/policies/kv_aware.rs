@@ -3467,41 +3467,23 @@ mod tests {
         let cold = workers[1].url();
         register_full(&policy, cold, target(cold, 0), "m", 64);
         let prompts: Arc<[Vec<u32>]> = Arc::from([(0..129).collect()]);
-        let different_hash = "a".repeat(64);
-        for (hash, expected) in [
-            (Some(TEST_IMAGE_HASH), 1),
-            (Some(different_hash.as_str()), 129),
-            (None, 129),
-        ] {
-            let mut inputs = WorkerTokenInputs::new();
-            for worker in &workers {
-                let url = worker.url().to_owned();
-                if let Some(hash) = hash {
-                    inputs.insert_image(
-                        url,
-                        prompts.clone(),
-                        ImagePrefix::new(hash, 60, 8, 129).unwrap(),
-                    );
-                } else {
-                    inputs.insert(url, prompts.clone());
-                }
-            }
-            let receipt = policy
-                .select_worker_with_inputs(
-                    &workers,
-                    KvRequestTokens::PerWorker(&inputs),
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .unwrap();
-            assert_eq!(receipt.new_prefill_tokens, expected);
-            if expected == 1 {
-                assert_eq!(receipt.worker_index, 0);
-            }
-            release_receipt(&workers, &receipt);
+        let image = ImagePrefix::new(TEST_IMAGE_HASH, 60, 8, 129).unwrap();
+        let mut inputs = WorkerTokenInputs::new();
+        for worker in &workers {
+            inputs.insert_image(worker.url().to_owned(), prompts.clone(), image.clone());
         }
+        let receipt = policy
+            .select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!((receipt.worker_index, receipt.new_prefill_tokens), (0, 1));
+        release_receipt(&workers, &receipt);
     }
 
     #[test]

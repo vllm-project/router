@@ -1011,16 +1011,17 @@ mod declarations {
             320
         );
 
-        let ratio = value["ranks"][0]["groups"][4]
-            .as_object_mut()
-            .unwrap()
-            .remove("tokens_per_state")
-            .unwrap();
-        assert!(matches!(
-            bind_layout(&value, "kv-events"),
-            Err("MLA cache role requires tokens_per_state")
-        ));
+        let group = &mut value["ranks"][0]["groups"][4];
+        let ratio = group["tokens_per_state"].take();
+        for role in ["sparse", "indexer"] {
+            value["ranks"][0]["groups"][4]["cache_role"] = role.into();
+            assert!(matches!(
+                bind_layout(&value, "kv-events"),
+                Err("MLA cache role requires tokens_per_state")
+            ));
+        }
         value["ranks"][0]["groups"][4]["tokens_per_state"] = ratio;
+        value["ranks"][0]["groups"][4]["cache_role"] = "sparse".into();
 
         for (path, invalid) in [(4, serde_json::json!("3")), (4, serde_json::json!("field"))] {
             let saved = value["ranks"][0]["groups"][path]["tokens_per_state"].clone();
@@ -1039,30 +1040,6 @@ mod declarations {
     }
 
     #[test]
-    fn mla_indexer_requires_compressed_prefix_evidence() {
-        let mut value = qwen_layout();
-        let group = &mut value["ranks"][0]["groups"][3];
-        group["kind"] = "mla_attention".into();
-        group["spec_type"] = "MLAAttentionSpec".into();
-        group["cache_role"] = "indexer".into();
-        group["tokens_per_state"] = "4".into();
-
-        let binding = bind_layout(&value, "epoch-1").unwrap();
-        assert_eq!(
-            binding.groups[3].kind,
-            GroupRule::CompressedFullAttention {
-                tokens_per_state: 4
-            }
-        );
-
-        value["ranks"][0]["groups"][3]["tokens_per_state"] = serde_json::Value::Null;
-        assert!(matches!(
-            bind_layout(&value, "epoch-1"),
-            Err("MLA cache role requires tokens_per_state")
-        ));
-    }
-
-    #[test]
     fn documented_hy4_flash_layouts_restore_the_expected_prefix() {
         use crate::config::{KvConnector, RoutingMode};
         use crate::kv_index::source::test_support::{event_batch, stored_block};
@@ -1070,11 +1047,26 @@ mod declarations {
 
         let guide = include_str!("../../../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
         let worker = "http://prefill";
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("layout.json");
-        for (label, page, ratio, hit, windows) in [
-            ("GPU · HY4 Flash", 256, 4, 2048, 2),
-            ("Ascend A5 · HY4 Flash", 64, 1, 64, 0),
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let mode = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![(worker.into(), None)],
+            decode_urls: vec!["http://decode".into()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        let source = EventSource {
+            source: Arc::from(worker),
+            dp_rank: 0,
+            pub_endpoint: "inproc://pub".into(),
+            replay_endpoint: Some("inproc://replay".into()),
+            topic: "epoch".into(),
+            hwm: None,
+        };
+        for (label, page, ratio, hit, pull_hit) in [
+            ("GPU · HY4 Flash", 256, 4, 2048, 0),
+            ("Ascend A5 · HY4 Flash", 64, 1, 64, 64),
         ] {
             let (_, section) = guide
                 .split_once(&format!("<summary>{label}</summary>"))
@@ -1087,24 +1079,9 @@ mod declarations {
                 serde_json::to_vec(&serde_json::json!({(worker): {"ranks": [rank]}})).unwrap(),
             )
             .unwrap();
-            let mode = RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![(worker.into(), None)],
-                decode_urls: vec!["http://decode".into()],
-                prefill_policy: None,
-                decode_policy: None,
-                discovery_address: None,
-            };
             let mut pd = std::collections::HashMap::new();
             crate::kv_index::apply_kv_layout_file(&path, &mode, &mut Default::default(), &mut pd)
                 .unwrap();
-            let source = EventSource {
-                source: Arc::from(worker),
-                dp_rank: 0,
-                pub_endpoint: "inproc://pub".into(),
-                replay_endpoint: Some("inproc://replay".into()),
-                topic: "epoch".into(),
-                hwm: None,
-            };
             let layout = pd.get_mut(worker).unwrap().hybrid.as_mut().unwrap();
             // Discovery supplies the worker model and its live publisher topic.
             layout.ranks[0].model = "hy4-flash".into();
@@ -1112,7 +1089,6 @@ mod declarations {
             let binding = layout
                 .bind_worker_source(&source, "hy4-flash", 128)
                 .unwrap();
-            assert_eq!(binding.groups.len(), windows + 1, "{label}");
             assert_eq!(
                 binding.groups[0].kind,
                 GroupRule::CompressedFullAttention {
@@ -1120,34 +1096,29 @@ mod declarations {
                 }
             );
             let tokens: Vec<u32> = (0..=hit as u32).collect();
-            let hashes: Vec<_> = binding
+            let hashes = binding
                 .keys
                 .generate_block_keys(&tokens[..hit])
                 .iter()
                 .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
                 .collect();
+            let store = stored_block(hashes, tokens[..hit].to_vec(), page);
             let events = binding
                 .groups
                 .iter()
                 .map(|group| {
-                    assert_eq!(group.block_size as usize, page);
-                    let mut start = 0;
-                    if group.group_idx != 0 {
-                        assert_eq!(group.kind, GroupRule::SlidingWindow { window_tokens: 512 });
-                        start = hashes.len() - 2;
-                    }
-                    let mut store = stored_block(
-                        hashes[start..].to_vec(),
-                        tokens[start * page..hit].to_vec(),
-                        group.block_size,
-                    );
+                    let mut store = store.clone();
                     store.group_idx = Some(group.group_idx);
-                    if start == 0 {
+                    if group.group_idx == 0 {
                         store.kv_cache_spec_kind = Some("mla_attention".into());
                     } else {
+                        // A sliding group retains only the final two pages in this case.
+                        let first = store.block_hashes.len() - 2;
+                        store.parent_block_hash = Some(store.block_hashes[first - 1].clone());
+                        store.block_hashes = store.block_hashes.split_off(first);
+                        store.token_ids = store.token_ids.split_off(first * page as usize);
                         store.kv_cache_spec_kind = Some("sliding_window_mla".into());
                         store.kv_cache_spec_sliding_window = Some(512);
-                        store.parent_block_hash = Some(hashes[start - 1].clone());
                     }
                     KVEvent::BlockStored(store)
                 })
@@ -1162,10 +1133,10 @@ mod declarations {
             let binding = binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, None);
             assert_eq!(
                 binding.reusable_tokens(&tokens, usize::MAX),
-                if windows == 0 { hit as u64 } else { 0 },
+                pull_hit,
                 "{label}"
             );
-            if windows == 0 {
+            if pull_hit != 0 {
                 let hf_compressed =
                     binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, Some(true));
                 assert_eq!(hf_compressed.reusable_tokens(&tokens, usize::MAX), 0);

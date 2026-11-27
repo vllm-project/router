@@ -40,7 +40,7 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
-Image prefix scoring supports one image in HTTP `/v1/chat/completions` with `kv_aware` and zero hash lookahead. Multi-image requests, other modalities, client-supplied media IDs, adapters, `cache_aware` alone and EPD use routing without image prefix credit.
+With `kv_aware` and zero hash lookahead, Router can score Prefill prefix reuse for single-image HTTP chat. Other multimodal inputs, client-supplied media IDs, adapters and EPD use routing without image prefix credit.
 
 ### Set the event ports
 
@@ -297,6 +297,7 @@ Expand the profile for your checkpoint and mode, then replace the object inside 
 <summary>GPU · HY4 Flash</summary>
 
 Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `tencent/Hy4-flash` (BF16).
+Pass `--enable-scale-out` to vLLM for HTTP chat rendering.
 
 ```json
 {

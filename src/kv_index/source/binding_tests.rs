@@ -1268,56 +1268,6 @@ fn salted_events_leave_replay_open_for_the_unsalted_chain() {
 }
 
 #[test]
-fn image_events_leave_replay_open_for_text() {
-    let index = fresh_index(16);
-    let text = qwen_batch();
-    let mut image = text.clone();
-    let image_key = rmpv::Value::Array(vec![rmpv::Value::Array(vec![
-        rmpv::Value::from("4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993"),
-        rmpv::Value::from(15),
-    ])]);
-    for event in &mut image.events {
-        let KVEvent::BlockStored(store) = event else {
-            panic!("expected store");
-        };
-        store.extra_keys = Some(vec![image_key.clone(); store.block_hashes.len()]);
-    }
-    assert_eq!(index.apply_batch(0, &image), Ok(()));
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 0);
-    assert_eq!(index.apply_batch(1, &text), Ok(()));
-    assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-}
-
-#[test]
-fn unsupported_image_keys_do_not_reset_valid_text_claims() {
-    let index = fresh_index(16);
-    let text = qwen_batch();
-    index.apply_batch(0, &text).unwrap();
-    for (sequence, identity) in [
-        "uuid:client-media",
-        "uuid:4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993",
-        "adapter:content:4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut image = text.clone();
-        for event in &mut image.events {
-            let KVEvent::BlockStored(store) = event else {
-                panic!("expected store")
-            };
-            let mut extra = vec![rmpv::Value::Nil; store.block_hashes.len()];
-            extra[0] =
-                rmpv::Value::Array(vec![rmpv::Value::Array(vec![identity.into(), 15.into()])]);
-            store.extra_keys = Some(extra);
-        }
-        assert_eq!(index.apply_batch(sequence as u64 + 1, &image), Ok(()));
-        assert_eq!(index.reusable_tokens(&prompt(), usize::MAX), 528);
-    }
-    assert_eq!(index.apply_batch(4, &text), Ok(()));
-}
-
-#[test]
 fn declared_adapter_store_does_not_hide_layout_errors() {
     for error in ["group", "kind", "locality", "block size", "token packing"] {
         let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);

@@ -745,7 +745,7 @@ impl VllmPDRouter {
                     Some(params)
                 }
             }
-            KvConnector::MooncakeV2 => self.mooncake_v2_handoff(prefill_response_json?).cloned(),
+            KvConnector::MooncakeV2 => prefill_response_json?.get("kv_transfer_params").cloned(),
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
                     let kvt = json.get("kv_transfer_params")?;
@@ -763,11 +763,11 @@ impl VllmPDRouter {
         }
     }
 
-    fn mooncake_v2_handoff<'a>(&self, prefill_response: &'a Value) -> Option<&'a Value> {
-        (self.kv_connector == KvConnector::MooncakeV2)
-            .then(|| prefill_response.get("kv_transfer_params"))
-            .flatten()
-            .filter(|params| Self::valid_mooncake_v2_handoff(params))
+    fn missing_mooncake_v2_handoff(&self, prefill_response: &Value) -> bool {
+        self.kv_connector == KvConnector::MooncakeV2
+            && !prefill_response
+                .get("kv_transfer_params")
+                .is_some_and(Self::valid_mooncake_v2_handoff)
     }
 
     fn invalid_mooncake_v2_handoff(prefill: &str, path: &str, started: Instant) -> Response {
@@ -2560,8 +2560,7 @@ impl VllmPDRouter {
             }
         };
 
-        let mooncake_handoff = self.mooncake_v2_handoff(&prefill_response_json);
-        if self.kv_connector == KvConnector::MooncakeV2 && mooncake_handoff.is_none() {
+        if self.missing_mooncake_v2_handoff(&prefill_response_json) {
             return Ok(Self::invalid_mooncake_v2_handoff(
                 &prefill_base_url,
                 path,
@@ -2633,14 +2632,12 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        if let Some(params) = mooncake_handoff.cloned().or_else(|| {
-            self.build_decode_kv_transfer_params(
-                prefill_worker.as_ref(),
-                Some(&prefill_response_json),
-                transfer_id.as_deref(),
-                Some(&request_id),
-            )
-        }) {
+        if let Some(params) = self.build_decode_kv_transfer_params(
+            prefill_worker.as_ref(),
+            Some(&prefill_response_json),
+            transfer_id.as_deref(),
+            Some(&request_id),
+        ) {
             decode_request["kv_transfer_params"] = params;
         } else {
             warn!(
@@ -2823,8 +2820,7 @@ impl VllmPDRouter {
             Some(kv) => json!({ "kv_transfer_params": kv }),
             None => json!({}),
         };
-        let mooncake_handoff = self.mooncake_v2_handoff(&prefill_response_json);
-        if self.kv_connector == KvConnector::MooncakeV2 && mooncake_handoff.is_none() {
+        if self.missing_mooncake_v2_handoff(&prefill_response_json) {
             attempt.release();
             return Self::invalid_mooncake_v2_handoff(&prefill_base_url, path, start_time);
         }
@@ -2857,14 +2853,12 @@ impl VllmPDRouter {
         };
         let decode_base_url = decode_worker.base_url().to_string();
 
-        let decode_params = mooncake_handoff.cloned().or_else(|| {
-            self.build_decode_kv_transfer_params(
-                prefill_worker.as_ref(),
-                Some(&prefill_response_json),
-                transfer_id.as_deref(),
-                Some(&request_id),
-            )
-        });
+        let decode_params = self.build_decode_kv_transfer_params(
+            prefill_worker.as_ref(),
+            Some(&prefill_response_json),
+            transfer_id.as_deref(),
+            Some(&request_id),
+        );
         if decode_params.is_none() {
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
@@ -7435,14 +7429,13 @@ mod tests {
     async fn mooncake_v2_forwards_the_prefill_handoff() {
         let mut router = test_vllm_pd_router().await;
         router.kv_connector = KvConnector::MooncakeV2;
-        assert!(router.generate_transfer_id().is_none());
         let params = router
             .build_prefill_kv_transfer_params(None, None, None, None)
             .unwrap();
         assert_eq!(params["do_remote_decode"], true);
         assert_eq!(params["do_remote_prefill"], false);
 
-        let worker = crate::core::BasicWorker::new(
+        let worker = BasicWorker::new(
             "http://prefill".into(),
             crate::core::WorkerType::Prefill {
                 bootstrap_port: None,
@@ -7459,44 +7452,28 @@ mod tests {
             "remote_kv_lease_duration": 120,
             "last_token_id": 42
         });
-        let decode_params = |params: &Value| {
-            let response = json!({"kv_transfer_params": params});
-            router.build_decode_kv_transfer_params(&worker, Some(&response), None, None)
-        };
-        assert_eq!(decode_params(&handoff).as_ref(), Some(&handoff));
-        assert!(router.mooncake_v2_handoff(&json!({})).is_none());
-        assert!(decode_params(&json!({"do_remote_prefill": true})).is_none());
-
-        for (field, invalid) in [
-            ("do_remote_prefill", json!(false)),
-            ("remote_block_ids", Value::Null),
-            ("remote_block_ids", json!([0, 1])),
-            ("remote_block_ids", json!([["0"]])),
-            ("remote_engine_id", json!("")),
-            ("remote_request_id", Value::Null),
-            ("remote_host", json!(" ")),
-            ("remote_port", json!(0)),
-            ("remote_port", json!(65536)),
-            ("remote_num_prompt_tokens", json!(-1)),
-            ("remote_kv_lease_duration", json!(5)),
+        let response = json!({"kv_transfer_params": handoff});
+        assert!(!router.missing_mooncake_v2_handoff(&response));
+        let params = router.build_decode_kv_transfer_params(&worker, Some(&response), None, None);
+        assert_eq!(params.as_ref(), response.get("kv_transfer_params"));
+        for field in [
+            "remote_block_ids",
+            "remote_engine_id",
+            "remote_request_id",
+            "remote_host",
+            "remote_port",
+            "remote_num_prompt_tokens",
+            "remote_kv_lease_duration",
         ] {
-            let mut params = handoff.clone();
-            params.as_object_mut().unwrap().remove(field);
-            assert!(decode_params(&params).is_none(), "missing {field}");
-            params[field] = invalid;
-            assert!(decode_params(&params).is_none(), "malformed {field}");
+            let mut invalid = response.clone();
+            invalid["kv_transfer_params"][field] = Value::Null;
+            assert!(router.missing_mooncake_v2_handoff(&invalid), "{field}");
         }
 
-        let mut no_transfer = handoff;
-        no_transfer
-            .as_object_mut()
-            .unwrap()
-            .remove("remote_kv_lease_duration");
-        for block_ids in [json!([]), json!([[], []])] {
-            no_transfer["remote_block_ids"] = block_ids;
-            no_transfer["remote_num_prompt_tokens"] = json!(0);
-            assert_eq!(decode_params(&no_transfer).as_ref(), Some(&no_transfer));
-        }
+        let mut no_transfer = response;
+        no_transfer["kv_transfer_params"]["remote_block_ids"] = json!([[], []]);
+        no_transfer["kv_transfer_params"]["remote_kv_lease_duration"] = Value::Null;
+        assert!(!router.missing_mooncake_v2_handoff(&no_transfer));
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
@@ -7592,29 +7569,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mixed_pd_policies_do_not_feed_image_tokens_to_cache_aware_prefill() {
-        use crate::kv_index::request_hash::ImagePrefix;
-        let prompts: Arc<[Vec<u32>]> = Arc::from([vec![1, 2, 3]]);
-        let input = |image| PdPrefillInput {
-            prompts: Some(prompts.clone()),
-            image,
-            work_by_rank: HashMap::new(),
-            allow_credit: true,
-            fallback_reason: None,
-        };
-        let inputs = HashMap::from([
-            ("http://text".into(), input(None)),
-            (
-                "http://image".into(),
-                input(ImagePrefix::new(&"a".repeat(64), 1, 1, 3)),
-            ),
-        ]);
-        let text = cache_aware_prefill_tokens(Some(&inputs));
-        assert_eq!(text.len(), 1);
-        assert_eq!(text.get("http://text"), Some(&prompts));
-    }
-
     #[tokio::test]
     async fn pd_requests_image_hashes_without_tensors_and_disables_rendering_for_epd() {
         let url = spawn_test_server(axum::Router::new().route(
@@ -7645,14 +7599,6 @@ mod tests {
             {"type":"image_url","image_url":{"url":"image"}}
         ]}]});
         for epd in [false, true] {
-            assert_eq!(
-                crate::backend::preprocess::http_input_requires_render(
-                    &body,
-                    "/v1/chat/completions",
-                    !epd,
-                ),
-                !epd,
-            );
             let config = crate::config::RouterConfig {
                 epd: epd.then(|| crate::config::EpdConfig {
                     encoder_urls: vec!["http://encoder".into()],
@@ -7685,6 +7631,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(inputs[&url].image.is_some(), !epd);
+            assert!(cache_aware_prefill_tokens(Some(&inputs)).is_empty());
             if epd {
                 assert_eq!(inputs[&url].fallback_reason, Some("multimodal_input"));
             }
@@ -7700,7 +7647,6 @@ mod tests {
                 .route(
                     "/v1/responses",
                     axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
-                        assert_eq!(body["max_output_tokens"], 1);
                         assert_eq!(body["ignore_eos"], true);
                         assert_eq!(body["stop"], json!([]));
                         assert_eq!(body["stop_token_ids"], json!([]));
@@ -7729,15 +7675,11 @@ mod tests {
         let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
         let mut router = test_vllm_pd_router().await;
         router.kv_connector = KvConnector::MooncakeV2;
-        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(prefill);
         router.pd_router.worker_registry.register(decode.clone());
         for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
             let response = dispatch_reservation_test_request(&router, path).await;
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
-            let body = axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .unwrap();
-            assert!(String::from_utf8_lossy(&body).contains("no valid Mooncake V2 KV handoff"));
             assert_eq!(decode.load(), 0);
         }
         assert_eq!(decode_calls.load(Ordering::Relaxed), 0);

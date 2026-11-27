@@ -642,15 +642,15 @@ impl PdRouterBase {
             results
                 .into_iter()
                 .map(|(base, result)| {
-                    let (prompts, image, reason) = match result {
-                        Ok(input) => (Some(input.prompts), input.image, None),
-                        Err(reason) => (None, None, Some(reason)),
+                    let (prompts, reason) = match result {
+                        Ok(input) => (Some(input.prompts), None),
+                        Err(reason) => (None, Some(reason)),
                     };
                     (
                         base,
                         PdPrefillInput {
                             prompts,
-                            image,
+                            image: None,
                             work_by_rank: HashMap::new(),
                             allow_credit: false,
                             fallback_reason: reason,
@@ -679,10 +679,7 @@ impl PdRouterBase {
             results
                 .into_iter()
                 .filter_map(|(base, result)| match result {
-                    Ok(input) => {
-                        debug_assert!(input.image.is_none());
-                        Some((base, input.prompts))
-                    }
+                    Ok(input) => Some((base, input.prompts)),
                     Err(reason) => {
                         crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
                         None

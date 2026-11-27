@@ -297,7 +297,6 @@ impl CacheAwarePolicy {
         let mut candidates = HashMap::new();
         for index in healthy {
             let worker = &workers[index];
-            debug_assert!(tokens.image_for(worker.as_ref()).is_none());
             let prompts = tokens.prompts_for(worker.as_ref());
             if prompts.is_empty() || prompts.iter().any(|ids| ids.is_empty()) {
                 continue;

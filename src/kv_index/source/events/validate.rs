@@ -87,32 +87,21 @@ pub(super) fn validate_store(
         if keys.len() != store.block_hashes.len() {
             return Err(SourceError::InvalidBatch);
         }
-        let multimodal: Option<Vec<_>> = keys
-            .iter()
-            .filter(|key| !key.is_nil())
-            .map(image_block_keys)
-            .collect();
-        if let Some(multimodal) = multimodal {
-            unsupported_image = multimodal
-                .iter()
-                .flatten()
-                .any(|(hash, _)| !is_image_hash(hash));
-        } else if let Some((first, rest)) = keys.split_first() {
-            if !rest.iter().all(rmpv::Value::is_nil) {
-                return Err(SourceError::InvalidBatch);
+        for (index, key) in keys.iter().enumerate().filter(|(_, key)| !key.is_nil()) {
+            if let Some(media) = image_block_keys(key) {
+                unsupported_image |= media.iter().any(|(hash, _)| !is_image_hash(hash));
+                continue;
             }
-            if !first.is_nil() {
-                // vLLM folds cache_salt into the first block's native hash.
-                // Leave salted requests on load-based routing without invalidating
-                // unrelated chains or the publisher's replay.
-                return if first.as_array().is_some_and(|parts| {
+            // vLLM folds a standalone cache salt into the first block only.
+            if index == 0
+                && key.as_array().is_some_and(|parts| {
                     matches!(parts.as_slice(), [salt] if salt.as_str().is_some_and(|s| !s.is_empty()))
-                }) {
-                    Ok(false)
-                } else {
-                    Err(SourceError::InvalidBatch)
-                };
+                })
+                && keys[1..].iter().all(rmpv::Value::is_nil)
+            {
+                return Ok(false);
             }
+            return Err(SourceError::InvalidBatch);
         }
     }
     let partial = partial_hash_hits
@@ -148,7 +137,6 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
-    // An unsupported image identity is not a reason to discard other chains.
     Ok(!unsupported_image)
 }
 
