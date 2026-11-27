@@ -39,7 +39,8 @@ steps:
         mirror_hardwares: mi300_2
         command: |
           timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
-          # Keep the supervisor alive while the harness handles TERM/cleanup.
+          # Bash defers this trap until its foreground command finishes,
+          # keeping timeout's kill-after active during harness cleanup.
           trap 'exit 143' TERM
           export MORIIO_READ_MODE=true
           export LM_EVAL_LIMIT=20
@@ -69,7 +70,8 @@ steps:
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
     command: |
       timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
-      # Keep the supervisor alive while the harness handles TERM/cleanup.
+      # Bash defers this trap until its foreground command finishes,
+      # keeping timeout's kill-after active during harness cleanup.
       trap 'exit 143' TERM
 
       bash .buildkite/scripts/install_packages.sh router-bin

@@ -321,10 +321,11 @@ acquisition counts toward Buildkite's step timeout. The hook can wait up to
 
 The MoRI and KV-aware lanes allow 450 minutes: 360 for the lease plus 90 for
 setup and execution. MoRI commands have a separate 89-minute limit covering
-setup and the harness, followed by up to one minute for cleanup before forced
-termination. KV-aware commands retain their shorter per-phase limits. Automatic
-retries are disabled; inspect failures before retrying manually. Each manual
-retry starts a fresh, independently bounded attempt.
+setup and the harness, followed by up to one minute before forcibly terminating
+the local process group. Container and remote-worker cleanup remains the
+harness's responsibility. KV-aware commands retain their shorter per-phase
+limits. Automatic retries are disabled; inspect failures before retrying
+manually. Each manual retry starts a fresh, independently bounded attempt.
 
 ## Adding New Tests
 
