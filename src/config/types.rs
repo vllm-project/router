@@ -254,6 +254,8 @@ pub struct PdProgramSchedulingConfig {
     pub local_append: bool,
     /// Only report warm when P KV usage is at least this value (0 = always).
     pub warm_min_p_kv_usage: f64,
+    /// Minimum extra tokens a warm read must save beyond a known P-local prefix.
+    pub warm_min_extra_tokens: u64,
     /// Only report warm when P running requests are at most this value.
     pub warm_max_p_running: usize,
     /// Total prompt-prefix tokens retained across all candidates.
@@ -310,6 +312,7 @@ impl Default for PdProgramSchedulingConfig {
             warm_remote: false,
             local_append: false,
             warm_min_p_kv_usage: 0.0,
+            warm_min_extra_tokens: 1,
             warm_max_p_running: usize::MAX,
             max_candidate_tokens: 2_097_152,
             max_candidates: 4096,

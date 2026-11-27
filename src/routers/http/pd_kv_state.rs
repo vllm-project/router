@@ -311,6 +311,14 @@ impl PdKvState {
         }
     }
 
+    pub(super) fn model_creditable(&self, base: &str, model: Option<&str>) -> bool {
+        self.supervisor
+            .worker_model_eligibility(&[base.to_owned()], model)
+            .get(base)
+            .copied()
+            .unwrap_or(false)
+    }
+
     async fn credit_by_base(&self, bases: &[String], request: &Value) -> HashMap<String, bool> {
         #[cfg(all(test, feature = "cpu", feature = "ready"))]
         let _wait = self.credit_gate.lock().await;

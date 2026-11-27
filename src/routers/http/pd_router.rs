@@ -135,6 +135,7 @@ pub(super) fn select_pd_pair(
         &prefill_indices,
         prefill_policy,
         context,
+        None,
     )?;
     if let Some(pairs) = context.worker_pairs {
         decode_indices
@@ -149,6 +150,7 @@ pub(super) fn select_pd_pair(
             &decode_indices,
             decode_policy,
             context,
+            None,
         )?
     } else {
         // The deferred pickup is provisional: it only seeds the request identity
@@ -215,6 +217,31 @@ pub(super) fn select_decode_stage(
         &indices,
         decode_policy,
         context,
+        None,
+    )
+}
+
+/// Score P only after Program admission has committed Decode.
+pub(super) fn select_program_kv_prefill(
+    loads: &Loads,
+    workers: &[Arc<dyn Worker>],
+    policy: &dyn LoadBalancingPolicy,
+    context: &PdRequestContext<'_>,
+    remote_miss: &HashMap<PdEndpoint, u64>,
+) -> Option<StageDecision> {
+    let (endpoints, indices) = Eligibility::new(loads, context).pool(Stage::Prefill, workers);
+    if indices.is_empty() {
+        return None;
+    }
+    select_stage(
+        loads,
+        Stage::Prefill,
+        workers,
+        &endpoints,
+        &indices,
+        policy,
+        context,
+        Some(remote_miss),
     )
 }
 
@@ -225,6 +252,7 @@ pub(super) fn model_eligible(worker: &dyn Worker, model_id: Option<&str>) -> boo
     model_id.is_none_or(|model| worker.model_id() == "unknown" || worker.model_id() == model)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_stage(
     loads: &Loads,
     stage: Stage,
@@ -233,6 +261,7 @@ fn select_stage(
     indices: &[usize],
     policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
+    remote_miss: Option<&HashMap<PdEndpoint, u64>>,
 ) -> Option<StageDecision> {
     let policy_input = context.legacy_policy_input;
     let kv_aware = kv_aware_ops(policy).is_some();
@@ -285,7 +314,16 @@ fn select_stage(
         // Token costs and request counts have different units. If any
         // eligible P has unknown work, compare the whole pool by occupancy.
         if let Some(inputs) = inputs {
-            let work: Vec<_> = inputs.iter().map(|(_, _, work)| *work).collect();
+            let work: Vec<_> = inputs
+                .iter()
+                .map(|(_, _, work)| {
+                    let mut estimate = *work;
+                    if remote_miss.is_some() {
+                        estimate.new_prefill_tokens = estimate.device_miss_tokens;
+                    }
+                    estimate
+                })
+                .collect();
             let costs: Vec<_> = selected_indices
                 .iter()
                 .zip(&work)
@@ -295,7 +333,13 @@ fn select_stage(
                         .copied()
                         .unwrap_or_default()
                         .active_prefill_tokens
-                        .saturating_add(work.new_prefill_tokens) as f64
+                        .saturating_add(
+                            remote_miss
+                                .and_then(|costs| costs.get(&endpoints[index]))
+                                .copied()
+                                .unwrap_or(u64::MAX)
+                                .min(work.new_prefill_tokens),
+                        ) as f64
                 })
                 .collect();
             let occupancy: Vec<_> = projected.iter().map(|worker| worker.load()).collect();
@@ -2922,6 +2966,65 @@ mod admission_tests {
             PdEndpoint::for_worker(d[1].as_ref()),
             "a price table missing one DP rank must not credit the others"
         );
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[test]
+    fn program_prefill_local_and_remote_overlap_is_credited_once() {
+        let p = pool("p", 2);
+        let d = pool("d", 1);
+        let tokens: Vec<u32> = (0..400).collect();
+        let policy = KvAwarePolicy::default();
+        let mut inputs = token_inputs(&p, &tokens, &policy);
+        for (worker, local_miss) in p.iter().zip([100, 200]) {
+            inputs
+                .get_mut(worker.base_url())
+                .unwrap()
+                .work_by_rank
+                .get_mut(&worker.dp_rank())
+                .unwrap()
+                .device_miss_tokens = local_miss;
+        }
+        let context = PdRequestContext {
+            prefill_inputs: Some(&inputs),
+            ..context()
+        };
+        let manager = PdLoadManager::default();
+        let backlog = manager.admit_bound(p[0].clone(), d[0].clone(), Some(60));
+        let choose = |remote| {
+            select_program_kv_prefill(&manager.snapshot(), &p, &policy, &context, remote).unwrap()
+        };
+        let cold = HashMap::new();
+        let local = choose(&cold);
+        assert_eq!((local.worker_index, local.score), (0, Some(160.0)));
+        let endpoints: Vec<_> = p
+            .iter()
+            .map(|w| PdEndpoint::for_worker(w.as_ref()))
+            .collect();
+        let remote = HashMap::from([(endpoints[0].clone(), 100), (endpoints[1].clone(), 100)]);
+        let warm = choose(&remote);
+        assert_eq!((warm.worker_index, warm.score), (1, Some(100.0)));
+        // The decision retains its cold cost. A failed read uses the same P/D receipt.
+        assert_eq!(warm.new_prefill_tokens, Some(200));
+        let turn = manager.admit_bound(p[1].clone(), d[0].clone(), Some(100));
+        turn.reprice_prefill(Some(200));
+        turn.reprice_prefill(Some(200));
+        let load = manager.snapshot()[&(Stage::Prefill, endpoints[1].clone())];
+        assert_eq!(
+            (
+                load.prefill_requests,
+                load.active_prefill_tokens,
+                load.unknown_prefill_requests
+            ),
+            (1, 200, 0)
+        );
+        turn.finish_prefill();
+        turn.reprice_prefill(Some(300));
+        assert!(!manager
+            .snapshot()
+            .contains_key(&(Stage::Prefill, endpoints[1].clone())));
+        drop((backlog, turn));
+        assert!(manager.snapshot().is_empty());
     }
 
     #[cfg(all(feature = "cpu", feature = "ready"))]

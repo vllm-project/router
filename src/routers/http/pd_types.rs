@@ -239,8 +239,6 @@ pub struct PdLoadManager {
 }
 
 impl PdLoadManager {
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
     }
@@ -331,10 +329,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
             decode_prompt_tokens: prompt,
             state: Mutex::new(AttemptState {
                 prefill: true,
+                prefill_tokens: selection.prefill.new_prefill_tokens,
                 decode: decode_state,
                 decode_endpoint,
                 affinity,
@@ -388,12 +386,12 @@ impl PdLoadManager {
     ///
     /// Program scheduling picks the decode engine by affinity before dispatch,
     /// so it cannot go through policy selection, but its occupancy must stay
-    /// visible to native admission and to `/metrics`. The prefill token count is
-    /// unknown here, so the attempt is charged as an unknown-size prefill.
+    /// visible to native admission and to `/metrics`. Known P token costs share the native ledger.
     pub(super) fn admit_bound(
         &self,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        prefill_tokens: Option<u64>,
     ) -> PdAttempt {
         let prefill = PdEndpoint::for_worker(prefill_worker.as_ref());
         let decode = PdEndpoint::for_worker(decode_worker.as_ref());
@@ -401,7 +399,10 @@ impl PdLoadManager {
             let mut loads = self.loads.lock();
             let p = loads.entry((Stage::Prefill, prefill.clone())).or_default();
             p.prefill_requests += 1;
-            p.unknown_prefill_requests += 1;
+            match prefill_tokens {
+                Some(tokens) => p.active_prefill_tokens += tokens,
+                None => p.unknown_prefill_requests += 1,
+            }
             p.publish(Stage::Prefill, &prefill);
             let d = loads.entry((Stage::Decode, decode.clone())).or_default();
             d.pending_decode_requests += 1;
@@ -414,7 +415,6 @@ impl PdLoadManager {
             prefill,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: None,
             // The prompt length is unknown here, so the Decode charge is
             // unknown too and the pool stays on request counts for this
             // attempt.
@@ -422,6 +422,7 @@ impl PdLoadManager {
 
             state: Mutex::new(AttemptState {
                 prefill: true,
+                prefill_tokens,
                 decode: DecodeState::Pending,
                 decode_endpoint: Some(decode),
                 affinity: None,
@@ -445,6 +446,7 @@ enum DecodeState {
 #[derive(Debug)]
 struct AttemptState {
     prefill: bool,
+    prefill_tokens: Option<u64>,
     decode: DecodeState,
     /// Committed decode endpoint; `None` while the commitment is deferred.
     decode_endpoint: Option<PdEndpoint>,
@@ -460,7 +462,6 @@ struct AttemptInner {
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
     /// Prompt length this attempt will hold on a Decode engine, counted once per request:
     /// the request's sequences share one copy of those blocks. `None` when the prompt was
     /// never measured.
@@ -496,7 +497,7 @@ impl AttemptInner {
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
+            if let Some(tokens) = state.prefill_tokens {
                 load.active_prefill_tokens -= tokens;
             } else {
                 load.unknown_prefill_requests -= 1;
@@ -660,6 +661,49 @@ impl PdAttempt {
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
+    /// A rejected LocalAppend can start one remote P leg on the same D reservation.
+    pub(super) fn restart_prefill(&self, tokens: Option<u64>) {
+        let mut state = self.0.state.lock();
+        debug_assert!(!state.prefill);
+        let mut loads = self.0.loads.lock();
+        let load = loads
+            .entry((Stage::Prefill, self.0.prefill.clone()))
+            .or_default();
+        load.prefill_requests += 1;
+        match tokens {
+            Some(tokens) => load.active_prefill_tokens += tokens,
+            None => load.unknown_prefill_requests += 1,
+        }
+        load.publish(Stage::Prefill, &self.0.prefill);
+        if let Some(worker) = self.0.prefill_worker.lock().as_ref() {
+            worker.increment_load();
+        }
+        state.prefill = true;
+        state.prefill_tokens = tokens;
+    }
+
+    /// Adjust an in-flight P leg on a warm-to-cold retry.
+    pub(super) fn reprice_prefill(&self, tokens: Option<u64>) {
+        let mut state = self.0.state.lock();
+        if !state.prefill || state.prefill_tokens == tokens {
+            return;
+        }
+        let mut loads = self.0.loads.lock();
+        let load = loads
+            .get_mut(&(Stage::Prefill, self.0.prefill.clone()))
+            .expect("active prefill charge");
+        match state.prefill_tokens {
+            Some(old) => load.active_prefill_tokens -= old,
+            None => load.unknown_prefill_requests -= 1,
+        }
+        match tokens {
+            Some(new) => load.active_prefill_tokens += new,
+            None => load.unknown_prefill_requests += 1,
+        }
+        state.prefill_tokens = tokens;
+        load.publish(Stage::Prefill, &self.0.prefill);
+    }
+
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }

@@ -275,7 +275,7 @@ fn hold_request_load_with_output_frame(
 
 /// vLLM HTTP accepts scalar xargs. Preserve the validated envelope in the
 /// JSON-string form understood by Program-aware engines and the Router.
-fn encode_session_xargs(body: &mut serde_json::Value) {
+pub(super) fn encode_session_xargs(body: &mut serde_json::Value) {
     if let Some(context) = body
         .pointer_mut("/vllm_xargs/agentic_context")
         .filter(|v| v.is_object())

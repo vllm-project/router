@@ -101,6 +101,9 @@ impl<'a> KvRequestTokens<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
     pub new_prefill_tokens: u64,
+    /// Work after confirmed device-local reuse only. Explicit Program warm
+    /// reads price their own transport and must not double-credit another tier.
+    pub device_miss_tokens: u64,
     pub placement_verified: bool,
 }
 
@@ -803,7 +806,7 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// Device prefix plus one external continuation, matching vLLM's two-segment
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+fn prefix_credits(candidate: &CandidateView<'_>, params: &CostParams) -> (u64, f64) {
     let device_blocks = crate::kv_index::layout::full_attention_prefix(
         candidate
             .matches
@@ -841,8 +844,16 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
     let credited_blocks = f64::from(device_blocks) + best_continuation;
     // External reuse may have a different alignment, but it cannot eliminate
     // the last-token logits work either.
-    (credited_blocks * f64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as f64)
+    let effective = (credited_blocks * f64::from(params.block_size))
+        .min(candidate.input_tokens.saturating_sub(1) as f64);
+    (
+        u64::from(device_blocks) * u64::from(params.block_size),
+        effective,
+    )
+}
+
+fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+    prefix_credits(candidate, params).1
 }
 
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
@@ -2118,6 +2129,7 @@ impl KvAwareOps for KvAwarePolicy {
                     ..self.params
                 };
                 let mut new_prefill_tokens = 0u64;
+                let mut device_miss_tokens = 0u64;
                 for tokens in prompts {
                     let matches = if verified {
                         Self::cached_matches(
@@ -2138,10 +2150,11 @@ impl KvAwareOps for KvAwarePolicy {
                         Cow::Borrowed(&[][..])
                     };
                     if matches.is_empty() {
+                        device_miss_tokens = device_miss_tokens.saturating_add(tokens.len() as u64);
                         new_prefill_tokens = new_prefill_tokens.saturating_add(tokens.len() as u64);
                         continue;
                     }
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
+                    let (device, effective) = prefix_credits(
                         &CandidateView {
                             target: &binding.target,
                             matches: &matches,
@@ -2150,10 +2163,15 @@ impl KvAwareOps for KvAwarePolicy {
                             prefill_tokens: None,
                         },
                         &params,
-                    ));
+                    );
+                    device_miss_tokens =
+                        device_miss_tokens.saturating_add(tokens.len() as u64 - device);
+                    new_prefill_tokens = new_prefill_tokens
+                        .saturating_add((tokens.len() as f64 - effective).ceil() as u64);
                 }
                 PrefillWorkEstimate {
                     new_prefill_tokens,
+                    device_miss_tokens,
                     placement_verified: verified,
                 }
             })

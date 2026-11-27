@@ -305,6 +305,7 @@ impl PdProgramRuntime {
     pub async fn reserve_prefill(
         &self,
         worker_id: &str,
+        dispatch: &crate::program_scheduling::ProgramDispatch,
     ) -> Result<OwnedSemaphorePermit, ScheduleError> {
         let gate = self
             .prefill_gates
@@ -312,7 +313,12 @@ impl PdProgramRuntime {
             .entry(worker_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.prefill_limit)))
             .clone();
-        tokio::time::timeout(self.queue_timeout, gate.acquire_owned())
+        let remaining = self
+            .queue_timeout
+            .checked_sub(dispatch.request_arrived_at().elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(ScheduleError::QueueTimeout)?;
+        tokio::time::timeout(remaining, gate.acquire_owned())
             .await
             .map_err(|_| ScheduleError::QueueTimeout)?
             .map_err(|_| ScheduleError::NoTargets)

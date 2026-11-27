@@ -145,6 +145,12 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `kv_events` | `false` | subscribe to KV events for advisory residency; never authorizes a transfer |
 | `kv_hash_mode` | `sha256` | `sha256`, `python_hash_seed`, `xxhash_cbor` |
 
+### Per-turn prefill selection
+
+With `--prefill-policy kv_aware`, each admitted Program turn selects a P after the scheduler commits its D. The Router uses backend-effective prompt tokens, the P rank’s confirmed device prefix and its outstanding prefill token work. An unpriced candidate or an unknown-size backlog switches the comparison to request counts for the whole eligible pool. Configure a KV event source for each P that should receive local prefix credit. An inherited KV-aware policy follows the same path.
+
+For exact-token completions on bidirectional NIXL, a reader with compatible capabilities can also receive credit for the portion of a retained D prefix that extends past its local prefix. The Router checks the source again after acquiring the P permit. A cold retry keeps the selected worker and adjusts the same in-flight token charge.
+
 ### `pd` — warm remote KV reuse
 
 | Field | Default | Notes |
@@ -152,6 +158,7 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `warm_remote` | `false` | enable D→P warm reads |
 | `protocol_revision` | `vllm-0.28.0-pd-feedback-v1` | must match the engine overlay |
 | `warm_min_p_kv_usage` | `0.0` | only route warm when the target P's scraped KV usage is at least this value (`0` = always) |
+| `warm_min_extra_tokens` | `1` | minimum additional compute tokens saved by a remote read when P work is known. An entirely overlapping prefix stays local. |
 | `warm_max_p_running` | unlimited | only route warm when the target P's scraped running requests are at most this value |
 | `max_prefix_tokens` | `32768` | largest verified prefix that may be published or pulled |
 | `max_candidate_tokens` | `2097152` | total retained prefix tokens across candidates |

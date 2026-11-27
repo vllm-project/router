@@ -350,6 +350,44 @@ async fn exact_two_turns_take_engine_metadata_once_and_reject_rewrite() {
         .is_none());
 }
 #[tokio::test]
+async fn kv_prefill_prices_the_same_history_on_two_readers_and_respects_minimum_gain() {
+    let policy = PolicyConfig::KvAware {
+        router_temperature: 0.0,
+        kv_penalty_host: 0.8,
+        kv_penalty_external: 0.6,
+        kv_penalty_disk: 0.3,
+        static_kv_event_sources: Box::default(),
+    };
+    for (minimum, expect_read) in [(1, true), (64, false)] {
+        let p0 = engine(true, false, false).await;
+        let p1 = engine(true, false, false).await;
+        let d = engine(false, false, false).await;
+        let router = router_with_prefills(
+            &[&p0, &p1],
+            &d,
+            policy.clone(),
+            false,
+            json!({"warm_min_extra_tokens":minimum}),
+        )
+        .await;
+        assert_eq!(call(&router, vec![1, 2, 3], false).await.0, StatusCode::OK);
+        assert_eq!(call(&router, next_prompt(), false).await.0, StatusCode::OK);
+        let calls: Vec<_> = [&p0, &p1]
+            .iter()
+            .flat_map(|p| prefill_calls(p, &next_prompt()))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .pointer("/kv_transfer_params/remote_engine_id")
+                .is_some(),
+            expect_read
+        );
+        assert_eq!(d.state.calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn capability_probe_is_cached_across_turns() {
     let p = engine(true, false, false).await;
     let d = engine(false, false, false).await;

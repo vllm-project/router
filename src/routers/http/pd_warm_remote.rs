@@ -39,7 +39,7 @@ pub(super) struct EngineIdentity {
     local_prefix_probe: bool,
     store: bool,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Candidate {
     topology_revision: u64,
     produced_attempt: u64,
@@ -201,15 +201,13 @@ impl PdWarmRemoteRuntime {
         s.feedback
             .retain(|key, _| targets.iter().any(|t| key.ends_with(&format!(":{}", t.id))));
     }
-    fn claim(
+    fn rejection(
         &self,
+        c: &Candidate,
         dispatch: &ProgramDispatch,
         prompt: &[u32],
         identity: [u8; 32],
-    ) -> Option<Candidate> {
-        self.refresh_loss();
-        let mut s = self.state.lock();
-        let c = s.candidates.remove(dispatch.program())?;
+    ) -> Option<&'static str> {
         let expiry_ok = c.expires
             > Instant::now()
                 + Duration::from_secs_f64(
@@ -222,7 +220,7 @@ impl PdWarmRemoteRuntime {
         let attempt_ok = c.produced_attempt < dispatch.attempt_id();
         let placement_ok = c.produced_placement <= dispatch.placement_epoch();
         if !(expiry_ok && identity_ok && prefix_ok && attempt_ok && placement_ok) {
-            let reason = if !expiry_ok {
+            return Some(if !expiry_ok {
                 "candidate_rejected_expiry"
             } else if !identity_ok {
                 "candidate_rejected_identity"
@@ -232,7 +230,170 @@ impl PdWarmRemoteRuntime {
                 "candidate_rejected_attempt"
             } else {
                 "candidate_rejected_placement"
+            });
+        }
+        None
+    }
+
+    /// Price a single-use source without claiming it. Reader capability probes
+    /// run outside scheduler and source locks.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prefill_remote_misses(
+        &self,
+        runtime: &PdProgramRuntime,
+        client: &reqwest::Client,
+        headers: Option<&HeaderMap>,
+        dispatch: &ProgramDispatch,
+        decode: &ProgramTarget,
+        request: &Value,
+        path: &str,
+        workers: &[Arc<dyn Worker>],
+        inputs: &HashMap<String, super::pd_types::PdPrefillInput>,
+    ) -> HashMap<super::pd_types::PdEndpoint, u64> {
+        if !self.config.warm_remote || runtime.discovery {
+            return HashMap::new();
+        }
+        let Some(prompt) = exact_request(request, path, self.config.max_prefix_tokens) else {
+            return HashMap::new();
+        };
+        let identity = request_identity(request);
+        self.refresh_loss();
+        let revision = runtime.worker_registry.revision();
+        let (miss, source, engine) = {
+            let state = self.state.lock();
+            let Some(c) = state.candidates.get(dispatch.program()) else {
+                return HashMap::new();
             };
+            if c.topology_revision != revision
+                || !c.engine.bidirectional
+                || self.rejection(c, dispatch, &prompt, identity).is_some()
+            {
+                return HashMap::new();
+            }
+            (
+                prompt.len().saturating_sub(c.prefix.len()).max(1) as u64,
+                c.source.clone(),
+                c.engine.clone(),
+            )
+        };
+        if self
+            .identify(client, &source, headers, revision)
+            .await
+            .as_ref()
+            .ok()
+            != Some(&engine)
+        {
+            return HashMap::new();
+        }
+        if *decode != source
+            && !self
+                .identify(client, decode, headers, revision)
+                .await
+                .is_ok_and(|d| d.profile == engine.profile)
+        {
+            return HashMap::new();
+        }
+        let profile = engine.profile;
+        let candidates = workers
+            .iter()
+            .filter_map(|worker| {
+                let target = super::pd_program_adapter::worker_target(worker);
+                let local = inputs
+                    .get(worker.base_url())?
+                    .work_by_rank
+                    .get(&worker.dp_rank())?
+                    .device_miss_tokens;
+                (self.worth_reading(local, miss)
+                    && self.pressure_ok(runtime, &target)
+                    && self.warm_beats_cold(
+                        runtime,
+                        &dispatch.target_id,
+                        &profile,
+                        prompt.len(),
+                        local,
+                        miss,
+                    ))
+                .then(|| {
+                    (
+                        super::pd_types::PdEndpoint::for_worker(worker.as_ref()),
+                        target,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        // A P which has never served this Program can still be the best reader.
+        let profile = profile.as_str();
+        futures_util::stream::iter(candidates)
+            .map(|(endpoint, target)| async move {
+                let pe = self
+                    .identify(client, &target, headers, revision)
+                    .await
+                    .ok()?;
+                (pe.profile == profile && pe.bidirectional && pe.fail_on_load_error)
+                    .then_some((endpoint, miss))
+            })
+            .buffer_unordered(8)
+            .filter_map(std::future::ready)
+            .collect()
+            .await
+    }
+
+    fn worth_reading(&self, local_miss: u64, remote_miss: u64) -> bool {
+        local_miss.saturating_sub(remote_miss) >= self.config.warm_min_extra_tokens.max(1)
+    }
+
+    fn pressure_ok(&self, runtime: &PdProgramRuntime, p: &ProgramTarget) -> bool {
+        runtime
+            .scheduler
+            .pd_prefill_kv_usage(&p.base_url)
+            .is_none_or(|usage| usage >= self.config.warm_min_p_kv_usage)
+            && runtime
+                .scheduler
+                .pd_prefill_load(&p.base_url)
+                .is_none_or(|running| running <= self.config.warm_max_p_running)
+    }
+
+    fn warm_beats_cold(
+        &self,
+        runtime: &PdProgramRuntime,
+        d: &str,
+        profile: &str,
+        prompt: usize,
+        local: u64,
+        miss: u64,
+    ) -> bool {
+        let Some(table) = self
+            .config
+            .calibration
+            .as_ref()
+            .filter(|t| t.profile == profile)
+        else {
+            return true;
+        };
+        let Some(running) = runtime.scheduler.pd_rank_load(d) else {
+            return true;
+        };
+        let estimate =
+            |path, work| table.estimate(path, prompt, work, running, self.correction(path, d));
+        match (
+            estimate(PdPath::WarmRemote, miss as usize),
+            estimate(PdPath::ColdRemote, local as usize),
+        ) {
+            (Some(warm), Some(cold)) => warm + table.min_route_gain_seconds < cold,
+            _ => true,
+        }
+    }
+
+    fn claim(
+        &self,
+        dispatch: &ProgramDispatch,
+        prompt: &[u32],
+        identity: [u8; 32],
+    ) -> Option<Candidate> {
+        self.refresh_loss();
+        let mut s = self.state.lock();
+        let c = s.candidates.remove(dispatch.program())?;
+        if let Some(reason) = self.rejection(&c, dispatch, prompt, identity) {
             *s.counters.entry(reason).or_default() += 1;
             *s.counters.entry("candidate_rejected").or_default() += 1;
             return None;
@@ -628,9 +789,7 @@ async fn local_prefix(
 /// by `cold_fallback_consumes_one_prefill_selection_per_turn` only indirectly
 /// (`round_robin` alternation), so keep the exits grouped at the top.
 ///
-/// `prefills` carries the target and the worker it charges together: both are
-/// derived from `policy_prefill`, so a caller cannot pass a target whose
-/// capacity is charged to a different worker.
+/// Derive the transfer target and load charge from the same selected P.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute(
     runtime: &PdProgramRuntime,
@@ -640,11 +799,11 @@ pub(super) async fn execute(
     request: &Value,
     path: &str,
     headers: Option<&HeaderMap>,
-    prefills: &[(ProgramTarget, Arc<dyn Worker>)],
+    prefill_worker: &Arc<dyn Worker>,
     targets: &[ProgramTarget],
-    policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
+    cold_work: impl Fn() -> Option<u64> + Sync,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -663,7 +822,7 @@ pub(super) async fn execute(
     };
     let mut dispatch = completion.dispatch().clone();
     let d = targets.iter().find(|t| t.id == dispatch.target_id)?;
-    let (p, prefill_worker) = prefills.get(policy_prefill)?;
+    let p = &super::pd_program_adapter::worker_target(prefill_worker);
     // Capability failure is a conservative fallback to the native path, never a
     // warm/local guess.
     let (de, pe) = match tokio::join!(
@@ -680,24 +839,25 @@ pub(super) async fn execute(
     let identity = request_identity(request);
     // Without warm reads or local reuse there is no consumer for a candidate;
     // claiming one would only consume it and inflate the claim counters.
-    let mut candidate = if warm_remote.config.warm_remote || warm_remote.config.local_append {
-        warm_remote.claim(&dispatch, &prompt, identity)
+    let candidate = if warm_remote.config.warm_remote || warm_remote.config.local_append {
+        warm_remote.refresh_loss();
+        warm_remote
+            .state
+            .lock()
+            .candidates
+            .get(dispatch.program())
+            .filter(|c| {
+                c.topology_revision == topology_revision
+                    && c.engine.profile == de.profile
+                    && c.engine.bidirectional
+                    && warm_remote
+                        .rejection(c, &dispatch, &prompt, identity)
+                        .is_none()
+            })
+            .cloned()
     } else {
         None
     };
-    if let Some(c) = candidate.as_ref() {
-        // A candidate must be validated against a *fresh* source identity:
-        // a restart at the same URL keeps the URL but drops the retained KV.
-        let source = identify_uncached(client, &c.source, headers, &warm_remote.config).await;
-        if c.topology_revision != topology_revision
-            || source.as_ref().ok() != Some(&c.engine)
-            || c.engine.profile != de.profile
-            || !c.engine.bidirectional
-        {
-            candidate = None;
-            warm_remote.count("source_epoch_rejected");
-        }
-    }
     let coverage = candidate.as_ref().map_or(0, |c| c.prefix.len());
     let local_coverage = if warm_remote.config.local_append
         && de.local_miss_guard
@@ -724,16 +884,15 @@ pub(super) async fn execute(
     // Native PD metrics label engines without the http:// scheme.
     let p_metric = p.base_url.strip_prefix("http://").unwrap_or(&p.base_url);
     let d_metric = d.base_url.strip_prefix("http://").unwrap_or(&d.base_url);
-    let p_kv_usage = runtime.scheduler.pd_prefill_kv_usage(&p.base_url);
-    let p_running = runtime.scheduler.pd_prefill_load(&p.base_url);
-    let warm_pressure_ok = p_kv_usage
-        .is_none_or(|usage| usage >= warm_remote.config.warm_min_p_kv_usage)
-        && p_running.is_none_or(|running| running <= warm_remote.config.warm_max_p_running);
+    let warm_pressure_ok = warm_remote.pressure_ok(runtime, p);
+    let remote_miss = prompt.len().saturating_sub(coverage).max(1) as u64;
+    let local_work = cold_work();
     let mut route = if warm_remote.config.warm_remote
         && pe.bidirectional
         && pe.fail_on_load_error
         && candidate.is_some()
         && warm_pressure_ok
+        && local_work.is_none_or(|local| warm_remote.worth_reading(local, remote_miss))
     {
         PdPath::WarmRemote
     } else {
@@ -763,7 +922,7 @@ pub(super) async fn execute(
                 let cold = table.estimate(
                     PdPath::ColdRemote,
                     prompt.len(),
-                    prompt.len(),
+                    local_work.map_or(prompt.len(), |tokens| tokens as usize),
                     running,
                     warm_remote.correction(PdPath::ColdRemote, &d.id),
                 );
@@ -816,23 +975,58 @@ pub(super) async fn execute(
             }
         }
     }
+    let mut permit = if route == PdPath::LocalAppend {
+        None
+    } else {
+        match runtime.reserve_prefill(&p.id, completion.dispatch()).await {
+            Ok(permit) => Some(permit),
+            Err(_) => return Some(Err("P capacity timeout".into())),
+        }
+    };
+    if runtime.worker_registry.revision() != topology_revision
+        || !prefill_worker.is_available()
+        || !decode_worker.is_available()
+    {
+        return Some(Err("PD target changed after capacity wait".into()));
+    }
+    let source_revision = candidate
+        .as_ref()
+        .map(|c| warm_remote.revision_for(&c.source));
+    let mut candidate = if warm_remote.config.warm_remote || warm_remote.config.local_append {
+        warm_remote.claim(&dispatch, &prompt, identity)
+    } else {
+        None
+    };
+    if let Some(c) = candidate.as_ref() {
+        let source = identify_uncached(client, &c.source, headers, &warm_remote.config).await;
+        if c.topology_revision != topology_revision
+            || source.as_ref().ok() != Some(&c.engine)
+            || c.engine.profile != de.profile
+            || !c.engine.bidirectional
+            || c.prefix.len() != coverage
+        {
+            candidate = None;
+            warm_remote.count("source_epoch_rejected");
+        }
+    }
+    if route == PdPath::LocalAppend && candidate.is_none() {
+        drop(local_permit.take());
+        route = PdPath::ColdRemote;
+        predicted = None;
+        permit = match runtime.reserve_prefill(&p.id, completion.dispatch()).await {
+            Ok(permit) => Some(permit),
+            Err(_) => return Some(Err("P capacity timeout".into())),
+        };
+    }
     let event_revision = warm_remote.revision_for(d);
     let started = Instant::now();
-    // Charge the same native P/D accounting the native two-stage path uses so
-    // load-aware policies and
-    // the published PD occupancy metrics see Program traffic too.
-    // admit_bound charges PdLoadManager and attaches the workers itself, so
-    // do not attach again: finish/Drop decrement exactly once.
-    let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker);
+    let local_work = cold_work();
+    let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker, local_work);
     let result = async {
         let d_params = if route == PdPath::LocalAppend {
             attempt.finish_prefill();
             json!({"do_remote_decode":false,"do_remote_prefill":false,"pd_local_max_miss_tokens":warm_remote.config.local_execution_budget_tokens,"pd_local_max_running_requests":local_running_limit,"pd_local_max_local_prefills":warm_remote.config.max_local_requests_per_target})
         } else {
-            let permit = runtime
-                .reserve_prefill(&p.id)
-                .await
-                .map_err(|_| "P capacity timeout")?;
             if runtime.worker_registry.revision() != topology_revision
                 || warm_remote
                     .identify(client, p, headers, topology_revision)
@@ -842,21 +1036,25 @@ pub(super) async fn execute(
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                 return Err("P epoch changed after capacity wait".into());
             }
+            // A newly selected reader may have restarted while it waited for P capacity.
+            if route == PdPath::WarmRemote && local_work.is_some()
+                && identify_uncached(client, p, headers, &warm_remote.config).await.as_ref().ok() != Some(&pe) {
+                warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                return Err("P epoch changed before warm read".into());
+            }
+            warm_remote.refresh_loss();
             let warm = candidate.as_ref().filter(|c| {
-                route == PdPath::WarmRemote
-                    && c.expires
-                        > Instant::now()
-                            + Duration::from_secs_f64(
-                                warm_remote
-                                    .config
-                                    .lease_margin_seconds
-                                    .max(c.engine.read_margin_millis as f64 / 1000.0),
-                            )
+                route == PdPath::WarmRemote && Some(warm_remote.revision_for(&c.source)) == source_revision && warm_remote.pressure_ok(runtime, p)
+                    && local_work.is_none_or(|local| warm_remote.worth_reading(local, remote_miss))
+                    && warm_remote.rejection(c, &dispatch, &prompt, identity).is_none()
             });
+            if warm.is_some() {
+                attempt.reprice_prefill(local_work.map(|local| local.min(remote_miss)));
+            }
             if route == PdPath::WarmRemote && warm.is_none() {
                 route = PdPath::ColdRemote;
                 predicted = None;
-                warm_remote.count("expired_before_read");
+                warm_remote.count("warm_rejected_before_read");
             }
             RouterMetrics::record_pd_prefill_request(p_metric);
             let mut value = prefill(
@@ -885,6 +1083,7 @@ pub(super) async fn execute(
                 warm_remote.read_outcome_in_profile(false, &de.profile);
                 route = PdPath::ColdRemote;
                 predicted = None;
+                attempt.reprice_prefill(cold_work());
                 // New transport ID, one bounded retry; no source metadata is reinserted.
                 value = prefill(
                     client,
@@ -1020,7 +1219,7 @@ pub(super) async fn execute(
             warm_remote.count("local_guard_cold_retry");
             // One remote retry while the same D reservation still covers the exact work.
             // Local rejected before output; use a fresh backend attempt and P permit.
-            let permit = match runtime.reserve_prefill(&p.id).await {
+            let permit = match runtime.reserve_prefill(&p.id, completion.dispatch()).await {
                 Ok(p) => p,
                 Err(_) => return Some(Err(error)),
             };
@@ -1034,6 +1233,7 @@ pub(super) async fn execute(
             {
                 return Some(Err("P epoch changed before local cold retry".into()));
             }
+            attempt.restart_prefill(cold_work());
             RouterMetrics::record_pd_prefill_request(p_metric);
             let value = prefill(
                 client,
@@ -1045,6 +1245,7 @@ pub(super) async fn execute(
                 warm_remote.config.max_response_bytes,
             )
             .await;
+            attempt.finish_prefill();
             drop(permit);
             let fallback = async {
                 let value = match value {
