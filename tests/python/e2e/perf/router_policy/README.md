@@ -16,7 +16,9 @@ sessions. The workload includes no `c16` or `c32` cells.
 
 Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
 
-Worker and router processes use [`helpers/process.py`](../../../helpers/process.py), the same launch path as `perf/grpc`.
+Workers, the router, and benchmark replay use [`helpers/process.py`](../../../helpers/process.py).
+The suite supplies per-case environment overrides; the shared launcher inherits
+the parent environment, as it does for `perf/grpc` and `perf/l1_encode`.
 
 ## Run
 
@@ -39,7 +41,11 @@ pytest tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -sv -
 Performance JSON and the run directory are separate. The nightly dashboard copies `tests/python/e2e/results` only.
 
 - `tests/python/e2e/results/perf/router_policy/<scenario>_<run_suffix>/c<concurrency>_t<task_num>.json` — copy of `calibration.json` when the cell is ok. One directory per scenario and session; one file per concurrency. The `concurrency` / `task_num` fields match the file name.
-- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads the complete cell directories matched by `run/perf/router_policy/c*-*/**/*`, including replay results, logs, Prometheus snapshots, and command files. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. Model caches stay under `tests/python/e2e/run/perf/router_policy/cache/` (shared across cells in this work root, excluded from nightly uploads). The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
+- `tests/python/e2e/run/perf/router_policy/<case_id>-<run_suffix>/` — cell files. Nightly uploads the complete cell directories matched by `run/perf/router_policy/c*-*/**/*`, including replay results, logs, Prometheus snapshots, and command files. The generated replay wrapper (`replay_entry.py`, including compatibility and stagger patches) is retained beside its command and logs after cleanup and uploaded for diagnosis and reproduction. The same stdout is also printed (`[engineN]`, `[vllm-router]`, `[replay]`).
+
+Workers inherit `HF_HOME`, `XDG_CACHE_HOME`, `VLLM_CACHE_ROOT`, and
+`TRITON_CACHE_DIR` from the environment. CI reuses its mounted Hugging Face
+model cache through `HF_HOME`; unset variables use each library's defaults.
 
 `<run_suffix>` is local time `YYYYMMDD_HHMMSS` (same format as grpc and l1_encode) unless you set **`AGENTX_RUN_SUFFIX`** (same suffix for all cells in one matrix, e.g. `export AGENTX_RUN_SUFFIX=20251029_171300`). The run directory is generated automatically from the case ID and run suffix.
 
@@ -50,6 +56,17 @@ Before replay, the cell runner **removes `result/`** if it already exists. The c
 **Ports**: HTTP, gRPC, and the router use OS-assigned ports held until that process starts. KV event PUB/replay use a free port in **25100–25299**, also held until that worker starts. This vLLM reports the configured endpoint unchanged, so `tcp://*:0` comes back as port 0 and the router rejects it. After each worker is healthy, the runner calls gRPC `Control.GetKvEventSources` and fails the cell if an advertised endpoint still uses port 0. Between pytest cells, default **`AGENTX_CELL_GAP_SEC=5`**; before allocate, **`AGENTX_PORT_SETTLE_SEC=2`**. Do not run multiple matrix jobs on one host in parallel.
 
 Worker and router processes are started with `helpers/process.py` (`launch_worker` once per worker, then `launch_router`). Pytest hides the stderr stream unless the invocation uses **`-sv`**.
+
+All workers are launched before the shared
+`tests.python.helpers.process.wait_workers_ready()` checks their HTTP health,
+so model loading and compilation on different GPUs can overlap. They share one
+1,800-second startup deadline; startup failure stops every worker already
+launched. Each policy cell still starts fresh engines and a fresh router,
+preserving a cold KV cache for each replay. `ENGINES_READY` and `ROUTER_READY`
+report startup time. In `calibration.json`, `wall_seconds` includes startup
+and cleanup, while `makespan_seconds` is the measured request window.
+The nightly 180-minute PD timeout is a job budget; actual H100 runtime needs
+GPU measurement.
 
 All six scenarios use the same vLLM 0.30.0 KV-event contract described in the
 [KV-aware worker requirements](https://github.com/vllm-project/router/blob/main/docs/load_balancing/kv_aware.md#worker-requirements).
@@ -120,10 +137,12 @@ timing dependencies do not generate measured request rows.
 Actual rows must have nonempty, globally unique `request_id` values and exactly
 match the planned `(session_id, request_id)` pairs. Missing or extra rows, wrong
 IDs, duplicates, and missing or malformed plan/source artifacts fail the cell
-and prevent dashboard publication. Expected counts come from the source
-inventory and selected plan, independently of `requests.jsonl` or its summary.
-The bundled workloads require 28 TraceLab requests or 144 AgentX requests; a
-TraceLab URL override is checked against its own inventory and plan. Counts and
+and prevent dashboard publication. Pinned workload counts are fixed independently
+of the importer, source analysis, plan, and measured rows: eight source sessions
+and 28 requests for TraceLab; twelve source sessions and 315 requests for AgentX.
+Source counts and the planned complete source cycle must both match, so a
+shortened import cannot pass by repeating one of its remaining sessions. An
+explicit TraceLab URL override is checked against its own inventory and plan. Counts and
 failure reasons are recorded in `replay_validation` in `calibration.json`.
 
 Merged `kv_aware` / `kv_aware_aff` cells and disaggregated `kv_aware` cells also
@@ -178,29 +197,32 @@ counters.
 ## Buildkite nightly (L3)
 
 The router policy steps in [`.buildkite/test-nightly.yml`](../../../../../.buildkite/test-nightly.yml)
-run on `l4_4` (four L4 GPUs per job).
+use four co-located GPUs per job.
 
-- `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged scenarios.
+- `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged
+  scenarios on `l4_4`.
 - `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c12` and runs
-  `cache_aware`, `kv_aware`, and `round_robin` sequentially in one four-GPU job.
+  `cache_aware`, `kv_aware`, and `round_robin` sequentially in one `h100_4` job.
   The three scenarios share a 180-minute timeout and artifact upload. This
   increases the previous 90-minute budget; the total runtime still needs
-  confirmation on the actual four-L4 lane. Failures in either router policy
+  confirmation on the actual four-H100 lane. Failures in either router policy
   job fail the Buildkite build.
 
 The PD cases use two prefill workers and two decode workers, each on its own
 GPU, with Rust gRPC frontends and NIXL KV transfer. Set `workers.prefill_count`
 to the number of prefill workers. The remaining workers decode. Merged cases
-use the default `prefill_count=0`. All cases reserve 12 GiB GPU KV per worker
-and use no CPU offload. Merged cases use `max_model_len=32768`; PD cases use
-`max_model_len=65536` for the pinned AgentX requests (maximum input plus output
-65,181 tokens). For the configured BF16 Qwen3-4B model, one full 64K sequence
-uses 9 GiB of KV, within the per-worker KV allocation.
+use the default `prefill_count=0`. Merged cases reserve 12 GiB GPU KV per worker
+with `max_model_len=32768`. PD cases use `max_model_len=163840`, 26 GiB GPU KV
+per worker, and `max_num_seqs=8`, matching the heterogeneous reference workload's
+memory profile. L4's 24 GB of device memory cannot hold the PD KV allocation;
+the PD CI job uses four H100s from the existing H100 pool. No case uses CPU
+offload.
 
 The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
 router. Merged cases use `data/tracelab-ci-uniform-28.jsonl` (eight sessions,
-28 requests). The three PD cases share `data/agentx-ci-12x12.jsonl` (twelve sessions,
-twelve turns each, 144 requests) with `trace_type=agentX`, `/v1/completions`,
+28 requests). The three PD cases share `data/agentx-hetero12x12.jsonl` (twelve
+sessions, twelve top-level entries each, 315 expanded model requests including
+subagents) with `trace_type=agentX`, `/v1/completions`,
 and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
 token-ID replay settings. See [data provenance and reproduction](data/README.md).
 
@@ -211,7 +233,8 @@ cell directory as `trace.jsonl`; this override applies only to TraceLab.
 Downloads replace the cell's trace atomically, and failures stop the cell
 before GPU processes start. Local pytest runs use the same setup.
 
-Run the three PD scenarios in an environment with four supported CUDA GPUs.
+Run the three PD scenarios with four CUDA GPUs that can hold the model,
+26 GiB of KV cache per GPU, and runtime overhead (for example, four H100s).
 
 ```bash
 python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c12'
@@ -220,5 +243,7 @@ python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scen
 Earlier TraceLab runs of cache-aware and KV-aware affinity passed on two L20
 GPUs with one prefill worker, one decode worker, and all 28 requests successful.
 Those runs used the vLLM native sampler because FlashInfer CUDA compilation
-failed in the test container. The current AgentX workload still needs GPU
-validation with four GPUs and two prefill/two decode workers.
+failed in the test container. A [reviewer replay on four H20s](https://github.com/vllm-project/router/pull/615#issuecomment-7207247874)
+used this heterogeneous fixture with vLLM 0.30.0, 2P2D, and c12: all three
+policies completed 315/315 requests. The updated four-H100 CI configuration
+still needs an actual GPU run.

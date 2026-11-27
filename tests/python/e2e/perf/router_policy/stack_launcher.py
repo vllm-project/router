@@ -7,8 +7,9 @@ Flow:
   4. Wait until router passes HTTP /health.
   5. Run agentinfer replay bench against the router.
 
-Workload is the TraceLab 8-session / 28-request subset
-(``data/tracelab-ci-uniform-28.jsonl``). Replay executes that plan and writes
+Merged cases use the TraceLab 8-session / 28-request subset; disaggregated
+cases use the AgentX heterogeneous 12-session / 315-request subset.
+Replay executes the selected plan and writes
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
@@ -47,15 +48,16 @@ from tests.python.e2e.perf.router_policy.log_summary import (
 )
 from tests.python.helpers.process import (
     RunningProc,
+    launch_process,
     launch_router,
     launch_worker,
+    wait_workers_ready,
     graceful_stop,
     release_all_port_holders,
     release_router_port_holders,
     release_worker_port_holders,
     reserve_port,
     router_cmd,
-    stream_process,
     vllm_rs_serve_cmd,
 )
 
@@ -66,7 +68,9 @@ class RouterPolicyStack:
 
     case: RouterPolicyCase
     out: Path
-    env: dict[str, str]
+    env: dict[
+        str, str
+    ]  # Per-case overrides; helpers/process.py inherits the parent env.
     gpus: list[str]
     clients: httpx.Client
     ports: dict[str, Any] = field(default_factory=dict)
@@ -97,16 +101,9 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
         flush=True,
     )
 
-    env = os.environ.copy()
     py = case.python
     py_prefix = str(Path(py).parent) if ("/" in py or "\\" in py) else ""
-    path_parts = [p for p in (py_prefix, env.get("PATH", "")) if p]
-    env_updates: dict[str, str] = {
-        "PATH": os.pathsep.join(path_parts),
-        "XDG_CACHE_HOME": str(case.perf_work_root / "cache"),
-        "HF_HOME": str(case.perf_work_root / "cache/huggingface"),
-        "VLLM_CACHE_ROOT": str(case.perf_work_root / "cache/vllm"),
-        "TRITON_CACHE_DIR": str(case.perf_work_root / "cache/triton"),
+    env: dict[str, str] = {
         "VLLM_ROUTER_MODEL": case.model,
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
         "TOKENIZERS_PARALLELISM": "false",
@@ -114,19 +111,22 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
         "RUST_LOG": os.environ.get("RUST_LOG", "info"),
         "AGENTX_TASK_STAGGER": str(case.task_stagger),
     }
+    if py_prefix:
+        env["PATH"] = os.pathsep.join(
+            p for p in (py_prefix, os.environ.get("PATH", "")) if p
+        )
     if case.agent_infer is not None:
-        existing = env.get("PYTHONPATH", "").strip()
-        env_updates["PYTHONPATH"] = (
+        existing = os.environ.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = (
             str(case.agent_infer)
             if not existing
             else f"{case.agent_infer}{os.pathsep}{existing}"
         )
-    env.update(env_updates)
     if case.openssl_lib_dir:
         env["LD_LIBRARY_PATH"] = (
-            case.openssl_lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+            case.openssl_lib_dir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
         )
-    gpus = env.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     if gpus == [""]:
         gpus = [str(i) for i in range(case.worker_count)]
     if len(gpus) < case.worker_count:
@@ -151,20 +151,17 @@ def _start_replay(
     Path(str(log) + ".command.json").write_text(
         json.dumps(command, indent=2), encoding="utf-8"
     )
-    proc = subprocess.Popen(
+    running = launch_process(
         command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        label="replay",
+        log_path=log,
+        log_prefix="router_policy",
         env=run.env,
         start_new_session=True,
-        text=True,
-        bufsize=1,
     )
-    run.replay_proc = proc
-    run.replay_stream = stream_process(
-        proc, label="replay", log_path=log, log_prefix="router_policy"
-    )
-    return proc
+    run.replay_proc = running.proc
+    run.replay_stream = running
+    return running.proc
 
 
 def cleanup(run: RouterPolicyStack) -> None:
@@ -325,6 +322,55 @@ def engine_command(run: RouterPolicyStack, i: int):
         served_model_name=run.case.served_model_name,
         engine_flags=engine,
     )
+
+
+def start_workers(run: RouterPolicyStack, *, timeout: float = 1800) -> None:
+    """Launch all workers before waiting for health, sharing one startup deadline."""
+    case, ports = run.case, run.ports
+    deadline = time.monotonic() + timeout
+    workers = []
+    try:
+        for i in range(case.worker_count):
+            release_worker_port_holders(run.port_holders, i, case.worker_count)
+            _release_kv_port_holders(run, i)
+            worker_env = run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]}
+            if case.prefill_count:
+                run.nixl_port_holders[i].close()
+                run.nixl_port_holders[i] = None
+                worker_env.update(
+                    VLLM_NIXL_SIDE_CHANNEL_HOST="127.0.0.1",
+                    VLLM_NIXL_SIDE_CHANNEL_PORT=str(ports["nixl_side"][i]),
+                    UCX_TLS=os.environ.get("UCX_TLS", "all"),
+                )
+            worker_cmd = engine_command(run, i)
+            worker_log = run.out / f"engine{i}.log"
+            Path(str(worker_log) + ".command.json").write_text(
+                json.dumps(worker_cmd, indent=2), encoding="utf-8"
+            )
+            worker = launch_worker(
+                worker_cmd,
+                label=f"engine{i}",
+                env=worker_env,
+                log_prefix="router_policy",
+                log_path=worker_log,
+            )
+            run.stack.append(worker)
+            workers.append(worker)
+        wait_workers_ready(
+            [
+                (
+                    f"http://127.0.0.1:{ports['http'][i]}/health",
+                    worker.proc,
+                    worker.label,
+                )
+                for i, worker in enumerate(workers)
+            ],
+            max(0, deadline - time.monotonic()),
+            prefix="router_policy",
+        )
+    except Exception:
+        cleanup(run)
+        raise
 
 
 def router_command(run: RouterPolicyStack):
@@ -669,34 +715,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
     try:
         try:
             preflight_router_bin(case.router_bin)
-            for i in range(case.worker_count):
-                release_worker_port_holders(run.port_holders, i, case.worker_count)
-                _release_kv_port_holders(run, i)
-                worker_env = run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]}
-                if case.prefill_count:
-                    run.nixl_port_holders[i].close()
-                    run.nixl_port_holders[i] = None
-                    worker_env.update(
-                        VLLM_NIXL_SIDE_CHANNEL_HOST="127.0.0.1",
-                        VLLM_NIXL_SIDE_CHANNEL_PORT=str(ports["nixl_side"][i]),
-                        UCX_TLS=run.env.get("UCX_TLS", "all"),
-                    )
-                worker_cmd = engine_command(run, i)
-                worker_log = run.out / f"engine{i}.log"
-                Path(str(worker_log) + ".command.json").write_text(
-                    json.dumps(worker_cmd, indent=2), encoding="utf-8"
-                )
-                run.stack.append(
-                    launch_worker(
-                        worker_cmd,
-                        label=f"engine{i}",
-                        env=worker_env,
-                        ready_url=f"http://127.0.0.1:{ports['http'][i]}/health",
-                        timeout=1800,
-                        log_prefix="router_policy",
-                        log_path=worker_log,
-                    )
-                )
+            start_workers(run)
             _require_resolved_kv_events(run)
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
             release_router_port_holders(run.port_holders, case.worker_count)

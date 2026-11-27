@@ -15,6 +15,7 @@
 #   h100_2     mithril-h100-pool, 2x H100 SXM (node.kubernetes.io/instance-type=gpu-h100-sxm).
 #              Image is the us-west-2 pull-through cache of the router CI image.
 #              Scheduling sets a GPU limit of 2 and does not request CPU, memory, or shm size.
+#   h100_4     Same H100 pool and image, four co-located GPUs for 2P2D replay.
 #
 # Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.
 
@@ -284,6 +285,41 @@ mirror_hardwares:
             # Not HF_TOKEN: a build-level HF_TOKEN overrides a pod env entry
             # with the same name. upload_pipeline.py exports HF_TOKEN from
             # this alias inside the job shell.
+            env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            - name: VLLM_CI_HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+          nodeSelector:
+            node.kubernetes.io/instance-type: gpu-h100-sxm
+          volumes:
+          - name: devshm
+            emptyDir:
+              medium: Memory
+          - name: hf-cache
+            hostPath:
+              path: /mnt/hf-cache
+              type: DirectoryOrCreate
+  h100_4:
+    retry: *hardware_retry
+    agents:
+      queue: mithril-h100-pool
+    plugins:
+    - kubernetes:
+        podSpec:
+          containers:
+          - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:router-$BUILDKITE_COMMIT
+            resources:
+              limits:
+                nvidia.com/gpu: 4
+            volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
             env:
             - name: HF_HOME
               value: /root/.cache/huggingface

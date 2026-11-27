@@ -147,7 +147,7 @@ steps:
 
       # ============================================================================
       # L3 router_policy replay — merged TraceLab c8 and disaggregated AgentX c12.
-      # 4× vllm-rs + router per cell (12GiB GPU KV/worker, no CPU offload) → L4×4.
+      # Merged: 12GiB GPU KV/worker on L4×4; PD: 26GiB/worker on H100×4.
       # TRACELAB_JSONL_URL overrides merged traces; PD uses a SHA256-pinned slice.
       # ============================================================================
       - label: ":bar_chart: Perf · PD Merge Router Policy (c8) Test"
@@ -171,7 +171,7 @@ steps:
         key: "router-policy-pd-disagg-perf-e2e"
         if: build.env("ROCM_ONLY") != "1"
         timeout_in_minutes: 180
-        mirror_hardwares: l4_4
+        mirror_hardwares: h100_4
         depends_on:
           - "upload-nightly-pipeline"
           - "image-build"

@@ -1,4 +1,4 @@
-"""Extract the first 12 eligible AgentX sessions, retaining 12 turns each."""
+"""Reproduce the review's fixed heterogeneous AgentX 12-by-12 replay slice."""
 
 from __future__ import annotations
 
@@ -7,70 +7,61 @@ import hashlib
 import json
 from pathlib import Path
 
-SESSION_COUNT = 12
+# Fixed by the reference extractor at KaisennHu/router commit d35dec404b1132f.
+# Four sessions from each of the small, medium, and large input-size cohorts.
+SESSION_IDS = (
+    "a89db4725a97da42ea24bd5128a093ffb215",
+    "751fbb2089c7c4303f3ed241f3a7a27a3f2c",
+    "b4c638cc16e89d17c18da83951a87fbc44dd",
+    "3c1fbf5cf98484c7f9ef07f2d4b00e65d829",
+    "e34c6bb77dc3a1cd393b29f573135d9d76a0",
+    "6d5c6b957d5f634a7f820ddff7389e161def",
+    "1007f04d2c64580308858bb42f292992929d",
+    "578354185933aedcdc6c17fbfbfcfb48876b",
+    "7754cd1191c469354df23c7d4e9de242f7cb",
+    "1a271af3dedd40be2efd413ef35fe7f0f53b",
+    "f204bbf87b0680d205fe8a14441fbde0ee71",
+    "4ba38d0b213f0aeab695e16da9c91635a817",
+)
+SESSION_COUNT = len(SESSION_IDS)
 TURNS_PER_SESSION = 12
-MAX_MODEL_LEN = 65536
-TRACE_FILE = "agentx-ci-12x12.jsonl"
-TRACE_SHA256 = "faf79824c90ddb72774a6f5f018f67821f26c48743cd5171cfbcfe9e00855537"
-
-
-def _eligible(session: dict, turns: int) -> bool:
-    requests = session.get("requests", [])[:turns]
-    block = session.get("block_size")
-    if (
-        session.get("hash_id_scope") != "local"
-        or type(block) is not int
-        or block <= 0
-        or len(requests) != turns
-    ):
-        return False
-    for request in requests:
-        input_tokens, output_tokens = request.get("in"), request.get("out")
-        if (
-            request.get("type") == "subagent"
-            or type(input_tokens) is not int
-            or type(output_tokens) is not int
-            or input_tokens <= 0
-            or output_tokens <= 1
-            or input_tokens + output_tokens > MAX_MODEL_LEN
-            or not isinstance(request.get("hash_ids"), list)
-            or len(request["hash_ids"]) != (input_tokens + block - 1) // block
-        ):
-            return False
-    return True
+MAX_MODEL_LEN = 163840
+TRACE_FILE = "agentx-hetero12x12.jsonl"
+TRACE_SHA256 = "e7e7fd7cd31f178483e2027281ce4592fca38bd35252c09b88e2a9dee1078638"
 
 
 def extract(
     source: Path,
     *,
-    session_count: int = SESSION_COUNT,
+    session_ids: tuple[str, ...] = SESSION_IDS,
     turns_per_session: int = TURNS_PER_SESSION,
     expected_sha256: str = TRACE_SHA256,
 ) -> bytes:
-    sessions = []
-    seen = set()
+    """Keep the fixed sessions in reference order, including all subagent calls."""
+    if not session_ids or len(set(session_ids)) != len(session_ids):
+        raise ValueError("expected nonempty, distinct session IDs")
+    selected = set(session_ids)
+    sessions = {}
     with source.open("rb") as handle:
         for raw in handle:
             session = json.loads(raw)
             session_id = session.get("id")
-            if (
-                not isinstance(session_id, str)
-                or not session_id
-                or session_id in seen
-                or not _eligible(session, turns_per_session)
-            ):
+            if session_id not in selected:
                 continue
-            seen.add(session_id)
-            sessions.append(
-                {**session, "requests": session["requests"][:turns_per_session]}
-            )
-            if len(sessions) == session_count:
+            if session_id in sessions:
+                raise ValueError(f"duplicate source session: {session_id}")
+            requests = session["requests"][:turns_per_session]
+            if len(requests) != turns_per_session:
+                raise ValueError(f"{session_id}: fewer than {turns_per_session} turns")
+            sessions[session_id] = {**session, "requests": requests}
+            if len(sessions) == len(session_ids):
                 break
-    if len(sessions) != session_count:
-        raise ValueError(f"source does not contain {session_count} eligible sessions")
+    missing = selected - sessions.keys()
+    if missing:
+        raise ValueError(f"source is missing fixed sessions: {sorted(missing)}")
+    # Match the reference serialization as well as its session selection.
     body = "".join(
-        json.dumps(session, sort_keys=True, separators=(",", ":")) + "\n"
-        for session in sessions
+        json.dumps(sessions[session_id]) + "\n" for session_id in session_ids
     ).encode("utf-8")
     if hashlib.sha256(body).hexdigest() != expected_sha256:
         raise ValueError("extracted AgentX trace SHA256 mismatch")

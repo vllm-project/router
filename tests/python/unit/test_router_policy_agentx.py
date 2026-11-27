@@ -1,8 +1,11 @@
 """CPU checks for the pinned AgentX workload and replay configuration."""
 
 import hashlib
+import io
 import json
+import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,10 +16,13 @@ import yaml
 from tests.python.e2e.perf.router_policy import case_loader
 from tests.python.e2e.perf.router_policy.data import extract_agentx_ci
 from tests.python.e2e.perf.router_policy.stack_launcher import (
+    allocate_ports,
+    cleanup,
     engine_command,
     open_cell,
     runtime_config,
     snapshot,
+    start_workers,
 )
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
@@ -100,6 +106,93 @@ def test_router_policy_worker_env_keeps_full_block_hashes(
         run.clients.close()
 
 
+@pytest.mark.parametrize("configured", [False, True], ids=["unset", "configured"])
+def test_worker_cache_environment_is_preserved(
+    worker_startup, tmp_path, monkeypatch, configured
+):
+    directories = ("XDG_CACHE_HOME", "HF_HOME", "VLLM_CACHE_ROOT", "TRITON_CACHE_DIR")
+    for name in directories:
+        if configured:
+            monkeypatch.setenv(name, str(tmp_path / "mounted" / name))
+        else:
+            monkeypatch.delenv(name, raising=False)
+    run, processes, _ = worker_startup
+    start_workers(run)
+    for process in processes:
+        for name in directories:
+            assert name not in run.env
+            if configured:
+                assert process.env[name] == str(tmp_path / "mounted" / name)
+            else:
+                assert name not in process.env
+
+
+@pytest.fixture
+def worker_startup(worker_case, tmp_path, monkeypatch):
+    processes, health_checks = [], []
+
+    class Worker:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.returncode = None
+            self.env = kwargs["env"]
+            processes.append(self)
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    def health(url, **kwargs):
+        assert len(processes) == worker_case.worker_count, (
+            "health check blocked launch of the remaining workers"
+        )
+        health_checks.append(url)
+        response = io.BytesIO()
+        response.status = 200
+        return response
+
+    monkeypatch.setattr(subprocess, "Popen", Worker)
+    monkeypatch.setattr(urllib.request, "urlopen", health)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    run = open_cell(worker_case, out_dir=tmp_path)
+    allocate_ports(run)
+    try:
+        yield run, processes, health_checks
+    finally:
+        cleanup(run)
+        run.clients.close()
+
+
+def test_worker_startup_launches_all_gpus_before_waiting(worker_startup, monkeypatch):
+    run, processes, health_checks = worker_startup
+    monkeypatch.setenv("UCX_TLS", "tcp,self")
+    start_workers(run)
+    assert health_checks == [
+        f"http://127.0.0.1:{port}/health" for port in run.ports["http"]
+    ]
+    assert [proc.env["CUDA_VISIBLE_DEVICES"] for proc in processes] == run.gpus
+    assert all(proc.env["UCX_TLS"] == "tcp,self" for proc in processes)
+    assert all(proc.poll() is None for proc in processes)
+
+
+def test_worker_startup_timeout_cleans_up_every_started_process(worker_startup):
+    run, processes, health_checks = worker_startup
+    with pytest.raises(TimeoutError, match="not ready"):
+        start_workers(run, timeout=0)
+    assert len(processes) == run.case.worker_count
+    assert not health_checks
+    assert all(proc.poll() is not None for proc in processes)
+    assert not run.stack
+    assert not run.port_holders
+    assert not run.kv_port_holders
+    assert not run.nixl_port_holders
+
+
 @pytest.mark.parametrize("router_status", [200, 503])
 def test_snapshot_uses_router_metrics_port_and_checks_http_status(
     tmp_path, router_status
@@ -145,21 +238,29 @@ def test_agentx_slice_matches_pd_cases():
         json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
     ]
     assert len(sessions) == extract_agentx_ci.SESSION_COUNT == 12
-    assert len({session["id"] for session in sessions}) == len(sessions)
+    assert tuple(session["id"] for session in sessions) == extract_agentx_ci.SESSION_IDS
     requests = []
+    subagent_groups = 0
     for session in sessions:
         assert session["hash_id_scope"] == "local"
         assert len(session["requests"]) == extract_agentx_ci.TURNS_PER_SESSION == 12
-        for request in session["requests"]:
-            assert request["type"] != "subagent"
+        session_requests = []
+        for entry in session["requests"]:
+            if entry["type"] == "subagent":
+                subagent_groups += 1
+                session_requests.extend(entry["requests"])
+            else:
+                session_requests.append(entry)
+        for request in session_requests:
             assert (
                 len(request["hash_ids"])
                 == (request["in"] + session["block_size"] - 1) // session["block_size"]
             )
-            assert 1 < request["out"]
+            assert 0 <= request["out"]
             assert request["in"] + request["out"] <= extract_agentx_ci.MAX_MODEL_LEN
-            requests.append(request)
-    assert len(requests) == 144
+        requests.extend(session_requests)
+    assert subagent_groups > 0
+    assert len(requests) == 315
     for filename in (
         "pd_disagg_cache_aware.json",
         "pd_disagg_kv_aware.json",
@@ -256,23 +357,27 @@ def extraction_source(tmp_path):
         "block_size": 4,
         "requests": [
             {"in": 4, "out": 2, "hash_ids": [1]},
-            {"in": 8, "out": 2, "hash_ids": [1, 2]},
+            {
+                "type": "subagent",
+                "agent_id": "child",
+                "requests": [
+                    {"in": 8, "out": 2, "hash_ids": [1, 2]},
+                    {"in": 4, "out": 0, "hash_ids": [3]},
+                ],
+            },
             {"in": 16, "out": 2, "hash_ids": [1, 2, 3, 4]},
         ],
     }
-    raw = (json.dumps(session) + "\n").encode()
+    second = {**session, "id": "second-session"}
+    raw = (json.dumps(session) + "\n" + json.dumps(second) + "\n").encode()
     source = tmp_path / "source.jsonl"
     source.write_bytes(raw)
-    expected = (
-        json.dumps(
-            {**session, "requests": session["requests"][:2]},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
+    expected = "".join(
+        json.dumps({**one, "requests": one["requests"][:2]}) + "\n"
+        for one in (second, session)
     ).encode()
     options = dict(
-        session_count=1,
+        session_ids=("second-session", "source-session"),
         turns_per_session=2,
         expected_sha256=hashlib.sha256(expected).hexdigest(),
     )
@@ -297,7 +402,20 @@ def test_extraction_rejects_changed_data(extraction_source, tamper):
 
 def test_extraction_requires_distinct_sessions(extraction_source):
     source, options, _ = extraction_source
-    source.write_bytes(source.read_bytes() * 2)
-    options["session_count"] = 2
-    with pytest.raises(ValueError, match="2 eligible sessions"):
+    options["session_ids"] = ("source-session", "source-session")
+    with pytest.raises(ValueError, match="distinct session IDs"):
+        extract_agentx_ci.extract(source, **options)
+
+
+def test_extraction_rejects_missing_fixed_sessions(extraction_source):
+    source, options, _ = extraction_source
+    options["session_ids"] = ("source-session", "missing-session")
+    with pytest.raises(ValueError, match="missing fixed sessions"):
+        extract_agentx_ci.extract(source, **options)
+
+
+def test_extraction_rejects_incomplete_sessions(extraction_source):
+    source, options, _ = extraction_source
+    options["turns_per_session"] = 4
+    with pytest.raises(ValueError, match="fewer than 4 turns"):
         extract_agentx_ci.extract(source, **options)

@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+from tests.python.helpers.process import wait_workers_ready
 from tests.python.e2e.function.helpers import launch
 from tests.python.e2e.function.helpers.worker_logs import SubprocessLogPump
 from tests.python.e2e.function.kv_aware.config import (
@@ -120,10 +121,6 @@ def spawn_two_vllm_rs_grpc_workers(
             echo=echo,
             prefix=f"[worker A grpc={grpc_a}] ",
         )
-        launch.wait_worker_health(
-            worker_a.http_url, worker_health_timeout, proc=worker_a.proc
-        )
-
         print(
             f"[e2e] worker B gpu={gpu_b} http={http_b} grpc={grpc_b}"
             f"{_kv_log(zmq_b, replay_b)}",
@@ -159,8 +156,13 @@ def spawn_two_vllm_rs_grpc_workers(
             echo=echo,
             prefix=f"[worker B grpc={grpc_b}] ",
         )
-        launch.wait_worker_health(
-            worker_b.http_url, worker_health_timeout, proc=worker_b.proc
+        wait_workers_ready(
+            [
+                (f"{worker.http_url}/health", worker.proc, f"worker {index}")
+                for index, worker in enumerate(workers)
+            ],
+            worker_health_timeout,
+            prefix="e2e",
         )
         return workers
     except Exception:

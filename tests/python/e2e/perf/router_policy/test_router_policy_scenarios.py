@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +45,9 @@ def _requests(value: Any, kind_field: str) -> list[dict[str, Any]]:
     return [node for node in records if node[kind_field] == "request"]
 
 
-def _expected_requests(result_dir: Path, task_num: int) -> set[tuple[str, str]]:
+def _expected_requests(
+    result_dir: Path, task_num: int, expected_inventory: tuple[int, int] | None
+) -> set[tuple[str, str]]:
     # AgentInfer writes both artifacts before sending any measured requests.
     # Source keys prevent a truncated plan from defining a smaller expected load.
     source = json.loads(
@@ -62,6 +66,18 @@ def _expected_requests(result_dir: Path, task_num: int) -> set[tuple[str, str]]:
         if name in sources or not keys or len(set(keys)) != len(keys):
             raise ValueError("empty or duplicate source request identities")
         sources[name] = set(keys)
+
+    if expected_inventory is not None:
+        session_count, request_count = expected_inventory
+        if len(sources) != session_count:
+            raise ValueError(
+                f"source session count mismatch: expected {session_count}, got {len(sources)}"
+            )
+        observed = sum(len(keys) for keys in sources.values())
+        if observed != request_count:
+            raise ValueError(
+                f"source request count mismatch: expected {request_count}, got {observed}"
+            )
 
     tasks = _records(plan["tasks"], "planned tasks")
     if len(tasks) != task_num:
@@ -96,20 +112,33 @@ def _expected_requests(result_dir: Path, task_num: int) -> set[tuple[str, str]]:
             request_ids.add(request_id)
             expected.add((session_id, request_id))
     # The pinned cases sample one complete source cycle.
-    if len(tasks) == len(sources) and Counter(sampled_sources) != Counter(
-        sources.keys()
-    ):
+    if (expected_inventory is not None or len(tasks) == len(sources)) and Counter(
+        sampled_sources
+    ) != Counter(sources.keys()):
         raise ValueError("planned sessions do not cover the complete source cycle")
+    if expected_inventory is not None and len(expected) != expected_inventory[1]:
+        raise ValueError(
+            f"planned request count mismatch: expected {expected_inventory[1]}, got {len(expected)}"
+        )
     return expected
 
 
 def validate_replay(
-    result_dir: Path, rows: list[dict[str, Any]], *, task_num: int
+    result_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    task_num: int,
+    expected_inventory: tuple[int, int] | None,
 ) -> dict[str, Any]:
     """Fail closed on incomplete, duplicate, or misidentified measured requests."""
     errors: list[str] = []
     checks: dict[str, Any] = {
-        "expected_requests": None,
+        "expected_source_sessions": expected_inventory[0]
+        if expected_inventory is not None
+        else None,
+        "expected_requests": expected_inventory[1]
+        if expected_inventory is not None
+        else None,
         "observed_requests": len(rows),
         "distinct_request_ids": 0,
         "errors": errors,
@@ -139,7 +168,7 @@ def validate_replay(
     if duplicates:
         errors.append(f"duplicate request IDs in {duplicates} extra rows")
     try:
-        expected = _expected_requests(result_dir, task_num)
+        expected = _expected_requests(result_dir, task_num, expected_inventory)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         errors.append(f"invalid replay plan/source inventory: {exc}")
         return checks
@@ -157,11 +186,22 @@ def validate_replay(
 
 def _run_cell(case_file: Path, concurrency: int) -> Path:
     case = case_at_concurrency(load_case(case_file), concurrency)
+    trace_type = case["runtime"].get("trace_type", "tracelab")
+    # Independent fixture facts: a truncated import/plan cannot redefine them.
+    # AgentX's 144 top-level entries expand into 315 model requests.
+    expected_inventory: tuple[int, int] | None = {
+        "agentX": (12, 315),
+        "tracelab": (8, 28),
+    }[trace_type]
+    if trace_type == "tracelab" and os.environ.get("TRACELAB_JSONL_URL", "").strip():
+        expected_inventory = None
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
     cell_out = run_router_policy_cell(
         case_file,
-        replay_validator=validate_replay,
+        replay_validator=partial(
+            validate_replay, expected_inventory=expected_inventory
+        ),
         concurrency=concurrency,
         out_dir=out,
         run_suffix=run_suffix,

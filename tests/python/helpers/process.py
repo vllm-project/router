@@ -2,7 +2,11 @@
 
 ``vllm_rs_serve_cmd``, ``vllm_serve_cmd``, and ``router_cmd`` build argv.
 Keyword arguments become flags, so each suite passes only the flags it needs.
-``launch_worker`` and ``launch_router`` start those processes.
+``launch_worker`` and ``launch_router`` start those processes. ``launch_process``
+starts other logged child processes, such as benchmark replay, with the same
+environment inheritance.
+Multi-worker callers launch every process without ``ready_url``, then call
+``wait_workers_ready`` once for the group.
 ``launch_vllm_http_worker`` starts a real vLLM HTTP worker for GPU tests.
 ``reserve_port`` and the ``release_*_port_holders`` helpers keep an
 OS-assigned port until the process that binds it is started.
@@ -23,7 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,7 +49,11 @@ def _http_ok(url: str) -> bool:
 
 
 def _popen(
-    cmd: list[str], env: dict[str, str] | None, *, prefix: str
+    cmd: list[str],
+    env: dict[str, str] | None,
+    *,
+    prefix: str,
+    start_new_session: bool = False,
 ) -> subprocess.Popen:
     _progress(prefix, "launch: " + " ".join(cmd))
     logger.info("launch: %s", " ".join(cmd))
@@ -59,6 +67,7 @@ def _popen(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=start_new_session,
     )
 
 
@@ -97,27 +106,57 @@ def wait_http(
     interval: float = 2.0,
 ) -> None:
     """Wait for an HTTP endpoint while its process is running."""
-    start = time.monotonic()
-    last_log = start
-    while time.monotonic() - start < timeout:
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"{label} exited early (code={proc.returncode}); see its log above"
-            )
-        if _http_ok(url):
-            _progress(
-                prefix,
-                f"{label} ready at {url} ({time.monotonic() - start:.0f}s)",
-            )
+    wait_workers_ready([(url, proc, label)], timeout, prefix=prefix, interval=interval)
+
+
+def wait_workers_ready(
+    workers: Iterable[tuple[str, subprocess.Popen, str]],
+    timeout: float,
+    *,
+    prefix: str,
+    interval: float = 2.0,
+) -> None:
+    """Wait for already-started ``(health_url, process, label)`` workers together.
+
+    All workers share one deadline. Watch every process for early exit, even
+    while a different worker is still loading. Callers own failure cleanup.
+    """
+    workers = list(workers)
+    pending = list(range(len(workers)))
+    started = time.monotonic()
+    last_log = started
+    while pending and time.monotonic() - started < timeout:
+        for _, proc, label in workers:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"{label} exited early (code={proc.returncode}); see its log above"
+                )
+        waiting = []
+        for index in pending:
+            url, _, label = workers[index]
+            if _http_ok(url):
+                _progress(
+                    prefix,
+                    f"{label} ready at {url} ({time.monotonic() - started:.0f}s)",
+                )
+            else:
+                waiting.append(index)
+        pending = waiting
+        if not pending:
             return
         now = time.monotonic()
         if now - last_log >= 30:
+            names = ", ".join(workers[index][2] for index in pending)
             _progress(
-                prefix, f"waiting for {url} ({now - start:.0f}s / {timeout:.0f}s)…"
+                prefix, f"waiting for {names} ({now - started:.0f}s / {timeout:.0f}s)"
             )
             last_log = now
         time.sleep(interval)
-    raise TimeoutError(f"{label} not ready at {url} within {timeout}s")
+    if pending:
+        names = ", ".join(
+            f"{workers[index][2]} at {workers[index][0]}" for index in pending
+        )
+        raise TimeoutError(f"workers not ready within {timeout}s: {names}")
 
 
 def graceful_stop(
@@ -458,6 +497,26 @@ def stream_process(
     return RunningProc(
         proc=proc, thread=thread, label=label, log_prefix=log_prefix, log_fp=log_fp
     )
+
+
+def launch_process(
+    cmd: list[str],
+    *,
+    label: str,
+    log_path: Path,
+    env: dict[str, str] | None = None,
+    log_prefix: str = "perf",
+    start_new_session: bool = False,
+) -> RunningProc:
+    """Start a logged process, inheriting the environment and applying overrides."""
+    proc = _popen(cmd, env, prefix=log_prefix, start_new_session=start_new_session)
+    try:
+        return stream_process(
+            proc, label=label, log_path=log_path, log_prefix=log_prefix
+        )
+    except BaseException:
+        graceful_stop(proc, process_group=start_new_session)
+        raise
 
 
 def launch_worker(

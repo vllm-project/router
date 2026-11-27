@@ -15,8 +15,12 @@ from pathlib import Path
 import requests
 
 from tests.python.helpers.client import get_load
-from tests.python.helpers.ports import find_free_port
-from tests.python.helpers.process import stop_any, wait_http
+from tests.python.helpers.process import (
+    release_all_port_holders,
+    reserve_port,
+    stop_any,
+    wait_workers_ready,
+)
 
 _MOCK_WORKER = Path(__file__).resolve().parent / "mock_worker.py"
 
@@ -49,11 +53,34 @@ class MockWorkerManager:
         processes: list[subprocess.Popen] = []
         urls: list[str] = []
         worker_ids: list[str] = []
-        for _ in range(n):
-            process, url, worker_id = self._spawn(args)
-            processes.append(process)
-            urls.append(url)
-            worker_ids.append(worker_id)
+        holders = []
+        try:
+            ports = [reserve_port(holders) for _ in range(n)]
+            for index, port in enumerate(ports):
+                holders[index].close()
+                holders[index] = None
+                process, url, worker_id = self._spawn(args, port)
+                processes.append(process)
+                urls.append(url)
+                worker_ids.append(worker_id)
+            wait_workers_ready(
+                [
+                    (f"{url}/health", process, worker_id)
+                    for process, url, worker_id in zip(
+                        processes, urls, worker_ids, strict=True
+                    )
+                ],
+                10,
+                prefix="mock",
+                interval=0.1,
+            )
+        except Exception:
+            for process in processes:
+                stop_any(process, timeout=3)
+                self._children.remove(process)
+            raise
+        finally:
+            release_all_port_holders(holders)
         return processes, urls, worker_ids
 
     def add_prefill(
@@ -105,8 +132,7 @@ class MockWorkerManager:
             stop_any(process, timeout=3)
         self._children.clear()
 
-    def _spawn(self, args: list[str]) -> tuple[subprocess.Popen, str, str]:
-        port = find_free_port()
+    def _spawn(self, args: list[str], port: int) -> tuple[subprocess.Popen, str, str]:
         worker_id = f"worker-{port}"
         cmd = [
             sys.executable,
@@ -120,11 +146,4 @@ class MockWorkerManager:
         process = subprocess.Popen(cmd)
         self._children.append(process)
         url = f"http://127.0.0.1:{port}"
-        try:
-            wait_http(
-                f"{url}/health", 10, process, worker_id, prefix="mock", interval=0.1
-            )
-        except Exception:
-            stop_any(process, timeout=3)
-            raise
         return process, url, worker_id

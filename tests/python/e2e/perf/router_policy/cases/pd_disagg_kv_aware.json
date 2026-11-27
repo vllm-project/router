@@ -2,9 +2,9 @@
   "id": "pd_disagg_kv_aware",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
-    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-ci-12x12.jsonl",
+    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-hetero12x12.jsonl",
     "trace_type": "agentX",
-    "trace_sha256": "faf79824c90ddb72774a6f5f018f67821f26c48743cd5171cfbcfe9e00855537",
+    "trace_sha256": "e7e7fd7cd31f178483e2027281ce4592fca38bd35252c09b88e2a9dee1078638",
     "endpoint": "/v1/completions"
   },
   "benchmark_params": {
@@ -19,10 +19,10 @@
     "protocol": "grpc",
     "per_worker": {
       "tensor_parallel_size": 1,
-      "max_model_len": 65536,
-      "max_num_seqs": 16,
+      "max_model_len": 163840,
+      "max_num_seqs": 8,
       "max_num_batched_tokens": 8192,
-      "kv_cache_memory_bytes": 12884901888,
+      "kv_cache_memory_bytes": 27917287424,
       "cpu_kv_bytes": 0,
       "dtype": "bfloat16",
       "enable_prefix_caching": true,
