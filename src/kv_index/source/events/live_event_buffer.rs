@@ -17,8 +17,10 @@ pub(super) enum HandoffError {
     InvalidLiveFrame,
     #[error("missing queued live sequence {seq} in replay")]
     MissingReplayPayload { seq: i64 },
-    #[error("payload conflict at queued live sequence {seq}")]
+    #[error("payload conflict at live sequence {seq}")]
     PayloadConflict { seq: i64 },
+    #[error("discarded live conflicts cannot be verified")]
+    UnverifiableDiscardedConflicts,
 }
 
 impl HandoffError {
@@ -27,6 +29,7 @@ impl HandoffError {
             Self::InvalidLiveFrame => 0,
             Self::MissingReplayPayload { .. } => 1,
             Self::PayloadConflict { .. } => 2,
+            Self::UnverifiableDiscardedConflicts => 3,
         }
     }
 
@@ -56,6 +59,7 @@ struct LiveEventBufferState {
     bytes: usize,
     recent_by_seq: HashMap<i64, [u8; 32]>,
     queued_by_seq: HashMap<i64, QueuedSequence>,
+    discarded_conflicts_unverifiable: bool,
 }
 
 struct QueuedLiveFrame {
@@ -76,6 +80,7 @@ struct QueuedSequence {
     frame_count: usize,
     replay_fingerprint: Option<[u8; 32]>,
     had_replay_conflict: bool,
+    discarded_live_fingerprint: Option<[u8; 32]>,
 }
 
 impl LiveEventBuffer {
@@ -147,30 +152,45 @@ impl LiveEventBuffer {
         *self.state.get_mut() = LiveEventBufferState::default();
     }
 
-    /// Free the replay buffer after overflow, retaining the gap trigger and its conflict status.
+    /// On overflow, keep the gap trigger and fingerprints of known conflicts.
+    /// Return the highest sequence whose frame was discarded.
     pub(super) fn discard_buffered_frames(&mut self, topic: &[u8]) -> Option<i64> {
         let state = self.state.get_mut();
-        let highest = state
-            .frames
-            .iter()
-            .skip(usize::from(state.gap_trigger_seq.is_some()))
-            .filter_map(|queued| valid_live_seq(&queued.frames, topic))
-            .max();
-        if let Some(seq) = state.gap_trigger_seq {
-            state.frames.truncate(1);
-            state.bytes = frame_bytes(&state.frames[0].frames);
-            state
-                .queued_by_seq
-                .retain(|&queued_seq, _| queued_seq == seq);
-            let trigger = state
+        let gap_trigger_seq = state.gap_trigger_seq;
+        let frames_to_keep = usize::from(gap_trigger_seq.is_some());
+        let mut highest = None;
+        for frame in state.frames.iter_mut().skip(frames_to_keep) {
+            let Some(seq) = valid_live_seq(&frame.frames, topic) else {
+                continue;
+            };
+            highest = highest.max(Some(seq));
+            let queued = state
                 .queued_by_seq
                 .get_mut(&seq)
-                .expect("queued gap trigger");
-            trigger.frame_count = 1;
-            trigger.replay_fingerprint = None;
-            state.recent_by_seq.clear();
-        } else {
-            *state = LiveEventBufferState::default();
+                .expect("queued live sequence");
+            if queued.had_replay_conflict {
+                let fingerprint = frame.payload_fingerprint();
+                let expected = queued.discarded_live_fingerprint.get_or_insert(fingerprint);
+                state.discarded_conflicts_unverifiable |= *expected != fingerprint;
+            }
+        }
+        state.frames.truncate(frames_to_keep);
+        state.bytes = state
+            .frames
+            .front()
+            .map_or(0, |frame| frame_bytes(&frame.frames));
+        state.recent_by_seq.clear();
+        state.queued_by_seq.retain(|&seq, queued| {
+            queued.frame_count = usize::from(gap_trigger_seq == Some(seq));
+            queued.replay_fingerprint = None;
+            queued.frame_count != 0 || queued.discarded_live_fingerprint.is_some()
+        });
+        // Repeated overflows can accumulate more conflicts than one queue can hold.
+        if state.queued_by_seq.len() > MAX_PENDING_LIVE_FRAMES {
+            state.discarded_conflicts_unverifiable = true;
+        }
+        if state.discarded_conflicts_unverifiable {
+            state.clear_discarded_conflicts();
         }
         highest
     }
@@ -241,7 +261,7 @@ impl LiveEventBuffer {
         clear_seq: Option<i64>,
     ) -> Result<(), HandoffError> {
         let state = self.state.get_mut();
-        let mut error = None;
+        let mut error = state.discarded_conflict_error(applied_seq);
         state.frames.retain_mut(|live_frame| {
             let Some(seq) = valid_live_seq(&live_frame.frames, topic) else {
                 HandoffError::prefer(&mut error, HandoffError::InvalidLiveFrame);
@@ -279,6 +299,7 @@ impl LiveEventBuffer {
         if let Some(error) = error {
             return Err(error);
         }
+        state.clear_discarded_conflicts();
         if let Some(seq) = state.gap_trigger_seq.take() {
             let trigger = state.frames.pop_front().expect("queued gap trigger");
             release_frame(&mut state.queued_by_seq, seq);
@@ -301,6 +322,27 @@ impl LiveEventBuffer {
 }
 
 impl LiveEventBufferState {
+    fn discarded_conflict_error(&self, applied_seq: i64) -> Option<HandoffError> {
+        if self.discarded_conflicts_unverifiable {
+            return Some(HandoffError::UnverifiableDiscardedConflicts);
+        }
+        self.queued_by_seq
+            .iter()
+            .filter_map(|(&seq, queued)| {
+                let expected = queued.discarded_live_fingerprint?;
+                (seq > applied_seq || queued.replay_fingerprint != Some(expected)).then_some(seq)
+            })
+            .min()
+            .map(|seq| HandoffError::PayloadConflict { seq })
+    }
+
+    fn clear_discarded_conflicts(&mut self) {
+        self.queued_by_seq.retain(|_, queued| {
+            queued.discarded_live_fingerprint = None;
+            queued.frame_count != 0
+        });
+    }
+
     fn track_queued_sequence(&mut self, seq: i64) {
         let replay_fingerprint = self.recent_by_seq.get(&seq).copied();
         self.queued_by_seq
@@ -309,6 +351,7 @@ impl LiveEventBufferState {
                 frame_count: 0,
                 replay_fingerprint,
                 had_replay_conflict: false,
+                discarded_live_fingerprint: None,
             })
             .frame_count += 1;
     }
@@ -339,8 +382,9 @@ impl LiveEventBufferState {
 
 fn release_frame(queued_by_seq: &mut HashMap<i64, QueuedSequence>, seq: i64) {
     if let Entry::Occupied(mut entry) = queued_by_seq.entry(seq) {
-        entry.get_mut().frame_count -= 1;
-        if entry.get().frame_count == 0 {
+        let queued = entry.get_mut();
+        queued.frame_count -= 1;
+        if queued.frame_count == 0 && queued.discarded_live_fingerprint.is_none() {
             entry.remove();
         }
     }
@@ -388,6 +432,29 @@ mod tests {
         assert!(matches!(
             live_events.validate_handoff(b"topic", 2, None),
             Err(HandoffError::PayloadConflict { seq: 2 })
+        ));
+    }
+
+    #[test]
+    fn discarded_conflicts_beyond_the_limit_keep_handoff_untrusted() {
+        let mut live_events = LiveEventBuffer::default();
+        let last_seq = MAX_PENDING_LIVE_FRAMES as i64;
+        for range in [0..last_seq, last_seq..last_seq + 1] {
+            for seq in range {
+                live_events.push(frame(seq, b"live"), b"topic");
+                live_events.record_replay_payload(seq, b"replay").unwrap();
+            }
+            assert!(matches!(
+                live_events.validate_handoff(b"topic", last_seq, None),
+                Err(HandoffError::PayloadConflict { .. })
+            ));
+            live_events.discard_buffered_frames(b"topic");
+        }
+
+        assert!(live_events.state.get_mut().queued_by_seq.is_empty());
+        assert!(matches!(
+            live_events.validate_handoff(b"topic", last_seq, Some(last_seq)),
+            Err(HandoffError::UnverifiableDiscardedConflicts)
         ));
     }
 

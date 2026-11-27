@@ -555,6 +555,36 @@ async fn retained_clear_does_not_hide_a_buffered_payload_conflict() {
 }
 
 #[tokio::test]
+async fn live_buffer_overflow_preserves_a_known_payload_conflict() {
+    use super::super::live_event_buffer::MAX_PENDING_LIVE_FRAMES;
+
+    let tcp = TcpReplay::with_hwm((MAX_PENDING_LIVE_FRAMES * 2) as i32);
+    let index = Arc::new(full_binding(target("overflow-conflict"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let empty = batch_payload(&[]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.live(9, &store);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.history(&request, &[(9, &empty), (10, &clear), (11, &store)]);
+
+    tcp.request(0).await;
+    for _ in 1..MAX_PENDING_LIVE_FRAMES {
+        tcp.live(11, &store);
+    }
+    let without_conflicting_seq = tcp.request(0).await;
+    tcp.history(&without_conflicting_seq, &[(10, &clear), (11, &store)]);
+
+    let matching = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&matching, &[(9, &store), (10, &clear), (11, &store)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
 async fn replay_after_clear_must_fill_later_gaps_before_publishing() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics = recorder.handle();
