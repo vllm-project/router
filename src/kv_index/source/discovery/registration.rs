@@ -167,14 +167,10 @@ impl KvIndexSupervisor {
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
-        // With unknown connector metadata, price the shorter Prefill lookup.
-        let truncates = match connector {
-            // NIXL started trimming bounded-replay layouts in vLLM 0.32.
-            Some(KvConnector::Nixl) => server_info.vllm_version.map(|version| version >= (0, 32)),
-            Some(KvConnector::Mooncake) => server_info.mooncake_truncates_compressed,
-            _ => None,
-        }
-        .unwrap_or(true);
+        // Native NIXL started trimming bounded-replay layouts in vLLM 0.32.
+        let nixl_truncates_replay = server_info
+            .vllm_version
+            .is_none_or(|version| version >= (0, 32));
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -210,7 +206,11 @@ impl KvIndexSupervisor {
                     };
                     bindings.insert(
                         source.dp_rank,
-                        binding.with_pd_prefill(connector, truncates),
+                        binding.with_pd_prefill(
+                            connector,
+                            nixl_truncates_replay,
+                            server_info.mooncake_truncates_compressed,
+                        ),
                     );
                     true
                 }

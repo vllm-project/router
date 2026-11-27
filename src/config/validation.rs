@@ -1927,14 +1927,46 @@ mod tests {
             (
                 vec!["http://prefill:5557".to_string()],
                 16,
-                "must be a reachable ZMQ address",
+                "without credentials or paths",
             ),
-            (vec!["tcp://*:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://0.0.0.0:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://[::]:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://prefill:0".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://prefill".into()], 16, "reachable ZMQ"),
-            (vec!["ipc://".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://*:5557".into()], 16, "cannot be a wildcard"),
+            (
+                vec!["tcp://0.0.0.0:5557".into()],
+                16,
+                "cannot be unspecified",
+            ),
+            (vec!["tcp://[::]:5557".into()], 16, "cannot be unspecified"),
+            (
+                vec!["tcp://prefill:0".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557/x".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557?rank=1".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557#rank".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://user:pass@prefill:5557".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (vec!["ipc://".into()], 16, "requires a non-empty path"),
             (vec![], 16, "no endpoints"),
             (vec!["tcp://prefill:5557".to_string()], 0, "block_size"),
         ] {
@@ -1965,6 +1997,12 @@ mod tests {
             .get_mut("http://prefill:8000")
             .unwrap()
             .replay_endpoints = Some(vec!["tcp://[::]:5558".into()]);
+        assert!(ConfigValidator::validate(&config).is_err());
+        config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap()
+            .replay_endpoints = Some(vec!["tcp://prefill:5558/x".into()]);
         assert!(ConfigValidator::validate(&config).is_err());
     }
 

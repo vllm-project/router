@@ -222,21 +222,28 @@ impl SourceBinding {
     pub(in crate::kv_index) fn with_pd_prefill(
         mut self,
         connector: Option<KvConnector>,
-        truncates: bool,
+        nixl_truncates_replay: bool,
+        truncates_compressed: Option<bool>,
     ) -> Self {
         let has_checkpoint = self
             .groups
             .iter()
             .any(|group| group.kind == GroupRule::Checkpoint);
+        let has_compressed = self
+            .groups
+            .iter()
+            .any(|group| matches!(group.kind, GroupRule::CompressedFullAttention { .. }));
         self.prefill_truncates_prompt = match connector {
-            Some(KvConnector::Nixl) => has_checkpoint || (truncates && self.replay_tokens != 0),
+            Some(KvConnector::Nixl) => {
+                // The pull handoff can forward parameters for a different engine connector.
+                has_checkpoint
+                    || (nixl_truncates_replay && self.replay_tokens != 0)
+                    || (has_compressed && truncates_compressed == Some(true))
+            }
             Some(KvConnector::Mooncake) => {
                 has_checkpoint
                     || self.replay_tokens != 0
-                    || truncates
-                        && self.groups.iter().any(|group| {
-                            matches!(group.kind, GroupRule::CompressedFullAttention { .. })
-                        })
+                    || (has_compressed && truncates_compressed.unwrap_or(true))
             }
             _ => false,
         };

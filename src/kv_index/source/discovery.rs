@@ -582,7 +582,7 @@ impl KvIndexSupervisor {
                 .flatten();
             }
         }
-        if connector != Some(KvConnector::Mooncake)
+        if !matches!(connector, Some(KvConnector::Nixl | KvConnector::Mooncake))
             || !layout.ranks.iter().any(|rank| {
                 rank.groups
                     .iter()
@@ -597,14 +597,15 @@ impl KvIndexSupervisor {
             .ok()
             .filter(|info| info.mooncake_truncates_compressed.is_none())
         {
-            // This optional metadata lookup must leave time to install the source.
+            // A cold /server_info can spend time collecting worker diagnostics.
+            let metadata_timeout = if connector == Some(KvConnector::Nixl) {
+                CONTROL_TIMEOUT / 2
+            } else {
+                lifecycle::OPTIONAL_METADATA_BUDGET
+            };
             if let Ok(Ok(runtime)) = tokio::time::timeout(
-                lifecycle::OPTIONAL_METADATA_BUDGET,
-                probe::query_server_info_json(
-                    &self.client,
-                    split_worker_rank(worker_url).0,
-                    self.api_key.as_deref(),
-                ),
+                metadata_timeout,
+                probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
             )
             .await
             {
