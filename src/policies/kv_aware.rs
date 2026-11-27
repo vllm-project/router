@@ -3448,6 +3448,76 @@ mod tests {
     }
 
     #[test]
+    fn colocated_image_routing_credits_only_the_matching_image() {
+        use crate::kv_index::source::test_support::{
+            image_store, TEST_IMAGE_BLOCK_HASHES, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::wire::KVEvent;
+
+        let policy = KvAwarePolicy::default();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://image-warm".into(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://image-cold".into(),
+                WorkerType::Regular,
+            )),
+        ];
+        for worker in &workers {
+            let binding = register_full(&policy, worker.url(), target(worker.url(), 0), "m", 64);
+            if worker.url() == workers[0].url() {
+                binding
+                    .apply_batch(
+                        0,
+                        &event_batch(vec![KVEvent::BlockStored(image_store(
+                            TEST_IMAGE_HASH,
+                            TEST_IMAGE_BLOCK_HASHES,
+                        ))]),
+                    )
+                    .unwrap();
+            }
+        }
+        let prompts: Arc<[Vec<u32>]> = Arc::from([(0..129).collect()]);
+        let different_hash = "a".repeat(64);
+        for (hash, expected) in [
+            (Some(TEST_IMAGE_HASH), 1),
+            (Some(different_hash.as_str()), 129),
+            (None, 129),
+        ] {
+            let mut inputs = WorkerTokenInputs::new();
+            for worker in &workers {
+                let url = worker.url().to_owned();
+                if let Some(hash) = hash {
+                    inputs.insert_image(
+                        url,
+                        prompts.clone(),
+                        ImagePrefix::new(hash, 60, 8, 129).unwrap(),
+                    );
+                } else {
+                    inputs.insert(url, prompts.clone());
+                }
+            }
+            let receipt = policy
+                .select_worker_with_inputs(
+                    &workers,
+                    KvRequestTokens::PerWorker(&inputs),
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(receipt.new_prefill_tokens, expected);
+            if expected == 1 {
+                assert_eq!(receipt.worker_index, 0);
+            }
+            release_receipt(&workers, &receipt);
+        }
+    }
+
+    #[test]
     fn cache_hit_offsets_load_until_cold_prefill_becomes_cheaper() {
         let policy = KvAwarePolicy::default();
         let warm = register_full(&policy, "http://warm", target("http://warm", 0), "model", 2);

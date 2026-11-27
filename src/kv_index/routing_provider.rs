@@ -380,10 +380,7 @@ mod tests {
         // Independent vLLM sha256_cbor goldens for image positions 60 and -4.
         check_image_prefix(
             "",
-            [
-                "702e3c6a2d000b3eb7efba64ac0d2faecbc18c68da6e7b43bbf3a61dfcc4d110",
-                "0ade0d242ddfcfc955a0bdc7a83168cf2cce2c9b3543a93320e976c369e01ca7",
-            ],
+            crate::kv_index::source::test_support::TEST_IMAGE_BLOCK_HASHES,
         );
         check_image_prefix(
             "content:",
@@ -395,38 +392,19 @@ mod tests {
     }
 
     fn check_image_prefix(namespace: &str, block_hashes: [&str; 2]) {
-        use crate::kv_index::source::test_support::{event_batch, full_binding, full_store};
-        use crate::kv_index::wire::{ExternalBlockHash, KVEvent};
+        use crate::kv_index::source::test_support::{
+            event_batch, full_binding, image_store, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::wire::KVEvent;
 
-        let digest = "4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993";
-        let hash = format!("{namespace}{digest}");
+        let hash = format!("{namespace}{TEST_IMAGE_HASH}");
         let same_image = ImagePrefix::new(&hash, 60, 8, 129).unwrap();
         let other_hash = format!("{namespace}{}", "a".repeat(64));
         let other_image = ImagePrefix::new(&other_hash, 60, 8, 129).unwrap();
         let tokens: Vec<u32> = (0..129).collect();
         let identical_ids = tokens.clone();
         let text_ids = tokens.clone();
-        let mut store = full_store(&tokens[..128], 64, None);
-        store.block_hashes = block_hashes
-            .map(|hex| {
-                ExternalBlockHash::Bytes(
-                    (0..hex.len())
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                        .collect(),
-                )
-            })
-            .into();
-        store.extra_keys = Some(
-            [60, -4]
-                .map(|offset| {
-                    rmpv::Value::Array(vec![rmpv::Value::Array(vec![
-                        hash.as_str().into(),
-                        offset.into(),
-                    ])])
-                })
-                .into(),
-        );
+        let store = image_store(&hash, block_hashes);
         let binding = full_binding(
             crate::kv_index::RoutableTarget {
                 instance_id: "image-worker".into(),

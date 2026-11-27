@@ -48,10 +48,7 @@ pub(super) fn image_block_keys(key: &rmpv::Value) -> Option<Vec<(&str, i64)>> {
             let [hash, offset] = feature.as_array()?.as_slice() else {
                 return None;
             };
-            Some((
-                hash.as_str().filter(|hash| is_image_hash(hash))?,
-                offset.as_i64()?,
-            ))
+            Some((hash.as_str()?, offset.as_i64()?))
         })
         .collect()
 }
@@ -81,6 +78,7 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
+    let mut unsupported_image = false;
     if let Some(keys) = store
         .extra_keys
         .as_ref()
@@ -89,10 +87,17 @@ pub(super) fn validate_store(
         if keys.len() != store.block_hashes.len() {
             return Err(SourceError::InvalidBatch);
         }
-        let image_only = keys
+        let multimodal: Option<Vec<_>> = keys
             .iter()
-            .all(|key| key.is_nil() || image_block_keys(key).is_some());
-        if let Some((first, rest)) = keys.split_first().filter(|_| !image_only) {
+            .filter(|key| !key.is_nil())
+            .map(image_block_keys)
+            .collect();
+        if let Some(multimodal) = multimodal {
+            unsupported_image = multimodal
+                .iter()
+                .flatten()
+                .any(|(hash, _)| !is_image_hash(hash));
+        } else if let Some((first, rest)) = keys.split_first() {
             if !rest.iter().all(rmpv::Value::is_nil) {
                 return Err(SourceError::InvalidBatch);
             }
@@ -143,7 +148,8 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
-    Ok(true)
+    // An unsupported image identity is not a reason to discard other chains.
+    Ok(!unsupported_image)
 }
 
 pub(in crate::kv_index) fn event_kind_matches(kind: GroupRule, store: &BlockStored) -> bool {

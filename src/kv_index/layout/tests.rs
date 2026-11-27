@@ -790,6 +790,7 @@ mod declarations {
             (None, 528),
             (Some(KvConnector::Nixl), 0),
             (Some(KvConnector::Mooncake), 0),
+            (Some(KvConnector::MooncakeV2), 0),
         ] {
             let binding = bind_layout(&value, "epoch-1")
                 .unwrap()
@@ -1055,6 +1056,120 @@ mod declarations {
         );
 
         value["ranks"][0]["groups"][3]["tokens_per_state"] = serde_json::Value::Null;
-        assert!(bind_layout(&value, "epoch-1").is_err());
+        assert!(matches!(
+            bind_layout(&value, "epoch-1"),
+            Err("MLA cache role requires tokens_per_state")
+        ));
+    }
+
+    #[test]
+    fn documented_hy4_flash_layouts_restore_the_expected_prefix() {
+        use crate::config::{KvConnector, RoutingMode};
+        use crate::kv_index::source::test_support::{event_batch, stored_block};
+        use crate::kv_index::wire::{ExternalBlockHash, KVEvent};
+
+        let guide = include_str!("../../../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
+        let worker = "http://prefill";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("layout.json");
+        for (label, page, ratio, hit, windows) in [
+            ("GPU · HY4 Flash", 256, 4, 2048, 2),
+            ("Ascend A5 · HY4 Flash", 64, 1, 64, 0),
+        ] {
+            let (_, section) = guide
+                .split_once(&format!("<summary>{label}</summary>"))
+                .unwrap();
+            let (_, example) = section.split_once("\n```json\n").unwrap();
+            let rank: serde_json::Value =
+                serde_json::from_str(example.split_once("\n```").unwrap().0).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({(worker): {"ranks": [rank]}})).unwrap(),
+            )
+            .unwrap();
+            let mode = RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(worker.into(), None)],
+                decode_urls: vec!["http://decode".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            };
+            let mut pd = std::collections::HashMap::new();
+            crate::kv_index::apply_kv_layout_file(&path, &mode, &mut Default::default(), &mut pd)
+                .unwrap();
+            let source = EventSource {
+                source: Arc::from(worker),
+                dp_rank: 0,
+                pub_endpoint: "inproc://pub".into(),
+                replay_endpoint: Some("inproc://replay".into()),
+                topic: "epoch".into(),
+                hwm: None,
+            };
+            let layout = pd.get_mut(worker).unwrap().hybrid.as_mut().unwrap();
+            // Discovery supplies the worker model and its live publisher topic.
+            layout.ranks[0].model = "hy4-flash".into();
+            layout.ranks[0].publisher_topic = Some(source.topic.clone());
+            let binding = layout
+                .bind_worker_source(&source, "hy4-flash", 128)
+                .unwrap();
+            assert_eq!(binding.groups.len(), windows + 1, "{label}");
+            assert_eq!(
+                binding.groups[0].kind,
+                GroupRule::CompressedFullAttention {
+                    tokens_per_state: ratio
+                }
+            );
+            let tokens: Vec<u32> = (0..=hit as u32).collect();
+            let hashes: Vec<_> = binding
+                .keys
+                .generate_block_keys(&tokens[..hit])
+                .iter()
+                .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                .collect();
+            let events = binding
+                .groups
+                .iter()
+                .map(|group| {
+                    assert_eq!(group.block_size as usize, page);
+                    let mut start = 0;
+                    if group.group_idx != 0 {
+                        assert_eq!(group.kind, GroupRule::SlidingWindow { window_tokens: 512 });
+                        start = hashes.len() - 2;
+                    }
+                    let mut store = stored_block(
+                        hashes[start..].to_vec(),
+                        tokens[start * page..hit].to_vec(),
+                        group.block_size,
+                    );
+                    store.group_idx = Some(group.group_idx);
+                    if start == 0 {
+                        store.kv_cache_spec_kind = Some("mla_attention".into());
+                    } else {
+                        store.kv_cache_spec_kind = Some("sliding_window_mla".into());
+                        store.kv_cache_spec_sliding_window = Some(512);
+                        store.parent_block_hash = Some(hashes[start - 1].clone());
+                    }
+                    KVEvent::BlockStored(store)
+                })
+                .collect();
+            binding.begin_empty(0);
+            binding.apply_batch(0, &event_batch(events)).unwrap();
+            assert_eq!(
+                binding.reusable_tokens(&tokens, usize::MAX),
+                hit as u64,
+                "{label}"
+            );
+            let binding = binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, None);
+            assert_eq!(
+                binding.reusable_tokens(&tokens, usize::MAX),
+                if windows == 0 { hit as u64 } else { 0 },
+                "{label}"
+            );
+            if windows == 0 {
+                let hf_compressed =
+                    binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, Some(true));
+                assert_eq!(hf_compressed.reusable_tokens(&tokens, usize::MAX), 0);
+            }
+        }
     }
 }

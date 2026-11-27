@@ -485,7 +485,7 @@ class RouterArgs:
             help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
-            "'mooncake-v2' uses Ascend MooncakeConnectorV2; "
+            "'mooncake-v2' uses vLLM-Ascend MooncakeConnectorV2 in pull mode with KV leases; "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
         # Prometheus configuration

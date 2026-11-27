@@ -309,12 +309,26 @@ impl SourceBinding {
                 .as_ref()
                 .and_then(|keys| keys.first())
                 .and_then(image_block_keys);
-            if let Some(image_keys) = image_keys.filter(|_| {
-                store.block_size as usize == self.keys.block_size()
-                    && self.keys.lookahead_tokens() == 0
-            }) {
-                if self.keys.root_block(&store.token_ids, &image_keys).as_ref() != hashes.first() {
-                    // Older vLLM builds hash untagged image keys.
+            if let Some(image_keys) =
+                image_keys.filter(|_| store.block_size as usize == self.keys.block_size())
+            {
+                let lookahead = store
+                    .lookahead_token_ids
+                    .as_ref()
+                    .and_then(|blocks| blocks.first())
+                    .map_or(&[][..], Vec::as_slice);
+                if self
+                    .keys
+                    .root_block(&store.token_ids, &image_keys, lookahead)
+                    .as_ref()
+                    != hashes.first()
+                {
+                    tracing::debug!(
+                        source = %self.target.instance_id,
+                        rank = self.target.dp_rank,
+                        group = group.group_idx,
+                        "Skipping KV store with an incompatible image hash root"
+                    );
                     return Ok(None);
                 }
             } else if proves_root

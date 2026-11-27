@@ -36,9 +36,11 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
-| HTTP text and chat | KV scoring uses the worker's render endpoint. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
+| HTTP text and chat | Enable the worker's render endpoint with `vllm serve --enable-scale-out` if required by your build. Simple text completions can use `/tokenize`. If preparation is unavailable, Router uses load. Explicit token ID prompts can be scored directly. |
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
+
+Image prefix scoring supports one image in HTTP `/v1/chat/completions` with `kv_aware`. Multi-image requests, other modalities, client-supplied media IDs, adapters, `cache_aware` alone and EPD use routing without image prefix credit.
 
 ### Set the event ports
 
@@ -635,7 +637,7 @@ Both the Rust and Python launchers accept these options. Configure vLLM workers 
 | `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
 | `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
 | `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
-| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` only with vLLM-Ascend's `MooncakeConnectorV2` in pull mode. |
+| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Match the P/D workers. MoRI-IO requires vLLM ZMQ discovery. `mooncake-v2` requires vLLM-Ascend `MooncakeConnectorV2` in pull mode with KV leases (commit `451b02ce13` or later). |
 | `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
 | `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |
 | `--kv-hybrid-layout` | JSON file path | Unset | Supply cache groups, hashing, and reuse rules when the Router cannot derive them or read them from the worker. |
@@ -684,3 +686,4 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
 | Worker restarted | Generate a new publisher topic. Update `--kv-event-topic` for a static source. A Router restart uses the available replay history. |
 | Decode has no remote read | Check whether the prompt was already cached on Decode, the connector and role settings, and Decode's transfer log. |
+| HTTP 502 with no valid Mooncake V2 KV handoff | Check that Prefill uses Mooncake V2 pull mode with KV leases and returns `kv_transfer_params`. |

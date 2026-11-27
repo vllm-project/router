@@ -877,6 +877,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_accepts_mooncake_v2() {
+        let args =
+            CliArgs::try_parse_from(["vllm-router", "--kv-connector", "mooncake-v2"]).unwrap();
+        assert_eq!(args.kv_connector, KvConnector::MooncakeV2);
+    }
+
+    #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {
         let guide = include_str!("../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
         let dir = tempfile::tempdir().unwrap();

@@ -643,6 +643,77 @@ mod kv_input_tests {
             .0
     }
     #[tokio::test]
+    async fn pd_prices_image_prefill_and_decode_with_the_image_identity() {
+        use crate::backend::preprocess::HttpTokenInput;
+        use crate::kv_index::request_hash::ImagePrefix;
+        use crate::kv_index::source::test_support::{
+            event_batch, full_binding, image_store, TEST_IMAGE_BLOCK_HASHES, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::wire::KVEvent;
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let state = PdKvState::new(Client::new());
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://image-worker".into(),
+            WorkerType::Regular,
+        ));
+        let base = worker.base_url().to_owned();
+        let target = RoutableTarget {
+            instance_id: Arc::from(base.as_str()),
+            dp_rank: 0,
+        };
+        let binding = Arc::new(full_binding(target.clone(), 64));
+        binding.begin_empty(0);
+        binding
+            .apply_batch(
+                0,
+                &event_batch(vec![KVEvent::BlockStored(image_store(
+                    TEST_IMAGE_HASH,
+                    TEST_IMAGE_BLOCK_HASHES,
+                ))]),
+            )
+            .unwrap();
+        policy.register_target_with_cache_identity(
+            &base,
+            target,
+            CacheKey {
+                model: Arc::from("m"),
+                block_size: 64,
+            },
+            binding,
+        );
+        let workers = [worker];
+        let allow = HashMap::from([(base.clone(), true)]);
+        let prompts: Arc<[Vec<u32>]> = Arc::from([(0..129).collect()]);
+        let different_hash = "a".repeat(64);
+        for (hash, expected) in [(TEST_IMAGE_HASH, 1), (different_hash.as_str(), 129)] {
+            let results = HashMap::from([(
+                base.clone(),
+                Ok(HttpTokenInput {
+                    prompts: prompts.clone(),
+                    source: "render",
+                    image: ImagePrefix::new(hash, 60, 8, 129),
+                }),
+            )]);
+            let prepared = PdKvState::build_prefill_inputs(&json!({}), &allow, results.clone());
+            let prefill =
+                PdKvState::prefill_work(&policy, &workers, &prepared, &mut PromptHashes::default());
+            assert_eq!(prefill[0].2.new_prefill_tokens, expected);
+            let decode = state
+                .decode_context_from_results(
+                    &policy,
+                    &workers,
+                    &allow,
+                    &results,
+                    &mut PromptHashes::default(),
+                )
+                .unwrap();
+            assert_eq!(decode[&base], expected);
+        }
+    }
+
+    #[tokio::test]
     async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
         let state = PdKvState::new(Client::new());
         let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());

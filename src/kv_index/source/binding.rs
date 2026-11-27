@@ -232,6 +232,16 @@ impl SourceBinding {
                     || self.replay_tokens != 0
                     || (has_compressed && truncates_compressed.unwrap_or(true))
             }
+            Some(KvConnector::MooncakeV2) => {
+                // The Ascend pull scheduler checks the cache groups and the HF
+                // compress_ratios field. Sparse MLA alone does not imply it.
+                has_checkpoint
+                    || self
+                        .groups
+                        .iter()
+                        .any(|group| matches!(group.kind, GroupRule::SlidingWindow { .. }))
+                    || truncates_compressed == Some(true)
+            }
             _ => false,
         };
         self

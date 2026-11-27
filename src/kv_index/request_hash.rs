@@ -41,6 +41,41 @@ pub(crate) fn is_image_hash(hash: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod image_window_tests {
+    use super::*;
+    use crate::kv_index::source::test_support::TEST_IMAGE_HASH;
+
+    #[test]
+    fn images_overlap_the_lookahead_and_respect_half_open_boundaries() {
+        let generator = BlockKeyGenerator::new(4, 0).with_lookahead(2);
+        let tokens: Vec<_> = (0..10).collect();
+        let in_lookahead = ImagePrefix::new(TEST_IMAGE_HASH, 5, 1, tokens.len()).unwrap();
+        let actual = generator.generate_block_keys_for_image(&tokens, &in_lookahead);
+        let expected = [
+            "916709a0ff0f9f54472c2dd6560c3555a9d2e90fc193c488c596464b6735172a",
+            "d9a49e3a1c822b469183b86afa31c728b64f9dcea795721433d5fe0f8df689cf",
+        ];
+        assert_eq!(actual.len(), expected.len());
+        for (hash, expected) in actual.iter().zip(expected) {
+            assert_eq!(
+                hash.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                expected
+            );
+        }
+        let starts_at_end = ImagePrefix::new(TEST_IMAGE_HASH, 6, 1, tokens.len()).unwrap();
+        assert_eq!(
+            generator.generate_block_keys_for_image(&tokens, &starts_at_end)[0],
+            generator.generate_block_keys(&tokens)[0],
+        );
+        let ends_at_start = ImagePrefix::new(TEST_IMAGE_HASH, 0, 4, tokens.len()).unwrap();
+        assert!(ends_at_start.key(4, 8).is_none());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockKeyGenerator {
     block_size: usize,
@@ -117,15 +152,16 @@ impl BlockKeyGenerator {
 
     /// Recompute a plain first block with the same encoding as request lookup.
     pub(crate) fn plain_root_block(&self, token_ids: &[u32]) -> Option<SequenceHash> {
-        self.root_block(token_ids, &[])
+        self.root_block(token_ids, &[], &[])
     }
 
     pub(crate) fn root_block(
         &self,
         token_ids: &[u32],
         image_keys: &[(&str, i64)],
+        lookahead: &[u32],
     ) -> Option<SequenceHash> {
-        if self.lookahead_tokens != 0 {
+        if self.lookahead_tokens != lookahead.len() {
             return None;
         }
         let block = token_ids.get(..self.block_size)?;
@@ -135,7 +171,7 @@ impl BlockKeyGenerator {
             block,
             None,
             image_keys,
-            &[],
+            lookahead,
         ))
     }
 
@@ -168,7 +204,8 @@ impl BlockKeyGenerator {
             .map(|(index, tokens)| {
                 let end = (index + 1) * self.block_size;
                 let lookahead = &token_ids[end..end + self.lookahead_tokens];
-                let image_key = image.and_then(|image| image.key(end - self.block_size, end));
+                let image_key =
+                    image.and_then(|image| image.key(end - self.block_size, end + lookahead.len()));
                 parent = hash_block(
                     &mut encoded,
                     &parent,

@@ -679,8 +679,10 @@ impl PdRouterBase {
             results
                 .into_iter()
                 .filter_map(|(base, result)| match result {
-                    Ok(input) if input.image.is_none() => Some((base, input.prompts)),
-                    Ok(_) => None,
+                    Ok(input) => {
+                        debug_assert!(input.image.is_none());
+                        Some((base, input.prompts))
+                    }
                     Err(reason) => {
                         crate::metrics::RouterMetrics::record_kv_routing_input("pd_decode", reason);
                         None

@@ -420,6 +420,12 @@ pub(crate) async fn prepare_http_token_inputs(
     let HttpKvInput::Render { path, image } = input else {
         unreachable!()
     };
+    let image_body = image.then(|| {
+        let mut payload = body.clone();
+        payload["mm_payload"] = "none".into();
+        payload
+    });
+    let render_body = image_body.as_ref().unwrap_or(body);
     let expected_prompts = if route == "/v1/completions" {
         body.get("prompt")
             .and_then(serde_json::Value::as_array)
@@ -443,7 +449,9 @@ pub(crate) async fn prepare_http_token_inputs(
             async move {
                 let result = async {
                     let (prompts, source, image) =
-                        match http_input_json(client, &url, path, body, headers, api_key).await {
+                        match http_input_json(client, &url, path, render_body, headers, api_key)
+                            .await
+                        {
                             Ok(rendered) if image => {
                                 let (tokens, image) = http_rendered_image(&rendered)?;
                                 (Arc::from(vec![tokens]), "render", Some(image))
@@ -1322,6 +1330,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_image_render_requests_hashes_without_tensors() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        let image_hash = "a".repeat(64);
+        let app = Router::new().route(
+            "/v1/chat/completions/render",
+            post(move |Json(body): Json<Value>| {
+                let image_hash = image_hash.clone();
+                async move {
+                    assert_eq!(body["mm_payload"], "none");
+                    assert_eq!(
+                        body["messages"][0]["content"][0]["image_url"]["url"],
+                        "image"
+                    );
+                    Json(json!({
+                        "token_ids": [1,2,3],
+                        "features": {
+                            "mm_hashes": {"image": [image_hash]},
+                            "mm_placeholders": {"image": [{"offset":1,"length":1}]}
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = "/v1/chat/completions";
+        let body = json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"image"}}
+        ]}]});
+        for render_images in [false, true] {
+            assert_eq!(
+                super::http_input_requires_render(&body, path, render_images),
+                render_images
+            );
+            let inputs = super::prepare_http_token_inputs(
+                &reqwest::Client::new(),
+                vec![base.clone()],
+                &body,
+                path,
+                None,
+                None,
+                Duration::from_secs(1),
+                render_images,
+            )
+            .await;
+            if render_images {
+                let input = inputs[&base].as_ref().unwrap();
+                assert!(input.image.is_some());
+                assert_eq!(input.prompts.as_ref(), &[vec![1, 2, 3]]);
+            } else {
+                assert_eq!(inputs[&base].as_ref().err(), Some(&"multimodal_input"));
+            }
+        }
+        assert!(body.get("mm_payload").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
         use super::prepare_http_token_inputs;
         use axum::{routing::post, Json, Router};
@@ -1773,6 +1842,12 @@ mod tests {
             }
         });
         assert_eq!(super::http_rendered_image(&rendered).unwrap().0, [1, 2, 3]);
+        let mut multiple = rendered.clone();
+        multiple["features"]["mm_hashes"]["image"] = json!(["a".repeat(64), "b".repeat(64)]);
+        multiple["features"]["mm_placeholders"]["image"] = json!([
+            {"offset":0,"length":1}, {"offset":1,"length":2}
+        ]);
+        assert!(super::http_rendered_image(&multiple).is_err());
         let digest = "a".repeat(64);
         rendered["features"]["mm_hashes"]["image"][0] = json!(format!("uuid:{digest}"));
         assert!(super::http_rendered_image(&rendered).is_err());

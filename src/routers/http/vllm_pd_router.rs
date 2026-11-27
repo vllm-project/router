@@ -6,7 +6,9 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    error_chain, PDRouterError, PdAttempt, PdEndpoint, PdPrefillInput, PdRequestContext,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -243,6 +245,22 @@ fn prefill_pins_commitment(
         .and_then(Value::as_str)
         .is_some_and(|mode| mode == "push");
     reported_push || cached_identity
+}
+
+fn cache_aware_prefill_tokens(
+    inputs: Option<&HashMap<String, PdPrefillInput>>,
+) -> WorkerTokenInputs {
+    inputs
+        .into_iter()
+        .flat_map(|inputs| inputs.iter())
+        .filter(|(_, input)| input.image.is_none())
+        .filter_map(|(base, input)| {
+            input
+                .prompts
+                .as_ref()
+                .map(|prompts| (base.clone(), prompts.clone()))
+        })
+        .collect()
 }
 
 /// Buffer budget for stage responses. Oversized Decode bodies are streamed;
@@ -727,10 +745,7 @@ impl VllmPDRouter {
                     Some(params)
                 }
             }
-            KvConnector::MooncakeV2 => prefill_response_json?
-                .get("kv_transfer_params")
-                .filter(|params| Self::valid_mooncake_v2_handoff(params))
-                .cloned(),
+            KvConnector::MooncakeV2 => self.mooncake_v2_handoff(prefill_response_json?).cloned(),
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
                     let kvt = json.get("kv_transfer_params")?;
@@ -746,6 +761,22 @@ impl VllmPDRouter {
                 Some(Self::build_nixl_push_decode_params(&identity, request_id?))
             }
         }
+    }
+
+    fn mooncake_v2_handoff<'a>(&self, prefill_response: &'a Value) -> Option<&'a Value> {
+        (self.kv_connector == KvConnector::MooncakeV2)
+            .then(|| prefill_response.get("kv_transfer_params"))
+            .flatten()
+            .filter(|params| Self::valid_mooncake_v2_handoff(params))
+    }
+
+    fn invalid_mooncake_v2_handoff(prefill: &str, path: &str, started: Instant) -> Response {
+        const MESSAGE: &str = "Prefill returned no valid Mooncake V2 KV handoff";
+        warn!(prefill_url = prefill, path, "{MESSAGE}");
+        RouterMetrics::record_pd_prefill_error(prefill);
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, started.elapsed());
+        (StatusCode::BAD_GATEWAY, MESSAGE).into_response()
     }
 
     fn valid_mooncake_v2_handoff(params: &Value) -> bool {
@@ -1302,18 +1333,11 @@ impl VllmPDRouter {
             .get("cache_salt")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
-        let prefill_tokens: WorkerTokenInputs = prefill_inputs
-            .iter()
-            .filter(|_| prefill_policy.name() == "cache_aware")
-            .flat_map(|inputs| inputs.iter())
-            .filter(|(_, input)| input.image.is_none())
-            .filter_map(|(base, input)| {
-                input
-                    .prompts
-                    .as_ref()
-                    .map(|prompts| (base.clone(), prompts.clone()))
-            })
-            .collect();
+        let prefill_tokens = cache_aware_prefill_tokens(
+            prefill_inputs
+                .as_ref()
+                .filter(|_| prefill_policy.name() == "cache_aware"),
+        );
         let decode_tokens = decode_inputs.unwrap_or_default();
         let [prefill_cache, decode_cache] = [
             (prefill_policy.as_ref(), prefill_workers, &prefill_tokens),
@@ -2408,6 +2432,12 @@ impl VllmPDRouter {
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        if self.kv_connector == KvConnector::MooncakeV2 && path == "/v1/responses" {
+            // vLLM Responses exposes stop controls but no min_tokens.
+            prefill_request["ignore_eos"] = json!(true);
+            prefill_request["stop"] = json!([]);
+            prefill_request["stop_token_ids"] = json!([]);
+        }
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
@@ -2530,6 +2560,15 @@ impl VllmPDRouter {
             }
         };
 
+        let mooncake_handoff = self.mooncake_v2_handoff(&prefill_response_json);
+        if self.kv_connector == KvConnector::MooncakeV2 && mooncake_handoff.is_none() {
+            return Ok(Self::invalid_mooncake_v2_handoff(
+                &prefill_base_url,
+                path,
+                start_time,
+            ));
+        }
+
         if self.epd.is_some()
             && !matches!(self.kv_connector, KvConnector::Mooncake)
             && !matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write))
@@ -2594,20 +2633,15 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        if let Some(params) = self.build_decode_kv_transfer_params(
-            prefill_worker.as_ref(),
-            Some(&prefill_response_json),
-            transfer_id.as_deref(),
-            Some(&request_id),
-        ) {
+        if let Some(params) = mooncake_handoff.cloned().or_else(|| {
+            self.build_decode_kv_transfer_params(
+                prefill_worker.as_ref(),
+                Some(&prefill_response_json),
+                transfer_id.as_deref(),
+                Some(&request_id),
+            )
+        }) {
             decode_request["kv_transfer_params"] = params;
-        } else if self.kv_connector == KvConnector::MooncakeV2 {
-            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-            RouterMetrics::record_pd_request(path);
-            RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-            return Err(PDRouterError::NetworkError {
-                message: "Prefill returned no valid Mooncake V2 KV handoff".into(),
-            });
         } else {
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
@@ -2789,6 +2823,11 @@ impl VllmPDRouter {
             Some(kv) => json!({ "kv_transfer_params": kv }),
             None => json!({}),
         };
+        let mooncake_handoff = self.mooncake_v2_handoff(&prefill_response_json);
+        if self.kv_connector == KvConnector::MooncakeV2 && mooncake_handoff.is_none() {
+            attempt.release();
+            return Self::invalid_mooncake_v2_handoff(&prefill_base_url, path, start_time);
+        }
 
         // Prefill is done, so the decode pool can be read live. The committed
         // worker replaces the admission-time pick for dispatch and metrics;
@@ -2818,24 +2857,15 @@ impl VllmPDRouter {
         };
         let decode_base_url = decode_worker.base_url().to_string();
 
-        let decode_params = self.build_decode_kv_transfer_params(
-            prefill_worker.as_ref(),
-            Some(&prefill_response_json),
-            transfer_id.as_deref(),
-            Some(&request_id),
-        );
+        let decode_params = mooncake_handoff.cloned().or_else(|| {
+            self.build_decode_kv_transfer_params(
+                prefill_worker.as_ref(),
+                Some(&prefill_response_json),
+                transfer_id.as_deref(),
+                Some(&request_id),
+            )
+        });
         if decode_params.is_none() {
-            if self.kv_connector == KvConnector::MooncakeV2 {
-                attempt.release();
-                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-                RouterMetrics::record_pd_request(path);
-                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    "Prefill returned no valid Mooncake V2 KV handoff",
-                )
-                    .into_response();
-            }
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
                 prefill_base_url
@@ -7589,6 +7619,144 @@ mod tests {
                 "model": "test", "input": "hi", "stream": true,
             })).await,
         }
+    }
+
+    #[test]
+    fn mixed_pd_policies_do_not_feed_image_tokens_to_cache_aware_prefill() {
+        use crate::kv_index::request_hash::ImagePrefix;
+        let prompts: Arc<[Vec<u32>]> = Arc::from([vec![1, 2, 3]]);
+        let input = |image| PdPrefillInput {
+            prompts: Some(prompts.clone()),
+            image,
+            work_by_rank: HashMap::new(),
+            allow_credit: true,
+            fallback_reason: None,
+        };
+        let inputs = HashMap::from([
+            ("http://text".into(), input(None)),
+            (
+                "http://image".into(),
+                input(ImagePrefix::new(&"a".repeat(64), 1, 1, 3)),
+            ),
+        ]);
+        let text = cache_aware_prefill_tokens(Some(&inputs));
+        assert_eq!(text.len(), 1);
+        assert_eq!(text.get("http://text"), Some(&prompts));
+    }
+
+    #[tokio::test]
+    async fn pd_router_disables_image_rendering_for_epd() {
+        let url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions/render",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "token_ids": [1, 2, 3],
+                    "features": {
+                        "mm_hashes":{"image":["a".repeat(64)]},
+                        "mm_placeholders":{"image":[{"offset":1,"length":1}]}
+                    }
+                }))
+            }),
+        ))
+        .await;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let body = json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"image"}}
+        ]}]});
+        for epd in [false, true] {
+            let config = crate::config::RouterConfig {
+                epd: epd.then(|| crate::config::EpdConfig {
+                    encoder_urls: vec!["http://encoder".into()],
+                    consumer_zmq_addrs: HashMap::new(),
+                }),
+                ..Default::default()
+            };
+            let ctx = Arc::new(
+                crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                    .unwrap(),
+            );
+            let policy: Arc<dyn LoadBalancingPolicy> =
+                Arc::new(crate::policies::KvAwarePolicy::default());
+            ctx.policy_registry.set_prefill_policy(policy.clone());
+            let router = PdRouterBase::new(vec![], vec![], &ctx).await.unwrap();
+            let (inputs, _) = router
+                .kv_state
+                .as_ref()
+                .unwrap()
+                .prepare_stages(
+                    std::slice::from_ref(&worker),
+                    &policy,
+                    &[],
+                    &policy,
+                    &body,
+                    "/v1/chat/completions",
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+            assert_eq!(inputs[&url].image.is_some(), !epd);
+            if epd {
+                assert_eq!(inputs[&url].fallback_reason, Some("multimodal_input"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_mooncake_v2_handoff_returns_bad_gateway_without_decode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .route(
+                    "/v1/responses",
+                    axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                        assert_eq!(body["max_output_tokens"], 1);
+                        assert_eq!(body["ignore_eos"], true);
+                        assert_eq!(body["stop"], json!([]));
+                        assert_eq!(body["stop_token_ids"], json!([]));
+                        axum::Json(json!({"kv_transfer_params": {"do_remote_prefill": true}}))
+                    }),
+                )
+                .fallback(|| async { axum::Json(json!({})) }),
+        )
+        .await;
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let calls = decode_calls.clone();
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let mut router = test_vllm_pd_router().await;
+        router.kv_connector = KvConnector::MooncakeV2;
+        router.pd_router.worker_registry.register(prefill.clone());
+        router.pd_router.worker_registry.register(decode.clone());
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let response = dispatch_reservation_test_request(&router, path).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("no valid Mooncake V2 KV handoff"));
+            assert_eq!(decode.load(), 0);
+        }
+        assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

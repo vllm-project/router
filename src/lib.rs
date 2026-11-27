@@ -288,20 +288,8 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
-            kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
-                "nixl" => config::KvConnector::Nixl,
-                "mooncake" => config::KvConnector::Mooncake,
-                "mooncake-v2" => config::KvConnector::MooncakeV2,
-                "moriio" => config::KvConnector::MoriIO,
-                other => {
-                    return Err(config::ConfigError::ValidationFailed {
-                        reason: format!(
-                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', 'mooncake-v2', or 'moriio'",
-                            other
-                        ),
-                    });
-                }
-            },
+            kv_connector: clap::ValueEnum::from_str(&self.kv_connector, true)
+                .map_err(|reason| config::ConfigError::ValidationFailed { reason })?,
             program_scheduling: config::ProgramSchedulingConfig::resolve(
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
