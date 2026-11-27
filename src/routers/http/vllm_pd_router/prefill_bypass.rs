@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
-#[value(rename_all = "snake_case")]
 pub enum PdPrefillBypassPolicy {
     #[default]
+    #[value(name = "short_suffix")]
     ShortSuffix,
+    #[value(name = "busy_prefill")]
     BusyPrefill,
+    #[value(name = "short_suffix_or_busy_prefill")]
     ShortSuffixOrBusyPrefill,
 }
 
@@ -364,7 +366,7 @@ impl PrefillBypass {
         } else {
             RouterMetrics::record_pd_decode_error(worker.base_url());
         }
-        let response = own_grpc_decode(response, &attempt);
+        let response = own_grpc_decode(response, attempt);
         Some(response)
     }
 
@@ -523,6 +525,7 @@ impl PrefillBypass {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

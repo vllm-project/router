@@ -188,11 +188,12 @@ P/D admission and before Prefill dispatch. It can continue the current P/D
 attempt, return Decode's response, or release the attempt and request one fresh
 P/D admission after a typed refusal.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--pd-prefill-bypass-max-ratio` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
-| `--pd-prefill-bypass-policy` | `short_suffix` | `short_suffix` checks the uncached fraction. `busy_prefill` checks Prefill load. `short_suffix_or_busy_prefill` accepts either. |
-| `--pd-prefill-bypass-p-busy-requests` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |
+| Option | Rust value | Rust default | Python value | Python default | Description |
+| --- | --- | --- | --- | --- | --- |
+| `--pd-prefill-bypass-max-tokens` | `usize` | `0` | `integer` | `0` | Maximum uncached prompt tokens on Decode. Zero disables bypass. |
+| `--pd-prefill-bypass-max-ratio` | `f64` | `0.7` | `float` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
+| `--pd-prefill-bypass-policy` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | Check the uncached fraction, Prefill load, or either. |
+| `--pd-prefill-bypass-p-busy-requests` | `usize` | unset | `integer` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |
 
 Decode workers opt in with `"nixl_pull_local_prefill": true` in their routing
 capabilities JSON. Router sends both remote transfer flags as `false` and sets
