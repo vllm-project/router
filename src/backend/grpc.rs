@@ -549,6 +549,7 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
 /// Test-only: the streaming and collect paths inline this settlement now,
 /// so the helper survives only as the unit-test oracle for the contract.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Option<&str>) -> bool {
     let aborted = finish == Some("abort");
     if aborted {
