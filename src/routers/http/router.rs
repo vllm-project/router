@@ -1,3 +1,4 @@
+use super::completion_output::CompletionOutputObserver;
 use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
 use super::peer_fetch::{apply_peer_fetch, wants_prompt_logprobs, PeerFetchApply};
 use super::program_adapter::{
@@ -116,14 +117,19 @@ struct LoadTrackedBody {
     /// gRPC and Completion streams report the frame containing model output.
     /// Other HTTP streams retain their first-frame behavior.
     output_frame: Option<OutputFrameConsumer>,
+    /// Set while the load holds a peer fetch slot on a successful SSE response:
+    /// watches the frames sent to the client for the first generated output.
+    peer_output: Option<CompletionOutputObserver>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
 
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
-    /// Active-mode peer fetch slot against the source. Freed when decode
-    /// begins (the fetch ends during prefill) or, at the latest, with the load.
+    /// Active-mode peer fetch slot against the source. Freed at the first SSE
+    /// event that carries generated output (the fetch ends during prefill) or,
+    /// for any other response, with the load. Transport chunks alone, such as
+    /// SSE heartbeats, do not free it.
     peer_permit: Option<PeerFetchPermit>,
     released: AtomicBool,
 }
@@ -182,17 +188,21 @@ impl RequestLoadGuard {
         }
     }
 
+    fn holds_peer_fetch(&self) -> bool {
+        self.state.peer_permit.is_some()
+    }
+
     fn tracks_worker(&self) -> bool {
         self.state.worker.is_some()
     }
 
-    /// Prefill is over, so any peer fetch has finished: free its slot now
-    /// rather than holding it through decode.
+    /// Move the KV slot to decode. The peer fetch slot is not freed here: some
+    /// callers see only transport chunks, so `LoadTrackedBody` frees it on
+    /// generated output instead.
     fn begin_decode(&self) {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
         }
-        self.release_peer_fetch();
     }
 
     fn release(&self) {
@@ -227,6 +237,16 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(bytes))) = &item {
+            if self
+                .peer_output
+                .as_mut()
+                .is_some_and(|observer| observer.observe(bytes))
+            {
+                self.peer_output = None;
+                self.load.release_peer_fetch();
+            }
+        }
         if matches!(&item, Poll::Ready(Some(Ok(_)))) {
             let output_started = self
                 .output_frame
@@ -292,13 +312,25 @@ fn hold_request_load_with_output_frame(
         });
     }
     let (parts, body) = response.into_parts();
+    let peer_output =
+        (load.holds_peer_fetch() && parts.status.is_success() && is_sse(&parts.headers))
+            .then(CompletionOutputObserver::generated_output);
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
         load,
         output_frame,
+        peer_output,
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 struct TypedDispatch<'a> {
@@ -4219,13 +4251,74 @@ mod tests {
         drop(dropped);
         assert_eq!(limiter.inflight("http://a"), 0);
 
-        // The fetch ends during prefill: the first output token frees the slot
-        // while the response keeps streaming.
+        // Transport-level decode start (any chunk) does not free the slot;
+        // only generated output on the body does (see the next test).
         let decoding = guard(&limiter);
         decoding.begin_decode();
-        assert_eq!(limiter.inflight("http://a"), 0);
-        assert!(limiter.try_acquire("http://a").is_some());
+        assert_eq!(limiter.inflight("http://a"), 1);
         decoding.release();
+        assert_eq!(limiter.inflight("http://a"), 0);
+    }
+
+    /// The slot is freed by the first event with generated output, not by a
+    /// heartbeat or a role-only delta; a body that is not SSE keeps it to EOF.
+    #[tokio::test]
+    async fn peer_fetch_slot_waits_for_generated_output_not_heartbeats() {
+        use bytes::Bytes;
+        use http_body_util::BodyExt as _;
+
+        let limiter = crate::policies::PeerFetchLimiter::new(1);
+        let open = |content_type: &'static str| {
+            let permit = limiter.try_acquire("http://a").expect("slot");
+            let load = RequestLoadGuard::with_peer_permit(None, None, Some(permit));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            (
+                tx,
+                hold_request_load_until_body_done(response, load).into_body(),
+            )
+        };
+        async fn next(body: &mut Body) -> Bytes {
+            body.frame()
+                .await
+                .expect("frame")
+                .expect("frame ok")
+                .into_data()
+                .expect("data")
+        }
+
+        let (tx, mut body) = open("text/event-stream; charset=utf-8");
+        for frame in [
+            ": keepalive\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        ] {
+            tx.send(Ok(Bytes::from(frame))).unwrap();
+            next(&mut body).await;
+            assert_eq!(limiter.inflight("http://a"), 1, "{frame:?} freed the slot");
+        }
+        tx.send(Ok(Bytes::from(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        )))
+        .unwrap();
+        next(&mut body).await;
+        assert_eq!(limiter.inflight("http://a"), 0, "output frees the slot");
+        drop(tx);
+        let _ = body.collect().await;
+
+        let (tx, mut body) = open("application/json");
+        tx.send(Ok(Bytes::from("{\"choices\":[{\"text\":\"done\"}]}")))
+            .unwrap();
+        next(&mut body).await;
+        assert_eq!(
+            limiter.inflight("http://a"),
+            1,
+            "a non-SSE body holds to EOF"
+        );
+        drop(tx);
+        assert!(body.frame().await.is_none());
         assert_eq!(limiter.inflight("http://a"), 0);
     }
 

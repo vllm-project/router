@@ -1,23 +1,49 @@
-//! Conservative model-output detection for proxied Completion SSE streams.
+//! Conservative model-output detection for proxied Completion SSE streams,
+//! and for any OpenAI-style generation stream that holds a peer fetch slot.
 
 use super::sse::{sse_lines, FrameScanner};
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+/// What a complete event must carry to count as model output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputRule {
+    /// A Completion choice with non-empty `text`.
+    CompletionText,
+    /// A Completion choice with non-empty `text`, or a chat choice whose
+    /// `delta` has non-empty `content`, `reasoning_content` or `reasoning`, or
+    /// a non-empty `tool_calls` list. A role-only delta, a usage-only event, a
+    /// finish without text and SSE comments (heartbeats) are not output.
+    GeneratedOutput,
+}
 
 pub(super) struct CompletionOutputObserver {
     event: Vec<u8>,
     scanner: FrameScanner,
     first_event: bool,
     stopped: bool,
+    rule: OutputRule,
 }
 
 impl CompletionOutputObserver {
     pub(super) fn new(disabled: bool) -> Self {
+        Self::with_rule(disabled, OutputRule::CompletionText)
+    }
+
+    /// Detects generated output on a Completion or chat stream. Used to free a
+    /// peer fetch source slot once prefill (and so the fetch) is over; a stream
+    /// in a shape this does not recognize keeps the slot until the body ends.
+    pub(super) fn generated_output() -> Self {
+        Self::with_rule(false, OutputRule::GeneratedOutput)
+    }
+
+    fn with_rule(disabled: bool, rule: OutputRule) -> Self {
         Self {
             event: Vec::new(),
             scanner: FrameScanner::default(),
             first_event: true,
             stopped: disabled,
+            rule,
         }
     }
 
@@ -48,7 +74,7 @@ impl CompletionOutputObserver {
                 } else {
                     &self.event
                 };
-                let output = event_has_output(event);
+                let output = event_has_output(event, self.rule);
                 self.event.clear();
                 if output {
                     self.stopped = true;
@@ -60,7 +86,7 @@ impl CompletionOutputObserver {
     }
 }
 
-fn event_has_output(event: &[u8]) -> bool {
+fn event_has_output(event: &[u8], rule: OutputRule) -> bool {
     let mut data = Vec::new();
     let mut event_type = None;
     for (line, _) in sse_lines(event) {
@@ -83,14 +109,31 @@ fn event_has_output(event: &[u8]) -> bool {
         && value
             .get("choices")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-                })
-            })
+            .is_some_and(|choices| choices.iter().any(|choice| choice_has_output(choice, rule)))
+}
+
+fn choice_has_output(choice: &serde_json::Value, rule: OutputRule) -> bool {
+    let non_empty_str = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    };
+    if non_empty_str(choice.get("text")) {
+        return true;
+    }
+    if rule == OutputRule::CompletionText {
+        return false;
+    }
+    let Some(delta) = choice.get("delta") else {
+        return false;
+    };
+    ["content", "reasoning_content", "reasoning"]
+        .iter()
+        .any(|field| non_empty_str(delta.get(*field)))
+        || delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -186,6 +229,35 @@ mod tests {
             assert!(!observer.observe(event.as_bytes()), "{event:?}");
         }
         assert!(observer.observe(b"data: {\"choices\":[{\"text\":\"yes\"}]}\n\n"));
+    }
+
+    #[test]
+    fn generated_output_counts_chat_deltas_but_not_heartbeats_or_metadata() {
+        for event in [
+            ": keepalive\n\n",
+            "event: ping\ndata: {}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
+            "data: {\"error\":{},\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
+            "event: error\ndata: {\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            let mut observer = CompletionOutputObserver::generated_output();
+            assert!(!observer.observe(event.as_bytes()), "{event:?}");
+        }
+        for event in [
+            "data: {\"choices\":[{\"text\":\"completion\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"chat\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n",
+        ] {
+            let mut observer = CompletionOutputObserver::generated_output();
+            assert!(observer.observe(event.as_bytes()), "{event:?}");
+        }
     }
 
     #[test]

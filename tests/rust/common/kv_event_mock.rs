@@ -11,6 +11,7 @@
 //! * `GET /kv_event_sources` -> one `zmq`/`msgpack`/`schema_version: 1` entry for the DP rank,
 //!   with an optional `peer_lookup` object ([`KvEventMockConfig::peer_lookup`])
 //! * `POST /v1/completions` and `POST /v1/chat/completions` -> OpenAI-style replies
+//! * `POST /v1/chat/completions/render` -> the body's `mock_token_ids`, else 404
 //!
 //! The ZMQ socket is an XPUB so the mock can observe the router's subscription
 //! (the standard cure for the slow-joiner race: wait for the subscribe frame,
@@ -26,7 +27,9 @@
 //! After [`KvEventMock::split_streams`], a `"stream": true` completion is
 //! answered as server-sent events: one output frame at once, then the closing
 //! `[DONE]` only after [`KvEventMock::release_stream_tails`] (or drop), so a
-//! test can hold a stream open after its first output frame.
+//! test can hold a stream open after its first output frame. With
+//! [`KvEventMock::heartbeat_streams`] as well, the stream opens with an SSE
+//! comment (`: keepalive`) and the output frame waits for the tail release.
 //!
 //! The marker is `priority` (a real completions field the router models) rather
 //! than an invented one: the router withholds KV placement credit from requests
@@ -189,6 +192,8 @@ struct MockState {
     held_inflight: AtomicUsize,
     /// Answer streaming completions as SSE with a held tail (see `split_streams`).
     split_streams: AtomicBool,
+    /// Open split streams with a heartbeat and hold their output too.
+    heartbeat_streams: AtomicBool,
     /// `false` while split stream tails must wait; `true` releases them.
     tail_release: watch::Sender<bool>,
     completions: AtomicUsize,
@@ -251,6 +256,7 @@ impl KvEventMock {
             release,
             held_inflight: AtomicUsize::new(0),
             split_streams: AtomicBool::new(false),
+            heartbeat_streams: AtomicBool::new(false),
             tail_release,
             completions: AtomicUsize::new(0),
             fail_next: AtomicUsize::new(0),
@@ -275,6 +281,7 @@ impl KvEventMock {
             .route("/kv_routing_capabilities", get(kv_routing_capabilities))
             .route("/v1/completions", post(completions))
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/chat/completions/render", post(chat_render))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -470,6 +477,13 @@ impl KvEventMock {
     /// at once, the closing `[DONE]` only after `release_stream_tails`.
     pub fn split_streams(&self) {
         self.state.split_streams.store(true, Ordering::Release);
+    }
+
+    /// Split streams open with an SSE heartbeat (`: keepalive`) and send their
+    /// output frame, then `[DONE]`, only after `release_stream_tails`.
+    pub fn heartbeat_streams(&self) {
+        self.split_streams();
+        self.state.heartbeat_streams.store(true, Ordering::Release);
     }
 
     /// Let every held stream tail finish.
@@ -693,7 +707,7 @@ async fn completions(State(state): State<Arc<MockState>>, body: Bytes) -> Respon
     let streaming = serde_json::from_slice::<Value>(&body)
         .is_ok_and(|value| value["stream"].as_bool() == Some(true));
     if streaming && state.split_streams.load(Ordering::Acquire) {
-        return split_stream(&state);
+        return split_stream(&state, false);
     }
     Json(json!({
         "id": "cmpl-mock",
@@ -706,11 +720,19 @@ async fn completions(State(state): State<Arc<MockState>>, body: Bytes) -> Respon
     .into_response()
 }
 
-/// One output frame now; `[DONE]` once the test releases stream tails.
-fn split_stream(state: &MockState) -> Response {
+/// One output frame now; `[DONE]` once the test releases stream tails. A chat
+/// stream sends a chat delta instead of Completion text.
+fn split_stream(state: &MockState, chat: bool) -> Response {
     use futures_util::StreamExt as _;
-    let first = format!(
-        "data: {}\n\n",
+    let frame = if chat {
+        json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": state.config.model,
+            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}],
+        })
+    } else {
         json!({
             "id": "cmpl-mock",
             "object": "text_completion",
@@ -718,16 +740,28 @@ fn split_stream(state: &MockState) -> Response {
             "model": state.config.model,
             "choices": [{"index": 0, "text": "ok", "finish_reason": null}],
         })
-    );
+    };
+    let first = format!("data: {frame}\n\n");
     let mut tail = state.tail_release.subscribe();
-    let stream =
+    let stream = if state.heartbeat_streams.load(Ordering::Acquire) {
+        futures_util::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keepalive\n\n"))
+        })
+        .chain(futures_util::stream::once(async move {
+            let _ = tail.wait_for(|released| *released).await;
+            Ok(Bytes::from(format!("{first}data: [DONE]\n\n")))
+        }))
+        .boxed()
+    } else {
         futures_util::stream::once(
             async move { Ok::<_, std::convert::Infallible>(Bytes::from(first)) },
         )
         .chain(futures_util::stream::once(async move {
             let _ = tail.wait_for(|released| *released).await;
             Ok(Bytes::from_static(b"data: [DONE]\n\n"))
-        }));
+        }))
+        .boxed()
+    };
     (
         [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
         axum::body::Body::from_stream(stream),
@@ -738,6 +772,11 @@ fn split_stream(state: &MockState) -> Response {
 async fn chat_completions(State(state): State<Arc<MockState>>, body: Bytes) -> Response {
     if let Some(failure) = admit(&state, &body).await {
         return failure;
+    }
+    let streaming = serde_json::from_slice::<Value>(&body)
+        .is_ok_and(|value| value["stream"].as_bool() == Some(true));
+    if streaming && state.split_streams.load(Ordering::Acquire) {
+        return split_stream(&state, true);
     }
     Json(json!({
         "id": "chatcmpl-mock",
@@ -752,4 +791,17 @@ async fn chat_completions(State(state): State<Arc<MockState>>, body: Bytes) -> R
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }))
     .into_response()
+}
+
+/// The engine's chat render endpoint, for tests only: a body that carries
+/// `mock_token_ids` renders to exactly those ids. Any other body gets 404, so
+/// the router finds no tokens for it (as with an engine without render).
+async fn chat_render(body: Bytes) -> Response {
+    match serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("mock_token_ids").cloned())
+    {
+        Some(ids) if ids.is_array() => Json(json!({"token_ids": ids})).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }

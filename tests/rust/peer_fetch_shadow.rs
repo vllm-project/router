@@ -407,13 +407,34 @@ impl Fixture {
     /// router holds the request's load, and any peer fetch slot, until the
     /// body ends.
     async fn open_stream(&self, tokens: &[u32]) -> axum::response::Response {
+        self.open_stream_at(
+            "/v1/completions",
+            json!({"prompt": tokens, "max_tokens": 1, "stream": true}),
+        )
+        .await
+    }
+
+    /// A streaming chat request whose body the caller keeps. The mock renders
+    /// it to `tokens` (see `mock_token_ids`).
+    async fn open_chat_stream(&self, tokens: &[u32]) -> axum::response::Response {
+        self.open_stream_at(
+            "/v1/chat/completions",
+            json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                "stream": true,
+                "mock_token_ids": tokens,
+            }),
+        )
+        .await
+    }
+
+    async fn open_stream_at(&self, uri: &str, body: serde_json::Value) -> axum::response::Response {
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/completions")
+            .uri(uri)
             .header("content-type", "application/json")
-            .body(Body::from(
-                json!({"prompt": tokens, "max_tokens": 1, "stream": true}).to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .unwrap();
         self.app
             .clone()
@@ -1132,6 +1153,70 @@ async fn s15b_slot_is_freed_at_the_first_output_frame() {
         fx.mock(instance).release_stream_tails();
     }
     let _ = body.collect().await;
+    fx.finish().await;
+}
+
+/// 15c: a heartbeat is not output. A chat stream (chat responses get no
+/// Completion output marker, so the router has to read the events itself) that
+/// has sent only an SSE comment is still in prefill: its slot stays held and
+/// the next planned request is refused (`inflight_cap`). The slot is freed
+/// once the output frame is read.
+#[tokio::test]
+async fn s15c_heartbeat_before_output_keeps_the_slot() {
+    use http_body_util::BodyExt as _;
+
+    let mut options = Options::new(&[("a", "m"), ("b", "m"), ("c", "m")]).active(&[
+        ("a", PeerLookupMock::new("fp")),
+        ("b", PeerLookupMock::new("fp")),
+        ("c", PeerLookupMock::new("fp")),
+    ]);
+    options.transfer.max_inflight_per_source = 1;
+    let (fx, prompt) = active_fixture(33, options).await;
+    for instance in ["a", "b", "c"] {
+        fx.mock(instance).heartbeat_streams();
+    }
+    let policy = kv_policy(&fx);
+    let kv = policy
+        .as_any()
+        .downcast_ref::<KvAwarePolicy>()
+        .expect("kv_aware policy");
+    let source_url = fx.mock("a").url.clone();
+
+    let (response, sent) = request_outcomes_of(fx.open_chat_stream(&prompt)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(sent, outcomes(&[("sent", 1)]));
+
+    // Read the heartbeat only: the slot is still held.
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(10), body.frame())
+        .await
+        .expect("heartbeat in time")
+        .expect("a first frame")
+        .expect("frame ok")
+        .into_data()
+        .expect("data frame");
+    assert_eq!(&first[..], b": keepalive\n\n");
+    assert_eq!(
+        kv.peer_fetch_inflight(&source_url),
+        1,
+        "a heartbeat must not free the slot"
+    );
+    let (status, sent) = request_outcomes_of(fx.complete(&prompt, None)).await;
+    assert_eq!(status, 200);
+    assert_eq!(sent, outcomes(&[("inflight_cap", 1)]));
+
+    // Output arrives: the slot is freed.
+    for instance in ["a", "b", "c"] {
+        fx.mock(instance).release_stream_tails();
+    }
+    let rest = body.collect().await.expect("stream").to_bytes();
+    assert!(
+        std::str::from_utf8(&rest)
+            .unwrap()
+            .contains("\"content\":\"ok\""),
+        "{rest:?}"
+    );
+    assert_eq!(kv.peer_fetch_inflight(&source_url), 0);
     fx.finish().await;
 }
 
