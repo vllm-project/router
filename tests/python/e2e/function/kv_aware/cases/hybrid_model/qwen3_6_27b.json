@@ -1,0 +1,53 @@
+{
+  "model": "Qwen/Qwen3.6-27B",
+  "local_model_env": "KV_AWARE_HYBRID_QWEN3_6_27B_MODEL",
+  "worker_count": 2,
+  "protocols": [
+    "http",
+    "grpc"
+  ],
+  "worker_params": {
+    "enable_prefix_caching": true,
+    "prefix_caching_hash_algo": "sha256_cbor",
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 4096,
+    "language_model_only": true,
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "prefix_match_unit": 16
+  },
+  "router_params": {
+    "--kv-hybrid-layout": {
+      "ranks": [
+        {
+          "rank": 0,
+          "hash_block_size": 16,
+          "hash_seed": "0",
+          "partial_hash_hits": true,
+          "speculative_tokens": 0,
+          "groups": [
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "full_attention"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "deployments": [
+    "colocated",
+    "1p1d_nixl"
+  ]
+}

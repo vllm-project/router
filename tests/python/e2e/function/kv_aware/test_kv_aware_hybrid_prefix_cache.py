@@ -4,7 +4,7 @@ Set ROUTER_BIN to a binary that includes PR #493 and run with vLLM 0.30.0.
 Each case uses two workers with the GPUs per replica set by its tensor
 parallel size. Use `-k` to select a model, protocol, or variant.
 The 1P1D cases require NixlConnector on both workers.
-Set the model's `local_model_env` from cases/hybrid_models.json to use a local
+Set the model's `local_model_env` from cases/hybrid_model/*.json to use a local
 checkpoint.
 The DeepSeek V4 Pro NVFP4 case targets Blackwell GPUs.
 """
@@ -20,7 +20,7 @@ import requests
 
 from tests.python.e2e.function.kv_aware.config import (
     kv_aware_request_log_poll_sec,
-    load_kv_aware_case,
+    load_hybrid_kv_aware_cases,
 )
 from tests.python.e2e.function.kv_aware.request_builder import (
     build_hybrid_prefix_requests,
@@ -60,27 +60,13 @@ _DRAFTS = "vllm:spec_decode_num_drafts_total"
 
 def _hybrid_parameters(deployment: str):
     parameters = []
-    for name, base in load_kv_aware_case("hybrid_models").items():
-        cases = [(name, base)]
-        for variant, overrides in base.get("variants", {}).items():
-            case = {
-                **base,
-                **overrides,
-                "worker_params": {
-                    **base["worker_params"],
-                    **overrides["worker_params"],
-                },
-            }
-            cases.append((f"{name}-{variant}", case))
-        for case_name, case in cases:
-            if deployment not in case.get("deployments", ("colocated",)):
-                continue
-            for protocol in case["protocols"]:
-                parameters.append(
-                    pytest.param(
-                        (case, protocol, deployment), id=f"{case_name}-{protocol}"
-                    )
-                )
+    for name, case in load_hybrid_kv_aware_cases().items():
+        if deployment not in case.get("deployments", ("colocated",)):
+            continue
+        for protocol in case["protocols"]:
+            parameters.append(
+                pytest.param((case, protocol, deployment), id=f"{name}-{protocol}")
+            )
     return parameters
 
 

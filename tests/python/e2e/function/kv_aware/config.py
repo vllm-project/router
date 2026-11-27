@@ -15,7 +15,7 @@ Optional environment (see also ``function/helpers/launch.py``):
 - ``KV_AWARE_HYBRID_MODEL``: optional local Qwen3.5-4B checkpoint.
 - ``KV_AWARE_HYBRID_QWEN3_8_27B_MODEL``: optional local Qwen3.8-27B checkpoint.
   Each hybrid case declares its local checkpoint variable in
-  ``cases/hybrid_models.json``.
+  ``cases/hybrid_model/*.json``.
 - ``KV_AWARE_USE_VLLM_SERVE``: ``0`` (default) use ``vllm-rs serve``.
   ``1`` is rejected: ``vllm serve`` cannot be a ``grpc://`` worker.
 - Worker serve extras (shell-split, first set wins):
@@ -60,6 +60,15 @@ from typing import Any
 def load_kv_aware_case(name: str) -> dict[str, Any]:
     path = Path(__file__).with_name("cases") / f"{name}.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_hybrid_kv_aware_cases() -> dict[str, dict[str, Any]]:
+    """Load one complete hybrid scenario per JSON; filenames define case IDs."""
+    directory = Path(__file__).with_name("cases") / "hybrid_model"
+    paths = sorted(directory.glob("*.json"))
+    if not paths:
+        raise ValueError(f"No hybrid KV-aware cases found in {directory}")
+    return {path.stem: json.loads(path.read_text(encoding="utf-8")) for path in paths}
 
 
 def kv_aware_e2e_model() -> str:

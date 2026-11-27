@@ -1,0 +1,103 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "local_model_env": "KV_AWARE_HYBRID_QWEN3_8_27B_MODEL",
+  "worker_count": 2,
+  "protocols": [
+    "http",
+    "grpc"
+  ],
+  "worker_params": {
+    "language_model_only": true,
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "enable_prefix_caching": true,
+    "prefix_caching_hash_algo": "sha256_cbor",
+    "prefix_match_unit": 16,
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 512,
+    "speculative_config": {
+      "method": "dspark",
+      "model": "RedHatAI/Qwen3.8-27B-speculator.dspark",
+      "num_speculative_tokens": 8,
+      "disable_eagle_block_drop": true
+    }
+  },
+  "router_params": {
+    "--kv-hybrid-layout": {
+      "ranks": [
+        {
+          "rank": 0,
+          "hash_block_size": 16,
+          "hash_seed": "0",
+          "partial_hash_hits": false,
+          "speculative_tokens": 8,
+          "groups": [
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "mamba",
+              "mamba_cache_mode": "align"
+            },
+            {
+              "kind": "full_attention"
+            },
+            {
+              "kind": "full_attention"
+            },
+            {
+              "kind": "full_attention"
+            },
+            {
+              "kind": "full_attention"
+            },
+            {
+              "kind": "sliding_window",
+              "sliding_window": 2048
+            }
+          ],
+          "hash_lookahead_tokens": 0,
+          "tail_drop_groups": []
+        }
+      ]
+    }
+  },
+  "deployments": [
+    "colocated",
+    "1p1d_nixl"
+  ]
+}
