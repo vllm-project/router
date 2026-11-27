@@ -1,5 +1,7 @@
 //! Versioned offline seeds and bounded online overlays for shadow prediction.
 
+use super::retention::evaluate_legacy_ttl;
+use super::ReturnTimeUtilityDiagnostic;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -266,6 +268,7 @@ pub(crate) struct PredictionProfileFile {
 pub(crate) struct ReturnPrediction {
     pub probability: f64,
     pub suggested_ttl_seconds: f64,
+    pub utility: Option<ReturnTimeUtilityDiagnostic>,
     pub support: usize,
     pub online_support: usize,
     pub backoff_level: usize,
@@ -472,6 +475,14 @@ impl PredictionProfileStore {
             return Some(ReturnPrediction {
                 probability,
                 suggested_ttl_seconds,
+                utility: evaluate_legacy_ttl(
+                    &counts,
+                    no_return,
+                    &self.return_time_bounds,
+                    cache_miss_cost,
+                    suggested_ttl_seconds,
+                    histogram.effective_max_observed(prior_weight),
+                ),
                 support,
                 online_support: histogram.online_support(),
                 backoff_level,
@@ -612,12 +623,6 @@ fn best_ttl(
     }
     let max_ttl = max_ttl.min(cache_miss_cost);
     let mut best = (0.0, 0.0);
-    let last_bound = bounds.last().copied().unwrap_or(0.0);
-    let overflow_upper = if max_observed > last_bound {
-        max_observed
-    } else {
-        f64::INFINITY
-    };
     for candidate in std::iter::once(0.0).chain(
         bounds
             .iter()
@@ -625,17 +630,17 @@ fn best_ttl(
             .filter(|bound| *bound <= max_ttl)
             .chain(std::iter::once(max_ttl)),
     ) {
-        let mut hit_probability = 0.0;
-        let mut retained_cost = no_return / total * candidate;
-        for (index, count) in counts.iter().enumerate() {
-            let upper = bounds.get(index).copied().unwrap_or(overflow_upper);
-            let probability = count / total;
-            if upper <= candidate {
-                hit_probability += probability;
-            }
-            retained_cost += probability * upper.min(candidate);
-        }
-        let utility = cache_miss_cost * hit_probability - retained_cost;
+        let Some(evaluation) = evaluate_legacy_ttl(
+            counts,
+            no_return,
+            bounds,
+            cache_miss_cost,
+            candidate,
+            max_observed,
+        ) else {
+            continue;
+        };
+        let utility = evaluation.modeled_utility_seconds;
         // Equal utility does not justify a longer reservation. Keeping the
         // earliest candidate preserves distinct return-time buckets instead of
         // collapsing every fully covered histogram onto the TTL cap.
@@ -1000,5 +1005,102 @@ mod tests {
         assert_eq!(best_ttl(&counts, 0.0, &bounds, 0.4, 10.0, 0.5), 0.0);
         assert_eq!(best_ttl(&counts, 0.0, &bounds, 0.8, 10.0, 0.5), 0.5);
         assert_eq!(best_ttl(&counts, 0.0, &bounds, 8.0, 0.25, 0.5), 0.0);
+    }
+
+    #[test]
+    fn utility_uses_ttl_probability_not_the_diagnostic_horizon() {
+        let mut store = PredictionProfileStore::empty(vec![0.1, 0.5], vec![64], 16, 20);
+        let key = ReturnTimeKey {
+            workflow_profile_id: None,
+            profile_version: None,
+            model_pool: None,
+            agent_role: None,
+            spawn_reason: None,
+            blocks_parent: None,
+            expected_resume: None,
+            step_bucket: None,
+        };
+        for seconds in [0.1, 0.1, 0.1, 0.5] {
+            store.observe_return(std::slice::from_ref(&key), seconds);
+        }
+        store.observe_no_return(std::slice::from_ref(&key));
+        let prediction = store
+            .predict_return(&[key], 0.0, 3600.0, 1, 1.0, 0.6, 10.0)
+            .unwrap();
+        assert!((prediction.probability - 0.8).abs() < 1e-12);
+        let utility = prediction.utility.unwrap();
+        assert_eq!(prediction.suggested_ttl_seconds, 0.1);
+        assert_eq!(utility.ttl_seconds, prediction.suggested_ttl_seconds);
+        assert!((utility.return_probability_within_ttl - 0.6).abs() < 1e-12);
+        assert!((utility.modeled_utility_seconds - 0.26).abs() < 1e-12);
+    }
+
+    #[test]
+    fn decomposed_selector_preserves_legacy_choices() {
+        // Frozen pre-refactor selector: observations must not alter scheduling.
+        fn reference(
+            counts: &[f64],
+            no_return: f64,
+            bounds: &[f64],
+            cost: f64,
+            cap: f64,
+            observed: f64,
+        ) -> f64 {
+            let total = counts.iter().sum::<f64>() + no_return;
+            if total <= 0.0 || cost <= 0.0 || cap <= 0.0 {
+                return 0.0;
+            }
+            let cap = cap.min(cost);
+            let last = bounds.last().copied().unwrap_or(0.0);
+            let overflow = if observed > last {
+                observed
+            } else {
+                f64::INFINITY
+            };
+            let mut best = (0.0, 0.0);
+            for ttl in std::iter::once(0.0).chain(
+                bounds
+                    .iter()
+                    .copied()
+                    .filter(|b| *b <= cap)
+                    .chain(std::iter::once(cap)),
+            ) {
+                let mut probability = 0.0;
+                let mut retained = no_return / total * ttl;
+                for (index, count) in counts.iter().enumerate() {
+                    let upper = bounds.get(index).copied().unwrap_or(overflow);
+                    let p = count / total;
+                    if upper <= ttl {
+                        probability += p;
+                    }
+                    retained += p * upper.min(ttl);
+                }
+                let utility = cost * probability - retained;
+                if utility > best.1 {
+                    best = (ttl, utility);
+                }
+            }
+            best.0
+        }
+        let bounds = [0.1, 0.5, 1.0];
+        for counts in [
+            [3.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 5.0],
+            [1.5, 0.5, 2.0, 1.0],
+            [0.0; 4],
+        ] {
+            for no_return in [0.0, 1.0, 10.0] {
+                for cost in [0.0, 0.05, 0.1, 0.6, 2.0, 10.0] {
+                    for cap in [0.0, 0.05, 0.1, 0.5, 1.0, 3.0] {
+                        for observed in [0.0, 1.0, 2.0] {
+                            assert_eq!(
+                                best_ttl(&counts, no_return, &bounds, cost, cap, observed),
+                                reference(&counts, no_return, &bounds, cost, cap, observed)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
