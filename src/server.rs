@@ -811,6 +811,7 @@ pub struct ServerConfig {
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    pub worker_canary_interval_secs: u64,
     /// Idle timeout in seconds for pooled backend connections. A value of 0
     /// disables connection reuse entirely.
     pub pool_idle_timeout_secs: u64,
@@ -1137,6 +1138,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
+    let worker_canary = if matches!(
+        config.router_config.mode,
+        crate::config::RoutingMode::Regular { .. }
+    ) && config.router_config.epd.is_none()
+    {
+        crate::core::worker_canary::WorkerCanary::start(
+            app_context.worker_registry.clone(),
+            app_context.client.clone(),
+            Duration::from_secs(config.worker_canary_interval_secs),
+            Duration::from_secs(config.router_config.health_check.timeout_secs.max(1)),
+            config.router_config.api_key.clone(),
+        )
+    } else {
+        None
+    };
+
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
@@ -1262,12 +1279,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let addr = format!("{}:{}", config.host, config.port);
     let listener = bind_listener(&addr).await?;
     info!("Starting server on {}", addr);
-    serve(listener, app)
+    let result = serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
-    Ok(())
+        .await;
+    if let Some(canary) = worker_canary {
+        canary.shutdown().await;
+    }
+    result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 /// Bind the client-facing listener with `TCP_NODELAY` on every accepted connection.

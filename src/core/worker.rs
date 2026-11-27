@@ -1,3 +1,4 @@
+use super::worker_canary::CanaryState;
 use super::{CircuitBreaker, CircuitBreakerConfig, WorkerError, WorkerResult};
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
@@ -48,6 +49,11 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
+
+    #[doc(hidden)]
+    fn canary_state(&self) -> Option<&CanaryState> {
+        None
+    }
 
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
@@ -309,6 +315,7 @@ pub struct BasicWorker {
     load_counter: Arc<AtomicUsize>,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
+    canary: CanaryState,
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
@@ -351,6 +358,7 @@ impl BasicWorker {
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            canary: CanaryState::default(),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
@@ -421,12 +429,18 @@ impl Worker for BasicWorker {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        self.healthy.load(Ordering::Acquire) && self.canary.healthy()
     }
 
     fn set_healthy(&self, healthy: bool) {
-        self.healthy.store(healthy, Ordering::Release);
-        RouterMetrics::set_worker_health(self.url(), healthy);
+        self.canary.update_passive_health(|| {
+            self.healthy.store(healthy, Ordering::Release);
+            RouterMetrics::set_worker_health(self.url(), self.is_healthy());
+        });
+    }
+
+    fn canary_state(&self) -> Option<&CanaryState> {
+        Some(&self.canary)
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -463,7 +477,7 @@ impl Worker for BasicWorker {
                 let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
                 // Mark healthy if we've reached the success threshold
-                if !self.is_healthy()
+                if !self.healthy.load(Ordering::Acquire)
                     && successes >= self.metadata.health_config.success_threshold as usize
                 {
                     self.set_healthy(true);
@@ -477,7 +491,7 @@ impl Worker for BasicWorker {
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
                 // Mark unhealthy if we've reached the failure threshold
-                if self.is_healthy()
+                if self.healthy.load(Ordering::Acquire)
                     && failures >= self.metadata.health_config.failure_threshold as usize
                 {
                     // Logged once per transition; a rejected key shows as 401.
@@ -609,6 +623,10 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn canary_state(&self) -> Option<&CanaryState> {
+        self.base_worker.canary_state()
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {

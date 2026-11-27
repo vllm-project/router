@@ -70,6 +70,7 @@ foldhash = "0.2"
 hashbrown = "0.16"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 anyhow = "1.0"
 dotenvy = "0.15"
 tokenizers = { version = "0.22.2" }
@@ -164,6 +165,10 @@ path = "benches/otel_disabled_path.rs"
 # Cargo auto-discovers only tests/*.rs. Integration tests live under tests/rust/.
 # Adding a file there requires a matching [[test]] entry; pre-commit hook
 # check-rust-tests enforces that.
+[[test]]
+name = "worker_canary"
+path = "tests/rust/worker_canary.rs"
+
 [[test]]
 name = "api_endpoints_test"
 path = "tests/rust/api_endpoints_test.rs"

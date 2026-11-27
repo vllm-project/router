@@ -70,6 +70,7 @@ pub struct WorkerRegistry {
 
     /// Monotonic topology and availability revision for read-side caches.
     revision: Arc<AtomicU64>,
+    canary_enabled: RwLock<bool>,
 }
 
 impl WorkerRegistry {
@@ -84,6 +85,7 @@ impl WorkerRegistry {
             registration_order: Arc::new(RwLock::new(Vec::new())),
             url_to_id: Arc::new(DashMap::new()),
             revision: Arc::new(AtomicU64::new(0)),
+            canary_enabled: RwLock::new(false),
         }
     }
 
@@ -103,7 +105,20 @@ impl WorkerRegistry {
         }
 
         // Store worker
-        self.workers.insert(worker_id.clone(), worker.clone());
+        if let Some(previous) = self.workers.insert(worker_id.clone(), worker.clone()) {
+            if !Arc::ptr_eq(&previous, &worker) {
+                if let Some(state) = previous.canary_state() {
+                    state.retire();
+                }
+            }
+        }
+        if *self
+            .canary_enabled
+            .read()
+            .expect("canary configuration lock")
+        {
+            super::worker_canary::enable(worker.as_ref());
+        }
 
         // Update URL mapping
         self.url_to_id
@@ -147,6 +162,9 @@ impl WorkerRegistry {
     /// Remove a worker by ID
     pub fn remove(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
         if let Some((_, worker)) = self.workers.remove(worker_id) {
+            if let Some(state) = worker.canary_state() {
+                state.retire();
+            }
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
@@ -398,6 +416,51 @@ impl WorkerRegistry {
             prefill_workers: prefill_count,
             decode_workers: decode_count,
         }
+    }
+
+    pub(crate) fn enable_canary(&self) -> bool {
+        let mut enabled = self
+            .canary_enabled
+            .write()
+            .expect("canary configuration lock");
+        if *enabled {
+            return false;
+        }
+        *enabled = true;
+        for entry in self.workers.iter() {
+            super::worker_canary::enable(entry.value().as_ref());
+        }
+        true
+    }
+
+    pub(crate) fn disable_canary(&self) {
+        let mut enabled = self
+            .canary_enabled
+            .write()
+            .expect("canary configuration lock");
+        *enabled = false;
+        for entry in self.workers.iter() {
+            let worker = entry.value();
+            if let Some(state) = worker.canary_state() {
+                let was = worker.is_healthy();
+                state.retire();
+                if worker.is_healthy() != was {
+                    RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
+                    self.notify_worker_state_change();
+                }
+            }
+        }
+    }
+
+    /// Fence verdict publication against removal and same-URL replacement.
+    pub(crate) fn with_registered_worker<T>(
+        &self,
+        id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+        inspect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let worker = self.workers.get(id)?;
+        Arc::ptr_eq(worker.value(), expected).then(inspect)
     }
 
     /// Start a health checker for all workers in the registry

@@ -420,6 +420,10 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
+    /// Probe idle standalone HTTP workers every N seconds (0 disables generation canaries)
+    #[arg(long, default_value_t = 0)]
+    worker_canary_interval_secs: u64,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -753,6 +757,7 @@ impl CliArgs {
             service_discovery_config,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
+            worker_canary_interval_secs: self.worker_canary_interval_secs,
             pool_idle_timeout_secs: self.pool_idle_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
                 None
@@ -875,6 +880,19 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_canary_cli_defaults_off_and_accepts_opt_in() {
+        assert_eq!(
+            CliArgs::parse_from(["vllm-router"]).worker_canary_interval_secs,
+            0
+        );
+        assert_eq!(
+            CliArgs::parse_from(["vllm-router", "--worker-canary-interval-secs", "7"])
+                .worker_canary_interval_secs,
+            7
+        );
+    }
 
     #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {
