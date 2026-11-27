@@ -1,31 +1,22 @@
 import pytest
-import requests
+
+from ..helpers.client import embeddings
 
 
 @pytest.mark.e2e
-def test_embeddings_basic(
-    e2e_router_only_rr, e2e_primary_embedding_worker, e2e_embedding_model
-):
-    base = e2e_router_only_rr.url
-    worker_url = e2e_primary_embedding_worker.url
+def test_embeddings_basic(router_manager, vllm_worker_manager, e2e_embedding_model):
+    base = router_manager.start_router(policy="round_robin", timeout=120).url
+    worker_url = vllm_worker_manager.start(e2e_embedding_model).url
 
     # Attach embedding worker to router-only instance
-    r = requests.post(f"{base}/add_worker", params={"url": worker_url}, timeout=180)
-    r.raise_for_status()
+    router_manager.add_worker(base, worker_url, timeout=180)
 
-    # Simple embedding request with two inputs
-    payload = {
-        "model": e2e_embedding_model,
-        "input": [
-            "the quick brown fox",
-            "jumps over the lazy dog",
-        ],
-    }
-    r = requests.post(f"{base}/v1/embeddings", json=payload, timeout=120)
-
-    assert r.status_code == 200, f"unexpected status: {r.status_code} {r.text}"
-
-    data = r.json()
+    data = embeddings(
+        base,
+        e2e_embedding_model,
+        ["the quick brown fox", "jumps over the lazy dog"],
+        timeout=120,
+    )
     assert "data" in data and isinstance(data["data"], list)
     assert len(data["data"]) == 2
 
