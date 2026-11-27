@@ -18,7 +18,7 @@ from tests.python.e2e.perf.binaries import (
 from tests.python.e2e.perf.binaries import (
     vllm_rs_bin as _shared_vllm_rs_bin,
 )
-from tests.python.e2e.perf.process import (
+from tests.python.helpers.process import (
     RunningProc,
     launch_router,
     launch_worker,

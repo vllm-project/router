@@ -27,13 +27,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "pyyaml>=6",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "PyYAML>=6.0",
     "grpcio-tools>=1.60",
     "grpcio-health-checking>=1.60",
     "pyzmq>=25",
     "msgpack>=1.0",
+    "cbor2>=5.4",
     "tomli>=1.1; python_version < '3.11'",
 ]
 

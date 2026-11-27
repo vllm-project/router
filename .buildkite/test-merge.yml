@@ -38,7 +38,9 @@ steps:
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
         command: |
-          bash -euo pipefail <<'BASH'
+          timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+          # Keep the supervisor alive while the harness handles TERM/cleanup.
+          trap 'exit 143' TERM
           export MORIIO_READ_MODE=true
           export LM_EVAL_LIMIT=20
           export LM_EVAL_BASELINE=0.38
@@ -66,7 +68,9 @@ steps:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
     command: |
-      set -euo pipefail
+      timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+      # Keep the supervisor alive while the harness handles TERM/cleanup.
+      trap 'exit 143' TERM
 
       bash .buildkite/scripts/install_packages.sh router-bin
 
@@ -82,6 +86,7 @@ steps:
       export WORKER_FABRIC_IP=192.168.200.2
 
       bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+      BASH
     mirror_hardwares: mi300_rdma
     depends_on: "upload-merge-pipeline"
     artifact_paths:
