@@ -235,6 +235,11 @@ fn token_input_path<'a>(
     generate.map_or(path, |body| body.http_token_input_route(path))
 }
 
+/// Whether the generation limits are nested in `sampling_params`.
+fn uses_sampling_params(path: &str, typed_generate: bool) -> bool {
+    typed_generate || path == "/inference/v1/generate"
+}
+
 /// Body a deferred commitment tokenizes for a Decode that was not admitted.
 ///
 /// The encoder rewrites the request before dispatch, so the commitment scores
@@ -1020,7 +1025,7 @@ impl VllmPDRouter {
     ///
     /// stream=false and stream_options removal are always applied at top level.
     fn prepare_prefill_request(mut request: Value, path: &str, typed_generate: bool) -> Value {
-        if typed_generate || path == "/inference/v1/generate" {
+        if uses_sampling_params(path, typed_generate) {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
@@ -3835,6 +3840,21 @@ impl VllmPDRouter {
             path
         );
 
+        // The prefill stage writes token limits into this value. Reject a value
+        // that cannot hold them before admission reserves workers. A null value
+        // gets the prefill defaults, like an omitted field.
+        if uses_sampling_params(path, generate.is_some())
+            && request_json
+                .get("sampling_params")
+                .is_some_and(|params| !params.is_object() && !params.is_null())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "sampling_params must be a JSON object",
+            )
+                .into_response();
+        }
+
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
             self.process_vllm_request(request_json, path, headers, model_id, generate)
@@ -4553,6 +4573,60 @@ mod tests {
                     usize::from(model.is_none())
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_rejects_non_object_sampling_params_before_admission() {
+        for discovery in [false, true] {
+            let (router, prefill, _) = recording_router(discovery).await;
+            let decode = Arc::new(RecordingPolicy {
+                select_worker: true,
+                ..Default::default()
+            });
+            router.policy_registry.set_decode_policy(decode.clone());
+            register_model_pair(&router, "model-a");
+            for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+                for sampling_params in [json!("text"), json!(1), json!(true), json!([])] {
+                    let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                        "token_ids": [123], "sampling_params": sampling_params
+                    }))
+                    .unwrap();
+                    let response = if path == "/inference/v1/generate" {
+                        router.route_inference_generate(None, &body, None).await
+                    } else {
+                        router
+                            .route_inference_generate_path(None, &body, path, None)
+                            .await
+                    };
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{path}: {sampling_params}"
+                    );
+                    assert_eq!(
+                        axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .unwrap(),
+                        "sampling_params must be a JSON object"
+                    );
+                }
+            }
+            assert!(prefill.selections.lock().unwrap().is_empty());
+            assert!(decode.selections.lock().unwrap().is_empty());
+
+            // An explicit null keeps the prefill defaults, like an omitted field.
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(RecordingPolicy::default()));
+            let body: InferenceGenerateRequest =
+                serde_json::from_value(json!({"token_ids": [123], "sampling_params": null}))
+                    .unwrap();
+            let response = router
+                .route_inference_generate_path(None, &body, "/custom/v1/generate", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(prefill.selections.lock().unwrap().len(), 1);
         }
     }
 
