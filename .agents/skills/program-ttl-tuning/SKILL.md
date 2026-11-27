@@ -15,8 +15,44 @@ Follow the [reference workflow](../../../docs/program_scheduling/program-schedul
 for baseline comparability, cache protection, and regression checks. This skill
 adds calibration steps, parameter sweeps, and deployment criteria.
 
-For a sample invocation, a live SWE-bench command, and a deployment decision table, see
-[Tuning DeepSeek V4 Flash on Ascend A3](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md).
+## Start with the operator's request
+
+The operator can invoke `$program-ttl-tuning` with a question and fill in
+details in conversation. The [Ascend A3 invocation](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#1-invoke-the-tuning-skill)
+shows a fully specified comparison. Its hardware, paths, workload and targets
+belong to that run.
+
+Read the request and any supplied configs or run artifacts first. Ask a focused
+question about the next decision that depends on missing input, wait for the
+reply, and use it to continue. Skip questions the available evidence answers.
+On a bare invocation, start with “What are you trying to decide, and do you
+have a run directory or launch config I can inspect?”
+If the operator says “Compare these two run directories,” inspect
+the summaries and task lists first. If they establish the workload and concurrency
+but leave the goal open, ask “Which matters more for this comparison, mean time
+per task after admission or wall time for the whole batch?”
+
+Use the following prompts where they affect the requested work.
+
+- **Decision and success criteria.** Is the operator diagnosing recorded runs or
+  choosing among native routing, affinity only and full scheduling? Establish
+  the primary metric, how failures and timeouts count, and any completion-rate
+  floor or client p95 TTFT ceiling. If a limit is unspecified, ask whether to
+  use the corresponding native baseline on the same tasks, concurrency and
+  timeout, as in the A3 example.
+- **Deployment and evidence.** Identify the served model, accelerator, workers
+  and TP/DP layout. For existing runs, locate the summaries, request logs and
+  configs. For live measurements, establish the Router, worker and metrics
+  endpoints and whether calibration data exists for that deployment.
+- **Repeatable workload.** For a new comparison, identify the agent and profile,
+  ordered task selection, normal concurrency, per-task timeout and where to
+  write fresh results for each mode. Recover these from the baseline run or
+  launch command where possible.
+
+Summarize the agreed objective and constraints, then proceed with the requested
+analysis or live experiment. For a deployment choice, report the eligible mode
+that best meets the objective and its config diff. If the evidence cannot
+distinguish the modes, identify the missing comparison.
 
 ## Scope and deployment shapes
 
