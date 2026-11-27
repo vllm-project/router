@@ -717,6 +717,13 @@ impl ConfigValidator {
                         .to_string(),
                 });
             }
+            if pd_mode && program.prediction_profile.mode == PredictionMode::Active {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason:
+                        "active return-time prediction does not support vLLM PD mode; use off or shadow"
+                            .to_string(),
+                });
+            }
             if pd_mode {
                 program
                     .pd
@@ -1089,6 +1096,30 @@ mod tests {
             Some("/definitely/missing/prediction-profile.json".to_string());
 
         assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+    }
+
+    #[test]
+    fn active_return_prediction_rejects_pd_mode() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        let mut program = ProgramSchedulingConfig {
+            token_capacity_per_dp_rank: Some(1_000),
+            enable_batch_gain_admission: false,
+            ..Default::default()
+        };
+        program.prediction_profile.mode = PredictionMode::Active;
+        config.program_scheduling = Some(program);
+
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("active return-time prediction does not support vLLM PD mode"));
     }
 
     #[test]
@@ -1896,14 +1927,46 @@ mod tests {
             (
                 vec!["http://prefill:5557".to_string()],
                 16,
-                "must be a reachable ZMQ address",
+                "without credentials or paths",
             ),
-            (vec!["tcp://*:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://0.0.0.0:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://[::]:5557".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://prefill:0".into()], 16, "reachable ZMQ"),
-            (vec!["tcp://prefill".into()], 16, "reachable ZMQ"),
-            (vec!["ipc://".into()], 16, "reachable ZMQ"),
+            (vec!["tcp://*:5557".into()], 16, "cannot be a wildcard"),
+            (
+                vec!["tcp://0.0.0.0:5557".into()],
+                16,
+                "cannot be unspecified",
+            ),
+            (vec!["tcp://[::]:5557".into()], 16, "cannot be unspecified"),
+            (
+                vec!["tcp://prefill:0".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557/x".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557?rank=1".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://prefill:5557#rank".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (
+                vec!["tcp://user:pass@prefill:5557".into()],
+                16,
+                "without credentials or paths",
+            ),
+            (vec!["ipc://".into()], 16, "requires a non-empty path"),
             (vec![], 16, "no endpoints"),
             (vec!["tcp://prefill:5557".to_string()], 0, "block_size"),
         ] {
@@ -1934,6 +1997,12 @@ mod tests {
             .get_mut("http://prefill:8000")
             .unwrap()
             .replay_endpoints = Some(vec!["tcp://[::]:5558".into()]);
+        assert!(ConfigValidator::validate(&config).is_err());
+        config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap()
+            .replay_endpoints = Some(vec!["tcp://prefill:5558/x".into()]);
         assert!(ConfigValidator::validate(&config).is_err());
     }
 

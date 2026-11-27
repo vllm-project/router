@@ -1331,12 +1331,7 @@ impl Router {
             std::collections::HashMap::new();
 
         for url in worker_urls {
-            // Extract base URL by removing @rank suffix if present
-            let base_url = if let Some(at_pos) = url.rfind('@') {
-                url[..at_pos].to_string()
-            } else {
-                url.clone()
-            };
+            let base_url = crate::backend::strip_dp_suffix(url).to_owned();
 
             unique_hosts.insert(base_url.clone());
             host_to_workers
@@ -1857,16 +1852,25 @@ impl Router {
                 Some(crate::backend::WorkerPoolKind::Grpc),
                 Some(GrpcRequestRef::Completion(completion)),
             ) if route == "/v1/completions" => {
-                let lowered = match crate::backend::prepare_grpc_completion(completion) {
-                    Ok(lowered) => lowered,
-                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-                };
-                match self
-                    .frontend
-                    .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-                    .await
-                {
-                    Ok(prepared) => Some(prepared),
+                // Count sequences from the raw prompt, without lowering:
+                // lowering allocates the text or token ids just to count
+                // them, then `prepare_completions` below would lower the
+                // same request again. A batch is rejected before any
+                // tokenization — dispatching more than one sequence is
+                // Stage 3's fan-out — and a tokenizer error can no longer
+                // mask the 400.
+                if completion.prompt.len() != 1 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "gRPC /v1/completions does not support batched prompts yet",
+                    )
+                        .into_response();
+                }
+                match self.frontend.prepare_completions(completion).await {
+                    Ok(mut prepared) => {
+                        // The count check above guarantees exactly one.
+                        Some(prepared.pop().unwrap())
+                    }
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
                     }
@@ -8183,6 +8187,16 @@ mod tests {
         let (url, _handle) = start_healthy_mock_server().await;
         let result = Router::wait_for_healthy_workers(&[url], 5, 1, None).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_preserves_host_after_userinfo() {
+        let (url, server) = start_healthy_mock_server().await;
+        let url = url.replacen("http://", "http://@", 1);
+        Router::wait_for_healthy_workers(&[url], 1, 1, None)
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

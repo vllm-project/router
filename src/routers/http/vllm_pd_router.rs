@@ -31,19 +31,24 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
+type MooncakePrefillTable = HashMap<u16, HashMap<String, MooncakePrefillInfo>>;
+
+const MOONCAKE_DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
     bootstrap_addr: String,
     dp_engine_ids: HashMap<usize, String>,
+    /// Share diagnostic suppression across clones; bootstrap values stay immutable.
+    fallback_warning: Arc<Once>,
 }
 
 /// Request-scoped facts threaded into decode-response handling: the route,
@@ -108,8 +113,10 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
-    /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
-    mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Startup-only bootstrap table keyed by port and transport base URL.
+    /// Ranks sharing both keys use the engine IDs reported by that bootstrap.
+    /// Runtime registration and per-request snapshots are tracked in #209.
+    mooncake_prefill_info: Arc<MooncakePrefillTable>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
     nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
@@ -458,6 +465,22 @@ fn finalize_decode_body(
 }
 
 impl VllmPDRouter {
+    /// Match the worker's base URL, stripping only the routing @rank suffix.
+    fn mooncake_prefill_target(
+        prefill_url: &str,
+        bootstrap_port: u16,
+    ) -> Result<(String, String), String> {
+        let (base_url, _) = dp_utils::parse_worker_url(prefill_url);
+        let parsed = url::Url::parse(&base_url)
+            .map_err(|e| format!("Invalid prefill URL '{}': {}", prefill_url, e))?;
+        let host = parsed
+            .host()
+            .ok_or_else(|| format!("Prefill URL '{}' has no host", prefill_url))?
+            .to_string();
+        let bootstrap_addr = format!("http://{host}:{bootstrap_port}");
+        Ok((base_url, bootstrap_addr))
+    }
+
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -639,34 +662,41 @@ impl VllmPDRouter {
 
     /// Build decode kv_transfer_params for all connectors. Returns `None` if params cannot be
     /// determined (e.g. Mooncake bootstrap info missing, or no kv_transfer_params in prefill response).
-    async fn build_decode_kv_transfer_params(
+    fn build_decode_kv_transfer_params(
         &self,
-        prefill_url: &str,
+        prefill_worker: &dyn Worker,
         prefill_response_json: Option<&Value>,
         transfer_id: Option<&str>,
-        prefill_dp_size: Option<usize>,
-        prefill_dp_rank: Option<u32>,
         request_id: Option<&str>,
     ) -> Option<Value> {
+        let prefill_url = prefill_worker.base_url();
+        let prefill_dp_rank = prefill_worker.dp_rank();
         match self.kv_connector {
             KvConnector::Mooncake => {
-                let Some((bootstrap_addr, engine_id)) = self
-                    .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
-                    .await
+                let WorkerType::Prefill { bootstrap_port } = prefill_worker.worker_type() else {
+                    return None;
+                };
+                let Some((bootstrap_addr, engine_id)) =
+                    self.get_mooncake_info(prefill_url, bootstrap_port, prefill_dp_rank)
                 else {
                     warn!(
-                        "No Mooncake bootstrap info for prefill {}, decode will proceed without kv_transfer_params",
-                        prefill_url
+                        prefill_url = prefill_worker.url(),
+                        ?bootstrap_port,
+                        "No Mooncake bootstrap info, decode will proceed without kv_transfer_params"
                     );
                     return None;
                 };
                 Some(self.build_mooncake_decode_kv_transfer_params(
                     transfer_id.unwrap_or(""),
-                    &bootstrap_addr,
-                    &engine_id,
+                    bootstrap_addr,
+                    engine_id,
                 ))
             }
             KvConnector::MoriIO => {
+                let remote_dp_size = prefill_worker
+                    .dp_size()
+                    .unwrap_or(self.intra_node_data_parallel_size)
+                    .max(1);
                 if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
                     // WRITE mode: build decode params directly; decode does not need the prefill response.
                     let prefill_base = prefill_url
@@ -675,9 +705,6 @@ impl VllmPDRouter {
                     let (tp_size, _) = self
                         .service_registry
                         .get_tp_dp_size(prefill_base, ServiceType::Prefill);
-                    let remote_dp_size = prefill_dp_size
-                        .unwrap_or(self.intra_node_data_parallel_size)
-                        .max(1);
                     let mut params = json!({
                         "do_remote_decode": false,
                         "do_remote_prefill": true,
@@ -696,9 +723,7 @@ impl VllmPDRouter {
                 } else {
                     // READ mode: extract params from prefill response and inject remote_dp_size.
                     let mut params = prefill_response_json?.get("kv_transfer_params")?.clone();
-                    params["remote_dp_size"] = json!(prefill_dp_size
-                        .unwrap_or(self.intra_node_data_parallel_size)
-                        .max(1));
+                    params["remote_dp_size"] = json!(remote_dp_size);
                     Some(params)
                 }
             }
@@ -711,7 +736,7 @@ impl VllmPDRouter {
                 }
                 let identity = self.ensure_nixl_push_identity(
                     prefill_url,
-                    prefill_dp_rank.map(|r| r as usize),
+                    prefill_dp_rank,
                     prefill_response_json,
                 )?;
                 Some(Self::build_nixl_push_decode_params(&identity, request_id?))
@@ -736,24 +761,48 @@ impl VllmPDRouter {
         })
     }
 
-    /// Look up Mooncake prefill info for a given prefill URL and dp_rank
-    async fn get_mooncake_info(
+    /// Borrow metadata from the selected worker's bootstrap server.
+    fn get_mooncake_info(
         &self,
         prefill_url: &str,
+        bootstrap_port: Option<u16>,
         dp_rank: Option<usize>,
-    ) -> Option<(String, String)> {
-        let info = self.mooncake_prefill_info.lock().await;
-        if let Some(prefill_info) = info.get(prefill_url) {
-            let rank = dp_rank.unwrap_or(0);
-            if let Some(engine_id) = prefill_info.dp_engine_ids.get(&rank) {
-                return Some((prefill_info.bootstrap_addr.clone(), engine_id.clone()));
-            }
-            // Fallback: use first available engine_id
-            if let Some(engine_id) = prefill_info.dp_engine_ids.values().next() {
-                return Some((prefill_info.bootstrap_addr.clone(), engine_id.clone()));
-            }
+    ) -> Option<(&str, &str)> {
+        let bootstrap_port = bootstrap_port.unwrap_or(MOONCAKE_DEFAULT_BOOTSTRAP_PORT);
+        let prefill_info = self
+            .mooncake_prefill_info
+            .get(&bootstrap_port)?
+            .get(prefill_url)?;
+        let rank = dp_rank.unwrap_or(0);
+        if let Some(engine_id) = prefill_info.dp_engine_ids.get(&rank) {
+            return Some((&prefill_info.bootstrap_addr, engine_id));
         }
-        None
+        // Legacy compatibility only: #209 replaces this with missing-rank rejection.
+        let (&fallback_rank, engine_id) = prefill_info
+            .dp_engine_ids
+            .iter()
+            .min_by_key(|(rank, _)| *rank)?;
+        let mut first_fallback = false;
+        prefill_info.fallback_warning.call_once(|| {
+            first_fallback = true;
+            warn!(
+                prefill_url,
+                bootstrap_port,
+                requested_dp_rank = rank,
+                fallback_dp_rank = fallback_rank,
+                "Mooncake DP rank missing; using the lowest available rank; further fallbacks for this prefill are logged at debug"
+            );
+        });
+        if !first_fallback {
+            debug!(
+                prefill_url,
+                bootstrap_port,
+                requested_dp_rank = rank,
+                fallback_dp_rank = fallback_rank,
+                "Mooncake DP rank missing; using the lowest available rank"
+            );
+        }
+        Some((&prefill_info.bootstrap_addr, engine_id))
     }
 
     fn is_nixl_push_mode(kvt: &Value) -> bool {
@@ -2505,17 +2554,12 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        if let Some(params) = self
-            .build_decode_kv_transfer_params(
-                &prefill_base_url,
-                Some(&prefill_response_json),
-                transfer_id.as_deref(),
-                prefill_worker.dp_size(),
-                prefill_dp_rank.map(|r| r as u32),
-                Some(&request_id),
-            )
-            .await
-        {
+        if let Some(params) = self.build_decode_kv_transfer_params(
+            prefill_worker.as_ref(),
+            Some(&prefill_response_json),
+            transfer_id.as_deref(),
+            Some(&request_id),
+        ) {
             decode_request["kv_transfer_params"] = params;
         } else {
             warn!(
@@ -2727,16 +2771,12 @@ impl VllmPDRouter {
         };
         let decode_base_url = decode_worker.base_url().to_string();
 
-        let decode_params = self
-            .build_decode_kv_transfer_params(
-                &prefill_base_url,
-                Some(&prefill_response_json),
-                transfer_id.as_deref(),
-                prefill_worker.dp_size(),
-                prefill_dp_rank.map(|rank| rank as u32),
-                Some(&request_id),
-            )
-            .await;
+        let decode_params = self.build_decode_kv_transfer_params(
+            prefill_worker.as_ref(),
+            Some(&prefill_response_json),
+            transfer_id.as_deref(),
+            Some(&request_id),
+        );
         if decode_params.is_none() {
             warn!(
                 "No kv_transfer_params for prefill {}, decode will proceed without them",
@@ -2886,11 +2926,9 @@ impl VllmPDRouter {
         decode_worker: &Arc<dyn Worker>,
         path: &str,
     ) -> Option<(Value, Value, String)> {
-        let prefill_base_url = prefill_worker.base_url().to_string();
-        let prefill_dp_rank = prefill_worker.dp_rank();
         let concurrent = match self.kv_connector {
             KvConnector::Nixl => self
-                .get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
+                .get_nixl_push_identity(prefill_worker.base_url(), prefill_worker.dp_rank())
                 .is_some(),
             KvConnector::MoriIO => self.moriio_transfer_mode() == Some(MoriIOTransferMode::Write),
             KvConnector::Mooncake => false,
@@ -2921,16 +2959,12 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
-        decode_request["kv_transfer_params"] = self
-            .build_decode_kv_transfer_params(
-                &prefill_base_url,
-                None,
-                transfer_id.as_deref(),
-                prefill_worker.dp_size(),
-                prefill_dp_rank.map(|rank| rank as u32),
-                Some(&request_id),
-            )
-            .await?;
+        decode_request["kv_transfer_params"] = self.build_decode_kv_transfer_params(
+            prefill_worker.as_ref(),
+            None,
+            transfer_id.as_deref(),
+            Some(&request_id),
+        )?;
 
         Some((prefill_request, decode_request, request_id))
     }
@@ -3170,7 +3204,9 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                // No static prefills in discovery mode; this stays empty.
+                // Runtime Mooncake registration is tracked in #209.
+                mooncake_prefill_info: Arc::new(HashMap::new()),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend: crate::backend::EngineFrontend::new(),
             })
@@ -3224,22 +3260,15 @@ impl VllmPDRouter {
             }
             info!("Initializing prefill and decode policies with workers.");
 
-            // Query Mooncake bootstrap servers if kv_connector is mooncake
-            let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
+            // Populate static Mooncake metadata before publishing the router.
+            // No request-time writers; runtime registration is tracked in #209.
+            let mut mooncake_prefill_info = MooncakePrefillTable::new();
             if matches!(kv_connector, KvConnector::Mooncake) {
                 info!("Mooncake connector enabled, querying prefill bootstrap servers...");
                 for (url, bootstrap_port) in &prefill_urls {
-                    let parsed = url::Url::parse(url)
-                        .map_err(|e| format!("Invalid prefill URL '{}': {}", url, e))?;
-                    let host = parsed.host_str().unwrap_or("127.0.0.1");
-                    let port = bootstrap_port.unwrap_or(8998);
-                    let bootstrap_addr = format!("http://{}:{}", host, port);
-                    let base_url = format!(
-                        "{}://{}:{}",
-                        parsed.scheme(),
-                        host,
-                        parsed.port().unwrap_or(8000)
-                    );
+                    let bootstrap_port = bootstrap_port.unwrap_or(MOONCAKE_DEFAULT_BOOTSTRAP_PORT);
+                    let (base_url, bootstrap_addr) =
+                        Self::mooncake_prefill_target(url, bootstrap_port)?;
 
                     info!(
                         "Querying Mooncake bootstrap at {} for prefill {}",
@@ -3251,13 +3280,17 @@ impl VllmPDRouter {
                                 "Got Mooncake engine_ids for {}: {:?}",
                                 base_url, dp_engine_ids
                             );
-                            mooncake_prefill_info.lock().await.insert(
-                                base_url,
-                                MooncakePrefillInfo {
-                                    bootstrap_addr,
-                                    dp_engine_ids,
-                                },
-                            );
+                            mooncake_prefill_info
+                                .entry(bootstrap_port)
+                                .or_default()
+                                .insert(
+                                    base_url,
+                                    MooncakePrefillInfo {
+                                        bootstrap_addr,
+                                        dp_engine_ids,
+                                        fallback_warning: Arc::new(Once::new()),
+                                    },
+                                );
                         }
                         Err(e) => {
                             error!("Failed to query Mooncake bootstrap for {}: {}", base_url, e);
@@ -3290,7 +3323,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                mooncake_prefill_info,
+                mooncake_prefill_info: Arc::new(mooncake_prefill_info),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
             })
@@ -3882,6 +3915,505 @@ mod tests {
     }
 
     use super::*;
+
+    fn mooncake_test_router() -> VllmPDRouter {
+        // Only construction needs a runtime; metadata access below must not.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut router = runtime.block_on(test_vllm_pd_router());
+        drop(runtime);
+        router.kv_connector = KvConnector::Mooncake;
+        let metadata = HashMap::from([
+            (
+                "http://prefill:8000".to_string(),
+                MooncakePrefillInfo {
+                    bootstrap_addr: "http://prefill:8998".to_string(),
+                    dp_engine_ids: HashMap::from([
+                        (0, "engine-0".to_string()),
+                        (1, "engine-1".to_string()),
+                    ]),
+                    fallback_warning: Arc::new(Once::new()),
+                },
+            ),
+            (
+                "grpc://prefill:8000".to_string(),
+                MooncakePrefillInfo {
+                    bootstrap_addr: "http://prefill:8998".to_string(),
+                    dp_engine_ids: HashMap::from([
+                        (0, "grpc-engine-0".to_string()),
+                        (1, "grpc-engine-1".to_string()),
+                    ]),
+                    fallback_warning: Arc::new(Once::new()),
+                },
+            ),
+            (
+                "http://empty:8000".to_string(),
+                MooncakePrefillInfo {
+                    bootstrap_addr: "http://empty:8998".to_string(),
+                    dp_engine_ids: HashMap::new(),
+                    fallback_warning: Arc::new(Once::new()),
+                },
+            ),
+        ]);
+        router.mooncake_prefill_info =
+            Arc::new(HashMap::from([(MOONCAKE_DEFAULT_BOOTSTRAP_PORT, metadata)]));
+        router
+    }
+
+    #[test]
+    fn mooncake_decode_metadata_preserves_bootstrap_contract() {
+        let router = mooncake_test_router();
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        for (prefill, rank, host, engine) in [
+            ("http://prefill:8000", None, "prefill", "engine-0"),
+            ("http://prefill:8000", Some(1), "prefill", "engine-1"),
+            ("grpc://prefill:8000", None, "prefill", "grpc-engine-0"),
+            ("grpc://prefill:8000", Some(1), "prefill", "grpc-engine-1"),
+        ] {
+            let worker_type = WorkerType::Prefill {
+                bootstrap_port: None,
+            };
+            let worker: Box<dyn Worker> = match rank {
+                Some(rank) => Box::new(DPAwareWorker::new(
+                    prefill.to_string(),
+                    rank,
+                    2,
+                    worker_type,
+                )),
+                None => Box::new(BasicWorker::new(prefill.to_string(), worker_type)),
+            };
+            let params = router.build_decode_kv_transfer_params(
+                worker.as_ref(),
+                None,
+                Some("xfer-test"),
+                Some("request-test"),
+            );
+            assert_eq!(
+                params,
+                Some(json!({
+                    "do_remote_decode": false,
+                    "do_remote_prefill": true,
+                    "transfer_id": "xfer-test",
+                    "remote_bootstrap_addr": format!("http://{host}:8998"),
+                    "remote_engine_id": engine,
+                }))
+            );
+        }
+        for prefill in ["http://unknown:8000", "http://empty:8000"] {
+            let worker = BasicWorker::new(
+                prefill.to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            assert!(router
+                .build_decode_kv_transfer_params(&worker, None, None, None)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn mooncake_lookup_does_not_alias_unconfigured_paths() {
+        let router = mooncake_test_router();
+        for prefill in [
+            "http://prefill:8000/",
+            "http://prefill:8000/v1",
+            "grpc://prefill:8000/",
+            "grpc://prefill:8000/v1",
+        ] {
+            assert!(router.get_mooncake_info(prefill, None, Some(1)).is_none());
+        }
+    }
+
+    #[test]
+    fn mooncake_metadata_keeps_configured_workers_distinct() {
+        let mut router = mooncake_test_router();
+        for scheme in ["http", "https", "grpc"] {
+            let workers = [
+                (format!("{scheme}://prefill"), 8998, "default-port-engine"),
+                (format!("{scheme}://prefill:8000"), 9998, "port-8000-engine"),
+                (
+                    format!("{scheme}://prefill:8000/prefill-a"),
+                    9999,
+                    "engine-a",
+                ),
+                (
+                    format!("{scheme}://prefill:8000/prefill-b"),
+                    10000,
+                    "engine-b",
+                ),
+            ];
+            for order in [[0, 1, 2, 3], [3, 2, 1, 0]] {
+                let mut metadata = MooncakePrefillTable::new();
+                for index in order {
+                    let (prefill, bootstrap_port, engine) = &workers[index];
+                    let (key, bootstrap_addr) =
+                        VllmPDRouter::mooncake_prefill_target(prefill, *bootstrap_port).unwrap();
+                    metadata.entry(*bootstrap_port).or_default().insert(
+                        key,
+                        MooncakePrefillInfo {
+                            bootstrap_addr,
+                            dp_engine_ids: HashMap::from([(0, engine.to_string())]),
+                            fallback_warning: Arc::new(Once::new()),
+                        },
+                    );
+                }
+                router.mooncake_prefill_info = Arc::new(metadata);
+                for (prefill, bootstrap_port, engine) in &workers {
+                    let worker = BasicWorker::new(
+                        prefill.clone(),
+                        WorkerType::Prefill {
+                            bootstrap_port: Some(*bootstrap_port),
+                        },
+                    );
+                    let params = router
+                        .build_decode_kv_transfer_params(&worker, None, Some("xfer-test"), None)
+                        .unwrap_or_else(|| panic!("missing metadata for {prefill}"));
+                    assert_eq!(params["remote_engine_id"], *engine, "{prefill} {order:?}");
+                    assert_eq!(
+                        params["remote_bootstrap_addr"],
+                        format!("http://prefill:{bootstrap_port}"),
+                        "{prefill} {order:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mooncake_legacy_missing_rank_fallback_uses_lowest_rank() {
+        let mut router = mooncake_test_router();
+        for ranks in [[9, 3, 7], [7, 3, 9]] {
+            let metadata = Arc::make_mut(&mut router.mooncake_prefill_info)
+                .get_mut(&MOONCAKE_DEFAULT_BOOTSTRAP_PORT)
+                .unwrap();
+            metadata.insert(
+                "http://fallback:8000".to_string(),
+                MooncakePrefillInfo {
+                    bootstrap_addr: "http://fallback:8998".to_string(),
+                    dp_engine_ids: ranks
+                        .into_iter()
+                        .map(|rank| (rank, format!("engine-{rank}")))
+                        .collect(),
+                    fallback_warning: Arc::new(Once::new()),
+                },
+            );
+            for rank in [None, Some(99)] {
+                assert_eq!(
+                    router.get_mooncake_info("http://fallback:8000", None, rank),
+                    Some(("http://fallback:8998", "engine-3"))
+                );
+            }
+            assert_eq!(
+                router.get_mooncake_info("http://fallback:8000", None, Some(9)),
+                Some(("http://fallback:8998", "engine-9"))
+            );
+        }
+    }
+
+    #[test]
+    fn mooncake_rank_fallback_warns_once_per_prefill_under_concurrency() {
+        // Other tests can register this warn! callsite without a subscriber.
+        // A fresh process isolates tracing's global callsite-interest cache.
+        const CHILD_ENV: &str = "VLLM_ROUTER_MOONCAKE_WARN_ONCE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    concat!(
+                        "routers::http::vllm_pd_router::tests::",
+                        "mooncake_rank_fallback_warns_once_per_prefill_under_concurrency"
+                    ),
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated logging test failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+        #[derive(Clone, Default)]
+        struct Counts {
+            warnings: Arc<AtomicUsize>,
+            debug: Arc<AtomicUsize>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Counts {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.warnings.fetch_add(1, Ordering::Relaxed);
+                } else if *event.metadata().level() == tracing::Level::DEBUG {
+                    self.debug.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let router = Arc::new(mooncake_test_router());
+        let counts = Counts::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(counts.clone()));
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert_eq!(
+                router.get_mooncake_info("http://prefill:8000", None, Some(1)),
+                Some(("http://prefill:8998", "engine-1"))
+            );
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 0);
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let router = router.clone();
+                let barrier = barrier.clone();
+                let dispatch = &dispatch;
+                scope.spawn(move || {
+                    tracing::dispatcher::with_default(dispatch, || {
+                        barrier.wait();
+                        for j in 0..16 {
+                            assert_eq!(
+                                router.get_mooncake_info(
+                                    "http://prefill:8000",
+                                    None,
+                                    Some(99 + (i + j) % 2)
+                                ),
+                                Some(("http://prefill:8998", "engine-0"))
+                            );
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 127);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            for _ in 0..2 {
+                assert_eq!(
+                    router.get_mooncake_info("grpc://prefill:8000", None, Some(99)),
+                    Some(("http://prefill:8998", "grpc-engine-0"))
+                );
+            }
+        });
+        assert_eq!(counts.warnings.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.debug.load(Ordering::Relaxed), 128);
+    }
+
+    #[test]
+    fn mooncake_prefill_target_preserves_configured_url_and_ipv6() {
+        let default_port = MOONCAKE_DEFAULT_BOOTSTRAP_PORT;
+        for (prefill, port, bootstrap) in [
+            ("http://prefill", default_port, "http://prefill:8998"),
+            ("http://prefill:80/v1", default_port, "http://prefill:8998"),
+            (
+                "https://prefill:443/v1",
+                default_port,
+                "http://prefill:8998",
+            ),
+            ("grpc://prefill", default_port, "http://prefill:8998"),
+            (
+                "grpc://prefill:8000/v1",
+                default_port,
+                "http://prefill:8998",
+            ),
+            ("https://prefill:9443/v1", 9000, "http://prefill:9000"),
+            ("http://[::1]:8000/v1", default_port, "http://[::1]:8998"),
+        ] {
+            assert_eq!(
+                VllmPDRouter::mooncake_prefill_target(prefill, port).unwrap(),
+                (prefill.to_string(), bootstrap.to_string())
+            );
+        }
+        for (base, bootstrap) in [
+            ("http://prefill:8000", "http://prefill:8998"),
+            ("http://prefill:8000/prefill-a", "http://prefill:8998"),
+            ("grpc://prefill:8000/prefill-a", "http://prefill:8998"),
+            ("http://[::1]:8000/prefill-a", "http://[::1]:8998"),
+        ] {
+            assert_eq!(
+                VllmPDRouter::mooncake_prefill_target(&format!("{base}@1"), default_port).unwrap(),
+                (base.to_string(), bootstrap.to_string())
+            );
+        }
+        for prefill in ["not-a-url", "file:///tmp/prefill"] {
+            assert!(VllmPDRouter::mooncake_prefill_target(prefill, default_port).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn mooncake_constructor_keeps_proxy_path_workers_distinct() {
+        let mut bootstraps = Vec::new();
+        for engine in ["boot-engine-a", "boot-engine-b"] {
+            bootstraps.push(
+                spawn_test_server(
+                    axum::Router::new()
+                        .route(
+                            "/query",
+                            axum::routing::get(move || async move {
+                                axum::Json(json!({
+                                    "0": {"engine_id": format!("{engine}-0")},
+                                    "1": {"engine_id": format!("{engine}-1")},
+                                }))
+                            }),
+                        )
+                        .fallback(|| async { StatusCode::OK }),
+                )
+                .await,
+            );
+        }
+        let prefills = [
+            (format!("{}/prefill-a", bootstraps[0]), "boot-engine-a"),
+            (format!("{}/prefill-b", bootstraps[0]), "boot-engine-b"),
+        ];
+        let config = crate::config::RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            policy: crate::config::PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            ..Default::default()
+        };
+        for order in [[0, 1], [1, 0]] {
+            for pinned_rank in [None, Some(1)] {
+                let ctx = Arc::new(
+                    crate::server::AppContext::new(
+                        config.clone(),
+                        reqwest::Client::new(),
+                        64,
+                        None,
+                        vec![],
+                    )
+                    .unwrap(),
+                );
+                let prefill_urls = order
+                    .into_iter()
+                    .map(|i| {
+                        let port = url::Url::parse(&bootstraps[i]).unwrap().port().unwrap();
+                        let prefill_url = match pinned_rank {
+                            Some(rank) => format!("{}@{rank}", prefills[i].0),
+                            None => prefills[i].0.clone(),
+                        };
+                        (prefill_url, Some(port))
+                    })
+                    .collect();
+                let router = VllmPDRouter::new(prefill_urls, vec![], None, &ctx)
+                    .await
+                    .unwrap();
+                let workers = router.pd_router.worker_registry.get_prefill_workers();
+                assert_eq!(workers.len(), if pinned_rank.is_some() { 2 } else { 4 });
+                for worker in workers {
+                    let i = prefills
+                        .iter()
+                        .position(|(url, _)| url == worker.base_url())
+                        .unwrap();
+                    let rank = worker.dp_rank().unwrap();
+                    if let Some(pinned) = pinned_rank {
+                        assert_eq!(rank, pinned);
+                    }
+                    let params = router
+                        .build_decode_kv_transfer_params(
+                            worker.as_ref(),
+                            None,
+                            Some("xfer-test"),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        params["remote_engine_id"],
+                        format!("{}-{rank}", prefills[i].1)
+                    );
+                    assert_eq!(params["remote_bootstrap_addr"], bootstraps[i]);
+                }
+                for bootstrap in &bootstraps {
+                    let port = url::Url::parse(bootstrap).unwrap().port();
+                    assert!(router
+                        .get_mooncake_info(&bootstraps[0], port, Some(0))
+                        .is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mooncake_constructor_keeps_pinned_rank_bootstraps_distinct() {
+        let mut bootstraps = Vec::new();
+        for server in 0..2 {
+            bootstraps.push(
+                spawn_test_server(
+                    axum::Router::new()
+                        .route(
+                            "/query",
+                            axum::routing::get(move || async move {
+                                axum::Json(json!({
+                                    "0": {"engine_id": format!("boot-{server}-rank-0")},
+                                    "1": {"engine_id": format!("boot-{server}-rank-1")},
+                                }))
+                            }),
+                        )
+                        .fallback(|| async { StatusCode::OK }),
+                )
+                .await,
+            );
+        }
+        let prefill_url = format!("{}/prefill", bootstraps[0]);
+        let config = crate::config::RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            policy: crate::config::PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 2,
+            ..Default::default()
+        };
+
+        for order in [[0, 1], [1, 0]] {
+            let ctx = Arc::new(
+                crate::server::AppContext::new(
+                    config.clone(),
+                    reqwest::Client::new(),
+                    64,
+                    None,
+                    vec![],
+                )
+                .unwrap(),
+            );
+            let prefills = order
+                .into_iter()
+                .map(|rank| {
+                    let port = url::Url::parse(&bootstraps[rank]).unwrap().port().unwrap();
+                    (format!("{prefill_url}@{rank}"), Some(port))
+                })
+                .collect();
+            let router = VllmPDRouter::new(prefills, vec![], None, &ctx)
+                .await
+                .unwrap();
+            let workers = router.pd_router.worker_registry.get_prefill_workers();
+            assert_eq!(workers.len(), 2);
+            for worker in workers {
+                assert_eq!(worker.base_url(), prefill_url);
+                let rank = worker.dp_rank().unwrap();
+                let params = router
+                    .build_decode_kv_transfer_params(worker.as_ref(), None, Some("xfer-test"), None)
+                    .unwrap();
+                assert_eq!(
+                    params["remote_bootstrap_addr"], bootstraps[rank],
+                    "{order:?}"
+                );
+                assert_eq!(
+                    params["remote_engine_id"],
+                    format!("boot-{rank}-rank-{rank}")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn monitored_pd_routes_reject_full_before_scheduling() {

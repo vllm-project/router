@@ -17,11 +17,12 @@ pub(super) async fn start_admin_auth_mock_server(
     start_worker_auth_mock_server(api_key, api_key).await
 }
 
-/// P/D health remains anonymous while its administrative endpoints require a key.
+/// P/D health and administrative probes can have different credential scopes.
 pub(super) async fn start_pd_admin_auth_mock_server(
     api_key: Option<&str>,
+    health_api_key: Option<&str>,
 ) -> (String, JoinHandle<()>, RequestLog) {
-    start_worker_auth_mock_server(api_key, None).await
+    start_worker_auth_mock_server(api_key, health_api_key).await
 }
 
 async fn start_worker_auth_mock_server(

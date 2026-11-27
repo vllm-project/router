@@ -141,7 +141,13 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
+
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
@@ -270,6 +276,7 @@ has tracing support.
 
 Regular HTTP worker health checks and the regular and P/D admin requests
 (`POST /flush_cache` and `GET /get_load`) send the configured bearer token.
+HTTP health probes for static and Kubernetes-registered P/D workers also send it.
 P/D admin requests, including background load polling, send it only to worker
 base URLs configured at startup and their DP ranks. Removing and re-registering
 one of those addresses retains its authorization. Other discovered or registered
@@ -277,7 +284,7 @@ addresses receive no shared credential.
 A cache flush sends one POST per worker base URL, even when several DP ranks
 or P/D roles share it. Load polling requires a worker that serves `/get_load`.
 
-gRPC worker calls and HTTP health checks for P/D or IGW-registered workers
+gRPC worker calls and health checks for IGW-registered workers
 omit this token. Clients authenticate to the router separately with
 `--api-key-validation-urls`.
 
