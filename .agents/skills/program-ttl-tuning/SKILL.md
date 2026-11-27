@@ -37,9 +37,11 @@ Use the following prompts where they affect the requested work.
 - **Decision and success criteria.** Is the operator diagnosing recorded runs or
   choosing among native routing, affinity only and full scheduling? Establish
   the primary metric, how failures and timeouts count, and any completion-rate
-  floor or client p95 TTFT ceiling. If a limit is unspecified, ask whether to
-  use the corresponding native baseline on the same tasks, concurrency and
-  timeout, as in the A3 example.
+  floor or client p95 TTFT ceiling. Apply an explicit fallback separately to
+  each missing limit. In the A3 example, use the corresponding native-baseline
+  measurement on the same tasks, concurrency and timeout. If a limit affects
+  the routing choice and the operator gave neither a target nor a fallback,
+  ask whether to use that baseline measurement.
 - **Deployment and evidence.** Identify the served model, accelerator, workers
   and TP/DP layout. For existing runs, locate the summaries, request logs and
   configs. For live measurements, establish the Router, worker and metrics
