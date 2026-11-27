@@ -143,32 +143,23 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let lifecycle = supervisor.lifecycle_for_worker(&worker);
-    let first = supervisor
-        .probe_registration(
+    let probe = || {
+        supervisor.probe_registration(
             &worker,
             false,
             None,
             &lifecycle,
             tokio::time::Instant::now() + CONTROL_TIMEOUT,
         )
-        .await
-        .unwrap();
+    };
+    let first = probe().await.unwrap();
     {
         let mut state = lifecycle.state.lock();
         state.info = Some(WorkerKvInfo::default());
         state.descriptor = Some(first.descriptor);
         state.base_models = first.worker.base_models.unwrap();
     }
-    let repeated = supervisor
-        .probe_registration(
-            &worker,
-            false,
-            None,
-            &lifecycle,
-            tokio::time::Instant::now() + CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
+    let repeated = probe().await.unwrap();
     assert_eq!(
         repeated.worker.base_models.unwrap(),
         HashSet::from(["alias-1".into()])
@@ -176,16 +167,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     assert_eq!(requests.load(Ordering::Relaxed), 1);
 
     instance.store(2, Ordering::Relaxed);
-    let replaced = supervisor
-        .probe_registration(
-            &worker,
-            false,
-            None,
-            &lifecycle,
-            tokio::time::Instant::now() + CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
+    let replaced = probe().await.unwrap();
     assert_eq!(
         replaced.worker.base_models.unwrap(),
         HashSet::from(["alias-2".into()])
@@ -2111,16 +2093,16 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     assert!(!probe::needs_admission_hashes(url, &discovered));
 
     let lifecycle = supervisor.lifecycle_for_worker(url);
-    let probe = || {
+    let probe = |budget| {
         supervisor.probe_registration(
             url,
             false,
             None,
             &lifecycle,
-            tokio::time::Instant::now() + CONTROL_TIMEOUT,
+            tokio::time::Instant::now() + budget,
         )
     };
-    probe().await.unwrap();
+    probe(CONTROL_TIMEOUT).await.unwrap();
     let requests = || worker.requests.metrics.load(Ordering::Relaxed);
     assert_eq!(
         requests(),
@@ -2130,17 +2112,15 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
 
     let sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
     lifecycle.state.lock().trusted = false;
-    assert!(probe().await.is_err());
+    assert!(probe(CONTROL_TIMEOUT).await.is_err());
     assert_eq!(requests(), 2, "failed source probe");
 
     *worker.sources.lock() = sources;
-    let without_budget = supervisor
-        .probe_registration(url, false, None, &lifecycle, tokio::time::Instant::now())
-        .await
-        .unwrap();
+    let without_budget = probe(Duration::ZERO).await.unwrap();
     assert!(without_budget.worker.engine_cache_configs.is_none());
     assert_eq!(requests(), 2, "insufficient refresh budget");
-    assert!(probe().await.unwrap().worker.engine_cache_configs.is_some());
+    let with_budget = probe(CONTROL_TIMEOUT).await.unwrap();
+    assert!(with_budget.worker.engine_cache_configs.is_some());
     assert_eq!(requests(), 3, "usable source for re-admission");
 }
 
@@ -2211,7 +2191,8 @@ async fn failed_reregistration_revokes_only_the_incompatible_rank() {
     }
     wait_for(|| hit(0) && hit(1)).await;
 
-    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    *worker.metrics.lock() = incompatible.clone();
     let sources = worker.sources.lock().clone();
     worker.sources.lock()["1"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
     let error = supervisor.on_worker_added(url).await.unwrap_err();
@@ -2221,29 +2202,22 @@ async fn failed_reregistration_revokes_only_the_incompatible_rank() {
     assert!(!supervisor.workers_have_cache_bindings([(url, 0)].into_iter()));
     assert!(supervisor.workers_have_cache_bindings([(url, 1)].into_iter()));
 
-    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     *worker.metrics.lock() = format!(
         "{incompatible}{}",
         incompatible.replace("engine=\"0\"", "engine=\"1\"")
     );
     assert!(supervisor.on_worker_added(url).await.is_err());
     assert!(!hit(1));
-    assert!(previous
-        .state
-        .lock()
-        .info
-        .as_ref()
-        .unwrap()
-        .ranks
-        .is_empty());
+    {
+        let state = previous.state.lock();
+        assert!(state.info.as_ref().unwrap().ranks.is_empty());
+    }
     assert!(supervisor.match_provider_for_worker(url).is_some());
 
     *worker.sources.lock() = sources;
     *worker.metrics.lock() = METRICS_ONLY.to_owned();
-    assert_eq!(
-        supervisor.on_worker_added(url).await.unwrap().ranks.len(),
-        2
-    );
+    let replacement = supervisor.on_worker_added(url).await.unwrap();
+    assert_eq!(replacement.ranks.len(), 2);
     let (reports, _) = metrics_meta::parse_cache_config_info(&incompatible);
     supervisor.fence_failed_registration(url, &previous, &reports);
     assert!(supervisor.workers_have_cache_bindings([(url, 0), (url, 1)].into_iter()));

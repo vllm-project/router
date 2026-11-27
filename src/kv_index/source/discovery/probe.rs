@@ -499,7 +499,7 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct WorkerMetadata {
     pub(super) server_info: ServerInfo,
     pub(super) base_models: Option<HashSet<String>>,
@@ -522,8 +522,7 @@ pub(super) async fn query_worker_metadata_and_models(
         Ok(server_info) => {
             return Ok(WorkerMetadata {
                 server_info,
-                base_models: None,
-                engine_cache_configs: None,
+                ..Default::default()
             })
         }
         Err(error) => error,
@@ -531,11 +530,6 @@ pub(super) async fn query_worker_metadata_and_models(
 
     query_metrics_metadata(client, worker_url, api_key)
         .await
-        .and_then(|mut metadata| {
-            metadata.server_info =
-                validate_worker_metadata(worker_url, "metrics", Ok(metadata.server_info))?;
-            Ok(metadata)
-        })
         .map_err(|error| format!("{control_error}; {error}"))
 }
 
@@ -652,7 +646,7 @@ async fn query_metrics_metadata(
         ..Default::default()
     };
     Ok(WorkerMetadata {
-        server_info: info,
+        server_info: validate_worker_metadata(worker_url, "metrics", Ok(info))?,
         base_models: models.as_ref().map(base_model_names),
         engine_cache_configs: Some(engines),
     })
