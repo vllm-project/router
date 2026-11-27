@@ -40,7 +40,7 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
-With `kv_aware` and zero hash lookahead, Router can score Prefill prefix reuse for single-image HTTP chat. Other multimodal inputs, client-supplied media IDs, adapters and EPD use routing without image prefix credit.
+KV-aware Prefill prefix scoring for single-image HTTP chat requires `hash_lookahead_tokens` set to `0`.
 
 ### Set the event ports
 
