@@ -2,15 +2,15 @@
   "id": "pd_disagg_cache_aware",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
-    "trace_path": "tests/python/e2e/perf/router_policy/data/tracelab-l4-6.jsonl",
-    "trace_type": "tracelab",
-    "trace_sha256": "105c375c30634d8191a22cfbc56a6e2d63ce3e2ddc571ffe7519581b8086e2e0",
-    "endpoint": "/v1/chat/completions"
+    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-l4-12x12.jsonl",
+    "trace_type": "agentX",
+    "trace_sha256": "1f37cb060e4609c5d52db9ca2d3674b23d32c6c42f3ed4a2cb4861e78b1f772b",
+    "endpoint": "/v1/completions"
   },
   "benchmark_params": {
-    "task-num": 6,
+    "task-num": 12,
     "max-concurrency": [
-      6
+      12
     ],
     "gap_scale": 0.002,
     "max_inflight": 1,

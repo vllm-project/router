@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 import pytest
 
 from tests.python.e2e.perf.router_policy import case_loader
-from tests.python.e2e.perf.router_policy.data import extract_tracelab
+from tests.python.e2e.perf.router_policy.data import extract_agentx_ci
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -127,24 +127,36 @@ def test_pinned_tracelab_rejects_changed_data(tmp_path, monkeypatch):
     assert not (tmp_path / "run").exists()
 
 
-def test_pd_tracelab_fits_all_pd_cases():
+def test_pd_agentx_fits_all_pd_cases():
     suite = Path(__file__).parents[1] / "e2e/perf/router_policy"
-    trace = suite / "data" / extract_tracelab.PD_TRACE_FILE
+    trace = suite / "data" / extract_agentx_ci.TRACE_FILE
     body = trace.read_bytes()
-    assert hashlib.sha256(body).hexdigest() == extract_tracelab.PD_TRACE_SHA
-    rows = [json.loads(line) for line in body.splitlines()]
-    assert len(rows) == 68
-    assert len({(row["provider"], row["session_id"]) for row in rows}) == 6
-    longest = max(row["input_tokens_total"] + row["output_tokens"] for row in rows)
-    assert longest == 60228
+    assert hashlib.sha256(body).hexdigest() == extract_agentx_ci.TRACE_SHA256
+    sessions = [json.loads(line) for line in body.splitlines()]
+    assert len(sessions) == len({session["id"] for session in sessions}) == 12
+    requests = []
+    for session in sessions:
+        assert session["hash_id_scope"] == "local"
+        assert len(session["requests"]) == 12
+        for request in session["requests"]:
+            assert request.get("type") != "subagent"
+            assert request["in"] > 0 and request["out"] > 1
+            assert (
+                len(request["hash_ids"])
+                == (request["in"] + session["block_size"] - 1) // session["block_size"]
+            )
+            requests.append(request)
+    assert len(requests) == 144
+    longest = max(request["in"] + request["out"] for request in requests)
+    assert longest == 65477
     for policy in ("cache_aware", "kv_aware", "round_robin"):
         case = case_loader.load_case(suite / "cases" / f"pd_disagg_{policy}.json")
         assert suite.parents[4] / case["runtime"]["trace_path"] == trace
-        assert case["runtime"]["trace_type"] == "tracelab"
-        assert case["runtime"]["trace_sha256"] == extract_tracelab.PD_TRACE_SHA
-        assert case["runtime"]["endpoint"] == "/v1/chat/completions"
-        assert case["benchmark_params"]["task-num"] == 6
-        assert case["benchmark_params"]["max-concurrency"] == [6]
+        assert case["runtime"]["trace_type"] == "agentX"
+        assert case["runtime"]["trace_sha256"] == extract_agentx_ci.TRACE_SHA256
+        assert case["runtime"]["endpoint"] == "/v1/completions"
+        assert case["benchmark_params"]["task-num"] == 12
+        assert case["benchmark_params"]["max-concurrency"] == [12]
         assert case["benchmark_params"]["max_inflight"] == 1
         assert case["workers"]["count"] == 4
         assert case["workers"]["prefill_count"] == 2

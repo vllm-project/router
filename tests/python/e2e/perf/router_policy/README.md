@@ -1,6 +1,6 @@
-# router_policy — TraceLab cold replay, router policy × concurrency
+# router_policy — TraceLab and AgentX cold replay, router policy × concurrency
 
-Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` is `[8]` for merged cases and `[6]` for PD cases; pytest collects one cell per scenario, such as `pd_merge_cache_aware/c8` or `pd_disagg_cache_aware/c6`:
+Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params.max-concurrency` is `[8]` for merged cases and `[12]` for PD cases; pytest collects one cell per scenario, such as `pd_merge_cache_aware/c8` or `pd_disagg_cache_aware/c12`:
 
 - **`runtime`** — paths **relative to vllm-router repo root** where applicable. **`MODEL`** overrides `runtime.model`. **`AGENTX_PYTHON`** (or `PYTHON`) overrides the pytest interpreter. The CI image runs `vllm-router` from `PATH` (`/usr/local/bin`) and `vllm-rs` from the installed `vllm` package.
 - **agentinfer** — install via **`pip install …whl`** (or `uv pip install …whl`) into the **same env as pytest** (no source checkout). Replay YAML is loaded from the installed package when a cell starts. Optional: `runtime.replay_config`; optional `runtime.agent_infer` for source dev.
@@ -8,10 +8,10 @@ Each **scenario JSON** under `cases/` is one routing scenario. `benchmark_params
 - **`router_params`** — policy, gRPC, penalties, balance thresholds
 - **`benchmark_params`** — `max-concurrency`, task-num, and the rest of the replay settings. pytest requires **all** replay requests to succeed and match the complete replay plan.
 
-Merged scenarios use eight replay sessions at `c8`; PD scenarios use six
-sessions at `c6`. Requests within each session are serial. These labels denote
+Merged scenarios use eight replay sessions at `c8`; PD scenarios use twelve
+sessions at `c12`. Requests within each session are serial. These labels denote
 the configured session-concurrency limit; request concurrency is at most eight
-or six respectively and can be lower because of trace gaps and completed
+or twelve respectively and can be lower because of trace gaps and completed
 sessions. The workload includes no `c16` or `c32` cells.
 
 Example: [cases/pd_merge_kv_aware.json](cases/pd_merge_kv_aware.json).
@@ -91,7 +91,7 @@ python -m pytest tests/python/unit/test_router_policy_log_summary.py -q
 ```
 
 The scenario test module and its inline validation run through the nightly
-GPU replay jobs, selecting merged c8 or disaggregated c6 cells.
+GPU replay jobs, selecting merged c8 or disaggregated c12 cells.
 
 ## Results schema
 
@@ -139,8 +139,8 @@ match the planned `(session_id, request_id)` pairs. Missing or extra rows, wrong
 IDs, duplicates, and missing or malformed plan/source artifacts fail the cell
 and prevent dashboard publication. Pinned workload counts are fixed independently
 of the importer, source analysis, plan, and measured rows: eight source sessions
-and 28 requests for merged TraceLab; six source sessions and 68 requests for
-disaggregated TraceLab.
+and 28 requests for merged TraceLab; twelve source sessions and 144 requests for
+disaggregated AgentX.
 Source counts and the planned complete source cycle must both match, so a
 shortened import cannot pass by repeating one of its remaining sessions. An
 explicit merged TraceLab URL override is checked against its own inventory and plan. Counts and
@@ -202,7 +202,7 @@ use four co-located GPUs per job.
 
 - `router-policy-perf-e2e` selects `pd_merge and c8` and runs the three merged
   scenarios on `l4_4`.
-- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c6` and runs
+- `router-policy-pd-disagg-perf-e2e` selects `pd_disagg and c12` and runs
   `cache_aware`, `kv_aware`, and `round_robin` sequentially in one `l4_4` job.
   The three scenarios share a 180-minute timeout and artifact upload. The
   timeout remains a budget; total runtime needs measurement on the actual
@@ -218,10 +218,10 @@ case uses CPU offload.
 
 The CI image supplies `agentinfer==0.2.0`, vLLM 0.30.0, NIXL, and the Rust
 router. Merged cases use `data/tracelab-ci-uniform-28.jsonl` (eight sessions,
-28 requests). The three PD cases share `data/tracelab-l4-6.jsonl` (six complete
-sessions, 68 requests) with `trace_type=tracelab`, `/v1/chat/completions`,
-and `gap_scale=0.002`. AgentInfer's `replay_tracelab.yaml` supplies the matching
-replay settings. See [data provenance and reproduction](data/README.md).
+28 requests). The three PD cases share `data/agentx-l4-12x12.jsonl` (twelve
+sessions, 144 requests) with `trace_type=agentX`, `/v1/completions`,
+and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
+token-ID replay settings. See [data provenance and reproduction](data/README.md).
 
 The shared cell launcher calls `prepare_trace()` before starting workers.
 PD cases verify `runtime.trace_sha256` against the bundled slice. Unpinned
@@ -234,14 +234,14 @@ Run the three PD scenarios with four CUDA GPUs that can hold the model,
 12 GiB of KV cache per GPU, and runtime overhead (for example, four L4s).
 
 ```bash
-python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c6'
+python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c12'
 ```
 
 Earlier TraceLab runs of cache-aware and KV-aware affinity passed on two L20
 GPUs with one prefill worker, one decode worker, and all 28 requests successful.
 Those runs used the vLLM native sampler because FlashInfer CUDA compilation
 failed in the test container. A [reviewer replay on four H20s](https://github.com/vllm-project/router/pull/615#issuecomment-7207247874)
-used the six-session TraceLab fixture with vLLM 0.30.0, 2P2D, c6, a 64K context,
-and 12 GiB KV per worker: all three policies completed 68/68 requests, with
-18m 17s total Slurm elapsed time. These measurements are from the reviewer's
+used the context-capped AgentX fixture with vLLM 0.30.0, 2P2D, c12, a 64K context,
+and 12 GiB KV per worker: all three policies completed 144/144 requests, with
+45m 46s total Slurm elapsed time. These measurements are from the reviewer's
 run at `0ab9effc`; the updated four-L4 CI configuration still needs a GPU run.

@@ -190,7 +190,7 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
     # Independent fixture facts: a truncated import/plan cannot redefine them.
     expected_inventory: tuple[int, int] | None = {
         "tracelab-ci-uniform-28.jsonl": (8, 28),
-        "tracelab-l4-6.jsonl": (6, 68),
+        "agentx-l4-12x12.jsonl": (12, 144),
     }[Path(case["runtime"]["trace_path"]).name]
     if (
         trace_type == "tracelab"

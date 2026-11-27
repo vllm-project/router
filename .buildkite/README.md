@@ -40,7 +40,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab merged c8 / PD c6 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X (scheduled builds only) |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab merged c8 / AgentX PD c12 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X (scheduled builds only) |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks,
@@ -325,7 +325,7 @@ Builds Docker image for the router.
 ## Agent Queues
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy merged c8 / PD c6)
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy merged c8 / PD c12)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue

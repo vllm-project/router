@@ -232,21 +232,21 @@ def test_snapshot_uses_router_metrics_port_and_checks_http_status(
     [
         (
             "pd_disagg_cache_aware",
-            "tracelab",
-            "/v1/chat/completions",
-            "replay_tracelab.yaml",
+            "agentX",
+            "/v1/completions",
+            "replay_agentX.yaml",
         ),
         (
             "pd_disagg_kv_aware",
-            "tracelab",
-            "/v1/chat/completions",
-            "replay_tracelab.yaml",
+            "agentX",
+            "/v1/completions",
+            "replay_agentX.yaml",
         ),
         (
             "pd_disagg_round_robin",
-            "tracelab",
-            "/v1/chat/completions",
-            "replay_tracelab.yaml",
+            "agentX",
+            "/v1/completions",
+            "replay_agentX.yaml",
         ),
         (
             "pd_merge_cache_aware",
@@ -294,5 +294,5 @@ def test_replay_uses_the_matching_adapter_template(
     if scenario.startswith("pd_disagg_"):
         assert case.prefill_count == 2
         assert case.trace_sha256
-        assert config["experiment"]["task_num"] == 6
-        assert config["experiment"]["max_concurrency"] == 6
+        assert config["experiment"]["task_num"] == 12
+        assert config["experiment"]["max_concurrency"] == 12
