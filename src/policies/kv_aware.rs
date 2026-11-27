@@ -3449,10 +3449,7 @@ mod tests {
 
     #[test]
     fn colocated_image_routing_credits_only_the_matching_image() {
-        use crate::kv_index::source::test_support::{
-            image_store, TEST_IMAGE_BLOCK_HASHES, TEST_IMAGE_HASH,
-        };
-        use crate::kv_index::wire::KVEvent;
+        use crate::kv_index::source::test_support::{warm_test_image, TEST_IMAGE_HASH};
 
         let policy = KvAwarePolicy::default();
         let workers: Vec<Arc<dyn Worker>> = vec![
@@ -3465,20 +3462,10 @@ mod tests {
                 WorkerType::Regular,
             )),
         ];
-        for worker in &workers {
-            let binding = register_full(&policy, worker.url(), target(worker.url(), 0), "m", 64);
-            if worker.url() == workers[0].url() {
-                binding
-                    .apply_batch(
-                        0,
-                        &event_batch(vec![KVEvent::BlockStored(image_store(
-                            TEST_IMAGE_HASH,
-                            TEST_IMAGE_BLOCK_HASHES,
-                        ))]),
-                    )
-                    .unwrap();
-            }
-        }
+        let warm = workers[0].url();
+        warm_test_image(&register_full(&policy, warm, target(warm, 0), "m", 64));
+        let cold = workers[1].url();
+        register_full(&policy, cold, target(cold, 0), "m", 64);
         let prompts: Arc<[Vec<u32>]> = Arc::from([(0..129).collect()]);
         let different_hash = "a".repeat(64);
         for (hash, expected) in [

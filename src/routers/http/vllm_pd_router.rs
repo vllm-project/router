@@ -7459,37 +7459,13 @@ mod tests {
             "remote_kv_lease_duration": 120,
             "last_token_id": 42
         });
-        let decode_params = |response: &Value| {
-            router.build_decode_kv_transfer_params(&worker, Some(response), None, None)
+        let decode_params = |params: &Value| {
+            let response = json!({"kv_transfer_params": params});
+            router.build_decode_kv_transfer_params(&worker, Some(&response), None, None)
         };
-        assert_eq!(
-            decode_params(&json!({"kv_transfer_params": handoff})).as_ref(),
-            Some(&handoff)
-        );
-        assert_eq!(decode_params(&json!({})), None);
-        assert_eq!(
-            decode_params(&json!({"kv_transfer_params": {"do_remote_prefill": true}})),
-            None
-        );
-
-        for field in [
-            "do_remote_prefill",
-            "remote_block_ids",
-            "remote_engine_id",
-            "remote_request_id",
-            "remote_host",
-            "remote_port",
-            "remote_num_prompt_tokens",
-            "remote_kv_lease_duration",
-        ] {
-            let mut incomplete = handoff.clone();
-            incomplete.as_object_mut().unwrap().remove(field);
-            assert_eq!(
-                decode_params(&json!({"kv_transfer_params": incomplete})),
-                None,
-                "missing {field}"
-            );
-        }
+        assert_eq!(decode_params(&handoff).as_ref(), Some(&handoff));
+        assert!(router.mooncake_v2_handoff(&json!({})).is_none());
+        assert!(decode_params(&json!({"do_remote_prefill": true})).is_none());
 
         for (field, invalid) in [
             ("do_remote_prefill", json!(false)),
@@ -7504,27 +7480,22 @@ mod tests {
             ("remote_num_prompt_tokens", json!(-1)),
             ("remote_kv_lease_duration", json!(5)),
         ] {
-            let mut malformed = handoff.clone();
-            malformed[field] = invalid;
-            assert_eq!(
-                decode_params(&json!({"kv_transfer_params": malformed})),
-                None,
-                "malformed {field}"
-            );
+            let mut params = handoff.clone();
+            params.as_object_mut().unwrap().remove(field);
+            assert!(decode_params(&params).is_none(), "missing {field}");
+            params[field] = invalid;
+            assert!(decode_params(&params).is_none(), "malformed {field}");
         }
 
+        let mut no_transfer = handoff;
+        no_transfer
+            .as_object_mut()
+            .unwrap()
+            .remove("remote_kv_lease_duration");
         for block_ids in [json!([]), json!([[], []])] {
-            let mut no_transfer = handoff.clone();
             no_transfer["remote_block_ids"] = block_ids;
             no_transfer["remote_num_prompt_tokens"] = json!(0);
-            no_transfer
-                .as_object_mut()
-                .unwrap()
-                .remove("remote_kv_lease_duration");
-            assert_eq!(
-                decode_params(&json!({"kv_transfer_params": no_transfer})),
-                Some(no_transfer)
-            );
+            assert_eq!(decode_params(&no_transfer).as_ref(), Some(&no_transfer));
         }
     }
 
@@ -7645,10 +7616,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pd_router_disables_image_rendering_for_epd() {
+    async fn pd_requests_image_hashes_without_tensors_and_disables_rendering_for_epd() {
         let url = spawn_test_server(axum::Router::new().route(
             "/v1/chat/completions/render",
-            axum::routing::post(|| async {
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["mm_payload"], "none");
+                assert_eq!(
+                    body["messages"][0]["content"][0]["image_url"]["url"],
+                    "image"
+                );
                 axum::Json(json!({
                     "token_ids": [1, 2, 3],
                     "features": {
@@ -7669,6 +7645,14 @@ mod tests {
             {"type":"image_url","image_url":{"url":"image"}}
         ]}]});
         for epd in [false, true] {
+            assert_eq!(
+                crate::backend::preprocess::http_input_requires_render(
+                    &body,
+                    "/v1/chat/completions",
+                    !epd,
+                ),
+                !epd,
+            );
             let config = crate::config::RouterConfig {
                 epd: epd.then(|| crate::config::EpdConfig {
                     encoder_urls: vec!["http://encoder".into()],

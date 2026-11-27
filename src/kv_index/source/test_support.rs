@@ -69,6 +69,13 @@ pub(crate) const TEST_IMAGE_BLOCK_HASHES: [&str; 2] = [
     "0ade0d242ddfcfc955a0bdc7a83168cf2cce2c9b3543a93320e976c369e01ca7",
 ];
 
+pub(crate) fn warm_test_image(binding: &SourceBinding) {
+    let store = image_store(TEST_IMAGE_HASH, TEST_IMAGE_BLOCK_HASHES);
+    binding
+        .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(store)]))
+        .unwrap();
+}
+
 /// Independent vLLM hashes for tokens 0..128, with the image spanning 60..68.
 pub(crate) fn image_store(hash: &str, blocks: [&str; 2]) -> BlockStored {
     let mut store = full_store(&(0..128).collect::<Vec<_>>(), 64, None);

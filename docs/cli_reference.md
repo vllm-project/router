@@ -136,7 +136,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--prefill` | `URL [PORT or none] (repeatable)` | `[]` | `string [1..] (repeatable)` | `unset` | Add one prefill URL and optional bootstrap port: `--prefill URL [PORT]`. Omit the port or pass `none` for no bootstrap port. |
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
-| `--kv-connector` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. `mooncake-v2` requires vLLM-Ascend `MooncakeConnectorV2` in pull mode with KV leases (commit `451b02ce13` or later). Missing or invalid Prefill handoff metadata returns HTTP 502. |
+| `--kv-connector` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` with vLLM-Ascend `MooncakeConnectorV2` in pull mode. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
