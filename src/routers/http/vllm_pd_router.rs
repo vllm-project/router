@@ -7456,18 +7456,27 @@ mod tests {
         assert!(!router.missing_mooncake_v2_handoff(&response));
         let params = router.build_decode_kv_transfer_params(&worker, Some(&response), None, None);
         assert_eq!(params.as_ref(), response.get("kv_transfer_params"));
-        for field in [
-            "remote_block_ids",
-            "remote_engine_id",
-            "remote_request_id",
-            "remote_host",
-            "remote_port",
-            "remote_num_prompt_tokens",
-            "remote_kv_lease_duration",
+        for (field, invalid_value) in [
+            ("do_remote_prefill", json!(false)),
+            ("remote_block_ids", json!([0, 1])),
+            ("remote_block_ids", json!([["0"]])),
+            ("remote_engine_id", json!("")),
+            ("remote_request_id", json!(1)),
+            ("remote_host", json!(" ")),
+            ("remote_port", json!(0)),
+            ("remote_port", json!(65536)),
+            ("remote_num_prompt_tokens", json!(-1)),
+            ("remote_kv_lease_duration", json!(5)),
         ] {
             let mut invalid = response.clone();
             invalid["kv_transfer_params"][field] = Value::Null;
-            assert!(router.missing_mooncake_v2_handoff(&invalid), "{field}");
+            assert!(router.missing_mooncake_v2_handoff(&invalid), "null {field}");
+            invalid["kv_transfer_params"][field] = invalid_value;
+            assert!(
+                router.missing_mooncake_v2_handoff(&invalid),
+                "invalid {field}: {}",
+                invalid["kv_transfer_params"][field]
+            );
         }
 
         let mut no_transfer = response;

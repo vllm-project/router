@@ -559,13 +559,14 @@ impl KvIndexSupervisor {
                 .flatten();
             }
         }
-        if !matches!(connector, Some(KvConnector::Nixl | KvConnector::Mooncake))
-            || !layout.ranks.iter().any(|rank| {
-                rank.groups
-                    .iter()
-                    .any(|group| group.kind == "mla_attention" && group.tokens_per_state.is_some())
-            })
-        {
+        if !matches!(
+            connector,
+            Some(KvConnector::Nixl | KvConnector::Mooncake | KvConnector::MooncakeV2)
+        ) || !layout.ranks.iter().any(|rank| {
+            rank.groups
+                .iter()
+                .any(|group| group.kind == "mla_attention" && group.tokens_per_state.is_some())
+        }) {
             return discovery;
         }
         if let Some(info) = discovery
@@ -575,10 +576,10 @@ impl KvIndexSupervisor {
             .filter(|info| info.mooncake_truncates_compressed.is_none())
         {
             // A cold /server_info can spend time collecting worker diagnostics.
-            let metadata_timeout = if connector == Some(KvConnector::Nixl) {
-                CONTROL_TIMEOUT / 2
-            } else {
+            let metadata_timeout = if connector == Some(KvConnector::Mooncake) {
                 CONTROL_TIMEOUT / 4
+            } else {
+                CONTROL_TIMEOUT / 2
             };
             if let Ok(Ok(runtime)) = tokio::time::timeout(
                 metadata_timeout,

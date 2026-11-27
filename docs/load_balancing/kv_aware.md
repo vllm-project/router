@@ -36,7 +36,7 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
-| HTTP text and chat | KV scoring uses the worker's render endpoint. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
+| HTTP text and chat | KV scoring uses the worker's render endpoint. Pass `--enable-scale-out` to vLLM if required to enable rendering. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
@@ -295,7 +295,6 @@ Expand the profile for your checkpoint and mode, then replace the object inside 
 <summary>GPU · HY4 Flash</summary>
 
 Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `tencent/Hy4-flash` (BF16).
-Pass `--enable-scale-out` to vLLM for HTTP chat rendering.
 
 ```json
 {
@@ -685,3 +684,4 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
 | Worker restarted | Generate a new publisher topic. Update `--kv-event-topic` for a static source. A Router restart uses the available replay history. |
 | Decode has no remote read | Check whether the prompt was already cached on Decode, the connector and role settings, and Decode's transfer log. |
+| Mooncake V2 P/D handoff fails for HY4 Flash | Use the vLLM-Ascend HY4 Flash recipe image with `MooncakeConnectorV2` in pull mode on both workers. |

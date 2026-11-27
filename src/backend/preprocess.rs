@@ -1777,9 +1777,17 @@ mod tests {
         for (hashes, placements) in [
             (json!([format!("uuid:{hash}")]), json!([placement])),
             (json!([hash, hash]), json!([placement, placement])),
+            (json!([hash]), json!([{"offset": 2, "length": 2}])),
         ] {
             assert!(super::http_rendered_image(&rendered(hashes, placements)).is_err());
         }
+
+        let image = json!({"type":"image_url","image_url":{"url":"image"}});
+        let body = json!({"messages":[{"role":"user","content":[image, image]}]});
+        assert!(matches!(
+            http_kv_input(&body, "/v1/chat/completions", true),
+            Err("multimodal_input")
+        ));
     }
     use super::*;
     use std::path::{Path, PathBuf};

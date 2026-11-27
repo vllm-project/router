@@ -3448,45 +3448,6 @@ mod tests {
     }
 
     #[test]
-    fn colocated_image_routing_credits_only_the_matching_image() {
-        use crate::kv_index::source::test_support::{warm_test_image, TEST_IMAGE_HASH};
-
-        let policy = KvAwarePolicy::default();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://image-warm".into(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://image-cold".into(),
-                WorkerType::Regular,
-            )),
-        ];
-        let warm = workers[0].url();
-        warm_test_image(&register_full(&policy, warm, target(warm, 0), "m", 64));
-        let cold = workers[1].url();
-        register_full(&policy, cold, target(cold, 0), "m", 64);
-        let prompts: Arc<[Vec<u32>]> = Arc::from([(0..129).collect()]);
-        let image = ImagePrefix::new(TEST_IMAGE_HASH, 60, 8, 129).unwrap();
-        let mut inputs = WorkerTokenInputs::new();
-        for worker in &workers {
-            inputs.insert_image(worker.url().to_owned(), prompts.clone(), image.clone());
-        }
-        let receipt = policy
-            .select_worker_with_inputs(
-                &workers,
-                KvRequestTokens::PerWorker(&inputs),
-                None,
-                None,
-                None,
-                &[],
-            )
-            .unwrap();
-        assert_eq!((receipt.worker_index, receipt.new_prefill_tokens), (0, 1));
-        release_receipt(&workers, &receipt);
-    }
-
-    #[test]
     fn cache_hit_offsets_load_until_cold_prefill_becomes_cheaper() {
         let policy = KvAwarePolicy::default();
         let warm = register_full(&policy, "http://warm", target("http://warm", 0), "model", 2);

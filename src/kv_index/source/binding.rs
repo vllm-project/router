@@ -233,8 +233,8 @@ impl SourceBinding {
                     || (has_compressed && truncates_compressed.unwrap_or(true))
             }
             Some(KvConnector::MooncakeV2) => {
-                // The Ascend pull scheduler checks the cache groups and the HF
-                // compress_ratios field. Sparse MLA alone does not imply it.
+                // The Ascend pull scheduler checks the cache groups and HF
+                // compress_ratios, which Router can read from /server_info.
                 has_checkpoint
                     || self
                         .groups
