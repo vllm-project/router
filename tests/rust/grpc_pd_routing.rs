@@ -288,6 +288,306 @@ async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
     assert!(decode.captured().is_empty());
 }
 
+/// Concurrent router -> gRPC P -> gRPC D validation without a GPU engine.
+/// The measured completion time includes mock delays and is not a TTFT claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with the PD pressure evaluation script"]
+async fn grpc_pd_cache_aware_pr1_stress() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn delta(before: &str, after: &str, name: &str, labels: &[&str]) -> f64 {
+        let sum = |text: &str| -> f64 {
+            text.lines()
+                .filter(|line| {
+                    line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                })
+                .sum()
+        };
+        sum(after) - sum(before)
+    }
+
+    let setting = |name: &str, default: usize, max: usize| {
+        let value = std::env::var(name)
+            .map(|value| value.parse::<usize>().expect("positive stress setting"))
+            .unwrap_or(default);
+        assert!((1..=max).contains(&value), "{name} must be in 1..={max}");
+        value
+    };
+    let rounds = setting("ROUTER_PD_STRESS_ROUNDS", 24, 10_000);
+    let concurrency = setting("ROUTER_PD_STRESS_CONCURRENCY", 16, 256);
+    metrics();
+    let mut prefills = Vec::new();
+    let mut decodes = Vec::new();
+    for i in 0..2 {
+        let mut kv = prefill_kv();
+        kv["remote_engine_id"] = json!(format!("stress-P{i}"));
+        prefills.push(
+            MockVllmRsServer::spawn_with_state(MockVllmRs {
+                finish_kv_transfer_params: Some(kv),
+                reply_delay: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .await,
+        );
+        decodes.push(
+            MockVllmRsServer::spawn_with_state(MockVllmRs {
+                reply_delay: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .await,
+        );
+    }
+    let prefill_urls: Vec<_> = prefills
+        .iter()
+        .map(|p| (p.grpc_url.clone(), None))
+        .collect();
+    let decode_urls: Vec<_> = decodes.iter().map(|d| d.grpc_url.clone()).collect();
+    let policy = PolicyConfig::CacheAware {
+        cache_threshold: 0.3,
+        balance_abs_threshold: 2,
+        balance_rel_threshold: 1.1,
+        eviction_interval_secs: 3600,
+        max_tree_size: 1 << 22,
+    };
+    let config = RouterConfig {
+        mode: RoutingMode::VllmPrefillDecode {
+            prefill_urls: prefill_urls.clone(),
+            decode_urls: decode_urls.clone(),
+            prefill_policy: Some(policy.clone()),
+            decode_policy: Some(policy.clone()),
+            discovery_address: None,
+        },
+        policy: policy.clone(),
+        kv_connector: KvConnector::Nixl,
+        disable_retries: true,
+        disable_circuit_breaker: true,
+        worker_startup_timeout_secs: 5,
+        ..RouterConfig::default()
+    };
+    vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
+    let ctx = create_test_context(config);
+    let affinity = ctx.policy_registry.kv_affinity_table();
+    ctx.policy_registry
+        .set_prefill_policy(PolicyFactory::create_from_config(&policy, Some(&affinity)));
+    ctx.policy_registry
+        .set_decode_policy(PolicyFactory::create_from_config(&policy, Some(&affinity)));
+    let router = Arc::new(
+        VllmPDRouter::new(prefill_urls, decode_urls, None, &ctx)
+            .await
+            .unwrap(),
+    );
+    router.pin_test_token_ids((0..128).collect());
+    // Seed real prefix affinity before measuring, including for a one-request smoke run.
+    let warmup = router.route_chat(None, &chat(false), None).await;
+    assert!(warmup.status().is_success(), "{}", warmup.status());
+    let bytes = axum::body::to_bytes(warmup.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("hello from worker"));
+    for server in prefills.iter().chain(&decodes) {
+        server.state.captured.lock().unwrap().clear();
+    }
+    let before = metrics().render();
+    let started = Instant::now();
+    let mut completion_us = Vec::with_capacity(rounds * concurrency);
+    for _ in 0..rounds {
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..concurrency {
+            let router = router.clone();
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let response = router.route_chat(None, &chat(i % 2 == 0), None).await;
+                assert!(response.status().is_success(), "{}", response.status());
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("hello from worker"));
+                started.elapsed().as_secs_f64() * 1_000_000.0
+            });
+        }
+        while let Some(result) = tokio::time::timeout(Duration::from_secs(30), tasks.join_next())
+            .await
+            .expect("gRPC stress wave timed out")
+        {
+            completion_us.push(result.unwrap());
+        }
+    }
+    let expected = rounds * concurrency;
+    let mut p_requests = HashMap::new();
+    for prefill in &prefills {
+        for request in prefill.captured() {
+            assert!(request.unary);
+            assert_eq!((request.max_new_tokens, request.min_new_tokens), (1, 1));
+            let expected_kv = prefill.state.finish_kv_transfer_params.clone().unwrap();
+            assert!(p_requests
+                .insert(request.request_id.clone(), (request, expected_kv))
+                .is_none());
+        }
+    }
+    assert_eq!(
+        p_requests.len(),
+        expected,
+        "every request has exactly one P"
+    );
+    let mut d_ids = BTreeSet::new();
+    for decode in &decodes {
+        for request in decode.captured() {
+            assert!(d_ids.insert(request.request_id.clone()));
+            let (p, expected_kv) = p_requests
+                .get(&request.request_id)
+                .expect("D must refer to an admitted P request");
+            assert!(!request.unary);
+            assert_eq!(request.max_new_tokens, 8);
+            assert_eq!(request.kv_transfer_params.as_ref(), Some(expected_kv));
+            assert_eq!(request.token_ids, p.token_ids);
+        }
+    }
+    assert_eq!(d_ids.len(), expected, "every request has exactly one D");
+    assert!(prefills
+        .iter()
+        .chain(&decodes)
+        .all(|s| s.aborts().is_empty()));
+    let used_prefills = prefills
+        .iter()
+        .filter(|server| !server.captured().is_empty())
+        .count();
+    let used_decodes = decodes
+        .iter()
+        .filter(|server| !server.captured().is_empty())
+        .count();
+    if concurrency >= 8 && rounds >= 2 {
+        assert_eq!(used_prefills, 2, "stress never dispatched to both prefills");
+        assert_eq!(used_decodes, 2, "stress never dispatched to both decodes");
+    }
+    let rendered = metrics().render();
+    let mut commit_counts = serde_json::Map::new();
+    for (stage, servers) in [("prefill", &prefills), ("decode", &decodes)] {
+        let stage_label = format!("stage=\"{stage}\"");
+        let selections = delta(
+            &before,
+            &rendered,
+            "vllm_router_prefix_routing_decisions_total",
+            &["policy=\"cache_aware\"", stage_label.as_str()],
+        );
+        assert_eq!(
+            selections, expected as f64,
+            "{stage} must commit exactly once per request"
+        );
+        let hits = delta(
+            &before,
+            &rendered,
+            "vllm_router_prefix_routing_decisions_total",
+            &[
+                "policy=\"cache_aware\"",
+                stage_label.as_str(),
+                "outcome=\"prefix_hit\"",
+            ],
+        );
+        assert!(
+            hits > 0.0,
+            "no real {stage} prefix hit during stress: {rendered}"
+        );
+        let missing = delta(
+            &before,
+            &rendered,
+            "vllm_router_prefix_routing_decisions_total",
+            &[
+                "policy=\"cache_aware\"",
+                stage_label.as_str(),
+                "outcome=\"missing_tokens\"",
+            ],
+        );
+        assert_eq!(missing, 0.0, "{stage} silently used missing-token fallback");
+        let worker_deltas = |name: &str, policy_label: bool| -> f64 {
+            servers
+                .iter()
+                .map(|server| {
+                    let worker_label = format!("worker=\"{}\"", server.grpc_url);
+                    let labels = if policy_label {
+                        vec![worker_label.as_str(), "policy=\"cache_aware\""]
+                    } else {
+                        vec![worker_label.as_str()]
+                    };
+                    delta(&before, &rendered, name, &labels)
+                })
+                .sum()
+        };
+        let processed = worker_deltas("vllm_router_processed_requests_total", false);
+        let policy_decisions = worker_deltas("vllm_router_policy_decisions_total", true);
+        assert_eq!(
+            processed, expected as f64,
+            "duplicate or missing {stage} processed accounting"
+        );
+        assert_eq!(
+            policy_decisions, expected as f64,
+            "duplicate or missing {stage} policy commit"
+        );
+        commit_counts.insert(stage.to_owned(), json!({
+            "selections": selections, "processed": processed, "policy_decisions": policy_decisions,
+            "prefix_hits": hits, "missing_tokens": missing,
+        }));
+    }
+    let mut required = Vec::new();
+    for server in prefills.iter().filter(|s| !s.captured().is_empty()) {
+        required.push(("vllm_router_pd_prefill_occupancy", &server.grpc_url));
+    }
+    for server in decodes.iter().filter(|s| !s.captured().is_empty()) {
+        required.push(("vllm_router_pd_pending_decode_requests", &server.grpc_url));
+        required.push(("vllm_router_pd_active_decode_requests", &server.grpc_url));
+    }
+    for (name, url) in required {
+        let series: Vec<_> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && line.contains(&format!("worker=\"{url}\""))
+            })
+            .collect();
+        assert!(!series.is_empty(), "missing {name} for {url}");
+        for line in series {
+            assert_eq!(
+                line.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap(),
+                0.0,
+                "{line}"
+            );
+        }
+    }
+    completion_us.sort_by(f64::total_cmp);
+    let percentile =
+        |percent: usize| completion_us[(completion_us.len() * percent).div_ceil(100) - 1];
+    println!(
+        "PD_PRESSURE_STRESS_RESULT {}",
+        json!({
+            "stage": "pr1",
+            "kind": "grpc_pd",
+            "rounds": rounds,
+            "concurrency": concurrency,
+            "requests": expected,
+            "completed": completion_us.len(),
+            "handoffs_verified": d_ids.len(),
+            "wall_seconds": started.elapsed().as_secs_f64(),
+            "completion_p50_us": percentile(50),
+            "completion_p95_us": percentile(95),
+            "final_occupancy": 0,
+            "workers_used": {"prefill": used_prefills, "decode": used_decodes},
+            "commit_counts": commit_counts,
+            "evidence": "mock gRPC PD handoff, not real-engine TTFT",
+        })
+    );
+}
+
 #[tokio::test]
 async fn grpc_pd_hands_prefill_kv_params_to_decode() {
     let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {

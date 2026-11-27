@@ -247,9 +247,18 @@ impl Inference for MockVllmRs {
         &self,
         request: Request<GenerateRequest>,
     ) -> Result<Response<GenerateResponse>, Status> {
+        let request_id = request.get_ref().request_id.clone();
         let mut stream = self.generate_stream(request).await?.into_inner();
-        if let Some(last) = self.captured.lock().unwrap().last_mut() {
-            last.unary = true;
+        // Another request can be captured while generate_stream is awaiting.
+        if let Some(captured) = self
+            .captured
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .rev()
+            .find(|captured| captured.request_id == request_id)
+        {
+            captured.unary = true;
         }
         let mut text = String::new();
         let mut prompt_info = None;
