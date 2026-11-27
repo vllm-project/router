@@ -2100,6 +2100,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pd_load_queries_normalize_trailing_slash() {
+        let (prefill_url, prefill_server, prefill_requests) =
+            start_pd_admin_auth_mock_server(Some("worker-key")).await;
+        let (decode_url, decode_server, decode_requests) =
+            start_pd_admin_auth_mock_server(Some("worker-key")).await;
+        let (prefill_url, decode_url) = (format!("{prefill_url}/"), format!("{decode_url}/"));
+        let router = PdRouterBase {
+            api_key: Some("worker-key".into()),
+            admin_auth: PdAdminAuth::new(
+                Some("worker-key"),
+                [prefill_url.as_str(), decode_url.as_str()].into_iter(),
+            ),
+            ..create_test_pd_router()
+        };
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            prefill_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )));
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            decode_url.clone(),
+            WorkerType::Decode,
+        )));
+        let requests = [&prefill_requests, &decode_requests];
+        let load_probes = |requests: &tokio::sync::watch::Receiver<Vec<(String, StatusCode)>>| {
+            requests
+                .borrow()
+                .iter()
+                .filter(|(path, _)| path.ends_with("get_load"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // The mock answers only an authorized `/get_load`; `//get_load` is a 404.
+        let assert_one_probe_each = |expected: usize| {
+            for requests in requests {
+                assert_eq!(
+                    load_probes(requests),
+                    vec![("/get_load".to_string(), StatusCode::OK); expected]
+                );
+            }
+        };
+
+        // Explicit /get_loads.
+        let loads = router.get_worker_loads().await;
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["loads"],
+            serde_json::json!({
+                format!("prefill_{prefill_url}"): 7,
+                format!("decode_{decode_url}"): 7,
+            }),
+            "{payload}"
+        );
+        assert_one_probe_each(1);
+
+        // Background power-of-two poll.
+        let (tx, mut monitored) = tokio::sync::watch::channel(HashMap::new());
+        let policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::RoundRobinPolicy::new());
+        let monitor = tokio::spawn(PdRouterBase::monitor_worker_loads_with_client(
+            vec![prefill_url.clone(), decode_url.clone()],
+            tx,
+            60,
+            Client::new(),
+            router.admin_auth.clone(),
+            Arc::clone(&policy),
+            policy,
+        ));
+        let batch = tokio::time::timeout(Duration::from_secs(2), monitored.changed())
+            .await
+            .unwrap()
+            .map(|()| monitored.borrow().clone())
+            .unwrap();
+        monitor.abort();
+        assert_eq!(
+            batch,
+            HashMap::from([(prefill_url.clone(), 7), (decode_url.clone(), 7)])
+        );
+        assert_one_probe_each(2);
+
+        prefill_server.abort();
+        decode_server.abort();
+    }
+
+    #[tokio::test]
     async fn test_pd_flush_cache_and_get_load_fail_without_matching_api_key() {
         let (url, server, requests) = start_admin_auth_mock_server(Some("worker-key")).await;
         let router = PdRouterBase {

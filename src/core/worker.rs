@@ -63,6 +63,9 @@ pub(crate) async fn fetch_worker_load(
     base_url: &str,
     api_key: Option<&str>,
 ) -> Option<isize> {
+    // Normalize like the cache flush path so a configured trailing slash
+    // does not produce `//get_load`.
+    let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/get_load");
     let response = match worker_get(client, &url, api_key).send().await {
         Ok(response) if response.status().is_success() => response,

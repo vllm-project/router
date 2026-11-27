@@ -8690,6 +8690,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_load_normalizes_trailing_slash() {
+        use crate::config::RouterConfig;
+
+        let (url, server, requests) = start_admin_auth_mock_server(Some("worker-key")).await;
+        let config = RouterConfig {
+            api_key: Some("worker-key".to_string()),
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let (router, ctx) = start_router(config, vec![]).await;
+        ctx.worker_registry.register(Arc::new(
+            BasicWorker::new(format!("{url}/"), WorkerType::Regular)
+                .with_worker_api_key(Some(Arc::from("worker-key"))),
+        ));
+        let load_probes = || {
+            requests
+                .borrow()
+                .iter()
+                .filter(|(path, _)| path.ends_with("get_load"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // The background monitor uses get_worker_load_static directly.
+        let slash_url = format!("{url}/");
+        assert_eq!(
+            Router::get_worker_load_static(&Client::new(), &slash_url, Some("worker-key")).await,
+            Some(7)
+        );
+        let loads = router.get_worker_loads().await;
+        let body = axum::body::to_bytes(loads.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["workers"][0]["load"], 7, "{payload}");
+        assert_eq!(
+            load_probes(),
+            [
+                ("/get_load".to_string(), StatusCode::OK),
+                ("/get_load".to_string(), StatusCode::OK)
+            ]
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_flush_cache_and_get_load_fail_without_matching_api_key() {
         use crate::config::RouterConfig;
 
