@@ -42,6 +42,14 @@ pub(crate) enum PageWriteError {
     InvalidResidencyMode,
 }
 
+/// Non-fatal observations from applying one event, regardless of its hash count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageWriteOutcome {
+    Applied,
+    DuplicateStore,
+    UnknownRemove,
+}
+
 /// Serializes one worker/rank across its cache groups.
 struct SourceLock {
     target: RoutableTarget,

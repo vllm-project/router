@@ -242,6 +242,12 @@ pub(super) struct LayoutWorkerProvider {
 }
 
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
+    fn hash_contract_failed(&self, rank: u32) -> bool {
+        self.indexes
+            .get(&rank)
+            .is_some_and(|index| index.hash_contract_failed(rank))
+    }
+
     fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
         self.indexes.get(&rank)?.shared_prefix_lookup(rank)
     }

@@ -1261,6 +1261,7 @@ impl KvAwarePolicy {
             if tokens.is_empty() {
                 return Vec::new();
             }
+            let start = binding.cache_key.as_ref().map(|_| Instant::now());
             let mut hits = binding.matches.matches_with_cache(
                 tokens,
                 binding.block_size,
@@ -1268,6 +1269,18 @@ impl KvAwarePolicy {
                 binding.target.dp_rank,
                 hashes,
             );
+            if let Some(start) = start {
+                crate::metrics::RouterMetrics::record_kv_index_lookup(
+                    !hits.is_empty(),
+                    start.elapsed(),
+                );
+                if hits.is_empty() {
+                    crate::metrics::RouterMetrics::record_kv_index_misses(
+                        binding.matches.hash_contract_failed(binding.target.dp_rank),
+                        1,
+                    );
+                }
+            }
             lookups.record(if binding.cache_key.is_none() {
                 "index_unavailable"
             } else if hits.is_empty() {
@@ -1662,6 +1675,7 @@ impl KvAwarePolicy {
             && lora_name.is_none()
             && credit_fallback.is_none()
         {
+            let start = Instant::now();
             prompts
                 .first()
                 .and_then(WorkerPrompts::single)
@@ -1683,18 +1697,25 @@ impl KvAwarePolicy {
                                     .is_some_and(|ids| std::ptr::eq(tokens, ids) || tokens == ids)
                         })
                 })
+                .map(|tokens| (tokens, start.elapsed()))
         } else {
             None
         };
-        if let Some(tokens) = shared_miss {
+        if let Some((tokens, elapsed)) = shared_miss {
             let size = bindings.len();
-            let count = input.eligibility.map_or(size, |_| {
-                healthy
-                    .iter()
-                    .filter(|&&i| input.allows_credit(i, workers.len()))
-                    .count()
-            });
-            lookups.record_count("miss", count as u64);
+            let mut count = 0;
+            let mut hash_failed = 0;
+            for (binding, &worker_index) in bindings.iter().zip(&healthy) {
+                if input.allows_credit(worker_index, workers.len()) {
+                    count += 1;
+                    hash_failed +=
+                        u64::from(binding.matches.hash_contract_failed(binding.target.dp_rank));
+                }
+            }
+            crate::metrics::RouterMetrics::record_kv_index_lookup(false, elapsed);
+            crate::metrics::RouterMetrics::record_kv_index_misses(true, hash_failed);
+            crate::metrics::RouterMetrics::record_kv_index_misses(false, count - hash_failed);
+            lookups.record_count("miss", count);
             return Some(SelectionPlan {
                 healthy,
                 bindings,
@@ -2548,6 +2569,91 @@ mod tests {
         let plan = plan(&inputs);
         assert!(plan.grouped[0].is_empty());
         assert!(!plan.grouped[1].is_empty());
+    }
+
+    #[test]
+    fn lookup_reports_only_the_rank_with_a_rejected_hash_contract() {
+        use crate::kv_index::{wire::ExternalBlockHash, SourceError};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let metrics = recorder.handle();
+        let policy = KvAwarePolicy::default();
+        let domain = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let indexes: Vec<_> = workers
+            .iter()
+            .map(|w| {
+                let target = target(w.url(), 0);
+                let index =
+                    Arc::new(full_binding(target.clone(), 16).with_shared_index(domain.clone()));
+                index.begin_empty(0);
+                policy.register_target_with_cache_identity(
+                    w.url(),
+                    target,
+                    CacheKey {
+                        model: "m".into(),
+                        block_size: 16,
+                    },
+                    index.clone(),
+                );
+                index
+            })
+            .collect();
+        let tokens = [42; 33];
+        let mut bad = full_store(&tokens[..16], 16, None);
+        bad.block_hashes[0] = ExternalBlockHash::Int(7);
+        assert_eq!(
+            indexes[0].apply_batch(0, &event_batch(vec![KVEvent::BlockStored(bad)])),
+            Err(SourceError::IntBlockHashes)
+        );
+        let lookup = |workers: &[Arc<dyn Worker>]| {
+            policy
+                .prepare_selection(
+                    workers,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(Some(&tokens)),
+                        eligibility: None,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap()
+                .grouped
+        };
+        // One shared query, with different evidence at the two ranks.
+        assert!(lookup(&workers).iter().all(Vec::is_empty));
+        // One direct query against the affected rank.
+        assert!(lookup(&workers[..1])[0].is_empty());
+        let text = metrics.render();
+        for line in [
+            r#"vllm_router_kv_index_requests_total{op="lookup",result="miss"} 2"#,
+            r#"vllm_router_kv_index_miss_reason_total{reason="hash_mismatch"} 2"#,
+            r#"vllm_router_kv_index_miss_reason_total{reason="no_match"} 1"#,
+            r#"vllm_router_kv_index_errors_total{kind="hash_contract"} 1"#,
+            r#"vllm_router_kv_index_request_duration_seconds_count{op="lookup"} 2"#,
+        ] {
+            assert!(
+                text.lines().any(|seen| seen == line),
+                "missing {line} in {text}"
+            );
+        }
+        assert!(!text.contains(r#"vllm_router_kv_index_requests_total{op="lookup",result="hit"}"#));
+        // A replay boundary alone cannot establish the publisher's hash representation.
+        indexes[0].begin_empty(0);
+        assert!(lookup(&workers[..1])[0].is_empty());
+        warm_full(&indexes[0], 0, &tokens[..32]);
+        assert!(!lookup(&workers[..1])[0].is_empty());
+        assert!(!indexes[0].hash_contract_failed(0));
+        let text = metrics.render();
+        assert!(
+            text.contains(r#"vllm_router_kv_index_miss_reason_total{reason="hash_mismatch"} 3"#)
+        );
+        assert!(text.contains(r#"vllm_router_kv_index_requests_total{op="lookup",result="hit"} 1"#));
     }
 
     #[test]

@@ -168,6 +168,10 @@ fn inferred_full_revokes_credit_on_an_incompatible_root_or_event_shape() {
             "{case}"
         );
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0, "{case}");
+        assert_eq!(
+            crate::policies::TieredMatchProvider::hash_contract_failed(&index, 0),
+            case == "root"
+        );
     }
 }
 

@@ -138,6 +138,7 @@ mod tests {
             &mut receiver,
             &mut pending,
             b"topic",
+            &super::super::liveness::SourceAge::new("test", 0),
         )
         .await
         .unwrap();
@@ -460,6 +461,7 @@ pub(super) async fn while_connected(
     sub: &mut ReadableSocket,
     pending: &mut PendingLive,
     topic: &[u8],
+    age: &super::liveness::SourceAge,
 ) -> io::Result<ReplayPoll> {
     tokio::pin!(replay);
     loop {
@@ -474,7 +476,7 @@ pub(super) async fn while_connected(
             }
             _ = tokio::time::sleep(Duration::from_millis(1)) => {
                 for _ in 0..64 {
-                    let frames = match sub.socket().recv_multipart(zmq::DONTWAIT) {
+                    let frames = match age.recv(sub.socket(), topic) {
                         Ok(frames) => frames,
                         Err(zmq::Error::EAGAIN) => break,
                         Err(error) => return Err(io::Error::other(error)),

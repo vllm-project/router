@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::storage::source_transaction::{StreamPhase, StreamState as State};
-use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError};
+use crate::kv_index::storage::{IndexBatch, PageChanges, PageWriteError, PageWriteOutcome};
 use crate::kv_index::wire::BlockStored;
 use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
+
+use crate::metrics::RouterMetrics;
 
 use super::validate::{publishes_int_hash, sequence_hash, validate_store};
 
@@ -41,6 +43,48 @@ pub(super) enum PreparedEvent<'a> {
     Clear,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum EventKind {
+    Stored,
+    Removed,
+    Cleared,
+}
+
+impl EventKind {
+    const ALL: [Self; 3] = [Self::Stored, Self::Removed, Self::Cleared];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Removed => "removed",
+            Self::Cleared => "cleared",
+        }
+    }
+}
+
+pub(super) struct Rejection {
+    cause: SourceError,
+    status: &'static str,
+}
+
+impl Rejection {
+    fn invalid(status: &'static str) -> Self {
+        Self {
+            cause: SourceError::InvalidBatch,
+            status,
+        }
+    }
+}
+
+impl From<SourceError> for Rejection {
+    fn from(cause: SourceError) -> Self {
+        Self {
+            cause,
+            status: "invalid_block",
+        }
+    }
+}
+
 impl PreparedEvent<'_> {
     pub(super) fn page_changes(events: &[Self], max_entries: usize) -> Option<PageChanges> {
         PageChanges::from_batches(
@@ -52,12 +96,20 @@ impl PreparedEvent<'_> {
         )
     }
 
+    fn kind(&self) -> EventKind {
+        match self {
+            Self::Store { .. } => EventKind::Stored,
+            Self::Remove { .. } => EventKind::Removed,
+            Self::Clear => EventKind::Cleared,
+        }
+    }
+
     fn apply(
         self,
         tx: &mut IndexBatch<'_>,
         owner: &ResidencyOwner,
         max_entries: usize,
-    ) -> Result<(), PageWriteError> {
+    ) -> Result<PageWriteOutcome, PageWriteError> {
         match self {
             Self::Store {
                 group,
@@ -83,7 +135,7 @@ impl PreparedEvent<'_> {
             } => tx.remove_hash_pages(owner, group, tier, &hashes, incremental),
             Self::Clear => {
                 tx.clear_owner_exact(owner);
-                Ok(())
+                Ok(PageWriteOutcome::Applied)
             }
         }
     }
@@ -127,7 +179,7 @@ impl SourceBinding {
     pub(super) fn prepare_batch<'a>(
         &self,
         batch: &'a KVEventBatch,
-    ) -> Result<Vec<PreparedEvent<'a>>, SourceError> {
+    ) -> Result<Vec<PreparedEvent<'a>>, (EventKind, Rejection)> {
         // MooncakeStoreConnector reports writes as CPU stores without a cache
         // spec kind. That event shape cannot establish worker-local residency.
         let events = batch.events.iter().filter(|event| {
@@ -137,53 +189,60 @@ impl SourceBinding {
         });
         let mut prepared = Vec::with_capacity(batch.events.len());
         for event in events {
+            let kind = match event {
+                KVEvent::BlockStored(_) => EventKind::Stored,
+                KVEvent::BlockRemoved(_) => EventKind::Removed,
+                KVEvent::AllBlocksCleared(_) => EventKind::Cleared,
+            };
             if publishes_int_hash(event) {
-                return Err(SourceError::IntBlockHashes);
+                return Err((kind, SourceError::IntBlockHashes.into()));
             }
-            match event {
-                KVEvent::BlockStored(store) => {
-                    if let Some(event) = self.prepare_store(store)? {
-                        prepared.push(event);
-                    }
-                }
-                KVEvent::BlockRemoved(remove) => {
-                    if remove.ownership.is_some() {
-                        continue;
-                    }
-                    let Some(tier) = tier_or_warn(remove.medium.as_deref()) else {
-                        continue;
-                    };
-                    // The wire decoder accepts an absent group for older publishers.
-                    // Admission requires a proven group before changing cache residency.
-                    if self.requires_root_proof && remove.group_idx != Some(0) {
-                        return Err(SourceError::InvalidBatch);
-                    }
-                    if remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
-                        || !self
-                            .groups
-                            .iter()
-                            .any(|group| remove.group_idx == Some(group.group_idx))
-                        || remove.block_hashes.is_empty()
-                    {
-                        return Err(SourceError::InvalidBatch);
-                    }
-                    let hashes = remove
-                        .block_hashes
-                        .iter()
-                        .map(sequence_hash)
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or(SourceError::InvalidBatch)?;
-                    prepared.push(PreparedEvent::Remove {
-                        group: remove.group_idx.expect("validated group"),
-                        tier,
-                        incremental: tier == StorageTier::Device,
-                        hashes,
-                    });
-                }
-                KVEvent::AllBlocksCleared(_) => prepared.push(PreparedEvent::Clear),
+            let next = match event {
+                KVEvent::BlockStored(store) => self.prepare_store(store),
+                KVEvent::BlockRemoved(remove) => self.prepare_remove(remove),
+                KVEvent::AllBlocksCleared(_) => Ok(Some(PreparedEvent::Clear)),
             }
+            .map_err(|error| (kind, error))?;
+            prepared.extend(next);
         }
         Ok(prepared)
+    }
+
+    fn prepare_remove(
+        &self,
+        remove: &super::wire::BlockRemoved,
+    ) -> Result<Option<PreparedEvent<'static>>, Rejection> {
+        if remove.ownership.is_some() {
+            return Ok(None);
+        }
+        let Some(tier) = tier_or_warn(remove.medium.as_deref()) else {
+            return Ok(None);
+        };
+        if (self.requires_root_proof && remove.group_idx != Some(0))
+            || !self
+                .groups
+                .iter()
+                .any(|group| remove.group_idx == Some(group.group_idx))
+        {
+            return Err(Rejection::invalid("unsupported_group"));
+        }
+        if remove.locality.as_deref().is_some_and(|s| s != "LOCAL")
+            || remove.block_hashes.is_empty()
+        {
+            return Err(SourceError::InvalidBatch.into());
+        }
+        let hashes = remove
+            .block_hashes
+            .iter()
+            .map(sequence_hash)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(SourceError::InvalidBatch)?;
+        Ok(Some(PreparedEvent::Remove {
+            group: remove.group_idx.expect("validated group"),
+            tier,
+            incremental: tier == StorageTier::Device,
+            hashes,
+        }))
     }
 
     /// The caller validates its lease in this same source transaction.
@@ -193,12 +252,15 @@ impl SourceBinding {
         tx: &mut IndexBatch<'_>,
         seq: u64,
         batch: &KVEventBatch,
-        prepared: Result<Vec<PreparedEvent<'_>>, SourceError>,
+        prepared: Result<Vec<PreparedEvent<'_>>, (EventKind, Rejection)>,
     ) -> Result<(), SourceError> {
         let Some(next_seq) = state.next_seq else {
             return Err(SourceError::Untrusted);
         };
         if seq != next_seq || seq == u64::MAX {
+            if seq < next_seq {
+                RouterMetrics::record_kv_event_warning("stale_sequence", 1);
+            }
             return Self::fail(state, tx, &self.owner, SourceError::Sequence);
         }
         // The vLLM publisher stamps every batch with its configured DP rank.
@@ -207,8 +269,23 @@ impl SourceBinding {
         }
         let prepared = match prepared {
             Ok(prepared) => prepared,
-            Err(error) => return Self::fail(state, tx, &self.owner, error),
+            Err((kind, rejection)) => {
+                if matches!(
+                    rejection.cause,
+                    SourceError::IntBlockHashes | SourceError::RootHashMismatch
+                ) {
+                    self.control
+                        .hash_contract_failed
+                        .store(true, Ordering::Relaxed);
+                    RouterMetrics::record_kv_hash_contract_error();
+                }
+                RouterMetrics::record_kv_events(kind.label(), rejection.status, 1);
+                return Self::fail(state, tx, &self.owner, rejection.cause);
+            }
         };
+        let mut accepted = [0_u64; 3];
+        let mut duplicate_stores = 0;
+        let mut unknown_removes = 0;
         let mut proved_root = false;
         for event in prepared {
             // Keep observations before the root proof under the same source
@@ -231,17 +308,51 @@ impl SourceBinding {
                     "verified default KV hash root"
                 );
             }
-            let clear = matches!(event, PreparedEvent::Clear);
-            if let Err(error) = event.apply(tx, &self.owner, self.max_entries) {
-                let error = match error {
-                    PageWriteError::Capacity => SourceError::Capacity,
-                    PageWriteError::InvalidResidencyMode => SourceError::InvalidBatch,
-                };
-                return Self::fail(state, tx, &self.owner, error);
+            let kind = event.kind();
+            match event.apply(tx, &self.owner, self.max_entries) {
+                Ok(PageWriteOutcome::Applied) => {}
+                Ok(PageWriteOutcome::DuplicateStore) => duplicate_stores += 1,
+                Ok(PageWriteOutcome::UnknownRemove) => unknown_removes += 1,
+                Err(error) => {
+                    let (error, status) = match error {
+                        PageWriteError::Capacity => {
+                            RouterMetrics::record_kv_event_warning("capacity_exhausted", 1);
+                            (SourceError::Capacity, "capacity_exhausted")
+                        }
+                        PageWriteError::InvalidResidencyMode => {
+                            (SourceError::InvalidBatch, "invalid_block")
+                        }
+                    };
+                    RouterMetrics::record_kv_events(kind.label(), status, 1);
+                    return Self::fail(state, tx, &self.owner, error);
+                }
             }
-            if clear {
+            accepted[kind as usize] += 1;
+            if matches!(kind, EventKind::Cleared) {
                 state.bump_generation();
             }
+        }
+        // A later rejection invalidates the whole batch, including earlier writes.
+        for (kind, n) in EventKind::ALL.into_iter().zip(accepted) {
+            if n > 0 {
+                RouterMetrics::record_kv_events(kind.label(), "ok", n);
+            }
+        }
+        for (kind, count) in [
+            ("duplicate_store", duplicate_stores),
+            ("unknown_remove", unknown_removes),
+        ] {
+            if count > 0 {
+                RouterMetrics::record_kv_event_warning(kind, count);
+            }
+        }
+        if accepted[EventKind::Stored as usize] > 0
+            && (!self.requires_root_proof || state.root_verified)
+            && self.control.hash_contract_failed.load(Ordering::Relaxed)
+        {
+            self.control
+                .hash_contract_failed
+                .store(false, Ordering::Relaxed);
         }
         state.next_seq = Some(seq + 1);
         if proved_root && state.phase == StreamPhase::Live && !state.visible() {
@@ -254,7 +365,7 @@ impl SourceBinding {
     fn prepare_store<'a>(
         &self,
         store: &'a BlockStored,
-    ) -> Result<Option<PreparedEvent<'a>>, SourceError> {
+    ) -> Result<Option<PreparedEvent<'a>>, Rejection> {
         let Some(tier) = tier_or_warn(store.medium.as_deref()) else {
             return Ok(None);
         };
@@ -266,22 +377,25 @@ impl SourceBinding {
         {
             return Ok(None);
         }
-        if self.requires_root_proof
-            && (store.group_idx != Some(0)
-                || store.kv_cache_spec_kind.as_deref() != Some("full_attention")
-                || store.kv_cache_spec_sliding_window.is_some()
-                || store.lookahead_token_ids.is_some()
-                || store.block_size as usize != self.keys.block_size())
-        {
-            return Err(SourceError::InvalidBatch);
-        }
         let group = self
             .groups
             .iter()
             .find(|group| store.group_idx == Some(group.group_idx))
-            .ok_or(SourceError::InvalidBatch)?;
-        if self.strict_event_block_size && store.block_size != group.block_size {
-            return Err(SourceError::InvalidBatch);
+            .ok_or_else(|| Rejection::invalid("unsupported_group"))?;
+        if self.requires_root_proof && store.group_idx != Some(0) {
+            return Err(Rejection::invalid("unsupported_group"));
+        }
+        if self.requires_root_proof && store.block_size as usize != self.keys.block_size()
+            || self.strict_event_block_size && store.block_size != group.block_size
+        {
+            return Err(Rejection::invalid("block_size_mismatch"));
+        }
+        if self.requires_root_proof
+            && (store.kv_cache_spec_kind.as_deref() != Some("full_attention")
+                || store.kv_cache_spec_sliding_window.is_some()
+                || store.lookahead_token_ids.is_some())
+        {
+            return Err(SourceError::InvalidBatch.into());
         }
         if !validate_store(
             group,
@@ -304,7 +418,7 @@ impl SourceBinding {
             && incremental
             && store.parent_block_hash.is_none();
         if proves_root && self.keys.plain_root_block(&store.token_ids).as_ref() != hashes.first() {
-            return Err(SourceError::RootHashMismatch);
+            return Err(SourceError::RootHashMismatch.into());
         }
         Ok(Some(PreparedEvent::Store {
             group: group.group_idx,
