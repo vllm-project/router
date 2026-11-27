@@ -12,9 +12,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_util::{Stream, StreamExt};
 use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -40,6 +42,16 @@ use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// SSE chunks queued between `GenerateStream` and the HTTP client.
+///
+/// The same depth the HTTP forwarder uses. It is a hand-off bound, not a
+/// process RSS cap. A client that keeps up finds a free slot immediately.
+const GRPC_SSE_QUEUE_CHUNKS: usize = 8;
+/// Emitted after the chunks that already fit, when the client stays connected
+/// and does not read within `request_timeout`. Not a normal token frame, and
+/// not `data: [DONE]`.
+const GRPC_SSE_STALL_ERROR: &str =
+    "data: {\"error\":\"gRPC stream stalled because the client stopped reading\"}\n\n";
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -183,13 +195,83 @@ impl GrpcStreamTask {
     }
 }
 
-fn send_stream_chunk(
-    tx: &mpsc::UnboundedSender<Result<String, std::io::Error>>,
+async fn send_stream_chunk(
+    tx: &mpsc::Sender<Result<String, std::io::Error>>,
     output: &mut OutputFrameProducer,
     chunk: String,
     has_generated_output: bool,
 ) -> bool {
-    output.send(tx, chunk, has_generated_output)
+    output
+        .send_bounded(tx, Ok(chunk), has_generated_output)
+        .await
+}
+
+enum Enqueue {
+    Queued,
+    Closed,
+    /// The client stayed connected and did not read within `request_timeout`.
+    /// The chunk was not queued. The body emits a stall error after the
+    /// chunks that already fit, instead of ending on this token.
+    Stalled,
+}
+
+/// Starts the client-stall timer. A concurrent P/D decode response is held
+/// inside the router until prefill returns, so the timer stays unarmed until
+/// that response is handed toward the client.
+#[derive(Clone)]
+pub(crate) struct ClientStallArm(watch::Sender<bool>);
+
+impl ClientStallArm {
+    pub(crate) fn arm(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+pub(crate) fn arm_client_stall(response: &Response) {
+    if let Some(arm) = response.extensions().get::<ClientStallArm>() {
+        arm.arm();
+    }
+}
+
+async fn enqueue_sse(
+    tx: &mpsc::Sender<Result<String, std::io::Error>>,
+    output: &mut OutputFrameProducer,
+    terminal: &watch::Sender<Option<String>>,
+    chunk: String,
+    has_generated_output: bool,
+    request_timeout: Duration,
+    stall_arm: &mut watch::Receiver<bool>,
+) -> Enqueue {
+    tokio::select! {
+        biased;
+        sent = send_stream_chunk(tx, output, chunk, has_generated_output) => {
+            if sent {
+                Enqueue::Queued
+            } else {
+                Enqueue::Closed
+            }
+        }
+        _ = client_stall(stall_arm, request_timeout) => {
+            terminal.send_replace(Some(GRPC_SSE_STALL_ERROR.to_string()));
+            Enqueue::Stalled
+        }
+    }
+}
+
+/// The stall timeout starts only after handoff. A dropped arm, from a held
+/// response that never reached the client, does not become a stall.
+async fn client_stall(arm: &mut watch::Receiver<bool>, request_timeout: Duration) {
+    if !*arm.borrow() && arm.wait_for(|armed| *armed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(request_timeout).await;
+}
+
+/// An upstream terminal error must not wait for a free SSE slot. A full queue
+/// would otherwise spend another `request_timeout` and replace this line with
+/// the client-stall error.
+fn publish_terminal(terminal: &watch::Sender<Option<String>>, line: String) {
+    terminal.send_replace(Some(line));
 }
 
 fn grpc_status_code(status: &tonic::Status) -> StatusCode {
@@ -544,11 +626,10 @@ fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Optio
     !aborted
 }
 
-async fn stream_openai(
-    mut stream: tonic::Streaming<super::pb::GenerateResponse>,
-    reply: ChatReply,
-    n_prompt_tokens: usize,
-) -> Response {
+async fn stream_openai<S>(mut stream: S, reply: ChatReply, n_prompt_tokens: usize) -> Response
+where
+    S: Stream<Item = Result<super::pb::GenerateResponse, tonic::Status>> + Unpin + Send + 'static,
+{
     let ChatReply {
         request_id,
         model,
@@ -570,10 +651,13 @@ async fn stream_openai(
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
-    let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
+    let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>(GRPC_SSE_QUEUE_CHUNKS);
+    let (terminal_tx, terminal_rx) = watch::channel(None::<String>);
     let (mut producer_output_frame, output_frame) = output_frame_tracking();
     let (failed_tx, failed_rx) = watch::channel(false);
+    let (stall_arm_tx, stall_arm_rx) = watch::channel(false);
     let producer = tokio::spawn(async move {
+        let mut stall_arm = stall_arm_rx;
         let finished = async {
             let mut detok = tok
                 .as_ref()
@@ -591,12 +675,10 @@ async fn stream_openai(
                         if let Some(observer) = &observer {
                             observer.record_error();
                         }
-                        let _ = send_stream_chunk(
-                            &tx,
-                            &mut producer_output_frame,
+                        publish_terminal(
+                            &terminal_tx,
                             "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
                                 .to_string(),
-                            false,
                         );
                         return false;
                     }
@@ -622,14 +704,12 @@ async fn stream_openai(
                                     if let Some(observer) = &observer {
                                         observer.record_error();
                                     }
-                                    let _ = send_stream_chunk(
-                                        &tx,
-                                        &mut producer_output_frame,
+                                    publish_terminal(
+                                        &terminal_tx,
                                         format!(
                                             "data: {{\"error\":{}}}\n\n",
                                             serde_json::to_string(&error).unwrap_or_default()
                                         ),
-                                        false,
                                     );
                                     return false;
                                 }
@@ -642,12 +722,21 @@ async fn stream_openai(
                             fill_engine_ms(&mut stages);
                             if stages_on {
                                 info!(%stages, "grpc generate stages");
-                                let _ = send_stream_chunk(
-                                    &tx,
-                                    &mut producer_output_frame,
-                                    format!(": router-stages {stages}\n\n"),
-                                    false,
-                                );
+                                if matches!(
+                                    enqueue_sse(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        &terminal_tx,
+                                        format!(": router-stages {stages}\n\n"),
+                                        false,
+                                        request_timeout,
+                                        &mut stall_arm,
+                                    )
+                                    .await,
+                                    Enqueue::Stalled
+                                ) {
+                                    return false;
+                                }
                             }
                             first_token_logged = true;
                         }
@@ -677,13 +766,20 @@ async fn stream_openai(
                                 finish.clone(),
                                 output_token_ids,
                             );
-                            if !send_stream_chunk(
-                                &tx,
-                                &mut producer_output_frame,
-                                line,
-                                generated_output,
+                            if !matches!(
+                                enqueue_sse(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    &terminal_tx,
+                                    line,
+                                    generated_output,
+                                    request_timeout,
+                                    &mut stall_arm,
+                                )
+                                .await,
+                                Enqueue::Queued
                             ) {
-                                break;
+                                return false;
                             }
                             first = false;
                         }
@@ -704,15 +800,37 @@ async fn stream_openai(
                                 };
                                 let line =
                                     sse_usage_chunk(shape, &request_id, &model, created, usage);
-                                let _ =
-                                    send_stream_chunk(&tx, &mut producer_output_frame, line, false);
+                                if matches!(
+                                    enqueue_sse(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        &terminal_tx,
+                                        line,
+                                        false,
+                                        request_timeout,
+                                        &mut stall_arm,
+                                    )
+                                    .await,
+                                    Enqueue::Stalled
+                                ) {
+                                    return false;
+                                }
                             }
-                            let _ = send_stream_chunk(
-                                &tx,
-                                &mut producer_output_frame,
-                                SSE_DONE.to_string(),
-                                false,
-                            );
+                            if matches!(
+                                enqueue_sse(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    &terminal_tx,
+                                    SSE_DONE.to_string(),
+                                    false,
+                                    request_timeout,
+                                    &mut stall_arm,
+                                )
+                                .await,
+                                Enqueue::Stalled
+                            ) {
+                                return false;
+                            }
                             return record_finish_outcome(observer.as_deref(), finish.as_deref());
                         }
                     }
@@ -720,14 +838,12 @@ async fn stream_openai(
                         if let Some(observer) = &observer {
                             observer.record_error();
                         }
-                        let _ = send_stream_chunk(
-                            &tx,
-                            &mut producer_output_frame,
+                        publish_terminal(
+                            &terminal_tx,
                             format!(
                                 "data: {{\"error\":{}}}\n\n",
                                 serde_json::to_string(status.message()).unwrap_or_default()
                             ),
-                            false,
                         );
                         return false;
                     }
@@ -736,11 +852,9 @@ async fn stream_openai(
             if let Some(observer) = &observer {
                 observer.record_error();
             }
-            let _ = send_stream_chunk(
-                &tx,
-                &mut producer_output_frame,
+            publish_terminal(
+                &terminal_tx,
                 "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
-                false,
             );
             false
         }
@@ -752,7 +866,11 @@ async fn stream_openai(
         }
     });
 
-    let body = Body::from_stream(UnboundedReceiverStream::new(rx));
+    let body = Body::from_stream(GrpcSseBody {
+        rx,
+        terminal: terminal_rx,
+        finished: false,
+    });
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -765,8 +883,43 @@ async fn stream_openai(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     response
         .extensions_mut()
+        .insert(ClientStallArm(stall_arm_tx));
+    response
+        .extensions_mut()
         .insert(GrpcStreamTask::with_output_frame(producer, output_frame).with_failure(failed_rx));
     response
+}
+
+/// Bounded SSE body. Chunks already queued are delivered first. If the
+/// producer stopped because the client was not reading, the stall error
+/// follows those chunks. The frame that was waiting for a slot is not
+/// emitted as a normal token, and the body does not end with `[DONE]`.
+struct GrpcSseBody {
+    rx: mpsc::Receiver<Result<String, std::io::Error>>,
+    terminal: watch::Receiver<Option<String>>,
+    finished: bool,
+}
+
+impl Stream for GrpcSseBody {
+    type Item = Result<String, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(None) => {
+                this.finished = true;
+                match this.terminal.borrow().clone() {
+                    Some(line) => Poll::Ready(Some(Ok(line))),
+                    None => Poll::Ready(None),
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 async fn collect_openai(
@@ -1002,7 +1155,10 @@ fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};
-    use std::sync::atomic::Ordering;
+    use futures_util::Stream;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
 
     #[test]
     fn prompt_info_does_not_count_as_generated_output() {
@@ -1063,34 +1219,261 @@ mod tests {
         assert_eq!(decode_started.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn output_frame_latches_to_the_first_generated_response() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+    #[tokio::test]
+    async fn output_frame_latches_to_the_first_generated_response() {
+        let (tx, _rx) = mpsc::channel(4);
         let (mut producer, mut consumer) = output_frame_tracking();
 
-        assert!(send_stream_chunk(
-            &tx,
-            &mut producer,
-            "prompt info".into(),
-            false,
-        ));
+        assert!(send_stream_chunk(&tx, &mut producer, "prompt info".into(), false).await);
         assert!(!consumer.on_frame());
 
-        assert!(send_stream_chunk(
-            &tx,
-            &mut producer,
-            "first token".into(),
-            true,
-        ));
+        assert!(send_stream_chunk(&tx, &mut producer, "first token".into(), true).await);
         assert!(consumer.on_frame());
 
-        assert!(send_stream_chunk(
-            &tx,
-            &mut producer,
-            "second token".into(),
-            true,
-        ));
+        assert!(send_stream_chunk(&tx, &mut producer, "second token".into(), true).await);
         assert!(consumer.on_frame());
+    }
+
+    fn token_frame(index: usize, last: bool) -> GenerateResponse {
+        use crate::backend::pb::finish_info::FinishReason;
+        use crate::backend::pb::FinishInfo;
+
+        let text = format!("tok-{index}");
+        GenerateResponse {
+            prompt_info: None,
+            outputs: Some(SequenceOutput {
+                index: 0,
+                text,
+                num_tokens: 1,
+                token_ids: vec![],
+                finish_info: last.then(|| FinishInfo {
+                    num_output_tokens: (index as u32) + 1,
+                    finish_reason: FinishReason::Stop as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Every `poll_next` is ready, so an unbounded reader would drain `total`
+    /// before the client touched the body.
+    struct ReadyFrames {
+        left: usize,
+        total: usize,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl Stream for ReadyFrames {
+        type Item = Result<GenerateResponse, tonic::Status>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.left == 0 {
+                return Poll::Ready(None);
+            }
+            let index = this.total - this.left;
+            this.left -= 1;
+            this.pulled.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Some(Ok(token_frame(index, this.left == 0))))
+        }
+    }
+
+    fn reply_for(timeout: Duration) -> ChatReply {
+        ChatReply {
+            request_id: "req".into(),
+            model: "m".into(),
+            created: 1,
+            tok: None,
+            prompt_ids: Arc::from([]),
+            skip_special: false,
+            prefer_worker_text: false,
+            include_usage: false,
+            shape: ResponseShape::Chat,
+            emit_token_ids: false,
+            request_timeout: timeout,
+            stages: serde_json::json!({}),
+            t_req: Instant::now(),
+            on_first_output: None,
+            fail_on_abort: false,
+            abort: EngineAbortGuard {
+                target: None,
+                timeout: Duration::from_secs(1),
+                answered: true,
+            },
+            observer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_client_stops_pulling_generate_stream() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 100;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        arm_client_stall(&response);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after_stall = pulled.load(Ordering::Relaxed);
+        assert_eq!(
+            after_stall, GRPC_SSE_QUEUE_CHUNKS + 1,
+            "a full queue of {GRPC_SSE_QUEUE_CHUNKS} plus the frame waiting for a slot; pulled {after_stall} of {total}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            pulled.load(Ordering::Relaxed),
+            after_stall,
+            "GenerateStream kept being polled after the hand-off stalled"
+        );
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn resumed_reader_sees_a_stall_error_after_buffered_frames() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 100;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        arm_client_stall(&response);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for index in 0..GRPC_SSE_QUEUE_CHUNKS {
+            assert!(
+                text.contains(&format!("tok-{index}")),
+                "missing buffered tok-{index} in {text}"
+            );
+        }
+        let last_buffered = text
+            .rfind(&format!("tok-{}", GRPC_SSE_QUEUE_CHUNKS - 1))
+            .expect("last buffered token");
+        let error_at = text
+            .find("gRPC stream stalled because the client stopped reading")
+            .expect("stall error");
+        assert!(
+            error_at > last_buffered,
+            "the stall error must follow the buffered frames"
+        );
+        assert!(
+            !text.contains(&format!("tok-{GRPC_SSE_QUEUE_CHUNKS}")),
+            "the frame that was waiting for a slot was emitted as a normal token: {text}"
+        );
+        assert!(!text.contains("[DONE]"), "{text}");
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
+    }
+
+    #[tokio::test]
+    async fn reading_the_body_receives_every_frame() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 20;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_secs(30)), 0).await;
+        arm_client_stall(&response);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for index in 0..total {
+            assert!(
+                text.contains(&format!("tok-{index}")),
+                "missing tok-{index} in {text}"
+            );
+        }
+        assert!(text.contains("[DONE]"), "{text}");
+        assert_eq!(pulled.load(Ordering::Relaxed), total);
+    }
+
+    #[tokio::test]
+    async fn held_response_does_not_stall_before_handoff() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let total = 100;
+        let stream = ReadyFrames {
+            left: total,
+            total,
+            pulled: pulled.clone(),
+        };
+        let response = stream_openai(stream, reply_for(Duration::from_millis(200)), 0).await;
+        let failed = response
+            .extensions()
+            .get::<GrpcStreamTask>()
+            .expect("stream task")
+            .failure();
+        tokio::pin!(failed);
+        tokio::select! {
+            _ = &mut failed => panic!("held decode failed before the response was returned"),
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        assert_eq!(pulled.load(Ordering::Relaxed), GRPC_SSE_QUEUE_CHUNKS + 1);
+        arm_client_stall(&response);
+        tokio::time::timeout(Duration::from_secs(2), failed)
+            .await
+            .expect("stall after handoff");
+    }
+
+    /// Eight ready frames fill the queue. The next pull stays pending, so
+    /// `GenerateStream` hits `request_timeout` with no free SSE slot.
+    struct FramesThenPending {
+        left: usize,
+        pulled: Arc<AtomicUsize>,
+    }
+
+    impl Stream for FramesThenPending {
+        type Item = Result<GenerateResponse, tonic::Status>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if this.left == 0 {
+                return Poll::Pending;
+            }
+            let index = GRPC_SSE_QUEUE_CHUNKS - this.left;
+            this.left -= 1;
+            this.pulled.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Some(Ok(token_frame(index, false))))
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_is_not_replaced_by_a_client_stall() {
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let stream = FramesThenPending {
+            left: GRPC_SSE_QUEUE_CHUNKS,
+            pulled: pulled.clone(),
+        };
+        let started = tokio::time::Instant::now();
+        let response = stream_openai(stream, reply_for(Duration::from_millis(400)), 0).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body");
+        let elapsed = started.elapsed();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "a full queue must not wait a second timeout, elapsed {elapsed:?}: {text}"
+        );
+        assert!(
+            text.contains("gRPC stream exceeded request timeout"),
+            "{text}"
+        );
+        assert!(!text.contains("stopped reading"), "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
+        for index in 0..GRPC_SSE_QUEUE_CHUNKS {
+            assert!(text.contains(&format!("tok-{index}")), "{text}");
+        }
     }
 
     #[test]

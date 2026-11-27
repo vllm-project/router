@@ -2416,6 +2416,8 @@ impl Router {
             if is_stream && response.status().is_success() {
                 response = hold_request_load_until_body_done(response, load);
             }
+            // The stall timer starts here, once the response leaves the router.
+            crate::backend::grpc::arm_client_stall(&response);
             return response;
         }
 

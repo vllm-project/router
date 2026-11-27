@@ -2801,6 +2801,8 @@ impl VllmPDRouter {
         } else {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
         }
+        // Sequential decode is returned as soon as it opens, so the client can read it.
+        crate::backend::grpc::arm_client_stall(&response);
         response
     }
 
@@ -2827,6 +2829,9 @@ impl VllmPDRouter {
             if prefill_failed {
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
             } else {
+                // This decode response is what the client receives. A held
+                // decode that is dropped with the prefill error stays unarmed.
+                crate::backend::grpc::arm_client_stall(&response);
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
             }
             RouterMetrics::record_pd_request(path);
@@ -2916,6 +2921,8 @@ impl VllmPDRouter {
         } else {
             RouterMetrics::record_pd_decode_error(&decode_base_url);
         }
+        // Prefill has finished, so the client can read the decode stream.
+        crate::backend::grpc::arm_client_stall(&response);
         response
     }
 
