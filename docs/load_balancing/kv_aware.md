@@ -311,9 +311,8 @@ Pass `--enable-scale-out` to vLLM for HTTP chat rendering.
 }
 ```
 
-- For colocated FP8 with five DFly tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, `tail_drop_groups` to `[]`, and `groups[1].block_size` to `16`.
+- For colocated FP8 with five DFly tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0` (also required for single-image HTTP chat Prefill scoring), `tail_drop_groups` to `[]`, and `groups[1].block_size` to `16`.
 - For NIXL P/D, use the Prefill worker URL and leave DFly disabled.
-- Single-image HTTP chat Prefill scoring requires `hash_lookahead_tokens: 0`.
 
 </details>
 
@@ -534,9 +533,8 @@ Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe
 }
 ```
 
-- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0`, and `tail_drop_groups` to `[]`.
+- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0` (also required for single-image HTTP chat Prefill scoring), and `tail_drop_groups` to `[]`.
 - For P/D, use the Prefill worker URL and set `--kv-connector mooncake-v2`.
-- Single-image HTTP chat Prefill scoring requires `hash_lookahead_tokens: 0`.
 
 </details>
 
