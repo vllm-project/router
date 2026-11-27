@@ -690,17 +690,23 @@ class RouterArgs:
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
-            if not self.service_discovery and not self.vllm_discovery_address:
+            if (
+                not self.enable_igw
+                and not self.service_discovery
+                and not self.vllm_discovery_address
+            ):
                 if not self.prefill_urls:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
 
-            # Warn about policy usage in PD mode
+            # Report which policy each PD stage uses
             if self.prefill_policy and self.decode_policy and self.policy:
-                logger.warning(
-                    "Both --prefill-policy and --decode-policy are specified. "
-                    "The main --policy flag will be ignored for PD mode."
+                logger.info(
+                    "Using stage-specific policies for PD mode: "
+                    f"prefill_policy='{self.prefill_policy}', "
+                    f"decode_policy='{self.decode_policy}'. "
+                    "The main --policy is used only where a stage override is absent."
                 )
             elif self.prefill_policy and not self.decode_policy and self.policy:
                 logger.info(

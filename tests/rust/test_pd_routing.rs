@@ -826,6 +826,7 @@ mod test_pd_routing {
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 program_scheduling: None,
                 enable_igw: false,
+                igw_pd_policies: None,
                 rate_limit_tokens_per_second: None,
                 connection_mode: ConnectionMode::Http,
                 history_backend: vllm_router_rs::config::HistoryBackend::Memory,

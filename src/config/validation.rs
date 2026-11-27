@@ -28,6 +28,11 @@ impl ConfigValidator {
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
+        if let Some(policies) = &config.igw_pd_policies {
+            for policy in policies.prefill.iter().chain(policies.decode.iter()) {
+                Self::validate_policy(policy)?;
+            }
+        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
@@ -995,6 +1000,29 @@ fn strictly_increasing_usize(values: &[usize]) -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn igw_stage_overrides_are_validated_like_the_main_policy() {
+        let invalid = Some(PolicyConfig::ConsistentHash { virtual_nodes: 0 });
+        for policies in [
+            IgwPdPolicies {
+                prefill: invalid.clone(),
+                decode: None,
+            },
+            IgwPdPolicies {
+                prefill: None,
+                decode: invalid.clone(),
+            },
+        ] {
+            let config = RouterConfig {
+                enable_igw: true,
+                igw_pd_policies: Some(policies),
+                ..Default::default()
+            };
+            let err = ConfigValidator::validate(&config).unwrap_err();
+            assert!(err.to_string().contains("virtual_nodes"), "{err}");
+        }
+    }
 
     #[test]
     fn session_affinity_ttl_is_optional_and_bounded() {

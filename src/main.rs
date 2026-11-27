@@ -498,7 +498,7 @@ impl CliArgs {
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode
         let mode = if self.enable_igw {
-            // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
+            // IGW keeps a regular placeholder; PD stage overrides are stored separately.
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
@@ -702,6 +702,12 @@ impl CliArgs {
                 endpoint: self.health_check_endpoint.clone(),
             },
             enable_igw: self.enable_igw,
+            igw_pd_policies: self
+                .enable_igw
+                .then(|| vllm_router_rs::config::IgwPdPolicies {
+                    prefill: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                    decode: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                }),
             rate_limit_tokens_per_second: None,
             history_backend: match self.history_backend.as_str() {
                 "none" => HistoryBackend::None,
@@ -988,6 +994,47 @@ mod tests {
             };
             assert_eq!(layout.ranks[0].publisher_topic.as_deref(), Some("boot-1"));
             assert_eq!(layout.ranks[0].groups[0].block_size, 16);
+        }
+    }
+
+    #[test]
+    fn igw_keeps_stage_overrides_and_program_defaults() {
+        // IGW hosts its PD router with or without --vllm-pd-disaggregation.
+        for pd_flag in [&["--vllm-pd-disaggregation"][..], &[]] {
+            let mut cli = vec![
+                "vllm-router",
+                "--enable-igw",
+                "--enable-program-scheduling",
+                "--policy",
+                "round_robin",
+                "--prefill-policy",
+                "cache_aware",
+                "--decode-policy",
+                "consistent_hash",
+            ];
+            cli.extend(pd_flag);
+            let args = CliArgs::try_parse_from(cli).unwrap();
+            let config = args.to_router_config(Vec::new()).unwrap();
+            assert!(matches!(
+                &config.mode,
+                RoutingMode::Regular { worker_urls } if worker_urls.is_empty()
+            ));
+            let policies = config.igw_pd_policies.as_ref().unwrap();
+            assert!(matches!(
+                policies.prefill,
+                Some(PolicyConfig::CacheAware { .. })
+            ));
+            assert!(matches!(
+                policies.decode,
+                Some(PolicyConfig::ConsistentHash { .. })
+            ));
+            assert!(config
+                .program_scheduling
+                .as_ref()
+                .unwrap()
+                .token_capacity_per_dp_rank
+                .is_none());
+            config.validate().unwrap();
         }
     }
 

@@ -9,6 +9,7 @@ import threading
 import time
 
 import pytest
+import requests
 
 from ..helpers.client import completion
 
@@ -368,3 +369,42 @@ def test_pd_program_scheduling_sticks_to_program(router_manager, mock_worker_man
     assert len(set(beta)) == 1, beta
     # program_round_robin assigns each new program to the next sorted target.
     assert alpha[0] != beta[0], (alpha, beta)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("pd_flag", [True, False])
+def test_igw_decode_policy_override_reaches_dynamic_workers(
+    router_manager, mock_worker_manager, pd_flag
+):
+    # IGW hosts a PD router for workers registered through POST /workers, with
+    # or without --vllm-pd-disaggregation. The main policy cycles the decode
+    # workers, so a session stays on one of them only when --decode-policy
+    # reaches that router.
+    mock_worker_manager.add_prefill(n=2)
+    mock_worker_manager.add_decode(n=3)
+    router = router_manager.start_router(
+        policy="round_robin",
+        vllm_pd_disaggregation=pd_flag,
+        decode_policy="consistent_hash",
+        extra={"enable_igw": True},
+    )
+    members = [(url, "prefill") for url, _ in mock_worker_manager.prefill_urls]
+    members += [(url, "decode") for url in mock_worker_manager.decode_urls]
+    for url, worker_type in members:
+        response = requests.post(
+            f"{router.url}/workers",
+            json={"url": url, "model_id": "test-model", "worker_type": worker_type},
+            timeout=10,
+        )
+        assert response.status_code == 200, response.text
+
+    workers = [
+        completion(
+            router.url,
+            f"turn {turn}",
+            extra={"session_params": {"session_id": "session-0"}},
+        )
+        for turn in range(12)
+    ]
+    assert set(workers) <= mock_worker_manager.decode_ids, workers
+    assert len(set(workers)) == 1, workers
