@@ -183,6 +183,11 @@ support, have verified reusable KV on device, and have no other pending or
 active Decode requests in the Router. Its estimated uncached prompt tokens must
 be at most `N` for every policy.
 
+The Router installs this hook at startup when `N` is positive. It runs after
+P/D admission and before Prefill dispatch. It can continue the current P/D
+attempt, return Decode's response, or release the attempt and request one fresh
+P/D admission after a typed refusal.
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--pd-prefill-bypass-max-ratio` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |

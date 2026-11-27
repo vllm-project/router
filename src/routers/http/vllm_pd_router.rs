@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 mod prefill_bypass;
-use prefill_bypass::PrefillEstimate;
+use prefill_bypass::{BeforePrefill, BypassOutcome, BypassTransport, PrefillBypass};
 pub use prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
@@ -117,7 +117,7 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
-    prefill_bypass: PdPrefillBypassConfig,
+    prefill_bypass: Option<PrefillBypass>,
     /// Startup-only bootstrap table keyed by port and transport base URL.
     /// Ranks sharing both keys use the engine IDs reported by that bootstrap.
     /// Runtime registration and per-request snapshots are tracked in #209.
@@ -127,6 +127,9 @@ pub struct VllmPDRouter {
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
     grpc_frontend: crate::backend::EngineFrontend,
 }
+
+/// An optional admission check under the same lock as Decode commitment.
+type DecodeCommitGuard<'a> = dyn Fn(&super::pd_types::Loads, &dyn Worker) -> bool + Sync + 'a;
 
 /// Everything the deferred decode commitment needs at dispatch time.
 ///
@@ -1406,7 +1409,7 @@ impl VllmPDRouter {
         request: &Value,
         headers: Option<&HeaderMap>,
         pin_to_provisional: bool,
-        bypass: Option<PrefillEstimate>,
+        guard: Option<&DecodeCommitGuard<'_>>,
     ) -> Result<Arc<dyn Worker>, (StatusCode, String)> {
         let decode_policy = self.policy_registry.get_decode_policy();
         // Rebuild the candidates: a worker removed while Prefill ran still
@@ -1496,23 +1499,9 @@ impl VllmPDRouter {
             route: &input.route,
             probe: false,
         };
-        let bypass_revision = bypass.and_then(|_| {
-            self.pd_router
-                .kv_state
-                .as_ref()?
-                .local_prefill_revision(candidates.first()?.as_ref())
-        });
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            if let Some(estimate) = bypass {
-                if bypass_revision != Some(estimate.worker_revision)
-                    || !self.prefill_bypass.load_allows(
-                        loads,
-                        attempt.prefill_endpoint(),
-                        &input.provisional_endpoint,
-                        0,
-                        estimate,
-                    )
-                {
+            if let Some(accept) = guard {
+                if !accept(loads, candidates.first()?.as_ref()) {
                     return None;
                 }
             }
@@ -1524,7 +1513,7 @@ impl VllmPDRouter {
             )
         });
         let Some(decision) = committed else {
-            if bypass.is_none() {
+            if guard.is_none() {
                 RouterMetrics::record_pd_decode_commit("empty");
             }
             return Err((
@@ -1978,7 +1967,7 @@ impl VllmPDRouter {
         } else {
             DecodePoolSource::Registry
         };
-        let mut allow_bypass = self.prefill_bypass.max_tokens > 0;
+        let mut bypass = self.prefill_bypass.as_ref();
         loop {
             let AdmittedPair {
                 prefill: prefill_worker,
@@ -2008,37 +1997,29 @@ impl VllmPDRouter {
                     None,
                 )
             });
-            if allow_bypass {
-                if let Some(worker) = self
-                    .prefill_bypass_target(
-                        &request,
-                        path,
-                        headers,
-                        &prefill_worker,
-                        &decode_worker,
-                        &attempt,
-                        commit.as_ref(),
-                        pool,
-                        None,
+            if let Some(plugin) = bypass {
+                match plugin
+                    .before_prefill(
+                        self,
+                        BeforePrefill {
+                            request: &request,
+                            path,
+                            headers,
+                            attempt: &attempt,
+                            prefill: &prefill_worker,
+                            decode: &decode_worker,
+                            commit: commit.as_ref(),
+                            pool,
+                            transport: BypassTransport::Http,
+                        },
                     )
                     .await
                 {
-                    match self
-                        .dispatch_http_local_prefill(
-                            &request,
-                            path,
-                            headers,
-                            worker.as_ref(),
-                            &attempt,
-                        )
-                        .await
-                    {
-                        Some(response) => return attempt.track_response(response),
-                        None => {
-                            attempt.release();
-                            allow_bypass = false;
-                            continue;
-                        }
+                    BypassOutcome::Split => {}
+                    BypassOutcome::Respond(response) => return response,
+                    BypassOutcome::ReadmitSplit => {
+                        bypass = None;
+                        continue;
                     }
                 }
             }
@@ -2281,7 +2262,7 @@ impl VllmPDRouter {
         workers: GrpcPdWorkers,
     ) -> Response {
         let mut workers = workers;
-        let mut allow_bypass = self.prefill_bypass.max_tokens > 0;
+        let mut bypass = self.prefill_bypass.as_ref();
         let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
         loop {
             let GrpcPdWorkers {
@@ -2331,39 +2312,37 @@ impl VllmPDRouter {
                     Some(router_prompts.clone()),
                 )
             });
-            if allow_bypass {
-                if let Some(worker) = self
-                    .prefill_bypass_target(
-                        &request_json,
-                        path,
-                        headers,
-                        &prefill_worker,
-                        &decode_worker,
-                        &attempt,
-                        commit.as_ref(),
-                        DecodePoolSource::Registry,
-                        Some(&router_prompts),
+            if let Some(plugin) = bypass {
+                match plugin
+                    .before_prefill(
+                        self,
+                        BeforePrefill {
+                            request: &request_json,
+                            path,
+                            headers,
+                            attempt: &attempt,
+                            prefill: &prefill_worker,
+                            decode: &decode_worker,
+                            commit: commit.as_ref(),
+                            pool: DecodePoolSource::Registry,
+                            transport: BypassTransport::Grpc {
+                                prepared: &prepared,
+                                prompts: &router_prompts,
+                            },
+                        },
                     )
                     .await
                 {
-                    if let Some(response) = self
-                        .dispatch_grpc_local_prefill(
-                            prepared.clone(),
-                            path,
-                            worker.as_ref(),
-                            &attempt,
-                        )
-                        .await
-                    {
-                        return attempt.track_response(response);
+                    BypassOutcome::Split => {}
+                    BypassOutcome::Respond(response) => return response,
+                    BypassOutcome::ReadmitSplit => {
+                        bypass = None;
+                        workers = match self.available_grpc_workers() {
+                            Ok(workers) => workers,
+                            Err(response) => return *response,
+                        };
+                        continue;
                     }
-                    attempt.release();
-                    allow_bypass = false;
-                    workers = match self.available_grpc_workers() {
-                        Ok(workers) => workers,
-                        Err(response) => return *response,
-                    };
-                    continue;
                 }
             }
             let response = self
@@ -3343,7 +3322,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                prefill_bypass: ctx.pd_prefill_bypass,
+                prefill_bypass: PrefillBypass::enabled(ctx.pd_prefill_bypass),
                 // No static prefills in discovery mode; this stays empty.
                 // Runtime Mooncake registration is tracked in #209.
                 mooncake_prefill_info: Arc::new(HashMap::new()),
@@ -3463,7 +3442,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                prefill_bypass: ctx.pd_prefill_bypass,
+                prefill_bypass: PrefillBypass::enabled(ctx.pd_prefill_bypass),
                 mooncake_prefill_info: Arc::new(mooncake_prefill_info),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,

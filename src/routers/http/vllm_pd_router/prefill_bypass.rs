@@ -18,7 +18,7 @@ pub enum PdPrefillBypassPolicy {
 }
 
 impl PdPrefillBypassPolicy {
-    pub(crate) fn uses_prefill_load(self) -> bool {
+    fn uses_prefill_load(self) -> bool {
         self != Self::ShortSuffix
     }
 }
@@ -93,7 +93,7 @@ impl PdPrefillBypassConfig {
 }
 
 impl PdPrefillBypassConfig {
-    pub(super) fn load_allows(
+    fn load_allows(
         self,
         loads: &Loads,
         prefill: &PdEndpoint,
@@ -126,18 +126,18 @@ const ERROR_CODE: &str = "local_prefill_limit_exceeded";
 const ERROR_HEADER: &str = "x-vllm-error-code";
 
 #[derive(Clone, Copy)]
-pub(super) struct PrefillEstimate {
-    pub prompt_tokens: usize,
-    pub remaining_tokens: usize,
-    pub worker_revision: u64,
+struct PrefillEstimate {
+    prompt_tokens: usize,
+    remaining_tokens: usize,
+    worker_revision: u64,
 }
 
 impl PrefillEstimate {
-    pub fn within_limit(self, limit: usize) -> bool {
+    fn within_limit(self, limit: usize) -> bool {
         limit > 0 && self.remaining_tokens < self.prompt_tokens && self.remaining_tokens <= limit
     }
 
-    pub fn allows(self, config: &PdPrefillBypassConfig, other_prefills: Option<usize>) -> bool {
+    fn allows(self, config: &PdPrefillBypassConfig, other_prefills: Option<usize>) -> bool {
         if !self.within_limit(config.max_tokens) {
             return false;
         }
@@ -255,9 +255,83 @@ fn grpc_rejected(status: &tonic::Status) -> bool {
             == Some(ERROR_CODE)
 }
 
-impl VllmPDRouter {
-    pub(super) async fn dispatch_grpc_local_prefill(
+/// Optional hook installed by the native P/D router at startup.
+#[derive(Debug)]
+pub(super) struct PrefillBypass {
+    config: PdPrefillBypassConfig,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BypassTransport<'a> {
+    Http,
+    Grpc {
+        prepared: &'a crate::backend::PreparedRequest,
+        prompts: &'a Arc<[Vec<u32>]>,
+    },
+}
+
+pub(super) struct BeforePrefill<'a> {
+    pub request: &'a Value,
+    pub path: &'a str,
+    pub headers: Option<&'a HeaderMap>,
+    pub prefill: &'a Arc<dyn Worker>,
+    pub decode: &'a Arc<dyn Worker>,
+    pub attempt: &'a PdAttempt,
+    pub commit: Option<&'a DecodeCommitInput>,
+    pub pool: DecodePoolSource,
+    pub transport: BypassTransport<'a>,
+}
+
+pub(super) enum BypassOutcome {
+    /// The admitted attempt can run the existing split path.
+    Split,
+    /// The hook dispatched Decode and owns response tracking.
+    Respond(Response),
+    /// The hook released its attempt after a pre-generation refusal.
+    ReadmitSplit,
+}
+
+impl PrefillBypass {
+    pub(super) fn enabled(config: PdPrefillBypassConfig) -> Option<Self> {
+        (config.max_tokens > 0).then_some(Self { config })
+    }
+
+    /// Runs at most once for a client request, just before Prefill dispatch.
+    pub(super) async fn before_prefill(
         &self,
+        router: &VllmPDRouter,
+        input: BeforePrefill<'_>,
+    ) -> BypassOutcome {
+        let Some(worker) = self.target(router, &input).await else {
+            return BypassOutcome::Split;
+        };
+        let response = match input.transport {
+            BypassTransport::Http => self.dispatch_http(router, &input, worker.as_ref()).await,
+            BypassTransport::Grpc { prepared, .. } => {
+                self.dispatch_grpc(
+                    router,
+                    prepared.clone(),
+                    input.path,
+                    worker.as_ref(),
+                    input.attempt,
+                )
+                .await
+            }
+        };
+        match response {
+            Some(response) => {
+                BypassOutcome::Respond(input.attempt.clone().track_response(response))
+            }
+            None => {
+                input.attempt.release();
+                BypassOutcome::ReadmitSplit
+            }
+        }
+    }
+
+    async fn dispatch_grpc(
+        &self,
+        router: &VllmPDRouter,
         prepared: crate::backend::PreparedRequest,
         path: &str,
         worker: &dyn Worker,
@@ -266,13 +340,13 @@ impl VllmPDRouter {
         let start = Instant::now();
         attempt.finish_prefill();
         attempt.begin_decode();
-        let response = self
+        let response = router
             .grpc_frontend
             .dispatch_decode(
                 worker.url(),
                 prepared,
                 Uuid::new_v4().to_string(),
-                Some(local_params(self.prefill_bypass.max_tokens)),
+                Some(local_params(self.config.max_tokens)),
             )
             .await;
         RouterMetrics::record_pd_decode_request(worker.base_url());
@@ -294,31 +368,37 @@ impl VllmPDRouter {
         Some(response)
     }
 
-    /// Check the admitted Decode rank before dispatching Prefill.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prefill_bypass_target(
+    async fn target(
         &self,
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
-        prefill: &Arc<dyn Worker>,
-        decode: &Arc<dyn Worker>,
-        attempt: &PdAttempt,
-        commit: Option<&DecodeCommitInput>,
-        pool: DecodePoolSource,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
+        router: &VllmPDRouter,
+        input: &BeforePrefill<'_>,
     ) -> Option<Arc<dyn Worker>> {
-        if !matches!(self.kv_connector, KvConnector::Nixl)
-            || self.epd.is_some()
+        let BeforePrefill {
+            request,
+            path,
+            headers,
+            prefill,
+            decode,
+            attempt,
+            commit,
+            pool,
+            transport,
+        } = *input;
+        let router_prompts = match transport {
+            BypassTransport::Http => None,
+            BypassTransport::Grpc { prompts, .. } => Some(prompts),
+        };
+        if !matches!(router.kv_connector, KvConnector::Nixl)
+            || router.epd.is_some()
             || !eligible_request(path, request)
-            || self
+            || router
                 .get_nixl_push_identity(prefill.base_url(), prefill.dp_rank())
                 .is_some()
         {
             return None;
         }
-        let state = self.pd_router.kv_state.as_ref()?;
-        let policy = self.policy_registry.get_decode_policy();
+        let state = router.pd_router.kv_state.as_ref()?;
+        let policy = router.policy_registry.get_decode_policy();
         let estimate = prepare_estimate(
             state,
             decode.as_ref(),
@@ -329,18 +409,28 @@ impl VllmPDRouter {
             router_prompts,
         )
         .await?;
-        if !estimate.within_limit(self.prefill_bypass.max_tokens) {
+        if !estimate.within_limit(self.config.max_tokens) {
             return None;
         }
         if let Some(commit) = commit {
-            return self
-                .select_and_commit_decode(attempt, commit, request, headers, true, Some(estimate))
+            let accept = |loads: &Loads, worker: &dyn Worker| {
+                state.local_prefill_revision(worker) == Some(estimate.worker_revision)
+                    && self.config.load_allows(
+                        loads,
+                        attempt.prefill_endpoint(),
+                        &commit.provisional_endpoint,
+                        0,
+                        estimate,
+                    )
+            };
+            return router
+                .select_and_commit_decode(attempt, commit, request, headers, true, Some(&accept))
                 .await
                 .ok();
         }
         let endpoint = PdEndpoint::for_worker(decode.as_ref());
-        let mut live = self.live_decode_candidates(pool);
-        Self::retain_commit_candidates(
+        let mut live = router.live_decode_candidates(pool);
+        VllmPDRouter::retain_commit_candidates(
             &mut live,
             request.get("model").and_then(Value::as_str),
             Some(&endpoint),
@@ -351,31 +441,31 @@ impl VllmPDRouter {
         })?;
         attempt
             .check_reserved_decode(&endpoint, |loads| {
-                self.prefill_bypass.load_allows(
-                    loads,
-                    attempt.prefill_endpoint(),
-                    &endpoint,
-                    1,
-                    estimate,
-                )
+                self.config
+                    .load_allows(loads, attempt.prefill_endpoint(), &endpoint, 1, estimate)
             })
             .then_some(worker)
     }
 
     /// None is reserved for a typed refusal before generation.
-    pub(super) async fn dispatch_http_local_prefill(
+    async fn dispatch_http(
         &self,
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
+        router: &VllmPDRouter,
+        input: &BeforePrefill<'_>,
         worker: &dyn Worker,
-        attempt: &PdAttempt,
     ) -> Option<Response> {
+        let BeforePrefill {
+            request,
+            path,
+            headers,
+            attempt,
+            ..
+        } = *input;
         let start = Instant::now();
         let url = worker.endpoint_url(path);
         let mut request = request.clone();
-        request["kv_transfer_params"] = local_params(self.prefill_bypass.max_tokens);
-        let builder = self
+        request["kv_transfer_params"] = local_params(self.config.max_tokens);
+        let builder = router
             .pd_router
             .client
             .post(&url)
