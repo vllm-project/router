@@ -534,6 +534,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
+        request_metrics::begin_preprocess();
         let response = next.run(request).await;
 
         // Return the token to the bucket
@@ -568,6 +569,7 @@ pub async fn concurrency_limit_middleware(
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
                             request_metrics::phase(Phase::Routing);
+                            request_metrics::begin_preprocess();
                             // Dequeue for embeddings
                             if is_embeddings {
                                 let new_val =

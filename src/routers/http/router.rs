@@ -2,7 +2,7 @@ use super::completion_route::{prepare_completion_route, reject_full_report, Comp
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
-use super::request_metrics::{self, Phase, ProducerEvidence};
+use super::request_metrics::{self, Phase, ProducerEvidence, Stage};
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{
     http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
@@ -1916,6 +1916,8 @@ impl Router {
             _ => None,
         };
 
+        request_metrics::end_preprocess();
+
         // Build the token fact once per request, not per retry attempt. Only
         // request extra Engine usage when there is an actual fact to verify;
         // failed optional preparation must leave the HTTP stream untouched.
@@ -2009,6 +2011,7 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |attempt: u32| async move {
+                let routing_stage = request_metrics::stage(Stage::Route);
                 // Each backend attempt is a fresh scheduling arrival. The
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
@@ -2181,6 +2184,7 @@ impl Router {
                     };
                     debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
+                drop(routing_stage);
                 if is_http {
                     request_metrics::worker(worker.as_ref());
                     request_metrics::phase(Phase::Decode);
@@ -2226,7 +2230,7 @@ impl Router {
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
-                request_metrics::phase(Phase::Routing);
+                request_metrics::retrying();
                 RouterMetrics::record_retry(route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
             },
@@ -2552,6 +2556,9 @@ impl Router {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !status.is_success() {
+            request_metrics::upstream_terminal();
+        }
         let http_ttfb_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
         if strip_usage
@@ -3648,6 +3655,9 @@ impl RouterTrait for Router {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
         let start = Instant::now();
 
+        request_metrics::end_preprocess();
+        let routing_stage = request_metrics::stage(Stage::Route);
+
         // Select a worker (filter by availability like select_worker_for_model)
         let model_id = body.get("model").and_then(serde_json::Value::as_str);
         let routing_model = model_id.filter(|model| self.worker_registry.has_model(model));
@@ -3841,6 +3851,7 @@ impl RouterTrait for Router {
             )
                 .into_response();
         };
+        drop(routing_stage);
         if crate::backend::is_grpc_url(worker.url()) {
             request_metrics::disable();
         } else {
@@ -3951,6 +3962,9 @@ impl RouterTrait for Router {
         {
             Ok(response) => {
                 let status = response.status();
+                if !status.is_success() {
+                    request_metrics::upstream_terminal();
+                }
                 // Keep the circuit breaker informed, as the typed path does:
                 // 2xx/4xx count as success, 5xx as worker failure.
                 let was_available = worker.is_available();

@@ -12,12 +12,12 @@ use std::{
 
 use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use metrics::{counter, gauge, Gauge};
+use metrics::{counter, gauge, histogram, Gauge};
 use parking_lot::Mutex;
 
 use crate::{config::types::RoutingMode, core::Worker, server::AppState};
 
-use super::response_metrics::{Observer, Usage};
+use super::response_metrics::{Observer, SseBatch, Usage};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Phase {
@@ -47,14 +47,153 @@ struct RequestState {
     cancelled: bool,
     stream: bool,
     echo: bool,
+    preprocess: Option<StageTimer>,
+    handoff_pending: bool,
 }
 
 tokio::task_local! {
     static REQUEST: Arc<Mutex<RequestState>>;
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Stage {
+    Preprocess,
+    Route,
+    PrefillDispatch,
+    DecodeDispatch,
+}
+
+impl Stage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preprocess => "preprocess",
+            Self::Route => "route",
+            Self::PrefillDispatch => "prefill_dispatch",
+            Self::DecodeDispatch => "decode_dispatch",
+        }
+    }
+}
+
+pub(super) struct StageTimer(Stage, Instant, Gauge);
+
+impl StageTimer {
+    fn new(stage: Stage) -> Self {
+        let gauge = gauge!("vllm_router_stage_requests", "stage" => stage.label());
+        gauge.increment(1);
+        Self(stage, Instant::now(), gauge)
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        self.2.decrement(1);
+        histogram!("vllm_router_stage_duration_seconds", "stage" => self.0.label())
+            .record(self.1.elapsed().as_secs_f64());
+    }
+}
+
+pub(super) fn active() -> bool {
+    REQUEST
+        .try_with(|request| request.lock().model.is_some())
+        .unwrap_or(false)
+}
+
+pub(super) fn stage(stage: Stage) -> Option<StageTimer> {
+    active().then(|| StageTimer::new(stage))
+}
+
+pub(crate) fn begin_preprocess() {
+    let _ = REQUEST.try_with(|request| {
+        let mut state = request.lock();
+        if state.model.is_some() {
+            state.preprocess = Some(StageTimer::new(Stage::Preprocess));
+        }
+    });
+}
+
+pub(super) fn end_preprocess() {
+    let _ = REQUEST.try_with(|request| request.lock().preprocess.take());
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Handoff {
+    Ok,
+    Rejected,
+    Timeout,
+    Failed,
+}
+
+impl Handoff {
+    fn record(self) {
+        let result = match self {
+            Self::Ok => "ok",
+            Self::Rejected => "rejected",
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        };
+        counter!("vllm_router_pd_handoff_total", "result" => result).increment(1);
+    }
+
+    pub(super) fn observed(self) {
+        if active() {
+            self.record();
+        }
+    }
+
+    pub(super) fn http_failure(status: http::StatusCode) {
+        if !status.is_success() {
+            if matches!(
+                status,
+                http::StatusCode::REQUEST_TIMEOUT | http::StatusCode::GATEWAY_TIMEOUT
+            ) {
+                Self::Timeout
+            } else if status.is_client_error() {
+                Self::Rejected
+            } else {
+                Self::Failed
+            }
+            .observed();
+        }
+    }
+
+    pub(super) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut source = Some(error);
+        while let Some(error) = source {
+            if error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+            {
+                return Self::Timeout;
+            }
+            source = error.source();
+        }
+        Self::Failed
+    }
+
+    pub(super) fn pending(verified_envelope: bool) {
+        let _ = REQUEST.try_with(|request| request.lock().handoff_pending = verified_envelope);
+    }
+
+    pub(super) fn body_failure(error: &(dyn std::error::Error + 'static)) {
+        let _ = REQUEST.try_with(|request| request.lock().handoff_pending = false);
+        Self::from_error(error).observed();
+    }
+}
+
 pub(crate) fn phase(phase: Phase) {
     let _ = REQUEST.try_with(|request| request.lock().phase = phase);
+}
+
+pub(super) fn upstream_terminal() {
+    let _ = REQUEST.try_with(|request| request.lock().cancelled = false);
+}
+
+pub(super) fn retrying() {
+    let _ = REQUEST.try_with(|request| {
+        let mut state = request.lock();
+        state.phase = Phase::Routing;
+        state.cancelled = true;
+    });
 }
 
 pub(super) fn prefill_pending(pending: bool) {
@@ -82,11 +221,7 @@ struct ProducerState {
 
 impl ProducerEvidence {
     pub(super) fn current() -> Option<Self> {
-        REQUEST
-            .try_with(|state| state.lock().model.is_some())
-            .ok()
-            .filter(|enabled| *enabled)
-            .map(|_| Self::default())
+        active().then(Self::default)
     }
 
     pub(super) fn fail(evidence: Option<&Self>) {
@@ -139,7 +274,18 @@ pub(crate) fn enabled(app: &AppState, request: &Request) -> bool {
     if config.epd.is_some() {
         return false;
     }
-    let grpc = |url: &str| crate::backend::is_grpc_url(url);
+    let grpc = crate::backend::is_grpc_url;
+    // A discovery-only gRPC pool has no startup URLs. Detect it here as
+    // well, before entering the HTTP admission queue.
+    if config.mode.worker_count() == 0
+        && !app
+            .context
+            .worker_registry
+            .get_by_connection(&crate::core::ConnectionMode::Grpc)
+            .is_empty()
+    {
+        return false;
+    }
     match &config.mode {
         RoutingMode::Regular { worker_urls } => !worker_urls.iter().any(|url| grpc(url)),
         RoutingMode::VllmPrefillDecode {
@@ -178,13 +324,21 @@ pub(crate) async fn measure(request: Request, next: Next) -> Response {
         cancelled: true,
         stream: false,
         echo: false,
+        preprocess: None,
+        handoff_pending: false,
     }));
     let guard = RequestGuard(state.clone());
     let response = REQUEST.scope(state.clone(), next.run(request)).await;
     let (mut parts, body) = response.into_parts();
-    let (is_stream, echo, enabled) = {
-        let state = state.lock();
-        (state.stream, state.echo, state.model.is_some())
+    let (is_stream, echo, enabled, handoff_pending) = {
+        let mut state = state.lock();
+        state.preprocess.take();
+        (
+            state.stream,
+            state.echo,
+            state.model.is_some(),
+            state.handoff_pending,
+        )
     };
     if !enabled || body.is_end_stream() || (!parts.status.is_success() && !is_stream) {
         guard.complete();
@@ -221,7 +375,15 @@ pub(crate) async fn measure(request: Request, next: Next) -> Response {
     let observer = (parts.status.is_success() && identity && (sse || json))
         .then(|| Observer::new(route, sse, echo))
         .flatten();
+    // Hyper may stop polling once an explicit Content-Length is written.
+    // A wrapped stream without an exact size hint needs its terminal poll
+    // for usage/handoff settlement and for any inner Program body observer.
+    // Leave exact-size, already-buffered bodies and their headers unchanged.
+    if body.size_hint().exact().is_none() {
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+    }
     let evidence = parts.extensions.remove::<ProducerEvidence>();
+    let sse_batch = parts.extensions.remove::<SseBatch>();
     Response::from_parts(
         parts,
         Body::new(MeasuredBody {
@@ -231,6 +393,8 @@ pub(crate) async fn measure(request: Request, next: Next) -> Response {
             started,
             route,
             evidence,
+            handoff_pending,
+            sse_batch,
         }),
     )
 }
@@ -274,6 +438,8 @@ struct MeasuredBody {
     started: Instant,
     route: &'static str,
     evidence: Option<ProducerEvidence>,
+    handoff_pending: bool,
+    sse_batch: Option<SseBatch>,
 }
 
 impl HttpBody for MeasuredBody {
@@ -289,7 +455,12 @@ impl HttpBody for MeasuredBody {
         if let Poll::Ready(frame) = &result {
             if let (Some(Ok(frame)), Some(observer)) = (frame, &mut this.observer) {
                 if let Some(bytes) = frame.data_ref() {
-                    observer.observe(bytes, this.started, Instant::now());
+                    observer.observe(
+                        bytes,
+                        this.started,
+                        Instant::now(),
+                        this.sse_batch.as_ref().is_some_and(SseBatch::is_coalesced),
+                    );
                 }
                 if observer.terminal() {
                     if let Some(guard) = &this.guard {
@@ -305,12 +476,27 @@ impl HttpBody for MeasuredBody {
                 }
             }
             if frame.as_ref().is_none_or(Result::is_err) || this.body.is_end_stream() {
+                if let Some(Err(error)) = frame {
+                    if std::mem::take(&mut this.handoff_pending) {
+                        Handoff::from_error(error).record();
+                    }
+                }
                 if let Some(observer) = this.observer.take().filter(|_| !failed) {
                     let usage = this
                         .evidence
                         .as_ref()
                         .and_then(|evidence| *evidence.0.usage.lock());
-                    observer.finish(this.route, usage);
+                    let observed = observer.finish(this.route, usage);
+                    if std::mem::take(&mut this.handoff_pending) {
+                        if let Some(success) = observed {
+                            if success {
+                                Handoff::Ok
+                            } else {
+                                Handoff::Failed
+                            }
+                            .record();
+                        }
+                    }
                 }
                 if let Some(guard) = this.guard.take() {
                     guard.complete();

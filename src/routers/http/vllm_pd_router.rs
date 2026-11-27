@@ -1,4 +1,4 @@
-use super::request_metrics::{self, Phase};
+use super::request_metrics::{self, Handoff, Phase, Stage};
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::completion_route::reject_full_report;
@@ -253,14 +253,23 @@ const MAX_JSON_REWRITE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Prefill control metadata must fit in the buffer; Decode may stream the rest.
 async fn read_prefill_body(response: reqwest::Response, url: &str) -> Result<Bytes, PDRouterError> {
+    let successful_status = response.status().is_success();
     match read_response_body(response, PD_BUFFERED_BODY_LIMIT_BYTES)
         .await
-        .map_err(|error| PDRouterError::NetworkError {
-            message: format!("Failed to read response body from {url}: {error}"),
+        .map_err(|error| {
+            if successful_status {
+                Handoff::from_error(&error).observed();
+            }
+            PDRouterError::NetworkError {
+                message: format!("Failed to read response body from {url}: {error}"),
+            }
         })? {
         ResponseBody::Buffered(body) => Ok(body),
         ResponseBody::Passthrough(_) => {
             RouterMetrics::record_pd_body_over_limit("prefill");
+            if successful_status {
+                Handoff::Failed.observed();
+            }
             Err(PDRouterError::NetworkError {
                 message: format!(
                     "Response body from {url} exceeds the {} MiB router buffer limit",
@@ -380,11 +389,16 @@ fn finalize_decode_stream(
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
     let stream = decode_response.bytes_stream();
-    let body = if status.is_success()
-        && pd_cached_tokens::is_supported_path(path)
-        && is_sse
-        && !is_encoded
-    {
+    let rewrite =
+        status.is_success() && pd_cached_tokens::is_supported_path(path) && is_sse && !is_encoded;
+    let batch =
+        (rewrite && request_metrics::active()).then(super::response_metrics::SseBatch::default);
+    let body = if rewrite {
+        use futures_util::future::Either;
+        let stream = match &batch {
+            Some(batch) => Either::Left(batch.track(stream)),
+            None => Either::Right(stream),
+        };
         Body::from_stream(pd_cached_tokens::rewrite_sse_stream(
             stream,
             pd_cached_tokens::prefill_cached_tokens(prefill_response_json),
@@ -393,7 +407,11 @@ fn finalize_decode_stream(
     } else {
         Body::from_stream(stream)
     };
-    response_with_body(status, &headers, body)
+    let mut response = response_with_body(status, &headers, body)?;
+    if let Some(batch) = batch {
+        response.extensions_mut().insert(batch);
+    }
+    Ok(response)
 }
 
 fn response_is_encoded(headers: &HeaderMap) -> bool {
@@ -1556,6 +1574,8 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
     ) -> Option<Response> {
         let runtime = self.program_runtime.as_ref()?;
+        request_metrics::end_preprocess();
+        let routing_stage = request_metrics::stage(Stage::Route);
         request_metrics::echo(
             request
                 .get("echo")
@@ -1626,6 +1646,7 @@ impl VllmPDRouter {
         // the same request inputs as the cold path (prompt text or cache routing
         // key, plus headers), so hash and cache-aware policies keep their
         // affinity on the warm path too.
+        drop(routing_stage);
         let mut selected = None;
         if let Some(warm_remote) = &runtime.warm_remote {
             // The warm-remote protocol has no discovery incarnation fence, and
@@ -1637,9 +1658,11 @@ impl VllmPDRouter {
                     .iter()
                     .map(|(_, worker)| worker.clone())
                     .collect::<Vec<_>>();
-                if let Some(index) =
+                let index = {
+                    let _routing_stage = request_metrics::stage(Stage::Route);
                     self.select_program_prefill_index(&prefill_workers, &request, path, headers)
-                {
+                };
+                if let Some(index) = index {
                     // The target and the worker it charges travel together, so
                     // execute() derives both from the same index.
                     let prefills = prefill_candidates
@@ -1690,6 +1713,7 @@ impl VllmPDRouter {
                 }
             }
         }
+        let routing_stage = request_metrics::stage(Stage::Route);
         let Some((prefill_id, prefill_worker)) = selected
             .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
         else {
@@ -1699,6 +1723,7 @@ impl VllmPDRouter {
                 "No feasible registered P/D pair",
             ));
         };
+        drop(routing_stage);
         let permit = match runtime.reserve_prefill(&prefill_id).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -1932,6 +1957,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
+        let routing_stage = request_metrics::stage(Stage::Route);
         let (
             prefill_worker,
             decode_worker,
@@ -1952,6 +1978,7 @@ impl VllmPDRouter {
                 return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
             }
         };
+        drop(routing_stage);
         request_metrics::worker(decode_worker.as_ref());
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
@@ -1992,12 +2019,22 @@ impl VllmPDRouter {
         attempt: &PdAttempt,
     ) -> Result<(StatusCode, Option<http::HeaderValue>, Bytes), PDRouterError> {
         let result = async {
-            let response = response.map_err(|error| PDRouterError::NetworkError {
-                message: format!("Prefill request to {base} failed: {}", error_chain(&error)),
+            let response = response.map_err(|error| {
+                request_metrics::upstream_terminal();
+                Handoff::from_error(&error).observed();
+                PDRouterError::NetworkError {
+                    message: format!("Prefill request to {base} failed: {}", error_chain(&error)),
+                }
             })?;
             let status = response.status();
+            Handoff::http_failure(status);
+            if !status.is_success() {
+                request_metrics::upstream_terminal();
+            }
             let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
-            let bytes = read_prefill_body(response, base).await?;
+            let bytes = read_prefill_body(response, base)
+                .await
+                .inspect_err(|_| request_metrics::upstream_terminal())?;
             Ok((status, content_type, bytes))
         }
         .await;
@@ -2024,6 +2061,10 @@ impl VllmPDRouter {
             start_time,
             request,
         } = context;
+        Handoff::http_failure(decode_response.status());
+        if !decode_response.status().is_success() {
+            request_metrics::upstream_terminal();
+        }
         self.stop_profiling(decode_base_url).await;
         RouterMetrics::record_pd_request(path);
         RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
@@ -2049,6 +2090,9 @@ impl VllmPDRouter {
             match read_response_body(decode_response, PD_BUFFERED_BODY_LIMIT_BYTES)
                 .await
                 .map_err(|error| {
+                    if status.is_success() {
+                        Handoff::body_failure(&error);
+                    }
                     format!("Failed to read response body from {decode_base_url}: {error}")
                 })? {
                 ResponseBody::Buffered(bytes) => {
@@ -2448,6 +2492,7 @@ impl VllmPDRouter {
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
         request_metrics::phase(Phase::Prefill);
+        let prefill_stage = request_metrics::stage(Stage::PrefillDispatch);
         let prefill_response = otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -2470,6 +2515,7 @@ impl VllmPDRouter {
         // The whole P body has been consumed (or never started): do not hold P
         // admission capacity while D generates the response.
         drop(prefill_permit);
+        drop(prefill_stage);
         request_metrics::phase(Phase::Routing);
         let (status, content_type, prefill_bytes) = finished_prefill?;
         if !status.is_success() {
@@ -2497,6 +2543,7 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
+                Handoff::Failed.observed();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -2529,6 +2576,7 @@ impl VllmPDRouter {
         // target can be chosen against live state without delaying dispatch:
         // the decode request body is built from this same response.
         if let Some(commit) = commit {
+            let _routing_stage = request_metrics::stage(Stage::Route);
             let pinned = self.prefill_pinned_to_provisional(
                 prefill_worker.as_ref(),
                 Some(&prefill_response_json),
@@ -2571,12 +2619,17 @@ impl VllmPDRouter {
                 obj.remove("ec_transfer_params");
             }
         }
+        let mut has_envelope = false;
         if let Some(params) = self.build_decode_kv_transfer_params(
             prefill_worker.as_ref(),
             Some(&prefill_response_json),
             transfer_id.as_deref(),
             Some(&request_id),
         ) {
+            has_envelope = params.as_object().is_some_and(|params| !params.is_empty())
+                && prefill_response_json
+                    .get("error")
+                    .is_none_or(Value::is_null);
             decode_request["kv_transfer_params"] = params;
         } else {
             warn!(
@@ -2632,7 +2685,8 @@ impl VllmPDRouter {
         attempt.begin_decode();
         request_metrics::worker(decode_worker.as_ref());
         request_metrics::phase(Phase::Decode);
-        let decode_response = match otel_http::send_client_request(
+        let decode_stage = request_metrics::stage(Stage::DecodeDispatch);
+        let decode_response = otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
             headers,
             ClientRequestOptions {
@@ -2642,10 +2696,13 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
-        .await
-        {
+        .await;
+        drop(decode_stage);
+        let decode_response = match decode_response {
             Ok(resp) => resp,
             Err(e) => {
+                request_metrics::upstream_terminal();
+                Handoff::from_error(&e).observed();
                 attempt.finish_decode();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
@@ -2659,6 +2716,7 @@ impl VllmPDRouter {
             }
         };
 
+        Handoff::pending(has_envelope && decode_response.status().is_success());
         self.handle_decode_response(
             decode_response,
             Some(&prefill_response_json),
@@ -3035,6 +3093,7 @@ impl VllmPDRouter {
         request_metrics::phase(Phase::Decode);
         request_metrics::prefill_pending(true);
         let prefill_fut = async {
+            let _prefill_stage = request_metrics::stage(Stage::PrefillDispatch);
             // Hold the P admission slot until the prefill body is consumed, then
             // release it even if D is still running.
             let prefill_permit = prefill_permit;
@@ -3057,8 +3116,8 @@ impl VllmPDRouter {
             finished
         };
         attempt.begin_decode();
-        let (prefill_result, decode_result) = tokio::join!(
-            prefill_fut,
+        let decode_fut = async {
+            let _decode_stage = request_metrics::stage(Stage::DecodeDispatch);
             otel_http::send_client_request(
                 stage_builder(&decode_url, decode_dp_rank).json(&decode_request),
                 headers,
@@ -3068,8 +3127,10 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("decode"),
                 },
-            ),
-        );
+            )
+            .await
+        };
+        let (prefill_result, decode_result) = tokio::join!(prefill_fut, decode_fut);
 
         let prefill_response_json = match prefill_result {
             Ok((status, _, bytes)) if status.is_success() => {
@@ -3125,6 +3186,8 @@ impl VllmPDRouter {
         let decode_response = match decode_result {
             Ok(resp) => resp,
             Err(e) => {
+                request_metrics::upstream_terminal();
+                Handoff::from_error(&e).observed();
                 attempt.finish_decode();
                 self.stop_profiling(&decode_base_url).await;
                 RouterMetrics::record_pd_decode_error(&decode_base_url);
@@ -3148,6 +3211,10 @@ impl VllmPDRouter {
             .strip_prefix("http://")
             .unwrap_or(&decode_base_url);
 
+        let prefill_ack = prefill_response_json.as_ref().is_some_and(|value| {
+            value.is_object() && value.get("error").is_none_or(Value::is_null)
+        });
+        Handoff::pending(prefill_ack && decode_response.status().is_success());
         self.handle_decode_response(
             decode_response,
             prefill_response_json.as_ref(),
@@ -3754,12 +3821,14 @@ impl RouterTrait for VllmPDRouter {
         // Body is already a serde_json::Value, use it directly
         request_metrics::stream(body.get("stream").and_then(Value::as_bool).unwrap_or(false));
         request_metrics::echo(body.get("echo").and_then(Value::as_bool).unwrap_or(false));
+        request_metrics::end_preprocess();
         let request_json = body;
 
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
             self.process_vllm_request(request_json, path, headers).await
         } else {
+            let routing_stage = request_metrics::stage(Stage::Route);
             // Direct URL mode - use worker registry, filtered by availability
             let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
             let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
@@ -3815,6 +3884,7 @@ impl RouterTrait for VllmPDRouter {
             let decode_idx = selection.decode.worker_index;
 
             let prefill_worker = &prefill_workers[prefill_idx];
+            drop(routing_stage);
             let decode_worker = &decode_workers[decode_idx];
             request_metrics::worker(decode_worker.as_ref());
 

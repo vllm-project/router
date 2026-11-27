@@ -1,8 +1,15 @@
 //! Observe public OpenAI HTTP response bodies without changing their framing.
 
-use std::time::Instant;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use bytes::Bytes;
+use futures_util::{stream, Stream, StreamExt};
 use metrics::histogram;
 use serde_json::Value;
 
@@ -10,6 +17,43 @@ use super::sse::{event_fields, FrameScanner};
 
 const BODY_LIMIT: usize = 1024 * 1024;
 pub(super) type Usage = (Option<u64>, Option<u64>);
+
+/// P/D's response rewriter may emit several downstream frames from one
+/// upstream body chunk. Preserve that coalescing evidence without changing
+/// how the rewriter frames any of the bytes it forwards.
+#[derive(Clone, Default)]
+pub(super) struct SseBatch(Arc<AtomicBool>);
+
+impl SseBatch {
+    pub(super) fn track<S, E>(
+        &self,
+        source: S,
+    ) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    {
+        stream::unfold(
+            (Box::pin(source), self.clone(), FrameScanner::default()),
+            |(mut source, batch, mut scanner)| async move {
+                let item = source.next().await?;
+                if let Ok(bytes) = &item {
+                    let mut tail = bytes.as_ref();
+                    let mut events = 0;
+                    while let Some(end) = scanner.frame_end(tail) {
+                        events += 1;
+                        tail = &tail[end..];
+                    }
+                    batch.0.store(events > 1, Ordering::Relaxed);
+                }
+                Some((item, (source, batch, scanner)))
+            },
+        )
+    }
+
+    pub(super) fn is_coalesced(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 pub(super) enum Observer {
     Sse(Sse),
@@ -31,9 +75,15 @@ impl Observer {
         })
     }
 
-    pub(super) fn observe(&mut self, bytes: &Bytes, started: Instant, at: Instant) {
+    pub(super) fn observe(
+        &mut self,
+        bytes: &Bytes,
+        started: Instant,
+        at: Instant,
+        coalesced: bool,
+    ) {
         match self {
-            Self::Sse(sse) => sse.observe(bytes, started, at),
+            Self::Sse(sse) => sse.observe(bytes, started, at, coalesced),
             Self::Json(body) => {
                 if let Some(buf) = body {
                     if bytes.len() <= BODY_LIMIT - buf.len() {
@@ -50,17 +100,24 @@ impl Observer {
         matches!(self, Self::Sse(sse) if sse.terminal || sse.failed)
     }
 
-    pub(super) fn finish(self, route: &'static str, hidden_usage: Option<Usage>) {
+    pub(super) fn finish(self, route: &'static str, hidden_usage: Option<Usage>) -> Option<bool> {
         let observed = match self {
-            Self::Sse(sse) => sse
-                .terminal
-                .then_some(sse)
-                .filter(|sse| !sse.failed)
-                .and_then(|sse| sse.usage.or(hidden_usage)),
-            Self::Json(body) => body
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .filter(|value| !is_error(value) && !bad_response_status(value))
-                .and_then(|value| value.get("usage").and_then(usage)),
+            Self::Sse(sse) if sse.failed => return Some(false),
+            Self::Sse(sse) if sse.uncertain => return None,
+            Self::Sse(sse) if sse.terminal => sse.usage.or(hidden_usage),
+            Self::Json(None) => return None,
+            Self::Json(Some(bytes)) => {
+                let Some(value) = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .filter(|value| {
+                        value.is_object() && !is_error(value) && !bad_response_status(value)
+                    })
+                else {
+                    return Some(false);
+                };
+                value.get("usage").and_then(usage)
+            }
+            _ => return Some(false),
         };
         if let Some((input, output)) = observed {
             if let Some(input) = input {
@@ -70,6 +127,7 @@ impl Observer {
                 histogram!("vllm_router_output_tokens", "route" => route).record(output as f64);
             }
         }
+        Some(true)
     }
 }
 
@@ -103,6 +161,7 @@ pub(super) struct Sse {
     scanner: FrameScanner,
     event: Vec<u8>,
     oversized: bool,
+    uncertain: bool,
     first_event: bool,
     first_output: bool,
     last_single: Option<(Instant, u64)>,
@@ -127,6 +186,7 @@ impl Sse {
             scanner: FrameScanner::default(),
             event: Vec::new(),
             oversized: false,
+            uncertain: false,
             first_event: true,
             first_output: false,
             last_single: None,
@@ -137,7 +197,7 @@ impl Sse {
         }
     }
 
-    fn observe(&mut self, mut bytes: &[u8], started: Instant, at: Instant) {
+    fn observe(&mut self, mut bytes: &[u8], started: Instant, at: Instant, coalesced: bool) {
         let mut batch = Output::None;
         self.reset_interval = false;
         while !bytes.is_empty() {
@@ -154,7 +214,7 @@ impl Sse {
                 let first_event = std::mem::take(&mut self.first_event);
                 if std::mem::take(&mut self.oversized) {
                     // The omitted event could hide output or a failure.
-                    self.failed = true;
+                    self.uncertain = true;
                     self.last_single = None;
                     continue;
                 }
@@ -173,13 +233,13 @@ impl Sse {
                 };
             }
         }
-        if !matches!(batch, Output::None) {
+        if !self.uncertain && !matches!(batch, Output::None) {
             if !self.first_output {
                 self.first_output = true;
                 histogram!("vllm_router_ttft_seconds", "route" => self.route, "stream" => "true")
                     .record(at.duration_since(started).as_secs_f64());
             }
-            let current = match (batch, self.reset_interval) {
+            let current = match (batch, self.reset_interval || coalesced) {
                 (Output::Single(index), false) => Some((at, index)),
                 _ => None,
             };

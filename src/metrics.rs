@@ -43,6 +43,22 @@ pub fn init_metrics() {
         "vllm_router_output_tokens",
         "Output tokens from final usage of successful HTTP inference responses"
     );
+    describe_gauge!(
+        "vllm_router_stage_requests",
+        "HTTP inference requests currently in each Router stage (P/D dispatch legs can overlap)"
+    );
+    describe_histogram!(
+        "vllm_router_stage_duration_seconds",
+        "Wall-clock seconds spent in each HTTP inference Router stage"
+    );
+    describe_counter!(
+        "vllm_router_pd_handoff_total",
+        "Observable HTTP P/D handoff outcomes, not physical KV transfer timings"
+    );
+    describe_counter!(
+        "vllm_router_warm_remote_total",
+        "Observed warm-remote lookups, read feedback and candidate invalidations"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",

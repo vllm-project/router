@@ -73,6 +73,7 @@ impl Worker {
             .route(COMPLETIONS, axum_post(mock))
             .route(CHAT, axum_post(mock))
             .route(RESPONSES, axum_post(mock))
+            .route("/v1/completions/render", axum_post(mock))
             .with_state(tx);
         Self {
             server: Server::start(app).await,
@@ -383,11 +384,437 @@ async fn ordinary(metrics: &Metrics) {
     assert_eq!(sample(&scrape, "requests_cancelled_total", &[]), 1.);
 }
 
+async fn expect_cancel(metrics: &Metrics, stage: &str, stage_total: f64, all: f64) {
+    metrics
+        .wait(|scrape| {
+            sample(scrape, "active_requests", &[]) == 0.
+                && sample(scrape, "requests_cancelled_total", &[("stage", stage)]) == stage_total
+        })
+        .await;
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "requests_cancelled_total", &[]), all);
+    assert_eq!(sample(&scrape, "stage_requests", &[]), 0.);
+}
+
+async fn queue_and_routing_cancellation(metrics: &Metrics) {
+    let mut worker = Worker::start().await;
+    let mode = RoutingMode::Regular {
+        worker_urls: vec![worker.server.url.clone()],
+    };
+    let (queue, mut pending) = mpsc::channel(1);
+    let queued_router = router(
+        RouterConfig {
+            max_concurrent_requests: 0,
+            ..config(mode.clone())
+        },
+        Some(queue),
+    )
+    .await;
+
+    let request = post(
+        &queued_router,
+        COMPLETIONS,
+        json!({"model":"test-model","prompt":"queued"}),
+    );
+    let _queued = pending.recv().await.unwrap();
+    request.abort();
+    let _ = request.await;
+    expect_cancel(metrics, "queued", 1., 2.).await;
+
+    // The real HTTP cache-aware prepare RPC holds routing open until its
+    // response. It is not yet a generation request to a selected worker.
+    let routing_router = router(
+        RouterConfig {
+            policy: PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 10,
+                balance_rel_threshold: 2.,
+                eviction_interval_secs: 120,
+                max_tree_size: 1000,
+            },
+            ..config(mode)
+        },
+        None,
+    )
+    .await;
+    let request = post(
+        &routing_router,
+        COMPLETIONS,
+        json!({"model":"test-model","prompt":"routing"}),
+    );
+    let _render = worker.call().await;
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "stage_requests", &[("stage", "route")]), 1.);
+    request.abort();
+    let _ = request.await;
+    expect_cancel(metrics, "routing", 1., 3.).await;
+}
+
+fn completion_reply() -> Response {
+    Json(json!({"choices":[{"text":"ok"}],"usage":{"prompt_tokens":6,"completion_tokens":2}}))
+        .into_response()
+}
+
+fn prefill_reply() -> Response {
+    Json(json!({
+        "choices":[{"text":"p"}],
+        "kv_transfer_params":{
+            "transfer_mode":"push","do_remote_prefill":true,
+            "remote_engine_id":"mock-P","remote_host":"127.0.0.1","remote_port":1234,"tp_size":1
+        }
+    }))
+    .into_response()
+}
+
+async fn pd(metrics: &Metrics) {
+    let mut prefill = Worker::start().await;
+    let mut decode = Worker::start().await;
+    let router = router(
+        config(RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![(prefill.server.url.clone(), None)],
+            decode_urls: vec![decode.server.url.clone()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        }),
+        None,
+    )
+    .await;
+    let request_body = || json!({"model":"test-model","prompt":"hi","stream":false});
+
+    let request = post(&router, COMPLETIONS, request_body());
+    let p = prefill.call().await;
+    assert!(p.request.get("kv_transfer_params").is_some());
+    let scrape = metrics.scrape().await;
+    assert_eq!(
+        sample(&scrape, "stage_requests", &[("stage", "prefill_dispatch")]),
+        1.
+    );
+    assert_eq!(sample(&scrape, "stage_requests", &[("stage", "route")]), 0.);
+    assert_eq!(
+        sample(&scrape, "stage_requests", &[("stage", "decode_dispatch")]),
+        0.
+    );
+    assert!(decode.calls.try_recv().is_err());
+    p.respond.send(prefill_reply()).unwrap();
+    let d = decode.call().await;
+    assert!(d.request["kv_transfer_params"].is_object());
+    d.respond.send(completion_reply()).unwrap();
+    let response = request.await.unwrap().error_for_status().unwrap();
+    response.bytes().await.unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "pd_handoff_total", &[("result", "ok")]), 1.);
+    assert_eq!(
+        sample(
+            &scrape,
+            "stage_duration_seconds_count",
+            &[("stage", "prefill_dispatch")]
+        ),
+        1.
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "stage_duration_seconds_bucket",
+            &[("stage", "prefill_dispatch"), ("le", "240")]
+        ),
+        1.
+    );
+    assert_eq!(sample(&scrape, "stage_requests", &[]), 0.);
+
+    // The preceding P response learned a NIXL push address. Both workers
+    // now receive the same logical request before either replies.
+    let mut streaming = request_body();
+    streaming["stream"] = json!(true);
+    let request = post(&router, COMPLETIONS, streaming);
+    let (p, d) = tokio::join!(prefill.call(), decode.call());
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "active_requests", &[]), 1.);
+    assert_eq!(
+        sample(&scrape, "stage_requests", &[("stage", "prefill_dispatch")]),
+        1.
+    );
+    assert_eq!(
+        sample(&scrape, "stage_requests", &[("stage", "decode_dispatch")]),
+        1.
+    );
+    assert_eq!(sample(&scrape, "stage_requests", &[("stage", "route")]), 0.);
+    p.respond.send(prefill_reply()).unwrap();
+    let tx = stream_reply(d);
+    let mut response = request.await.unwrap().error_for_status().unwrap();
+    // The P/D usage rewriter yields one frame per SSE event even if both
+    // arrived together. That rewrite must not invent a token interval.
+    send(
+        &tx,
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"text\":\"co\",\"token_ids\":[8]}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\"alesced\",\"token_ids\":[9]}]}\n\n",
+        ),
+    )
+    .await;
+    read_until(&mut response, "[9]}]}\n\n").await;
+    let route = ("route", COMPLETIONS);
+    assert_eq!(
+        sample(&metrics.scrape().await, "itl_seconds_count", &[route]),
+        1.
+    );
+    for (token, frame) in [
+        (
+            "[10]}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\" next\",\"token_ids\":[10]}]}\n\n",
+        ),
+        (
+            "[11]}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"text\":\" single\",\"token_ids\":[11]}]}\n\n",
+        ),
+    ] {
+        send(&tx, frame).await;
+        read_until(&mut response, token).await;
+    }
+    send(&tx, "data: [DONE]\n\n").await;
+    drop(tx);
+    response.bytes().await.unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "itl_seconds_count", &[route]), 2.);
+    assert_eq!(sample(&scrape, "pd_handoff_total", &[("result", "ok")]), 2.);
+    assert_eq!(
+        sample(&scrape, "ttft_seconds_count", &[("route", COMPLETIONS)]),
+        2.
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "stage_duration_seconds_count",
+            &[("stage", "prefill_dispatch")]
+        ),
+        2.
+    );
+    assert_eq!(
+        sample(
+            &scrape,
+            "stage_duration_seconds_count",
+            &[("stage", "decode_dispatch")]
+        ),
+        2.
+    );
+    assert_eq!(sample(&scrape, "stage_requests", &[]), 0.);
+
+    let request = post(&router, COMPLETIONS, request_body());
+    let (_p, _d) = tokio::join!(prefill.call(), decode.call());
+    request.abort();
+    let _ = request.await;
+    expect_cancel(metrics, "prefill", 1., 4.).await;
+
+    let request = post(&router, COMPLETIONS, request_body());
+    let (p, _d) = tokio::join!(prefill.call(), decode.call());
+    p.respond.send(prefill_reply()).unwrap();
+    metrics
+        .wait(|scrape| {
+            sample(scrape, "stage_requests", &[("stage", "prefill_dispatch")]) == 0.
+                && sample(scrape, "stage_requests", &[("stage", "decode_dispatch")]) == 1.
+        })
+        .await;
+    request.abort();
+    let _ = request.await;
+    expect_cancel(metrics, "decode", 1., 5.).await;
+
+    for (status, result) in [
+        (StatusCode::BAD_REQUEST, "rejected"),
+        (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+    ] {
+        let request = post(&router, COMPLETIONS, request_body());
+        let (p, d) = tokio::join!(prefill.call(), decode.call());
+        p.respond.send(prefill_reply()).unwrap();
+        d.respond.send(status.into_response()).unwrap();
+        request.await.unwrap().bytes().await.unwrap();
+        let scrape = metrics.scrape().await;
+        assert_eq!(
+            sample(&scrape, "pd_handoff_total", &[("result", result)]),
+            1.
+        );
+        assert_eq!(sample(&scrape, "pd_handoff_total", &[("result", "ok")]), 2.);
+        assert_eq!(sample(&scrape, "requests_cancelled_total", &[]), 5.);
+        assert_eq!(sample(&scrape, "active_requests", &[]), 0.);
+    }
+}
+
+async fn chat_and_responses(metrics: &Metrics) {
+    let mut worker = Worker::start().await;
+    let router = router(
+        config(RoutingMode::Regular {
+            worker_urls: vec![worker.server.url.clone()],
+        }),
+        None,
+    )
+    .await;
+
+    let request = post(
+        &router,
+        CHAT,
+        json!({
+            "model":"test-model", "messages":[{"role":"user","content":"hello"}], "stream":true,
+            "stream_options":{"include_usage":true},
+        }),
+    );
+    let tx = stream_reply(worker.call().await);
+    let mut response = request.await.unwrap().error_for_status().unwrap();
+    send(&tx, concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"function\":{\"name\":\"weather\",\"arguments\":\"\"}}]}}]}\n\n",
+    )).await;
+    read_until(&mut response, "\"arguments\":\"\"}}]}}]}\n\n").await;
+    let route = ("route", CHAT);
+    assert_eq!(
+        sample(&metrics.scrape().await, "ttft_seconds_count", &[route]),
+        0.
+    );
+    send(&tx, "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Think\"},\"token_ids\":[7]}]}\n\n").await;
+    read_until(&mut response, "[7]}]}\n\n").await;
+    send(&tx, "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]},\"token_ids\":[8]}]}\n\n").await;
+    read_until(&mut response, "[8]}]}\n\n").await;
+    send(&tx, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n").await;
+    drop(tx);
+    response.bytes().await.unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(
+        sample(&scrape, "ttft_seconds_count", &[route, ("stream", "true")]),
+        1.
+    );
+    assert_eq!(sample(&scrape, "itl_seconds_count", &[route]), 1.);
+    assert_eq!(
+        sample(&scrape, "input_tokens_bucket", &[route, ("le", "16")]),
+        0.
+    );
+    assert_eq!(
+        sample(&scrape, "input_tokens_bucket", &[route, ("le", "32")]),
+        1.
+    );
+    assert_eq!(
+        sample(&scrape, "output_tokens_bucket", &[route, ("le", "4")]),
+        1.
+    );
+
+    let request = post(
+        &router,
+        CHAT,
+        json!({
+            "model":"test-model", "messages":[{"role":"user","content":"echo me"}],
+            "stream":true, "echo":true,
+        }),
+    );
+    let tx = stream_reply(worker.call().await);
+    send(&tx, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"echo me\"},\"token_ids\":[9]}]}\n\ndata: [DONE]\n\n").await;
+    drop(tx);
+    request
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "ttft_seconds_count", &[route]), 1.);
+    assert_eq!(sample(&scrape, "input_tokens_count", &[route]), 1.);
+
+    // A worker can send SSE with Content-Length instead of chunked
+    // framing. Hyper must still let the Router observe the terminal poll.
+    let request = post(
+        &router,
+        CHAT,
+        json!({
+            "model":"test-model", "messages":[{"role":"user","content":"hello"}], "stream":true,
+            "stream_options":{"include_usage":true},
+        }),
+    );
+    worker
+        .call()
+        .await
+        .respond
+        .send(
+            (
+                [(CONTENT_TYPE, "text/event-stream")],
+                concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        ),
+            )
+                .into_response(),
+        )
+        .unwrap();
+    request
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "ttft_seconds_count", &[route]), 2.);
+    assert_eq!(sample(&scrape, "input_tokens_count", &[route]), 2.);
+    assert_eq!(sample(&scrape, "output_tokens_count", &[route]), 2.);
+
+    let responses_request = || json!({"model":"test-model","input":"hello","stream":true});
+    let request = post(&router, RESPONSES, responses_request());
+    let tx = stream_reply(worker.call().await);
+    let mut response = request.await.unwrap().error_for_status().unwrap();
+    send(&tx, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\n").await;
+    read_until(&mut response, "\"message\"}}\n\n").await;
+    let route = ("route", RESPONSES);
+    assert_eq!(
+        sample(&metrics.scrape().await, "ttft_seconds_count", &[route]),
+        0.
+    );
+    send(&tx, concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n",
+    )).await;
+    drop(tx);
+    response.bytes().await.unwrap();
+    let scrape = metrics.scrape().await;
+    assert_eq!(
+        sample(&scrape, "ttft_seconds_count", &[route, ("stream", "true")]),
+        1.
+    );
+    assert_eq!(sample(&scrape, "itl_seconds_count", &[route]), 0.);
+    assert_eq!(sample(&scrape, "input_tokens_count", &[route]), 1.);
+    assert_eq!(
+        sample(&scrape, "output_tokens_bucket", &[route, ("le", "1")]),
+        1.
+    );
+
+    // An incomplete upstream HTTP body after a success-looking terminal
+    // usage frame must not count as successful usage or client cancellation.
+    let request = post(&router, RESPONSES, responses_request());
+    let tx = stream_reply(worker.call().await);
+    let mut response = request.await.unwrap().error_for_status().unwrap();
+    send(&tx, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":98,\"output_tokens\":99}}}\n\n").await;
+    read_until(&mut response, "99}}}\n\n").await;
+    tx.send(Err(std::io::Error::other(
+        "worker dropped its response body",
+    )))
+    .await
+    .unwrap();
+    drop(tx);
+    assert!(response.bytes().await.is_err());
+    let scrape = metrics.scrape().await;
+    assert_eq!(sample(&scrape, "input_tokens_count", &[route]), 1.);
+    assert_eq!(sample(&scrape, "output_tokens_count", &[route]), 1.);
+    assert_eq!(sample(&scrape, "requests_cancelled_total", &[]), 5.);
+    assert_eq!(sample(&scrape, "active_requests", &[]), 0.);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scrape_http_inference_metrics() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let metrics = Metrics::start();
         ordinary(&metrics).await;
+        queue_and_routing_cancellation(&metrics).await;
+        pd(&metrics).await;
+        chat_and_responses(&metrics).await;
     })
     .await
     .unwrap();

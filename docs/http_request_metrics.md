@@ -23,7 +23,8 @@ OpenAI-provider proxy or arbitrary transparent paths.
   adjacent output-bearing SSE deliveries that each confirm exactly one token
   from the same choice via token IDs or corresponding logprobs. It needs
   maintainer confirmation. There is no sample across a multi-token,
-  uncountable or co-delivered batch, and no inferred in-frame timing.
+  uncountable or co-delivered batch, even if the P/D usage rewriter later
+  splits that batch. No in-frame timing is inferred.
 - `input_tokens{route}` and `output_tokens{route}` use final engine-reported
   usage on successful responses. JSON usage is recorded on clean completion.
   Chat and Completion SSE require a final usage-only event, `[DONE]` and
@@ -38,3 +39,30 @@ terminal events and metadata do not count as generated output. With echo
 enabled, timing is omitted because echoed and generated text cannot generally
 be separated reliably. Encoded payloads the Router does not decode and
 unrecognized native formats have no output timing or usage observations.
+
+## P/D dispatch
+
+`stage_requests{stage}` counts current work and
+`stage_duration_seconds{stage}` observes time until work finishes or is
+abandoned. `preprocess` covers admitted HTTP request preparation.
+`route` covers selection, including routing input RPCs and a deferred decode
+re-selection. `prefill_dispatch` runs through the P control response body.
+`decode_dispatch` runs through D response headers (the Program path also
+waits for its existing output gate). Parallel P and D scopes overlap; neither
+subtracts the other. Prefill inference is not charged to `route`.
+
+`pd_handoff_total{result}` reports HTTP-observable outcomes of a P/D attempt.
+A dispatched nonempty transfer envelope and a clean supported D response
+provide `ok` evidence. HTTP client rejection is `rejected`, 408/504 or a known
+transport deadline is `timeout`, and other known transport, status or
+protocol errors are `failed`. Cancellation alone is not handoff evidence.
+An unobservable response (for example encoded SSE or an over-limit observer)
+does not imply success or failure. The Router cannot independently confirm
+that any physical KV bytes were moved, or measure their transfer time.
+
+`warm_remote_total{result}` reports `hit` only when verified P feedback reports
+a positive external cached-token count for an attempted warm read. A candidate
+lookup with no entry or an explicit zero external token count is `miss`.
+A rejected candidate or an invalidation that removed candidate state is
+`invalidated`. Merely having a candidate, choosing cold for cost or pressure,
+and receiving no external-read feedback do not count as a hit.

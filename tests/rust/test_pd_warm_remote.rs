@@ -319,6 +319,148 @@ async fn send_completion(
 fn next_prompt() -> Vec<u32> {
     vec![1, 2, 3, 42, 43, 44, 45, 99]
 }
+#[test]
+fn scrape_warm_remote_outcomes_through_http_router() {
+    // Scope the recorder to this current-thread runtime so the other warm
+    // protocol tests cannot increment these counters.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let port = portpicker::pick_unused_port().unwrap();
+    let (recorder, exporter) = runtime.block_on(async {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap()
+    });
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            tokio::spawn(exporter);
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                use vllm_router_rs::{
+                    metrics::init_metrics,
+                    routers::RouterFactory,
+                    server::{build_app, AppState},
+                };
+
+                init_metrics();
+                let p = engine(true, false, false).await;
+                let d = engine(false, false, false).await;
+                let (cfg, _) = warm_router_config(
+                    &[&p],
+                    &d,
+                    &PolicyConfig::RoundRobin,
+                    false,
+                    json!({"capability_cache_seconds": 0.0}),
+                );
+                let client = reqwest::Client::new();
+                let context =
+                    Arc::new(AppContext::new(cfg, client.clone(), 64, None, vec![]).unwrap());
+                let router: Arc<dyn RouterTrait> =
+                    Arc::from(RouterFactory::create_router(&context).await.unwrap());
+                let app = build_app(
+                    Arc::new(AppState {
+                        router,
+                        context,
+                        concurrency_queue_tx: None,
+                        router_manager: None,
+                    }),
+                    1024 * 1024,
+                    vec![],
+                    vec![],
+                    false,
+                );
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                let api = format!("http://{}/v1/completions", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+                let assert_counters = |scrape: &str, expected: [u64; 3], turn: usize| {
+                    for (result, count) in ["miss", "hit", "invalidated"].into_iter().zip(expected)
+                    {
+                        let prefix =
+                            format!("vllm_router_warm_remote_total{{result=\"{result}\"}} ");
+                        let observed = scrape
+                            .lines()
+                            .find_map(|line| line.strip_prefix(&prefix))
+                            .map(|number| number.parse::<f64>().unwrap())
+                            .unwrap_or(0.);
+                        assert_eq!(
+                            observed, count as f64,
+                            "turn {turn}, warm remote result {result}",
+                        );
+                    }
+                };
+                let second = next_prompt();
+                let mut third = second.clone();
+                third.extend([42, 43, 44, 45, 100]);
+                for (turn, (prompt, counters)) in [
+                    (vec![1, 2, 3], [1, 0, 0]),
+                    (second, [1, 1, 0]),
+                    (third, [1, 1, 1]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if turn == 2 {
+                        // Restart the same endpoint before the third turn.
+                        d.state.epoch.store(2, Ordering::SeqCst);
+                    }
+                    client
+                        .post(&api)
+                        .json(&completion_body("task", &prompt, true, false))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                    let scrape = client
+                        .get(&metrics_url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap();
+                    assert_counters(&scrape, counters, turn + 1);
+                    for prefix in [
+                        "vllm_router_pd_handoff_total{result=\"ok\"} ",
+                        "vllm_router_input_tokens_count{route=\"/v1/completions\"} ",
+                        "vllm_router_output_tokens_count{route=\"/v1/completions\"} ",
+                    ] {
+                        let actual = scrape
+                            .lines()
+                            .find_map(|line| line.strip_prefix(prefix))
+                            .map(|number| number.parse::<f64>().unwrap());
+                        assert_eq!(
+                            actual,
+                            Some((turn + 1) as f64),
+                            "{prefix} on turn {}",
+                            turn + 1
+                        );
+                    }
+                }
+                let requests = p.state.calls.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                let warm_reads = requests
+                    .iter()
+                    .map(|r| r.pointer("/kv_transfer_params/remote_request_id").is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(warm_reads, [false, true, false]);
+            })
+            .await
+            .unwrap();
+        });
+    });
+}
+
 #[tokio::test]
 async fn exact_two_turns_take_engine_metadata_once_and_reject_rewrite() {
     let p = engine(true, false, false).await;
