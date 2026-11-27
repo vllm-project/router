@@ -729,9 +729,7 @@ impl VllmPDRouter {
             }
             KvConnector::MooncakeV2 => prefill_response_json?
                 .get("kv_transfer_params")
-                .filter(|params| {
-                    params.get("do_remote_prefill").and_then(Value::as_bool) == Some(true)
-                })
+                .filter(|params| Self::valid_mooncake_v2_handoff(params))
                 .cloned(),
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
@@ -748,6 +746,41 @@ impl VllmPDRouter {
                 Some(Self::build_nixl_push_decode_params(&identity, request_id?))
             }
         }
+    }
+
+    fn valid_mooncake_v2_handoff(params: &Value) -> bool {
+        let Some(groups) = params["remote_block_ids"].as_array() else {
+            return false;
+        };
+        let valid_groups = groups.iter().all(|group| {
+            group
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().all(Value::is_u64))
+        });
+        let has_peer_identity = ["remote_engine_id", "remote_request_id", "remote_host"]
+            .into_iter()
+            .all(|field| {
+                params[field]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
+        let valid_port = params["remote_port"]
+            .as_u64()
+            .is_some_and(|port| (1..=u64::from(u16::MAX)).contains(&port));
+        // Decode only renews a lease when Prefill supplies remote blocks.
+        let valid_lease = groups
+            .iter()
+            .all(|group| group.as_array().is_some_and(Vec::is_empty))
+            || params["remote_kv_lease_duration"]
+                .as_u64()
+                .is_some_and(|seconds| seconds >= 6);
+
+        params["do_remote_prefill"].as_bool() == Some(true)
+            && valid_groups
+            && has_peer_identity
+            && valid_port
+            && params["remote_num_prompt_tokens"].is_u64()
+            && valid_lease
     }
 
     /// Build kv_transfer_params for the decode request (Mooncake only).
@@ -2573,7 +2606,7 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_request(path);
             RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
             return Err(PDRouterError::NetworkError {
-                message: "Prefill returned no Mooncake V2 KV handoff".into(),
+                message: "Prefill returned no valid Mooncake V2 KV handoff".into(),
             });
         } else {
             warn!(
@@ -2799,7 +2832,7 @@ impl VllmPDRouter {
                 RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
                 return (
                     StatusCode::BAD_GATEWAY,
-                    "Prefill returned no Mooncake V2 KV handoff",
+                    "Prefill returned no valid Mooncake V2 KV handoff",
                 )
                     .into_response();
             }
@@ -7387,19 +7420,82 @@ mod tests {
         );
         let handoff = json!({
             "do_remote_prefill": true,
-            "remote_block_ids": [[0, 1]],
+            "remote_block_ids": [[], [0, 1]],
             "remote_engine_id": "prefill",
             "remote_request_id": "request",
-            "remote_num_prompt_tokens": 65
+            "remote_host": "127.0.0.1",
+            "remote_port": 9000,
+            "remote_num_prompt_tokens": 65,
+            "remote_kv_lease_duration": 120,
+            "last_token_id": 42
         });
         let decode_params = |response: &Value| {
             router.build_decode_kv_transfer_params(&worker, Some(response), None, None)
         };
         assert_eq!(
-            decode_params(&json!({"kv_transfer_params": handoff})),
-            Some(handoff)
+            decode_params(&json!({"kv_transfer_params": handoff})).as_ref(),
+            Some(&handoff)
         );
         assert_eq!(decode_params(&json!({})), None);
+        assert_eq!(
+            decode_params(&json!({"kv_transfer_params": {"do_remote_prefill": true}})),
+            None
+        );
+
+        for field in [
+            "do_remote_prefill",
+            "remote_block_ids",
+            "remote_engine_id",
+            "remote_request_id",
+            "remote_host",
+            "remote_port",
+            "remote_num_prompt_tokens",
+            "remote_kv_lease_duration",
+        ] {
+            let mut incomplete = handoff.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                decode_params(&json!({"kv_transfer_params": incomplete})),
+                None,
+                "missing {field}"
+            );
+        }
+
+        for (field, invalid) in [
+            ("do_remote_prefill", json!(false)),
+            ("remote_block_ids", Value::Null),
+            ("remote_block_ids", json!([0, 1])),
+            ("remote_block_ids", json!([["0"]])),
+            ("remote_engine_id", json!("")),
+            ("remote_request_id", Value::Null),
+            ("remote_host", json!(" ")),
+            ("remote_port", json!(0)),
+            ("remote_port", json!(65536)),
+            ("remote_num_prompt_tokens", json!(-1)),
+            ("remote_kv_lease_duration", json!(5)),
+        ] {
+            let mut malformed = handoff.clone();
+            malformed[field] = invalid;
+            assert_eq!(
+                decode_params(&json!({"kv_transfer_params": malformed})),
+                None,
+                "malformed {field}"
+            );
+        }
+
+        for block_ids in [json!([]), json!([[], []])] {
+            let mut no_transfer = handoff.clone();
+            no_transfer["remote_block_ids"] = block_ids;
+            no_transfer["remote_num_prompt_tokens"] = json!(0);
+            no_transfer
+                .as_object_mut()
+                .unwrap()
+                .remove("remote_kv_lease_duration");
+            assert_eq!(
+                decode_params(&json!({"kv_transfer_params": no_transfer})),
+                Some(no_transfer)
+            );
+        }
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---
