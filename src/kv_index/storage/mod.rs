@@ -73,6 +73,8 @@ impl SourceVersion {
         &self.source.target
     }
 
+    /// Ordinary store/remove keeps the version current. Suspension, resume,
+    /// and retirement invalidate it.
     pub(crate) fn is_current(&self) -> bool {
         self.generation.is_multiple_of(2)
             && self.source.generation.load(Ordering::Acquire) == self.generation
@@ -148,15 +150,6 @@ impl KvBlockIndexer {
                 ))
             })
             .clone()
-    }
-
-    /// Check a snapshot after dropping its locks. Ordinary store/remove is a
-    /// valid snapshot transition; suspension, resume, or retirement invalidates
-    /// the result. This does not reserve engine blocks.
-    #[cfg(all(test, feature = "cpu", feature = "ready"))]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
-        version.is_current()
     }
 
     /// Hide a source while contiguous replay repairs its observations.

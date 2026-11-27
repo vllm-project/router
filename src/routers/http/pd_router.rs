@@ -359,7 +359,7 @@ fn select_stage(
         let decode_prices = if !decode_tokens_known {
             None
         } else {
-            context.decode_tokens().filter(|prices| {
+            context.marginal_decode_context().filter(|prices| {
                 projected
                     .iter()
                     .all(|worker| prices.contains_key(worker.url()))
@@ -484,7 +484,7 @@ fn select_stage(
             Stage::Decode => {
                 let additional = if decode_prices_used {
                     context
-                        .decode_tokens()
+                        .marginal_decode_context()
                         .and_then(|prices| prices.get(worker.url()))
                         .copied()
                         .unwrap_or(0)
@@ -764,40 +764,41 @@ impl PdRouterBase {
         // Deferred selection has no prefill pair. When any hybrid pairs are
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
-        // Keep the source guards until admission has committed the selection.
-        let mut prefill_validated = None;
-        let mut decode_validated = None;
-        let select = |loads: &Loads| {
-            let context = PdRequestContext {
-                prefill_pricing: context
-                    .prefill_pricing
-                    .map(|prices| prices.validate(prefill_workers, &mut prefill_validated)),
-                decode_pricing: if !defer && !context.probe {
-                    context
-                        .decode_pricing
-                        .map(|prices| prices.validate(decode_workers, &mut decode_validated))
-                } else {
-                    None
-                },
-                ..context.clone()
+        let admitted = {
+            // Keep the source guards until admission has committed the selection.
+            let mut prefill_validated = None;
+            let mut decode_validated = None;
+            let select = |loads: &Loads| {
+                let context = PdRequestContext {
+                    prefill_pricing: context
+                        .prefill_pricing
+                        .map(|prices| prices.validate(prefill_workers, &mut prefill_validated)),
+                    decode_pricing: if !defer && !context.probe {
+                        context
+                            .decode_pricing
+                            .map(|prices| prices.validate(decode_workers, &mut decode_validated))
+                    } else {
+                        None
+                    },
+                    ..context.clone()
+                };
+                select_pd_pair(
+                    loads,
+                    prefill_workers,
+                    decode_workers,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &context,
+                    !defer,
+                )
             };
-            select_pd_pair(
-                loads,
-                prefill_workers,
-                decode_workers,
-                prefill_policy.as_ref(),
-                decode_policy.as_ref(),
-                &context,
-                !defer,
-            )
+            let reserve_decode = !context.probe;
+            if defer {
+                self.pd_load.admit_deferred(select)
+            } else {
+                self.pd_load.admit_with(select, reserve_decode)
+            }
         };
-        let reserve_decode = !context.probe;
-        let admitted = if defer {
-            self.pd_load.admit_deferred(select)
-        } else {
-            self.pd_load.admit_with(select, reserve_decode)
-        };
-        drop((prefill_validated, decode_validated));
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
             if kv_aware_ops(prefill_policy.as_ref()).is_some() {
@@ -2943,9 +2944,10 @@ mod admission_tests {
             select_decode_stage(&loads, &workers, &policy, &decode_context).unwrap()
         };
 
-        // A price table missing rank 1 uses occupancy alone, even with rank 0 warm.
+        // Occupancy alone picks rank 1. Honoring its 17-token price while
+        // leaving rank 0 unpriced would pick rank 0 with 10 occupied tokens.
         let partial = policy
-            .prepare_decode_prices(&inputs[..1], &mut PromptHashes::new(), false)
+            .prepare_decode_prices(&inputs[1..], &mut PromptHashes::new(), false)
             .unwrap();
         assert_eq!(select_decode(&partial.validate(&workers)).worker_index, 1);
 
@@ -2958,31 +2960,33 @@ mod admission_tests {
             );
             assert_eq!(select_decode(&decode).worker_index, expected_worker);
 
-            let mut prefill_validated = None;
-            let (selection, attempt) = manager
-                .admit(|loads| {
-                    let context = PdRequestContext {
-                        prefill_inputs: Some(&prefill_inputs),
-                        prefill_pricing: Some(
-                            StagePricing::Prepared(&prefill_prices)
-                                .validate(&workers, &mut prefill_validated),
-                        ),
-                        ..context()
-                    };
-                    let work = context.prefill_work(workers[0].url()).unwrap();
-                    assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
-                    assert!(work.placement_verified);
-                    select_pd_pair(
-                        loads,
-                        &workers,
-                        &other_decode,
-                        &policy,
-                        &policy,
-                        &context,
-                        true,
-                    )
-                })
-                .unwrap();
+            let (selection, attempt) = {
+                let mut prefill_validated = None;
+                manager
+                    .admit(|loads| {
+                        let context = PdRequestContext {
+                            prefill_inputs: Some(&prefill_inputs),
+                            prefill_pricing: Some(
+                                StagePricing::Prepared(&prefill_prices)
+                                    .validate(&workers, &mut prefill_validated),
+                            ),
+                            ..context()
+                        };
+                        let work = context.prefill_work(workers[0].url()).unwrap();
+                        assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
+                        assert!(work.placement_verified);
+                        select_pd_pair(
+                            loads,
+                            &workers,
+                            &other_decode,
+                            &policy,
+                            &policy,
+                            &context,
+                            true,
+                        )
+                    })
+                    .unwrap()
+            };
             let expected = expected_tokens[expected_worker];
             assert_eq!(selection.prefill.worker_index, expected_worker);
             assert_eq!(selection.prefill.new_prefill_tokens, Some(expected));

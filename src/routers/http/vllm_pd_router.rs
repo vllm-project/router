@@ -1415,10 +1415,10 @@ impl VllmPDRouter {
         // figure taken then is stale by the time a candidate is actually picked.
         // Prepare the estimate before locking the ledger. The commit only
         // pins and revalidates the captured source evidence before selection.
-        let decode_context = match self.pd_router.kv_state.as_ref() {
+        let decode_prices = match self.pd_router.kv_state.as_ref() {
             Some(state) => {
                 state
-                    .prepare_decode_context(
+                    .prepare_decode_prices(
                         &candidates,
                         &decode_policy,
                         request,
@@ -1446,27 +1446,28 @@ impl VllmPDRouter {
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
             prefill_pricing: None,
-            decode_pricing: decode_context.as_ref().map(StagePricing::Prepared),
+            decode_pricing: decode_prices.as_ref().map(StagePricing::Prepared),
             route: &input.route,
             probe: false,
         };
-        // Keep the source guards until the deferred Decode commit finishes.
-        let mut validated = None;
-        let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            let context = PdRequestContext {
-                decode_pricing: context
-                    .decode_pricing
-                    .map(|prices| prices.validate(&candidates, &mut validated)),
-                ..context
-            };
-            super::pd_router::select_decode_stage(
-                loads,
-                &candidates,
-                decode_policy.as_ref(),
-                &context,
-            )
-        });
-        drop(validated);
+        let committed = {
+            // Keep the source guards until the deferred Decode commit finishes.
+            let mut validated = None;
+            self.pd_router.pd_load.commit_decode(attempt, |loads| {
+                let context = PdRequestContext {
+                    decode_pricing: context
+                        .decode_pricing
+                        .map(|prices| prices.validate(&candidates, &mut validated)),
+                    ..context
+                };
+                super::pd_router::select_decode_stage(
+                    loads,
+                    &candidates,
+                    decode_policy.as_ref(),
+                    &context,
+                )
+            })
+        };
         let Some(decision) = committed else {
             RouterMetrics::record_pd_decode_commit("empty");
             return Err((
@@ -6065,7 +6066,7 @@ mod tests {
     }
 
     /// A Decode candidate removed while commit-time pricing waits on the bindings
-    /// lock must not be committed: the re-read after `prepare_decode_context`
+    /// lock must not be committed: the re-read after `prepare_decode_prices`
     /// drops it. The prefill gate lands the removal after admission but before
     /// the commit's re-read, which is the window that re-read protects.
     #[tokio::test]

@@ -16,8 +16,8 @@ use sha2::{Digest as _, Sha256};
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
 use crate::kv_index::{
-    CacheKey, PlacementEvidence, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup,
-    SourceReadGuard, StorageTier, TierMatch, WorkerKvInfo,
+    CacheKey, PlacementEvidence, PlacementPinError, PromptKey, RequestHashCache, RoutableTarget,
+    SharedPrefixLookup, SourceReadGuard, StorageTier, TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
 
@@ -167,11 +167,14 @@ impl ValidatedWorkPrices<'_> {
 fn pin_credit<'a>(
     evidence: impl Iterator<Item = &'a PlacementEvidence>,
 ) -> Option<smallvec::SmallVec<[SourceReadGuard<'a>; 1]>> {
-    let guards = PlacementEvidence::try_pin_all(evidence);
-    if guards.is_none() {
-        crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_pin_failed");
-    }
-    guards
+    let outcome = match PlacementEvidence::try_pin_all(evidence) {
+        Ok(guards) => return Some(guards),
+        Err(PlacementPinError::Busy) => "credit_pin_busy",
+        Err(PlacementPinError::Revoked) => "credit_pin_revoked",
+        Err(PlacementPinError::Missing) => "credit_pin_missing",
+    };
+    crate::metrics::RouterMetrics::record_kv_placement_lookup(outcome);
+    None
 }
 
 impl PdWorkPrices {
@@ -206,8 +209,8 @@ impl PdWorkPrices {
 
 /// Optional operations used by adapters with tokenized requests and KV discovery.
 pub trait KvAwareOps: Send + Sync {
-    /// P/D uses the same placement/credit contract as colocated routing,
-    /// but accounts token backlog in the shared P/D admission manager.
+    /// Estimate Prefill work from lookup-time placement. P/D admission uses
+    /// the commit-validated prices from the preparation hook below.
     fn estimate_prefill_work<'tokens>(
         &self,
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
@@ -219,7 +222,8 @@ pub trait KvAwareOps: Send + Sync {
     /// verified; the returned estimate is `None` for an unverified candidate.
     ///
     /// `hashes` is shared with the Prefill estimate so the same prompt is
-    /// hashed once per request rather than once per stage.
+    /// hashed once per request rather than once per stage. P/D selection uses
+    /// the commit-validated prices from the preparation hook below.
     fn estimate_decode_work<'tokens>(
         &self,
         inputs: &[(&dyn Worker, &'tokens [Vec<u32>], bool)],
@@ -234,6 +238,7 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Vec<DecodeWorkEstimate> {
         self.estimate_decode_work(inputs, hashes)
     }
+    /// P/D Prefill pricing entry point. Carries source evidence to admission.
     #[doc(hidden)]
     fn prepare_prefill_prices<'tokens>(
         &self,
@@ -242,6 +247,7 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Option<PdWorkPrices> {
         None
     }
+    /// P/D Decode pricing entry point. Carries source evidence to Decode commit.
     #[doc(hidden)]
     fn prepare_decode_prices<'tokens>(
         &self,
@@ -1237,7 +1243,9 @@ impl KvAwarePolicy {
                 ..self.params
             };
             if matches!(stage, WorkStage::Decode { .. }) {
-                // Decode needs GPU blocks for host or external pages too.
+                // Only device-resident blocks reduce new Decode occupancy.
+                // Host, external, and disk pages still need GPU blocks on arrival.
+                // Prefill retains tiered credit because those pages avoid recompute.
                 params.transfer_credits.host_pinned = 0.0;
                 params.transfer_credits.external = 0.0;
                 params.transfer_credits.disk = 0.0;
@@ -1288,6 +1296,8 @@ impl KvAwarePolicy {
                             reused
                         };
                         // Each request holds one copy of the prompt across its sequences.
+                        // Count its uncached remainder once so rankings use the same
+                        // per-request units as the Decode ledger.
                         context.saturating_sub(reused)
                     }
                 };
@@ -4799,16 +4809,26 @@ mod tests {
             if !reserve_prefill {
                 policy.slot_manager = None;
             }
-            let receipt = policy
-                .select_worker_with_inputs(
-                    &workers,
-                    KvRequestTokens::PerWorker(&inputs),
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .unwrap();
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let receipt = metrics::with_local_recorder(&recorder, || {
+                policy
+                    .select_worker_with_inputs(
+                        &workers,
+                        KvRequestTokens::PerWorker(&inputs),
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+            });
+            let rendered = recorder.handle().render();
+            let unevidenced = "vllm_router_kv_placement_lookups_total{result=\"unevidenced\"}";
+            if reserve_prefill {
+                assert!(rendered.contains(&format!("{unevidenced} 1")));
+            } else {
+                assert!(!rendered.contains(unevidenced));
+            }
             assert_eq!(receipt.new_prefill_tokens, expected);
             assert_eq!(receipt.slot.is_some(), reserve_prefill);
             assert_eq!(
@@ -4912,10 +4932,10 @@ mod tests {
             index.begin_empty(0);
             warm_full(index, 0, &prompt[..32]);
         }
-        let select = |expected_worker: usize, expected_prefill| {
+        let select = |tokens, expected_worker: usize, expected_prefill| {
             let excluded = [workers[1 - expected_worker].url().to_owned()];
             let receipt = policy
-                .select_worker_with_receipt(&workers, Some(&prompt), None, None, None, &excluded)
+                .select_worker_with_inputs(&workers, tokens, None, None, None, &excluded)
                 .unwrap();
             assert_eq!(receipt.worker_index, expected_worker);
             assert_eq!(receipt.new_prefill_tokens, expected_prefill);
@@ -4933,7 +4953,16 @@ mod tests {
             assert_eq!(workers[expected_worker].load(), 0);
         };
 
-        select(0, 1);
+        let mut second_prompt = prompt;
+        second_prompt[32] = 8;
+        let batch: Arc<[Vec<u32>]> = Arc::from([prompt.to_vec(), second_prompt.to_vec()]);
+        let inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), batch.clone()))
+            .collect();
+        let batch_tokens = KvRequestTokens::PerWorker(&inputs);
+        let single_tokens = KvRequestTokens::Shared(Some(&prompt));
+        select(batch_tokens, 0, 2);
 
         let clear = event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]);
         let mut clear_seq = Some(1);
@@ -4946,11 +4975,11 @@ mod tests {
             }
         }));
         let revoked = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        metrics::with_local_recorder(&revoked, || select(0, 33));
+        metrics::with_local_recorder(&revoked, || select(batch_tokens, 0, 66));
         let rendered = revoked.handle().render();
         assert!(rendered
             .contains("vllm_router_kv_placement_lookups_total{result=\"credit_revoked\"} 1"));
-        assert!(!rendered.contains("credit_pin_failed"));
+        assert!(!rendered.contains("credit_pin_revoked"));
 
         // Revoke the first rank on every lookup, while giving the peer an
         // uninterrupted generation and keeping the first rank queryable.
@@ -4964,17 +4993,17 @@ mod tests {
             first.apply_batch(seq, &replace).unwrap();
             seq += 1;
         }));
-        select(1, 1);
-        select(0, 33);
+        select(single_tokens, 1, 1);
+        select(single_tokens, 0, 33);
 
         // Invalidate after the initial plan check on every scored attempt.
         // The existing final attempt reserves full input without a KV query.
         *load.after_lookup.lock() = peer.before_lookup.lock().take();
         let pin_failure = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        metrics::with_local_recorder(&pin_failure, || select(0, 33));
+        metrics::with_local_recorder(&pin_failure, || select(single_tokens, 0, 33));
         let rendered = pin_failure.handle().render();
         assert!(rendered
-            .contains("vllm_router_kv_placement_lookups_total{result=\"credit_pin_failed\"} 3"));
+            .contains("vllm_router_kv_placement_lookups_total{result=\"credit_pin_revoked\"} 3"));
         assert!(rendered.contains("outcome=\"placement_pin_failed\""));
         assert!(!rendered.contains("registration_churn"));
         assert_eq!(load.revocations.load(Ordering::Relaxed), 4);

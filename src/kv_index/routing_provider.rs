@@ -135,6 +135,12 @@ pub(crate) struct PlacementEvidence {
     lease: Option<SourceLease>,
 }
 
+pub(crate) enum PlacementPinError {
+    Busy,
+    Revoked,
+    Missing,
+}
+
 impl PlacementEvidence {
     pub(crate) fn target(&self) -> &RoutableTarget {
         self.snapshot.version.target()
@@ -147,16 +153,23 @@ impl PlacementEvidence {
     /// Try the source guards without waiting under the policy's selection lock.
     pub(crate) fn try_pin_all<'a>(
         evidence: impl Iterator<Item = &'a Self>,
-    ) -> Option<SmallVec<[SourceReadGuard<'a>; 1]>> {
+    ) -> Result<SmallVec<[SourceReadGuard<'a>; 1]>, PlacementPinError> {
         let mut pins = SmallVec::new();
         for proof in evidence {
-            let guard = proof.snapshot.version.try_read()?;
+            let guard = proof
+                .snapshot
+                .version
+                .try_read()
+                .ok_or(PlacementPinError::Busy)?;
             if proof.is_revoked() {
-                return None;
+                return Err(PlacementPinError::Revoked);
             }
             pins.push(guard);
         }
-        (!pins.is_empty()).then_some(pins)
+        if pins.is_empty() {
+            return Err(PlacementPinError::Missing);
+        }
+        Ok(pins)
     }
 }
 

@@ -210,7 +210,8 @@ pub struct PdRequestContext<'a> {
 }
 
 impl<'a> StagePricing<'a> {
-    /// Preserve the guard holder until the load transaction returns.
+    /// The caller keeps the guard slot outside the selection callback so it
+    /// outlives both the callback and the ledger write.
     pub(super) fn validate<'b>(
         self,
         workers: &[Arc<dyn Worker>],
@@ -235,7 +236,7 @@ impl PdRequestContext<'_> {
         }
     }
 
-    pub(super) fn decode_tokens(&self) -> Option<&HashMap<String, u64>> {
+    pub(super) fn marginal_decode_context(&self) -> Option<&HashMap<String, u64>> {
         match self.decode_pricing {
             Some(StagePricing::Validated(prices)) => Some(prices.tokens()),
             _ => None,

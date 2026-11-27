@@ -356,8 +356,8 @@ impl PdKvState {
         // A deferred decision only picks a provisional worker here and re-prices at commit,
         // so rendering and pricing Decode now would be discarded - and could stall admission
         // on a slow backend for nothing.
-        // A candidate can only be priced when its base is creditable. `decode_context_from_
-        // results` needs an estimate for every candidate, so pricing with a partial set
+        // A candidate can only be priced when its base is creditable. The Decode
+        // price table needs an estimate for every candidate, so pricing a partial set
         // always falls back - after paying for the slowest render. Require the whole set.
         // Decode pricing also never renders on non-gRPC pools: only gRPC router_prompts
         // and direct token-id prompts price without a `/render` fan-out.
@@ -383,9 +383,9 @@ impl PdKvState {
         let mut hashes = PromptHashes::new();
         let prefill_prices = kv_aware_ops(prefill_policy.as_ref())
             .and_then(|kv| Self::prefill_prices(kv, prefill_workers, &prepared, &mut hashes));
-        let decode_context = if decode_priced_here {
+        let decode_prices = if decode_priced_here {
             let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
-            self.decode_context_from_results(
+            self.decode_prices_from_results(
                 kv,
                 decode_workers,
                 &allow_credit,
@@ -402,7 +402,7 @@ impl PdKvState {
         drop(hashes);
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
-        (prepared, prefill_prices, decode_context)
+        (prepared, prefill_prices, decode_prices)
     }
 
     /// Render the request against each base, or reuse the router's own ids.
@@ -487,7 +487,7 @@ impl PdKvState {
     /// Returns `None` when any candidate is unpriced, because one credited
     /// figure beside a full-price one would compare different units across the
     /// pool.
-    fn decode_context_from_results<'tokens>(
+    fn decode_prices_from_results<'tokens>(
         &self,
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
@@ -529,7 +529,7 @@ impl PdKvState {
     /// `hashes` is the caller's cache: the admission path shares it with the
     /// Prefill estimate, while the deferred commit starts a fresh one because it
     /// prices against the index as it stands at commit time.
-    pub(super) async fn prepare_decode_context(
+    pub(super) async fn prepare_decode_prices(
         &self,
         workers: &[Arc<dyn Worker>],
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -560,7 +560,7 @@ impl PdKvState {
         let results = self
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
-        self.decode_context_from_results(
+        self.decode_prices_from_results(
             kv,
             workers,
             &allow_credit,
@@ -1207,7 +1207,7 @@ mod kv_input_tests {
         let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1222,7 +1222,7 @@ mod kv_input_tests {
         // HTTP prices Decode only from free ids: a token-id prompt prices, a string falls back.
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1258,7 +1258,7 @@ mod kv_input_tests {
                 )
                 .await;
             let commit = state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1272,7 +1272,7 @@ mod kv_input_tests {
         }
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &json!({"model":"m","prompt":"hello"}),
@@ -1334,7 +1334,7 @@ mod kv_input_tests {
         state.bind_refresh().await;
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1350,7 +1350,7 @@ mod kv_input_tests {
         state.bind_refresh().await;
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
