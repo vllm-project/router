@@ -1,6 +1,5 @@
-"""CPU checks for the pinned AgentX workload and replay configuration."""
+"""CPU checks for router policy workers and the pinned replay configuration."""
 
-import hashlib
 import io
 import json
 import subprocess
@@ -14,7 +13,6 @@ import httpx
 import yaml
 
 from tests.python.e2e.perf.router_policy import case_loader
-from tests.python.e2e.perf.router_policy.data import extract_agentx_ci
 from tests.python.e2e.perf.router_policy.stack_launcher import (
     allocate_ports,
     cleanup,
@@ -229,75 +227,26 @@ def test_snapshot_uses_router_metrics_port_and_checks_http_status(
     ]
 
 
-def test_agentx_slice_matches_pd_cases():
-    trace = SUITE / "data" / extract_agentx_ci.TRACE_FILE
-    assert (
-        hashlib.sha256(trace.read_bytes()).hexdigest() == extract_agentx_ci.TRACE_SHA256
-    )
-    sessions = [
-        json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()
-    ]
-    assert len(sessions) == extract_agentx_ci.SESSION_COUNT == 12
-    assert tuple(session["id"] for session in sessions) == extract_agentx_ci.SESSION_IDS
-    requests = []
-    subagent_groups = 0
-    for session in sessions:
-        assert session["hash_id_scope"] == "local"
-        assert len(session["requests"]) == extract_agentx_ci.TURNS_PER_SESSION == 12
-        session_requests = []
-        for entry in session["requests"]:
-            if entry["type"] == "subagent":
-                subagent_groups += 1
-                session_requests.extend(entry["requests"])
-            else:
-                session_requests.append(entry)
-        for request in session_requests:
-            assert (
-                len(request["hash_ids"])
-                == (request["in"] + session["block_size"] - 1) // session["block_size"]
-            )
-            assert 0 <= request["out"]
-            assert request["in"] + request["out"] <= extract_agentx_ci.MAX_MODEL_LEN
-        requests.extend(session_requests)
-    assert subagent_groups > 0
-    assert len(requests) == 315
-    for filename in (
-        "pd_disagg_cache_aware.json",
-        "pd_disagg_kv_aware.json",
-        "pd_disagg_round_robin.json",
-    ):
-        case = json.loads((SUITE / "cases" / filename).read_text(encoding="utf-8"))
-        assert case["runtime"]["trace_type"] == "agentX"
-        assert case["runtime"]["trace_sha256"] == extract_agentx_ci.TRACE_SHA256
-        assert (SUITE.parents[4] / case["runtime"]["trace_path"]) == trace
-        assert (
-            case["workers"]["per_worker"]["max_model_len"]
-            == extract_agentx_ci.MAX_MODEL_LEN
-        )
-        assert case["benchmark_params"]["task-num"] == len(sessions)
-        assert case["benchmark_params"]["max-concurrency"] == [12]
-
-
 @pytest.mark.parametrize(
     "scenario,trace_type,endpoint,template",
     [
         (
             "pd_disagg_cache_aware",
-            "agentX",
-            "/v1/completions",
-            "replay_agentX.yaml",
+            "tracelab",
+            "/v1/chat/completions",
+            "replay_tracelab.yaml",
         ),
         (
             "pd_disagg_kv_aware",
-            "agentX",
-            "/v1/completions",
-            "replay_agentX.yaml",
+            "tracelab",
+            "/v1/chat/completions",
+            "replay_tracelab.yaml",
         ),
         (
             "pd_disagg_round_robin",
-            "agentX",
-            "/v1/completions",
-            "replay_agentX.yaml",
+            "tracelab",
+            "/v1/chat/completions",
+            "replay_tracelab.yaml",
         ),
         (
             "pd_merge_cache_aware",
@@ -342,80 +291,8 @@ def test_replay_uses_the_matching_adapter_template(
     assert config["replay"]["sample_seed"] == 0
     assert config["replay"]["max_inflight_requests"] == 1
     assert config["replay"]["trace_same_agent_gap_scale"] == case.gap_scale
-    if trace_type == "agentX":
+    if scenario.startswith("pd_disagg_"):
         assert case.prefill_count == 2
         assert case.trace_sha256
-        assert config["experiment"]["task_num"] == 12
-        assert config["experiment"]["max_concurrency"] == 12
-
-
-@pytest.fixture
-def extraction_source(tmp_path):
-    session = {
-        "id": "source-session",
-        "hash_id_scope": "local",
-        "block_size": 4,
-        "requests": [
-            {"in": 4, "out": 2, "hash_ids": [1]},
-            {
-                "type": "subagent",
-                "agent_id": "child",
-                "requests": [
-                    {"in": 8, "out": 2, "hash_ids": [1, 2]},
-                    {"in": 4, "out": 0, "hash_ids": [3]},
-                ],
-            },
-            {"in": 16, "out": 2, "hash_ids": [1, 2, 3, 4]},
-        ],
-    }
-    second = {**session, "id": "second-session"}
-    raw = (json.dumps(session) + "\n" + json.dumps(second) + "\n").encode()
-    source = tmp_path / "source.jsonl"
-    source.write_bytes(raw)
-    expected = "".join(
-        json.dumps({**one, "requests": one["requests"][:2]}) + "\n"
-        for one in (second, session)
-    ).encode()
-    options = dict(
-        session_ids=("second-session", "source-session"),
-        turns_per_session=2,
-        expected_sha256=hashlib.sha256(expected).hexdigest(),
-    )
-    return source, options, expected
-
-
-def test_extraction_preserves_source_requests(extraction_source):
-    source, options, expected = extraction_source
-    assert extract_agentx_ci.extract(source, **options) == expected
-
-
-@pytest.mark.parametrize("tamper", ["source", "digest"])
-def test_extraction_rejects_changed_data(extraction_source, tamper):
-    source, options, _ = extraction_source
-    if tamper == "source":
-        source.write_bytes(source.read_bytes().replace(b'"out": 2', b'"out": 3'))
-    else:
-        options["expected_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="SHA256 mismatch"):
-        extract_agentx_ci.extract(source, **options)
-
-
-def test_extraction_requires_distinct_sessions(extraction_source):
-    source, options, _ = extraction_source
-    options["session_ids"] = ("source-session", "source-session")
-    with pytest.raises(ValueError, match="distinct session IDs"):
-        extract_agentx_ci.extract(source, **options)
-
-
-def test_extraction_rejects_missing_fixed_sessions(extraction_source):
-    source, options, _ = extraction_source
-    options["session_ids"] = ("source-session", "missing-session")
-    with pytest.raises(ValueError, match="missing fixed sessions"):
-        extract_agentx_ci.extract(source, **options)
-
-
-def test_extraction_rejects_incomplete_sessions(extraction_source):
-    source, options, _ = extraction_source
-    options["turns_per_session"] = 4
-    with pytest.raises(ValueError, match="fewer than 4 turns"):
-        extract_agentx_ci.extract(source, **options)
+        assert config["experiment"]["task_num"] == 6
+        assert config["experiment"]["max_concurrency"] == 6

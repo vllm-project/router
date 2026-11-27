@@ -2,14 +2,16 @@
   "id": "pd_disagg_round_robin",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
-    "trace_path": "tests/python/e2e/perf/router_policy/data/agentx-hetero12x12.jsonl",
-    "trace_type": "agentX",
-    "trace_sha256": "e7e7fd7cd31f178483e2027281ce4592fca38bd35252c09b88e2a9dee1078638",
-    "endpoint": "/v1/completions"
+    "trace_path": "tests/python/e2e/perf/router_policy/data/tracelab-l4-6.jsonl",
+    "trace_type": "tracelab",
+    "trace_sha256": "105c375c30634d8191a22cfbc56a6e2d63ce3e2ddc571ffe7519581b8086e2e0",
+    "endpoint": "/v1/chat/completions"
   },
   "benchmark_params": {
-    "task-num": 12,
-    "max-concurrency": [12],
+    "task-num": 6,
+    "max-concurrency": [
+      6
+    ],
     "gap_scale": 0.002,
     "max_inflight": 1,
     "task_stagger": 0
@@ -19,10 +21,10 @@
     "protocol": "grpc",
     "per_worker": {
       "tensor_parallel_size": 1,
-      "max_model_len": 163840,
+      "max_model_len": 65536,
       "max_num_seqs": 8,
       "max_num_batched_tokens": 8192,
-      "kv_cache_memory_bytes": 27917287424,
+      "kv_cache_memory_bytes": 12884901888,
       "cpu_kv_bytes": 0,
       "dtype": "bfloat16",
       "enable_prefix_caching": true,

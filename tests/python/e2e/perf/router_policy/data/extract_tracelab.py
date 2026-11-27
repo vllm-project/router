@@ -1,20 +1,24 @@
-"""Extract the eight TraceLab sessions used by the router_policy cold replay.
+"""Extract the fixed TraceLab subsets used by router_policy cold replay.
 
 Source: ``UW-SyFI/TraceLab`` revision ``7256bbf77e76d5cb83f4ddbd5ad31d8faee9dc7a``,
 file ``data/v0.0.2/syfi_coding_trace.jsonl.gz``. The extractor keeps every
-original ``provider == "codex"`` row for the eight session ids, in source order.
+original ``provider == "codex"`` row for the eight merged session ids by default.
+``--subset pd_disagg`` selects the review's six complete, context-capped sessions.
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import json
-import sys
 from pathlib import Path
 
 SOURCE_SHA = "11ce51ec0a25e3d1d95b025bca2f7d1647e47571eb7cc968acd5fc64d4b4fb65"
 TRACE_SHA = "d81e020824255602125cb0f5f94777601bc935fcd8739cd429665cf11331b849"
+PD_TRACE_FILE = "tracelab-l4-6.jsonl"
+PD_TRACE_SHA = "105c375c30634d8191a22cfbc56a6e2d63ce3e2ddc571ffe7519581b8086e2e0"
+PD_MAX_MODEL_LEN = 65536
 IDS = {
     "codex:20af69c9-826d-9ae3-51ce-185ac55fa8af",
     "codex:e2a0b3e9-6e0f-0860-76d6-10fa77b06519",
@@ -35,13 +39,45 @@ def digest(path: Path) -> str:
     return hashed.hexdigest()
 
 
+def extract_pd_disagg(source: Path) -> bytes:
+    """Keep complete sessions from the first sixteen keys that fit 64K context."""
+    maxima: dict[tuple[str, str], int] = {}
+    rows = []
+    with gzip.open(source, "rb") as handle:
+        for line in handle:
+            row = json.loads(line)
+            session = (row["provider"], row["session_id"])
+            if len(maxima) < 16:
+                maxima.setdefault(session, 0)
+            if session in maxima:
+                length = (row["input_tokens_total"] or 0) + (row["output_tokens"] or 0)
+                maxima[session] = max(maxima[session], length)
+                rows.append((session, row))
+    keep = {session for session, length in maxima.items() if length <= PD_MAX_MODEL_LEN}
+    selected = [row for session, row in rows if session in keep]
+    if len(maxima) != 16 or len(keep) != 6 or len(selected) != 68:
+        raise ValueError("expected six complete sessions and 68 requests")
+    # Match the review's serialization as well as its session selection.
+    body = "".join(json.dumps(row) + "\n" for row in selected).encode("utf-8")
+    if hashlib.sha256(body).hexdigest() != PD_TRACE_SHA:
+        raise ValueError("extracted PD TraceLab SHA-256 mismatch")
+    return body
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {Path(sys.argv[0]).name} syfi_coding_trace.jsonl.gz")
-    source = Path(sys.argv[1])
-    dest = Path(__file__).resolve().parent / "tracelab-ci-uniform-28.jsonl"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("--subset", choices=("merged", "pd_disagg"), default="merged")
+    args = parser.parse_args()
+    source = args.source
+    data_dir = Path(__file__).resolve().parent
     if digest(source) != SOURCE_SHA:
         raise SystemExit("source SHA-256 mismatch")
+    if args.subset == "pd_disagg":
+        (data_dir / PD_TRACE_FILE).write_bytes(extract_pd_disagg(source))
+        print(f"Extracted 6 complete sessions and 68 requests: {PD_TRACE_SHA}")
+        return
+    dest = data_dir / "tracelab-ci-uniform-28.jsonl"
     count = 0
     found: set[str] = set()
     with gzip.open(source, "rt", encoding="utf-8") as src, dest.open(

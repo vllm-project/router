@@ -134,20 +134,24 @@ def prepare_trace(
     trace_type: str = "tracelab",
     expected_sha256: str = "",
 ) -> Path:
-    """Verify pinned AgentX data or resolve a TraceLab URL override."""
+    """Verify pinned data or resolve an unpinned TraceLab URL override."""
 
-    url = _env_first("TRACELAB_JSONL_URL") if trace_type == "tracelab" else ""
+    url = (
+        _env_first("TRACELAB_JSONL_URL")
+        if trace_type == "tracelab" and not expected_sha256
+        else ""
+    )
     if not url:
         if not trace_path.is_file():
             label = "AgentX" if trace_type == "agentX" else "TraceLab"
             raise FileNotFoundError(f"{label} replay file does not exist: {trace_path}")
-        if trace_type == "agentX":
-            if not expected_sha256:
-                raise ValueError("AgentX replay requires runtime.trace_sha256")
+        if trace_type == "agentX" and not expected_sha256:
+            raise ValueError("AgentX replay requires runtime.trace_sha256")
+        if expected_sha256:
             actual = hashlib.sha256(trace_path.read_bytes()).hexdigest()
             if actual != expected_sha256:
                 raise ValueError(
-                    f"AgentX trace SHA256 mismatch: expected {expected_sha256}, got {actual}"
+                    f"{trace_type} trace SHA256 mismatch: expected {expected_sha256}, got {actual}"
                 )
         return trace_path
 

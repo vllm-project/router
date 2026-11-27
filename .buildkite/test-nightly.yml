@@ -146,8 +146,8 @@ steps:
           - "tests/python/e2e/results/perf/grpc/**/*.json"
 
       # ============================================================================
-      # L3 router_policy replay — merged TraceLab c8 and disaggregated AgentX c12.
-      # Merged: 12GiB GPU KV/worker on L4×4; PD: 26GiB/worker on H100×4.
+      # L3 router_policy replay — merged TraceLab c8 and disaggregated TraceLab c6.
+      # Both jobs: 12GiB GPU KV per worker on four co-located L4 GPUs.
       # TRACELAB_JSONL_URL overrides merged traces; PD uses a SHA256-pinned slice.
       # ============================================================================
       - label: ":bar_chart: Perf · PD Merge Router Policy (c8) Test"
@@ -167,18 +167,18 @@ steps:
           - "tests/python/e2e/results/perf/router_policy/**/*"
           - "tests/python/e2e/run/perf/router_policy/c*-*/**/*"
 
-      - label: ":bar_chart: Perf · PD Disaggregated Router Policy (c12) Test"
+      - label: ":bar_chart: Perf · PD Disaggregated Router Policy (c6) Test"
         key: "router-policy-pd-disagg-perf-e2e"
         if: build.env("ROCM_ONLY") != "1"
         timeout_in_minutes: 180
-        mirror_hardwares: h100_4
+        mirror_hardwares: l4_4
         depends_on:
           - "upload-nightly-pipeline"
           - "image-build"
         env:
           AGENTX_CELL_GAP_SEC: "${AGENTX_CELL_GAP_SEC:-15}"
           AGENTX_PORT_SETTLE_SEC: "${AGENTX_PORT_SETTLE_SEC:-5}"
-        command: python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c12'
+        command: python -m pytest -sv tests/python/e2e/perf/router_policy/test_router_policy_scenarios.py -k 'pd_disagg and c6'
         # Performance JSON for the dashboard, plus the cell files used to diagnose a run.
         artifact_paths:
           - "tests/python/e2e/results/perf/router_policy/**/*"

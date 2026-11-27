@@ -8,7 +8,7 @@ Flow:
   5. Run agentinfer replay bench against the router.
 
 Merged cases use the TraceLab 8-session / 28-request subset; disaggregated
-cases use the AgentX heterogeneous 12-session / 315-request subset.
+cases use the context-capped TraceLab 6-session / 68-request subset.
 Replay executes the selected plan and writes
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 

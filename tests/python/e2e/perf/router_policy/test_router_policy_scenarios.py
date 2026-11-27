@@ -188,12 +188,15 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
     case = case_at_concurrency(load_case(case_file), concurrency)
     trace_type = case["runtime"].get("trace_type", "tracelab")
     # Independent fixture facts: a truncated import/plan cannot redefine them.
-    # AgentX's 144 top-level entries expand into 315 model requests.
     expected_inventory: tuple[int, int] | None = {
-        "agentX": (12, 315),
-        "tracelab": (8, 28),
-    }[trace_type]
-    if trace_type == "tracelab" and os.environ.get("TRACELAB_JSONL_URL", "").strip():
+        "tracelab-ci-uniform-28.jsonl": (8, 28),
+        "tracelab-l4-6.jsonl": (6, 68),
+    }[Path(case["runtime"]["trace_path"]).name]
+    if (
+        trace_type == "tracelab"
+        and not case["runtime"].get("trace_sha256")
+        and os.environ.get("TRACELAB_JSONL_URL", "").strip()
+    ):
         expected_inventory = None
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)

@@ -2,11 +2,14 @@
 
 import hashlib
 import io
+import json
+from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
 
 from tests.python.e2e.perf.router_policy import case_loader
+from tests.python.e2e.perf.router_policy.data import extract_tracelab
 
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
@@ -75,21 +78,22 @@ def test_http_error_fails_trace_preparation(tmp_path, monkeypatch):
     assert not list(out.iterdir())
 
 
-def test_agentx_trace_is_pinned_and_ignores_tracelab_override(tmp_path, monkeypatch):
-    trace = tmp_path / "agentx.jsonl"
-    trace.write_bytes(b"pinned AgentX data\n")
+@pytest.mark.parametrize("trace_type", ["agentX", "tracelab"])
+def test_pinned_trace_ignores_tracelab_override(tmp_path, monkeypatch, trace_type):
+    trace = tmp_path / "pinned.jsonl"
+    trace.write_bytes(b"pinned replay data\n")
     expected = hashlib.sha256(trace.read_bytes()).hexdigest()
     monkeypatch.setenv("TRACELAB_JSONL_URL", "https://example.test/tracelab.jsonl")
 
     def unexpected_download(*args, **kwargs):
-        pytest.fail("AgentX must not use the TraceLab URL override")
+        pytest.fail("pinned traces must not use the TraceLab URL override")
 
     monkeypatch.setattr(case_loader, "urlopen", unexpected_download)
     assert (
         case_loader.prepare_trace(
             trace,
             out_dir=tmp_path / "run",
-            trace_type="agentX",
+            trace_type=trace_type,
             expected_sha256=expected,
         )
         == trace
@@ -108,3 +112,42 @@ def test_agentx_trace_requires_a_matching_hash(tmp_path, expected):
             expected_sha256=expected,
         )
     assert not (tmp_path / "run").exists()
+
+
+def test_pinned_tracelab_rejects_changed_data(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRACELAB_JSONL_URL", raising=False)
+    trace = tmp_path / "pinned.jsonl"
+    trace.write_bytes(b"changed replay data\n")
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        case_loader.prepare_trace(
+            trace,
+            out_dir=tmp_path / "run",
+            expected_sha256="0" * 64,
+        )
+    assert not (tmp_path / "run").exists()
+
+
+def test_pd_tracelab_fits_all_pd_cases():
+    suite = Path(__file__).parents[1] / "e2e/perf/router_policy"
+    trace = suite / "data" / extract_tracelab.PD_TRACE_FILE
+    body = trace.read_bytes()
+    assert hashlib.sha256(body).hexdigest() == extract_tracelab.PD_TRACE_SHA
+    rows = [json.loads(line) for line in body.splitlines()]
+    assert len(rows) == 68
+    assert len({(row["provider"], row["session_id"]) for row in rows}) == 6
+    longest = max(row["input_tokens_total"] + row["output_tokens"] for row in rows)
+    assert longest == 60228
+    for policy in ("cache_aware", "kv_aware", "round_robin"):
+        case = case_loader.load_case(suite / "cases" / f"pd_disagg_{policy}.json")
+        assert suite.parents[4] / case["runtime"]["trace_path"] == trace
+        assert case["runtime"]["trace_type"] == "tracelab"
+        assert case["runtime"]["trace_sha256"] == extract_tracelab.PD_TRACE_SHA
+        assert case["runtime"]["endpoint"] == "/v1/chat/completions"
+        assert case["benchmark_params"]["task-num"] == 6
+        assert case["benchmark_params"]["max-concurrency"] == [6]
+        assert case["benchmark_params"]["max_inflight"] == 1
+        assert case["workers"]["count"] == 4
+        assert case["workers"]["prefill_count"] == 2
+        worker = case["workers"]["per_worker"]
+        assert longest <= worker["max_model_len"] == 65536
+        assert worker["kv_cache_memory_bytes"] == 12 * 1024**3

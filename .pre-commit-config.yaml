@@ -15,8 +15,6 @@ repos:
         args: ['--allow-multiple-documents']
       - id: check-added-large-files
         args: ['--maxkb=1000']
-        # Fixed review fixture (1.83 MB); its SHA-256 is checked at replay startup.
-        exclude: ^tests/python/e2e/perf/router_policy/data/agentx-hetero12x12\.jsonl$
       - id: check-merge-conflict
       - id: check-toml
       - id: mixed-line-ending
