@@ -54,6 +54,9 @@ impl ConfigValidator {
     }
 
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
+        for (worker, source) in &config.binding_kv_sources {
+            source.validate(worker)?;
+        }
         if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
             && config.token_capacity_per_dp_rank.is_none()
         {

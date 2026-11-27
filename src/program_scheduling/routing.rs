@@ -1,6 +1,5 @@
 //! Coordinate Program membership, binding recommendations and fixed-rank dispatch.
-//! The five built-in selectors only do synchronous, in-memory work. Their selection
-//! and commit share the scheduler transaction to preserve PR 286 ordering.
+//! Full HTTP sessions rank eligible candidates outside admission and commit a fenced ticket.
 
 use super::scheduler::ProgramAdmission;
 use super::scheduler_admission::AdmissionGuard;
@@ -17,7 +16,7 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct ProgramRouter {
     pub(super) admission: ProgramAdmission,
-    policy: Mutex<Box<dyn ProgramBindingPolicy>>,
+    pub(super) policy: Mutex<Box<dyn ProgramBindingPolicy>>,
 }
 
 // Forward existing admission, observation and settlement APIs to their owner.
@@ -140,12 +139,24 @@ impl ProgramRouter {
         targets: &[ProgramTarget],
         text: Option<String>,
     ) -> Result<ProgramDispatch, ScheduleError> {
+        self.acquire_with_scorer(identity, context, targets, text, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_with_scorer(
+        &self,
+        identity: ProgramIdentity,
+        context: ContextTokens,
+        targets: &[ProgramTarget],
+        text: Option<String>,
+        scorer: Option<&dyn super::SessionRankScorer>,
+    ) -> Result<ProgramDispatch, ScheduleError> {
         if targets.is_empty() {
             return Err(ScheduleError::NoTargets);
         }
         let arrived_at = Instant::now();
         let expected_resume = identity.expected_resume();
-        let (handle, pending) = {
+        let (handle, pending, strict) = {
             let mut state = self.admission.state.lock();
             let (handle, context) = self.admission.register_attempt(
                 &mut state,
@@ -155,29 +166,77 @@ impl ProgramRouter {
                 arrived_at,
             );
             let reference = handle.program().clone();
-            let rank = self.initial_binding(
-                &mut state,
-                &identity,
-                &reference,
-                arrived_at,
-                text.as_deref(),
-            );
+            let strict = state
+                .decisions
+                .get(&reference)
+                .map_or(identity.session_admission, |d| d.session_admission);
+            let rank = if strict {
+                None
+            } else {
+                self.initial_binding(
+                    &mut state,
+                    &identity,
+                    &reference,
+                    arrived_at,
+                    text.as_deref(),
+                )
+            };
             let pending = self
                 .admission
                 .finish_registration(&mut state, &identity, reference, context, rank, arrived_at);
-            (handle, pending)
+            (handle, pending, strict)
         };
         let mut guard = AdmissionGuard::new(&self.admission, handle);
         let (output_prediction, return_time_keys) = pending?;
         let deadline = arrived_at + self.admission.config.queue_timeout;
+        let mut refreshed = false;
+        let mut deferred_revision = None;
         loop {
+            if strict && Instant::now() >= deadline {
+                return Err(ScheduleError::QueueTimeout);
+            }
             let wait_handle = guard.handle().clone();
             let notified = wait_handle.notified();
             if let Some(mut dispatch) = self.next_dispatch(guard.handle()) {
-                dispatch.attach_prediction_context(expected_resume, output_prediction, return_time_keys);
+                dispatch.attach_prediction_context(
+                    expected_resume,
+                    output_prediction,
+                    return_time_keys,
+                );
                 guard.disarm();
                 return Ok(dispatch);
             }
+            if strict
+                && deferred_revision
+                    .is_none_or(|r| self.admission.state.lock().admission_revision != r)
+            {
+                if let Some(task) =
+                    self.admission
+                        .binding_task(guard.handle(), &identity, deadline)?
+                {
+                    let (dispatch, retry) = self
+                        .select_and_commit_ticket(&task, text.as_deref(), scorer)
+                        .await?;
+                    if let Some(mut dispatch) = dispatch {
+                        dispatch.attach_prediction_context(
+                            expected_resume,
+                            output_prediction,
+                            return_time_keys,
+                        );
+                        guard.disarm();
+                        return Ok(dispatch);
+                    }
+                    deferred_revision = None;
+                    if !retry || refreshed {
+                        deferred_revision = Some(task.revision);
+                    }
+                    if retry && !refreshed {
+                        refreshed = true;
+                        continue;
+                    }
+                }
+            }
+            refreshed = false;
             let now = Instant::now();
             if now >= deadline {
                 return Err(ScheduleError::QueueTimeout);
@@ -208,24 +267,54 @@ impl ProgramRouter {
         &self,
         snapshots: impl IntoIterator<Item = (String, Arc<[ProgramTarget]>)>,
     ) {
+        self.sync_registry_snapshots(None, snapshots);
+    }
+
+    pub(crate) fn sync_registry_snapshots(
+        &self,
+        revision: Option<u64>,
+        snapshots: impl IntoIterator<Item = (String, Arc<[ProgramTarget]>)>,
+    ) {
         let mut state = self.admission.state.lock();
         for (model_pool, targets) in snapshots {
+            if let Some(revision) = revision {
+                let installed = state
+                    .registry_revisions
+                    .entry(model_pool.clone())
+                    .or_default();
+                if revision < *installed {
+                    continue;
+                }
+                *installed = revision;
+            }
             let Some((removed, affected)) =
                 self.admission.sync_pool(&mut state, &model_pool, targets)
             else {
                 continue;
             };
+            ProgramAdmission::wake_capacity_waiters(&mut state);
             for target in &removed {
                 self.policy.lock().remove_target(&model_pool, target);
             }
             for work in affected {
                 let invalidated = self.admission.begin_rebind(&mut state, &work, &removed);
-                let replacement =
-                    self.select_and_commit(&mut state, &work.identity, Instant::now(), None);
+                let replacement = if state.decisions[&work.program].session_admission {
+                    None
+                } else {
+                    self.select_and_commit(&mut state, &work.identity, Instant::now(), None)
+                };
                 self.admission
                     .finish_rebind(&mut state, work, replacement, invalidated);
             }
         }
+    }
+
+    pub(crate) fn binding_only(&self) -> bool {
+        self.admission.config.binding_only
+    }
+
+    pub(crate) fn uses_kv_binding(&self) -> bool {
+        self.admission.config.binding_strategy == super::ProgramBindingStrategy::KvAware
     }
 
     /// Whether initial Program binding needs the request text for prefix affinity.

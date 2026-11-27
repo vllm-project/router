@@ -415,6 +415,8 @@ pub struct ProgramSchedulingConfig {
     pub cross_rank_headroom_ratio: f64,
     #[serde(default)]
     pub binding_strategy: ProgramBindingStrategy,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub binding_kv_sources: HashMap<String, StaticKvEventSources>,
     #[serde(default = "default_program_hash_virtual_nodes")]
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,6 +640,7 @@ impl Default for ProgramSchedulingConfig {
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
             binding_strategy: ProgramBindingStrategy::default(),
+            binding_kv_sources: HashMap::new(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
             token_count_mode: TokenCountMode::default(),
@@ -694,6 +697,8 @@ struct ProgramSchedulingConfigInput {
     cross_rank_headroom_ratio: f64,
     #[serde(default)]
     binding_strategy: ProgramBindingStrategy,
+    #[serde(default)]
+    binding_kv_sources: HashMap<String, StaticKvEventSources>,
     #[serde(default = "default_program_hash_virtual_nodes")]
     hash_virtual_nodes: u32,
     #[serde(default, alias = "token_capacity_per_target")]
@@ -836,6 +841,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             resume_order: input.resume_order,
             cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
             binding_strategy: input.binding_strategy,
+            binding_kv_sources: input.binding_kv_sources,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
             token_count_mode: input.token_count_mode,

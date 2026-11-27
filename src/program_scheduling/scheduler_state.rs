@@ -243,6 +243,9 @@ impl ProgramPauseReason {
 /// Scheduling facts associated with one exact live Program generation.
 #[derive(Debug, Clone)]
 pub(crate) struct ProgramDecisionState {
+    pub(crate) session_admission: bool,
+    pub(crate) binding_ticket: Option<u64>,
+    pub(crate) committed_ticket: Option<u64>,
     pub(crate) placement_key: String,
     pub(crate) placement_hash_key: String,
     pub(crate) task_id: Option<String>,
@@ -306,6 +309,9 @@ impl ProgramDecisionState {
     ) -> Self {
         Self {
             placement_key,
+            session_admission: false,
+            binding_ticket: None,
+            committed_ticket: None,
             placement_hash_key,
             task_id: None,
             session_id: None,
@@ -473,6 +479,10 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) model_target_snapshots: HashMap<String, Arc<[ProgramTarget]>>,
     /// Monotonic fence for target topology or target-attribute changes.
     pub(crate) target_snapshot_revision: u64,
+    pub(crate) registry_revisions: HashMap<String, u64>,
+    pub(crate) capacity_waiters: HashMap<String, VecDeque<ProgramRef>>,
+    pub(crate) next_ticket: u64,
+    pub(crate) admission_revision: u64,
     pub(crate) rank_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
@@ -535,6 +545,10 @@ impl ProgramSchedulerState {
             model_targets: HashMap::new(),
             model_target_snapshots: HashMap::new(),
             target_snapshot_revision: 0,
+            registry_revisions: HashMap::new(),
+            capacity_waiters: HashMap::new(),
+            next_ticket: 0,
+            admission_revision: 0,
             rank_queues: HashMap::new(),
             global_queues: HashMap::new(),
             observations: HashMap::new(),

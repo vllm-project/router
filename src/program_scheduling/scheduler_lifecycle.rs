@@ -612,10 +612,16 @@ impl ProgramAdmission {
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);
         }
-        if self.config.pd_mode {
+        if self.config.pd_mode
+            || state
+                .decisions
+                .get(dispatch.program())
+                .is_some_and(|d| d.session_admission)
+        {
             state.runtime.notify_front(dispatch.program());
         }
         self.run_periodic_decisions(&mut state, now);
+        Self::wake_capacity_waiters(&mut state);
     }
 
     /// Evaluate deadlines, repair capacity, and admit rank-local waiters.
@@ -634,13 +640,15 @@ impl ProgramAdmission {
                 .paused_retention_ttl
                 .max(std::time::Duration::from_secs(60)),
         );
-        if self.config.pd_mode || self.config.enable_acting_ttl {
-            self.expire_acting_ttls(state, now);
-        }
-        self.release_expired_paused(state, now);
+        let mut changed = (self.config.pd_mode || self.config.enable_acting_ttl)
+            && self.expire_acting_ttls(state, now);
+        changed |= self.release_expired_paused(state, now);
         if !self.config.binding_only {
-            self.repair_capacity(state, now);
-            self.schedule_waiting(state, now);
+            changed |= self.repair_capacity(state, now);
+            changed |= self.schedule_waiting(state, now);
+        }
+        if changed {
+            Self::wake_capacity_waiters(state);
         }
     }
 
@@ -756,6 +764,7 @@ impl ProgramAdmission {
             if let Some((target_id, tokens)) = active_relief {
                 Self::adjust_usage(state, &target_id, -tokens);
             }
+            Self::remove_capacity_waiter(state, program);
             state.decisions.remove(program);
             state.bindings.release_program(program);
         }

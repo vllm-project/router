@@ -175,7 +175,13 @@ impl ProgramAdmission {
         context: ContextTokens,
         home_target: Option<String>,
         arrived_at: Instant,
-    ) -> Result<(Option<output_length::PendingOutputPrediction>, Vec<ReturnTimeKey>), ScheduleError> {
+    ) -> Result<
+        (
+            Option<output_length::PendingOutputPrediction>,
+            Vec<ReturnTimeKey>,
+        ),
+        ScheduleError,
+    > {
         let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
             decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
         });
@@ -280,11 +286,14 @@ impl ProgramAdmission {
                 Self::adjust_usage(state, &placement, current_tokens - previous_tokens);
             }
         } else {
-            let target_id = state
-                .decisions
-                .get(&reference)
-                .and_then(|decision| decision.last_target.clone())
-                .ok_or(ScheduleError::NoTargets)?;
+            let decision = &state.decisions[&reference];
+            let Some(target_id) = decision.last_target.clone() else {
+                if decision.session_admission {
+                    self.enqueue_capacity_waiter(state, &reference);
+                    return Ok((pending_output_prediction, return_time_keys));
+                }
+                return Err(ScheduleError::NoTargets);
+            };
             let queue = if self.config.global_queue {
                 state
                     .global_queues
@@ -393,6 +402,52 @@ impl ProgramAdmission {
                 return None;
             }
         }
+        if state
+            .decisions
+            .get(handle.program())
+            .is_some_and(|d| d.session_admission)
+        {
+            if !state.runtime.is_front(handle) {
+                return None;
+            }
+            let program = handle.program();
+            let context = state.runtime.front_request_context(program)?;
+            let decode = self.config.progress_ttl.decode_buffer_tokens;
+            let decision = &state.decisions[program];
+            let context = context.max(decision.context.tokens());
+            let mut output = state
+                .runtime
+                .front_request_hints(program)?
+                .expected_output_tokens
+                .unwrap_or(decode);
+            if state.runtime.view(program)?.in_flight_requests > 0 {
+                output = output.max(decision.output_token_reservation.unwrap_or(decode));
+            }
+            let old = decision.private_tokens(decode);
+            let demand = decision.private_tokens_from_context(context, decode, Some(output));
+            if demand > old
+                && self
+                    .ordinary_capacity_plan(
+                        state,
+                        program,
+                        &target,
+                        Instant::now(),
+                        Some((context, Some(output))),
+                        false,
+                    )
+                    .is_none()
+            {
+                self.enqueue_capacity_waiter(state, program);
+                return None;
+            }
+            Self::remove_capacity_waiter(state, program);
+            Self::adjust_usage(state, &target, demand - old);
+            let decision = state.decisions.get_mut(program)?;
+            if context != decision.context.tokens() {
+                decision.set_context_tokens(context);
+            }
+            decision.output_token_reservation = Some(output);
+        }
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
         // Promote the admitted turn's context estimate: the front request is
         // now the Program's active turn, and later admission must account for
@@ -426,6 +481,11 @@ impl ProgramAdmission {
 
     pub(crate) fn cancel_retained_request(&self, handle: &ProgramRequestHandle) {
         let mut state = self.state.lock();
+        if state.runtime.is_front(handle) {
+            if let Some(decision) = state.decisions.get_mut(handle.program()) {
+                decision.binding_ticket = None;
+            }
+        }
         let before = state.runtime.view(handle.program());
         let before_tokens = state
             .decisions
@@ -493,6 +553,7 @@ impl ProgramAdmission {
             .view(program)
             .is_some_and(|view| view.waiting_requests > 0);
         if !keep_queued {
+            Self::remove_capacity_waiter(&mut state, program);
             for queue in state.rank_queues.values_mut() {
                 queue.retain(|queued| queued != program);
             }
@@ -512,6 +573,7 @@ impl ProgramAdmission {
             self.release_program(&mut state, program, Instant::now());
         }
         self.schedule_waiting(&mut state, Instant::now());
+        Self::wake_capacity_waiters(&mut state);
     }
 
     pub(crate) fn schedule_rank_local(
@@ -698,7 +760,11 @@ impl ProgramAdmission {
     ) -> Option<RankAdmissionPlan> {
         let runtime = state.runtime.view(program)?;
         let decision = state.decisions.get(program)?;
-        if !self.config.global_queue && decision.last_target.as_deref() != Some(target_id) {
+        let initial = decision.session_admission && decision.last_target.is_none();
+        if !initial
+            && !self.config.global_queue
+            && decision.last_target.as_deref() != Some(target_id)
+        {
             return None;
         }
         if runtime.state != ProgramState::Paused
@@ -707,6 +773,32 @@ impl ProgramAdmission {
         {
             return None;
         }
+        let forced = !initial
+            && decision
+                .force_resume_deadline
+                .is_some_and(|deadline| deadline <= now);
+        self.ordinary_capacity_plan(
+            state,
+            program,
+            target_id,
+            now,
+            context_override.map(|n| (n, None)),
+            forced,
+        )
+    }
+
+    /// Evaluate the same demand and headroom for binding, growth and resume.
+    /// An active continuation already owns its current reservation.
+    fn ordinary_capacity_plan(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+        target_id: &str,
+        now: Instant,
+        demand_override: Option<(usize, Option<usize>)>,
+        forced: bool,
+    ) -> Option<RankAdmissionPlan> {
+        let decision = state.decisions.get(program)?;
         if self.config.pd_mode
             && !state
                 .observations
@@ -716,9 +808,6 @@ impl ProgramAdmission {
         {
             return None;
         }
-        let forced = decision
-            .force_resume_deadline
-            .is_some_and(|deadline| deadline <= now);
         if self.config.admission_waiting_request_threshold > 0
             && state
                 .observations
@@ -733,10 +822,17 @@ impl ProgramAdmission {
             .runtime
             .iter_views()
             .filter(|other| {
-                other.state == ProgramState::Active && other.placement == Some(target_id)
+                other.reference != program
+                    && other.state == ProgramState::Active
+                    && other.placement == Some(target_id)
             })
             .collect::<Vec<_>>();
-        let used_tokens = self.target_usage(state, target_id, now);
+        let owned = if state.runtime.placement(program) == Some(target_id) {
+            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+        } else {
+            0.0
+        };
+        let used_tokens = (self.target_usage(state, target_id, now) - owned).max(0.0);
         let active_count = active.len();
         let expected_output_tokens = state
             .runtime
@@ -745,16 +841,27 @@ impl ProgramAdmission {
         // Charge the front turn's own prompt. A later retained turn with a
         // larger prompt must not inflate the front turn's capacity check. A
         // counterfactual caller supplies its own demand instead.
-        let context_tokens = context_override.unwrap_or_else(|| {
-            state
-                .runtime
-                .front_request_context(program)
-                .unwrap_or(decision.context.tokens())
-        });
+        let context_tokens = demand_override
+            .map(|(context, _)| context)
+            .unwrap_or_else(|| {
+                state
+                    .runtime
+                    .front_request_context(program)
+                    .unwrap_or(decision.context.tokens())
+            });
         let required_tokens = decision.private_tokens_from_context(
             context_tokens,
             self.config.progress_ttl.decode_buffer_tokens,
-            expected_output_tokens,
+            if decision.session_admission {
+                Some(
+                    demand_override
+                        .and_then(|(_, output)| output)
+                        .or(expected_output_tokens)
+                        .unwrap_or(self.config.progress_ttl.decode_buffer_tokens),
+                )
+            } else {
+                expected_output_tokens
+            },
         );
         let capacity = self.config.progress_ttl.token_capacity;
         // P KV pressure tightens the cap back to the P prefill permits so the
@@ -894,7 +1001,16 @@ impl ProgramAdmission {
         // its observed shrink policy.
         if let Some(context_tokens) = state.runtime.front_request_context(program) {
             if let Some(decision) = state.decisions.get_mut(program) {
-                if self.config.pd_mode || context_tokens > decision.context.tokens() {
+                if decision.session_admission {
+                    decision.output_token_reservation = state
+                        .runtime
+                        .front_request_hints(program)
+                        .and_then(|h| h.expected_output_tokens);
+                }
+                if decision.session_admission
+                    || self.config.pd_mode
+                    || context_tokens > decision.context.tokens()
+                {
                     decision.set_context_tokens(context_tokens);
                 }
             }

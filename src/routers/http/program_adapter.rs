@@ -41,6 +41,7 @@ impl StreamEnd {
 
 #[derive(Clone)]
 pub(super) struct ProgramCompletion {
+    pub(super) session_admission: bool,
     inner: Arc<ProgramCompletionInner>,
 }
 
@@ -66,6 +67,7 @@ impl ProgramCompletion {
         token_estimate_calibration: TokenEstimateCalibration,
     ) -> Self {
         Self {
+            session_admission: false,
             inner: Arc::new(ProgramCompletionInner {
                 scheduler,
                 dispatch,

@@ -574,7 +574,7 @@ impl CliArgs {
             }
         };
 
-        let kv_sources = vllm_router_rs::config::KvSourceOptions {
+        let mut kv_sources = vllm_router_rs::config::KvSourceOptions {
             layout: self.kv_hybrid_layout.as_deref(),
             publishers: &self.kv_event_source,
             pd_publishers: &self.pd_kv_events,
@@ -587,17 +587,12 @@ impl CliArgs {
 
         // Main policy
         let mut policy = self.parse_policy(&self.policy);
-        if let PolicyConfig::KvAware {
-            static_kv_event_sources: configured,
-            ..
-        } = &mut policy
-        {
-            **configured = kv_sources.regular;
-        } else if !kv_sources.regular.is_empty() {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
-            });
-        }
+        let mut program_scheduling = ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+
+        kv_sources.install_regular(&mut policy, program_scheduling.as_mut())?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -634,11 +629,6 @@ impl CliArgs {
         } else {
             Vec::new()
         };
-
-        let program_scheduling = ProgramSchedulingConfig::resolve(
-            self.enable_program_scheduling,
-            self.program_scheduling_config_json.as_deref(),
-        )?;
 
         // Build RouterConfig
         Ok(RouterConfig {

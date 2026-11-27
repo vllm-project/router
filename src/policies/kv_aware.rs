@@ -1344,6 +1344,97 @@ impl KvAwarePolicy {
         Some((worker_index, decision))
     }
 
+    /// Score only the admission snapshot. No affinity record, slot or worker load is acquired.
+    pub(crate) fn recommend_binding(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'_>,
+        lora: Option<&str>,
+        salt: Option<&str>,
+    ) -> Option<usize> {
+        let plan = self.prepare_selection(workers, input, lora, salt)?;
+        let candidates = self.candidate_views(workers, &plan);
+        let has_credit = candidates.iter().enumerate().any(|(i, c)| {
+            let params = CostParams {
+                block_size: plan.bindings[i].block_size,
+                ..self.params
+            };
+            request_prefill_tokens(c, &params) < c.input_tokens as u64
+        });
+        let position = if has_credit {
+            let (costs, components) = self.score_candidates(&plan, &candidates)?;
+            self.pick_position(true, &costs, &components, None)?
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, candidate)| {
+                    (
+                        candidate.load.active_requests,
+                        candidate.load.active_prefill_tokens,
+                    )
+                })
+                .map(|(i, _)| i)?
+        };
+        crate::metrics::RouterMetrics::record_prefix_routing_decision(
+            "kv_aware",
+            "session_binding",
+            if has_credit {
+                "prefix_cost"
+            } else {
+                "load_only"
+            },
+        );
+        Some(plan.healthy[position])
+    }
+
+    /// A dispatch already owns placement. Take execution load only on its destination.
+    pub(crate) fn account_fixed_target(
+        &self,
+        worker: &Arc<dyn Worker>,
+        input: QualifiedKvInput<'_>,
+        lora: Option<&str>,
+        salt: Option<&str>,
+    ) -> Option<KvSelectionReceipt> {
+        let workers = std::slice::from_ref(worker);
+        let plan = self.prepare_selection(workers, input, lora, salt)?;
+        let _guard = self.selection_lock.lock();
+        if !worker.is_available() {
+            return None;
+        }
+        let candidates = self.candidate_views(workers, &plan);
+        let candidate = candidates.first()?;
+        let binding = self.binding_for_worker(worker.as_ref());
+        let fresh = binding.generation == plan.bindings[0].generation;
+        let params = CostParams {
+            block_size: binding.block_size,
+            ..self.params
+        };
+        let tokens = if fresh {
+            request_prefill_tokens(candidate, &params)
+        } else {
+            candidate.input_tokens as u64
+        };
+        let target = binding.target.clone();
+        let components = cost_components(candidate, &params);
+        let decision = CostDecision {
+            target: target.clone(),
+            cost: components.ptoken as f64 * (1 + components.batchsize) as f64,
+            components,
+        };
+        let slot = self.slot_manager.as_ref().map(|manager| {
+            manager.begin_prefill(&target, tokens);
+            KvRequestSlot::new(manager.clone(), target, tokens, None)
+        });
+        worker.increment_load();
+        Some(KvSelectionReceipt {
+            worker_index: 0,
+            new_prefill_tokens: tokens,
+            decision,
+            slot,
+        })
+    }
+
     /// Select, reserve, and bind atomically. KV queries run outside every
     /// lock; the short critical section rechecks the affinity table, samples
     /// fresh load, picks (or reuses the bound target), and reserves slot and
@@ -2632,6 +2723,42 @@ mod tests {
             binding.clone(),
         );
         binding
+    }
+
+    #[test]
+    fn session_scoring_is_read_only_and_only_fixed_dispatch_takes_load() {
+        let workers: Vec<Arc<dyn Worker>> = ["a", "b"]
+            .map(|id| {
+                Arc::new(BasicWorker::new(
+                    format!("http://{id}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .to_vec();
+        let policy = KvAwarePolicy::default();
+        let slots = policy.slot_manager().unwrap();
+        workers[0].increment_load();
+        let ids = [1, 2, 3];
+        let input = QualifiedKvInput {
+            tokens: KvRequestTokens::Shared(Some(&ids)),
+            eligibility: None,
+        };
+        assert_eq!(
+            policy.recommend_binding(&workers, input, None, Some("salt")),
+            Some(1)
+        );
+        assert_eq!((workers[0].load(), workers[1].load()), (1, 0));
+        let target = policy.target_for_worker(workers[1].as_ref());
+        assert_eq!(slots.sample(&target).active_requests, 0);
+        let receipt = policy
+            .account_fixed_target(&workers[1], input, None, Some("salt"))
+            .unwrap();
+        assert_eq!(slots.sample(&target).active_prefill_tokens, 3);
+        assert_eq!(workers[1].load(), 1);
+        release_receipt(&workers[1..], &receipt);
+        assert_eq!(slots.sample(&target).active_requests, 0);
+        assert_eq!(workers[1].load(), 0);
+        workers[0].decrement_load();
     }
 
     #[test]

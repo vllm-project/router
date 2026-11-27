@@ -25,6 +25,8 @@ pub enum ProgramBindingStrategy {
     ReasoningTokenBalance,
     /// Combine request-text prefix affinity with current KV headroom.
     CacheAware,
+    /// Rank by candidate-qualified KV reuse and current execution load.
+    KvAware,
 }
 
 /// Program-level load snapshot used only for initial binding.
@@ -57,6 +59,21 @@ pub trait ProgramBindingPolicy: Send + Sync + Debug {
         routing_text: Option<&str>,
     ) -> Option<String>;
 
+    fn cursor(&self, _pool: &str) -> usize {
+        0
+    }
+
+    fn recommend(
+        &mut self,
+        identity: &ProgramIdentity,
+        candidates: &[ProgramBindingCandidate],
+        text: Option<&str>,
+    ) -> Option<String> {
+        self.select(identity, candidates, text)
+    }
+
+    fn confirm(&mut self, _pool: &str) {}
+
     fn commit_placement(&self, _model_pool: &str, _text: &str, _target_id: &str) {}
 
     fn remove_target(&self, _model_pool: &str, _target_id: &str) {}
@@ -68,7 +85,7 @@ pub(crate) fn make_binding_policy(
     hash_virtual_nodes: u32,
 ) -> Box<dyn ProgramBindingPolicy> {
     match strategy {
-        ProgramBindingStrategy::ConsistentHash => {
+        ProgramBindingStrategy::ConsistentHash | ProgramBindingStrategy::KvAware => {
             Box::new(ConsistentHashBinding::new(hash_virtual_nodes))
         }
         ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
@@ -255,16 +272,34 @@ impl ProgramBindingPolicy for RoundRobinBinding {
         candidates: &[ProgramBindingCandidate],
         _routing_text: Option<&str>,
     ) -> Option<String> {
+        let selected = self.recommend(identity, candidates, _routing_text)?;
+        self.confirm(identity.model_pool());
+        Some(selected)
+    }
+
+    fn cursor(&self, pool: &str) -> usize {
+        self.next_by_model.get(pool).copied().unwrap_or_default()
+    }
+
+    fn recommend(
+        &mut self,
+        identity: &ProgramIdentity,
+        candidates: &[ProgramBindingCandidate],
+        _: Option<&str>,
+    ) -> Option<String> {
         if candidates.is_empty() {
             return None;
         }
-        let next = self
-            .next_by_model
-            .entry(identity.model_pool().to_string())
-            .or_default();
-        let target_id = candidates[*next % candidates.len()].target_id.clone();
+        Some(
+            candidates[self.cursor(identity.model_pool()) % candidates.len()]
+                .target_id
+                .clone(),
+        )
+    }
+
+    fn confirm(&mut self, pool: &str) {
+        let next = self.next_by_model.entry(pool.to_owned()).or_default();
         *next = next.wrapping_add(1);
-        Some(target_id)
     }
 }
 

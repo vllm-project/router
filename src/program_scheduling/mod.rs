@@ -20,6 +20,8 @@ mod return_time;
 mod routing;
 mod runtime;
 mod scheduler;
+mod session_admission;
+pub(crate) use session_admission::SessionRankScorer;
 mod scheduler_admission;
 mod scheduler_fairness;
 mod scheduler_global;

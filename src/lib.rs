@@ -187,7 +187,7 @@ impl Router {
 
         // Convert main policy and attach static regular-mode KV event sources.
         let mut policy = convert_policy(&self.policy);
-        let sources = config::KvSourceOptions {
+        let mut sources = config::KvSourceOptions {
             layout: self.kv_hybrid_layout.as_deref(),
             publishers: &self.kv_event_source,
             pd_publishers: &self.pd_kv_events,
@@ -197,17 +197,11 @@ impl Router {
             model: self.kv_event_model.as_deref(),
         }
         .load(&mode)?;
-        if let ConfigPolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = &mut policy
-        {
-            **static_kv_event_sources = sources.regular;
-        } else if !sources.regular.is_empty() {
-            return Err(config::ConfigError::IncompatibleConfig {
-                reason: "--kv-event-source requires the kv_aware policy".to_string(),
-            });
-        }
+        let mut program_scheduling = config::ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+        sources.install_regular(&mut policy, program_scheduling.as_mut())?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -301,10 +295,7 @@ impl Router {
                     });
                 }
             },
-            program_scheduling: config::ProgramSchedulingConfig::resolve(
-                self.enable_program_scheduling,
-                self.program_scheduling_config_json.as_deref(),
-            )?,
+            program_scheduling,
         })
     }
 }

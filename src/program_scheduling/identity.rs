@@ -55,6 +55,7 @@ pub struct ProgramRequestHints {
 /// Stable scheduling identity for one Program generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramIdentity {
+    pub(crate) session_admission: bool,
     model_pool: String,
     program_id: String,
     /// Exact key consumed by the standalone Consistent Hash policy.
@@ -110,6 +111,11 @@ impl ProgramIdentity {
         );
     }
 
+    pub(super) fn restore_placement_keys(&mut self, hash: &str, key: &str) {
+        self.placement_hash_key = hash.to_owned();
+        self.placement_key = key.to_owned();
+    }
+
     pub(crate) fn for_rebinding(
         reference: &super::ProgramRef,
         placement_hash_key: String,
@@ -117,6 +123,7 @@ impl ProgramIdentity {
         expected_resume: bool,
     ) -> Self {
         Self {
+            session_admission: false,
             model_pool: reference.model_pool().to_string(),
             program_id: reference.program_id().to_string(),
             placement_hash_key,
@@ -162,19 +169,56 @@ impl ProgramIdentity {
         model_pool: Option<&str>,
         enable_key: ProgramSchedulingEnableKey,
     ) -> Result<Option<Self>, ScheduleError> {
+        Self::resolve(headers, request, model_pool, enable_key, false)
+    }
+
+    pub(crate) fn resolve(
+        headers: Option<&HeaderMap>,
+        request: Option<&JsonValue>,
+        model_pool: Option<&str>,
+        enable_key: ProgramSchedulingEnableKey,
+        session_admission: bool,
+    ) -> Result<Option<Self>, ScheduleError> {
         let request_object = request.and_then(JsonValue::as_object);
         let canonical = canonical_context(request_object)?;
         if enable_key == ProgramSchedulingEnableKey::AgenticContext && canonical.is_none() {
             return Ok(None);
         }
-        let Some(stable) = identity_from_parts(headers, request_object, canonical.as_ref())? else {
+        let mut canonical = canonical;
+        if session_admission {
+            if let Some(context) = canonical.as_mut() {
+                let (header_session, header_actor, _) = framework_identity_headers(headers)?;
+                if context_string(context, &["program_id"])?.is_none()
+                    && context_string(context, &["agent_id"])?.is_none()
+                    && header_actor.is_none()
+                {
+                    if let Some(session) =
+                        context_string(context, &["session_id"])?.or(header_session)
+                    {
+                        context.insert("program_id".into(), JsonValue::String(session));
+                    }
+                }
+            }
+        }
+        let Some(mut stable) = identity_from_parts(headers, request_object, canonical.as_ref())?
+        else {
             if let Some(context) = &canonical {
                 context_string(context, &["agent_role"])?;
             }
             return Ok(None);
         };
+        if session_admission
+            && stable.source == IdentitySource::FrameworkHeader
+            && stable.agent_id.is_none()
+        {
+            if let Some(session) = &stable.session_id {
+                stable.program_id.clone_from(session);
+            }
+        }
         let source = stable.source;
         let mut identity = Self::from_stable(stable, model_pool)?;
+        identity.session_admission =
+            session_admission && identity.session_id() == Some(identity.program_id());
         if let Some(context) = &canonical {
             apply_canonical_scheduling(&mut identity, context, headers)?;
         } else if let Some(hint) = request_object
@@ -231,6 +275,7 @@ impl ProgramIdentity {
         }
         let placement_key = stable.placement_key().to_string();
         Ok(Self {
+            session_admission: false,
             model_pool,
             placement_hash_key: placement_key.clone(),
             placement_key,

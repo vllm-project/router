@@ -30,7 +30,7 @@ pub struct ProgramAdmission {
 }
 
 pub(super) struct RebindWork {
-    program: ProgramRef,
+    pub(super) program: ProgramRef,
     pub(super) identity: ProgramIdentity,
     waiting_requests: usize,
     lost_current_target: bool,
@@ -240,9 +240,15 @@ impl ProgramAdmission {
             .collect::<Vec<_>>();
         for target_id in &removed {
             state.bindings.remove_target(model_pool, target_id);
-            state.rank_queues.remove(target_id);
-            state.rank_factors.remove(target_id);
-            state.observations.remove(target_id);
+            if !state
+                .model_targets
+                .values()
+                .any(|targets| targets.contains(target_id))
+            {
+                state.rank_queues.remove(target_id);
+                state.rank_factors.remove(target_id);
+                state.observations.remove(target_id);
+            }
         }
         let affected = state
             .runtime
@@ -316,6 +322,8 @@ impl ProgramAdmission {
     ) {
         let program = work.program;
         if let Some(decision) = state.decisions.get_mut(&program) {
+            decision.binding_ticket = None;
+            decision.committed_ticket = None;
             decision.home_target = replacement.clone();
             decision.last_target = replacement.clone();
             if invalidated {
@@ -327,7 +335,13 @@ impl ProgramAdmission {
                 Self::restart_shared_prefix_freshness(decision, now);
             }
         }
-        if work.waiting_requests > 0 {
+        if work.waiting_requests > 0
+            && replacement.is_none()
+            && state.decisions[&program].session_admission
+        {
+            self.enqueue_capacity_waiter(state, &program);
+            state.runtime.notify_front(&program);
+        } else if work.waiting_requests > 0 {
             if self.config.global_queue {
                 state
                     .global_queues
@@ -529,6 +543,7 @@ impl ProgramAdmission {
                 "Program scheduling diagnostic"
             );
         }
+        Self::wake_capacity_waiters(&mut state);
     }
 
     pub(crate) fn binding_candidates(
@@ -642,13 +657,17 @@ impl ProgramAdmission {
             identity.parent_program_id(),
             identity.root_program_id(),
         );
-        let preserve_front = self.config.pd_mode
-            && state.runtime.view(&reference).is_some_and(|p| {
-                // A newly retained tail request must not change the current
-                // front or in-flight turn's budget or context scope in either
-                // direction.
-                p.in_flight_requests > 0 || p.waiting_requests > 1
-            });
+        // A session pays for the FIFO head at claim time. A tail arrival cannot
+        // modify the charge used to decide whether the head fits.
+        let preserve_front = state
+            .decisions
+            .get(&reference)
+            .is_some_and(|d| d.session_admission)
+            || (self.config.pd_mode
+                && state
+                    .runtime
+                    .view(&reference)
+                    .is_some_and(|p| p.in_flight_requests > 0 || p.waiting_requests > 1));
         if let Some(decision) = state.decisions.get_mut(&reference) {
             if !preserve_front {
                 if self.config.pd_mode {
@@ -692,6 +711,7 @@ impl ProgramAdmission {
             context,
             now,
         );
+        decision.session_admission = identity.session_admission;
         decision.task_id = identity.task_id().map(str::to_string);
         decision.session_id = identity.session_id().map(str::to_string);
         decision.agent_id = identity.agent_id().map(str::to_string);

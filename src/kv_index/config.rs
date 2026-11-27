@@ -79,6 +79,34 @@ pub struct ConfiguredKvSources {
     pub pd: std::collections::HashMap<String, PdKvEventSources>,
 }
 
+impl ConfiguredKvSources {
+    pub fn install_regular(
+        &mut self,
+        policy: &mut PolicyConfig,
+        program: Option<&mut crate::config::ProgramSchedulingConfig>,
+    ) -> ConfigResult<()> {
+        if self.regular.is_empty() {
+            return Ok(());
+        }
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = policy
+        {
+            **static_kv_event_sources = std::mem::take(&mut self.regular);
+        } else if let Some(program) = program.filter(|p| {
+            p.binding_strategy == crate::program_scheduling::ProgramBindingStrategy::KvAware
+        }) {
+            program.binding_kv_sources = std::mem::take(&mut self.regular);
+        } else {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--kv-event-source requires kv_aware routing or Program binding".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl KvSourceOptions<'_> {
     pub fn load(&self, mode: &RoutingMode) -> ConfigResult<ConfiguredKvSources> {
         let is_pd = matches!(mode, RoutingMode::VllmPrefillDecode { .. });
@@ -370,11 +398,17 @@ fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
-    if let PolicyConfig::KvAware {
-        static_kv_event_sources,
-        ..
-    } = &config.policy
-    {
+    let static_sources = match &config.policy {
+        PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } => Some(static_kv_event_sources.as_ref()),
+        _ => config
+            .program_scheduling
+            .as_ref()
+            .map(|p| &p.binding_kv_sources),
+    };
+    if let Some(static_kv_event_sources) = static_sources {
         if !static_kv_event_sources.is_empty() {
             let RoutingMode::Regular { worker_urls } = &config.mode else {
                 return Err(ConfigError::IncompatibleConfig {
