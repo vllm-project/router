@@ -743,7 +743,10 @@ impl CliArgs {
         self.apply_mode_overrides(config, &has_cli, prefill_urls)?;
 
         if has_cli("policy") {
-            config.policy = self.parse_policy(&self.policy);
+            let parsed = self.parse_policy(&self.policy);
+            if std::mem::discriminant(&config.policy) != std::mem::discriminant(&parsed) {
+                config.policy = parsed;
+            }
         }
         self.apply_policy_param_overrides(config, &has_cli);
         self.apply_kv_event_overrides(config, &has_cli)?;
@@ -840,10 +843,20 @@ impl CliArgs {
             config.pd_worker_pairs = vllm_router_rs::config::parse_pd_worker_pairs(&self.pd_pair)?;
         }
         if has_cli("enable_program_scheduling") || has_cli("program_scheduling_config_json") {
-            config.program_scheduling = ProgramSchedulingConfig::resolve(
-                self.enable_program_scheduling,
-                self.program_scheduling_config_json.as_deref(),
-            )?;
+            let enabled = if has_cli("enable_program_scheduling") {
+                self.enable_program_scheduling
+            } else {
+                config.program_scheduling.is_some()
+            };
+            if has_cli("program_scheduling_config_json")
+                || !enabled
+                || config.program_scheduling.is_none()
+            {
+                config.program_scheduling = ProgramSchedulingConfig::resolve(
+                    enabled,
+                    self.program_scheduling_config_json.as_deref(),
+                )?;
+            }
         }
 
         self.apply_subconfig_overrides(config, &has_cli);
@@ -1846,5 +1859,148 @@ policy:
                 other => panic!("expected regular mode for --backend {backend}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn cli_same_policy_override_preserves_config_file_tuning_and_kv_sources() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: regular
+  worker_urls:
+    - http://127.0.0.1:8000
+policy:
+  type: kv_aware
+  router_temperature: 0.25
+  kv_penalty_host: 0.7
+  static_kv_event_sources:
+    "http://127.0.0.1:8000":
+      endpoints:
+        - tcp://127.0.0.1:5557
+      block_size: 16
+      model: qwen3
+"#
+        )
+        .unwrap();
+
+        let matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--policy",
+                "kv_aware",
+            ])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+        cfg.validate().unwrap();
+
+        match cfg.policy {
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                static_kv_event_sources,
+                ..
+            } => {
+                assert!((router_temperature - 0.25).abs() < f64::EPSILON);
+                assert!((kv_penalty_host - 0.7).abs() < f64::EPSILON);
+                assert!(static_kv_event_sources.contains_key("http://127.0.0.1:8000"));
+            }
+            other => panic!("expected kv_aware, got {other:?}"),
+        }
+
+        let tuned_matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--policy",
+                "kv_aware",
+                "--router-temperature",
+                "0.5",
+            ])
+            .unwrap();
+        let tuned_args = CliArgs::from_arg_matches(&tuned_matches).unwrap();
+        let tuned_cfg = tuned_args
+            .resolve_router_config(&tuned_matches, vec![])
+            .unwrap();
+        tuned_cfg.validate().unwrap();
+
+        match tuned_cfg.policy {
+            PolicyConfig::KvAware {
+                router_temperature,
+                kv_penalty_host,
+                static_kv_event_sources,
+                ..
+            } => {
+                assert!((router_temperature - 0.5).abs() < f64::EPSILON);
+                assert!((kv_penalty_host - 0.7).abs() < f64::EPSILON);
+                assert!(static_kv_event_sources.contains_key("http://127.0.0.1:8000"));
+            }
+            other => panic!("expected kv_aware, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_enable_program_scheduling_preserves_file_settings_unless_json_supplied() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"{{
+  "mode": {{
+    "type": "regular",
+    "worker_urls": ["http://127.0.0.1:8000"]
+  }},
+  "policy": {{ "type": "kv_aware" }},
+  "program_scheduling": {{
+    "decode_buffer_tokens": 4096,
+    "max_active_programs_per_target": 8
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let matches_a = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--enable-program-scheduling",
+            ])
+            .unwrap();
+        let args_a = CliArgs::from_arg_matches(&matches_a).unwrap();
+        let cfg_a = args_a.resolve_router_config(&matches_a, vec![]).unwrap();
+        cfg_a.validate().unwrap();
+
+        let ps_a = cfg_a
+            .program_scheduling
+            .expect("program_scheduling should stay enabled");
+        assert_eq!(ps_a.decode_buffer_tokens, 4096);
+        assert_eq!(ps_a.max_active_programs_per_target, 8);
+
+        let matches_b = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--enable-program-scheduling",
+                "--program-scheduling-config-json",
+                r#"{"decode_buffer_tokens": 2048, "max_active_programs_per_target": 3}"#,
+            ])
+            .unwrap();
+        let args_b = CliArgs::from_arg_matches(&matches_b).unwrap();
+        let cfg_b = args_b.resolve_router_config(&matches_b, vec![]).unwrap();
+        cfg_b.validate().unwrap();
+
+        let ps_b = cfg_b
+            .program_scheduling
+            .expect("program_scheduling should be enabled");
+        assert_eq!(ps_b.decode_buffer_tokens, 2048);
+        assert_eq!(ps_b.max_active_programs_per_target, 3);
     }
 }
