@@ -91,7 +91,7 @@ Identity-free requests do not create Program state, enter RequestPool, or trigge
 
 All fields below belong to `program_scheduling`. Values omitted from the JSON object use the listed defaults.
 
-| Parameter | Default | Effect on scheduling |
+| Parameter | Effective default (non-PD) | Effect on scheduling |
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
@@ -108,19 +108,19 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `exact_text_endpoints` | `[]` | Text endpoints allowed to use a Router-tokenized exact count (for example `["/v1/chat/completions"]`). Only consulted when `token_count_mode` is not `estimated`; configuration validation rejects routes that are not `/v1/chat/completions` or `/v1/completions`, so a typo fails at startup instead of silently never matching. Enable it only after the Router renderer and tokenizer are verified equal to the Engine's; set `VLLM_ROUTER_TOKENIZER` to the deployed model directory, and watch `vllm_router_agent_aware_context_token_observation_delta_ratio` plus revocations for drift. |
 | `max_active_programs_per_target` | `64` | Limits active Programs on one Rank as a coarse concurrency guard. It is the primary capacity guard when token capacity is absent and remains a count guard when token capacity is configured; forced resume may override it. |
 | `metrics_interval_seconds` | `1.0` | Sets the backend metrics polling and periodic scheduling interval. It also defines observation freshness and the minimum residence used by parts of cross-Rank resume. |
-| `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. `0` disables this waiting gate. |
+| `admission_waiting_request_threshold` | `1` | Blocks ordinary admission or resume to a Rank when its native vLLM waiting-request count reaches this threshold. |
 | `queue_timeout_seconds` | `600.0` | Sets the maximum time a retained request may remain in the Router RequestPool. A request-scoped deadline can shorten, but not extend, this limit. |
 | `force_resume_timeout_seconds` | `300.0` | Sets the fallback and upper bound for the workload-derived force-resume deadline that prevents starvation. The actual deadline may be shorter based on queued work and measured request throughput. |
 | `paused_retention_ttl_seconds` | `1800.0` | Releases an idle paused Program generation after this retention period so stale Program state and logical capacity do not persist indefinitely. |
 | `shared_prefix_freshness_warmup_seconds` | `100.0` | Sets the shared-prefix observation lifetime before rolling statistics are mature, and acts as the fallback lifetime when the dynamic estimate cannot be computed. |
 | `shared_prefix_freshness_kv_turnovers` | `2.0` | Scales the mature shared-prefix freshness interval by the estimated time required for this many whole-KV-pool turnovers. Larger values retain an observation longer and reduce prefix queries, but increase stale-observation risk. |
 | `decode_buffer_tokens` | `100` | Adds an immediate output-growth allowance to a Program's private-token demand when the request does not provide `expected_output_length`. It affects admission, resume, and logical occupancy accounting. |
-| `max_acting_ttl_seconds` | `10.0` | Caps the request-specific acting TTL chosen from the mature interval window and cache-miss impact. Before the window is complete, the automatic TTL is `0`; request-scoped `kv_retention_ttl_seconds` overrides the computed value. |
+| `max_acting_ttl_seconds` | `10.0` | Caps automatic TTL selection. The rank-level fit is zero before its continuity window fills. A request-scoped `kv_retention_ttl_seconds` overrides automatic selection. |
 | `high_watermark_ratio` | `1.0` | Multiplies token capacity to define when capacity repair starts pausing reasoning Programs. It must be greater than or equal to `low_watermark_ratio`. |
 | `low_watermark_ratio` | `1.0` | Multiplies token capacity to define the admission/resume limit and the occupancy target of capacity repair. Lower values leave more free KV headroom. |
 | `capacity_repair_policy` | `legacy` | Selects capacity-repair victim ordering. `legacy` preserves the original age/context heuristic. `retention_value` first releases observed candidates with the lowest applied-TTL value, calculated from remaining or last-applied TTL and cache-miss impact. Programs with no completed request have unknown value, not zero value: they sort after observed candidates and use legacy ordering within that group. They remain eligible if needed to reach the repair target. Legacy ordering is the deterministic tie-breaker for equal observed values. Both policies preserve the same watermarks and capacity-safety fallback. |
 | `max_segment_rounds` | `14` | Caps the rolling estimate of protected continuous-service rounds. An idle Program that reaches this limit yields under local queue pressure and receives one-shot lower resume priority. |
-| `stats_window_size` | `100` | Sets the fixed number of valid samples required before request-growth and continuity estimates become active, and bounds their rolling windows. Until then, growth reserve is zero and automatic acting TTL is zero. |
+| `stats_window_size` | `100` | Sets the fixed number of valid samples required before request-growth and continuity estimates become active, and bounds their rolling windows. Until then, growth reserve is zero and the rank-level fitted TTL is zero. In active mode a mature workflow prediction can supply the acting TTL. |
 | `enable_batch_gain_admission` | `true` | Allows modeled decode batch gain to bypass only the continuous-growth reserve when it covers candidate recovery and continuity-loss costs. It never bypasses immediate capacity or Program-count limits. |
 | `prefill_cost_model.intercept_seconds` | `0.06600061907132926` | Adds the fixed component of estimated cold-prefill cost used by TTL utility and batch-gain decisions. |
 | `prefill_cost_model.linear_seconds_per_1k_tokens` | `0.05702024012166613` | Adds the linear cold-prefill cost for each 1K uncached prompt tokens. |
@@ -129,6 +129,8 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `decode_throughput_model.fixed_step_seconds` | `0.010635218423115973` | Sets the batch-independent decode-step latency in the throughput surface used to estimate admission batch gain. |
 | `decode_throughput_model.batch_step_seconds_per_request` | `0.0004192803698834784` | Sets the additional decode-step latency contributed by each request in the batch. |
 | `decode_throughput_model.context_step_seconds_per_token` | `1.420458414996201e-7` | Sets the additional decode-step latency contributed by each token in the sum of full Program contexts. |
+
+For `max_active_programs_per_target` and `admission_waiting_request_threshold`, omitting the field or setting it to `0` uses the default shown above. With a waiting threshold of `0`, the gate stays active and blocks ordinary admission or resume to a Rank as soon as one backend request is waiting there.
 
 ## Canonical request metadata
 
@@ -314,6 +316,8 @@ The built-in values remain backward-compatible defaults. When Program scheduling
 
 For `x = uncached_prompt_tokens / 1000`, the cold-prefill estimate is `prefill_seconds = intercept_seconds + linear_seconds_per_1k_tokens * x + quadratic_seconds_per_1k_tokens_squared * x^2`. Progress-TTL includes mixed-batch decode interference as `cache_miss_impact_seconds = prefill_seconds * (2 - decode_throughput_alpha)`.
 
+Once the continuity window is full, the rank-level TTL fit considers durations up to `min(max_acting_ttl_seconds, cache_miss_impact_seconds)`. It fits the observed return intervals and selects the duration with the highest estimated utility. Zero is a candidate even when the upper bound is positive.
+
 | `prefill_cost_model` field | Unit | Constraint | Default |
 |---|---|---|---:|
 | `intercept_seconds` | seconds | finite and >= 0 | `0.06600061907132926` |
@@ -332,6 +336,8 @@ For batch size `B` and the sum of full Program contexts `C`, aggregate decode th
 ## Performance tuning workflow
 
 Program scheduling improves an HBM-only deployment by retaining reusable Program KV across short tool calls while limiting how many Programs concurrently own logical capacity. Tune it as a sequence of controlled checks: first establish that the baseline has meaningful KV pressure, then verify that scheduling improves token-weighted cache reuse, and only then adjust admission if protection reduces useful backend concurrency too much.
+
+For a step-by-step procedure and worked example, see the [Program tuning skill](../../.agents/skills/program-ttl-tuning/SKILL.md) and the [Ascend A3 case study](ascend-a3-deepseek-v4-flash.md).
 
 ### Establish a comparable pressure point
 
