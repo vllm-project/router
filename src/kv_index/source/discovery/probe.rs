@@ -4,11 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tonic::client::Grpc;
 use tonic_prost::ProstCodec;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::lifecycle::WorkerLifecycle;
+use super::lifecycle::{WorkerLifecycle, OPTIONAL_METADATA_BUDGET};
 use super::metrics_meta::EngineCacheConfigs;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
@@ -19,8 +20,6 @@ use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
 use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
-
-const ADMISSION_HASH_TIMEOUT: Duration = Duration::from_millis(750);
 
 pub(super) struct RegistrationProbe {
     pub(super) descriptor: WorkerDescriptor,
@@ -73,8 +72,8 @@ impl KvIndexSupervisor {
         plain_only: bool,
         connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
+        deadline: Instant,
     ) -> Result<RegistrationProbe, String> {
-        let started = tokio::time::Instant::now();
         let mut worker = self.discover_for_role(base, connector).await;
         if plain_only
             && worker
@@ -113,12 +112,9 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        // A retry can re-admit usable sources after trust expires. Reserve
-        // time for one optional metrics scrape. Model lookup is handled above.
-        if started.elapsed() < CONTROL_TIMEOUT.saturating_sub(ADMISSION_HASH_TIMEOUT)
-            && !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor)
-        {
-            self.probe_admission_hashes(base, &mut worker).await;
+        if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
+            self.probe_admission_hashes(base, &mut worker, Some(deadline))
+                .await;
         }
         Ok(RegistrationProbe { descriptor, worker })
     }
@@ -127,26 +123,43 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         worker: &mut WorkerDiscovery,
+        deadline: Option<Instant>,
     ) {
         let (base, _) = split_worker_rank(worker_url);
-        if worker.engine_cache_configs.is_some()
-            || worker.hybrid.is_none()
-            || crate::backend::is_grpc_url(base)
-            || !worker
-                .sources
-                .as_ref()
-                .is_ok_and(|sources| sources.values().any(events_enabled))
-        {
+        if !needs_admission_hashes(base, worker) {
             return;
         }
-        worker.engine_cache_configs = tokio::time::timeout(
-            ADMISSION_HASH_TIMEOUT,
+        // Leave enough time for the optional scrape inside the refresh deadline.
+        if deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) <= OPTIONAL_METADATA_BUDGET
+        }) {
+            debug!(
+                worker_url,
+                "Skipping KV hash probe because the refresh budget is exhausted"
+            );
+            return;
+        }
+        match tokio::time::timeout(
+            OPTIONAL_METADATA_BUDGET,
             query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
         )
         .await
-        .ok()
-        .and_then(Result::ok);
+        {
+            Ok(Ok(configs)) => worker.engine_cache_configs = Some(configs),
+            Ok(Err(error)) => debug!(worker_url, %error, "Optional KV hash probe failed"),
+            Err(_) => debug!(worker_url, "Optional KV hash probe timed out"),
+        }
     }
+}
+
+pub(super) fn needs_admission_hashes(base: &str, worker: &WorkerDiscovery) -> bool {
+    worker.engine_cache_configs.is_none()
+        && worker.hybrid.is_some()
+        && !crate::backend::is_grpc_url(base)
+        && worker
+            .sources
+            .as_ref()
+            .is_ok_and(|sources| sources.values().any(events_enabled))
 }
 
 pub(super) fn grpc_kv_event_source_entries(
@@ -486,11 +499,11 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-pub(super) type WorkerMetadata = (
-    ServerInfo,
-    Option<HashSet<String>>,
-    Option<EngineCacheConfigs>,
-);
+pub(super) struct WorkerMetadata {
+    pub(super) server_info: ServerInfo,
+    pub(super) base_models: Option<HashSet<String>>,
+    pub(super) engine_cache_configs: Option<EngineCacheConfigs>,
+}
 
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
 /// the multi-backend control contract, the engine config endpoint, then the
@@ -505,15 +518,22 @@ pub(super) async fn query_worker_metadata_and_models(
     api_key: Option<&str>,
 ) -> Result<WorkerMetadata, String> {
     let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
-        Ok(info) => return Ok((info, None, None)),
+        Ok(server_info) => {
+            return Ok(WorkerMetadata {
+                server_info,
+                base_models: None,
+                engine_cache_configs: None,
+            })
+        }
         Err(error) => error,
     };
 
     query_metrics_metadata(client, worker_url, api_key)
         .await
-        .and_then(|(info, models, configs)| {
-            validate_worker_metadata(worker_url, "metrics", Ok(info))
-                .map(|info| (info, models, configs))
+        .and_then(|mut metadata| {
+            metadata.server_info =
+                validate_worker_metadata(worker_url, "metrics", Ok(metadata.server_info))?;
+            Ok(metadata)
         })
         .map_err(|error| format!("{control_error}; {error}"))
 }
@@ -630,7 +650,11 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok((info, models.as_ref().map(base_model_names), Some(engines)))
+    Ok(WorkerMetadata {
+        server_info: info,
+        base_models: models.as_ref().map(base_model_names),
+        engine_cache_configs: Some(engines),
+    })
 }
 
 pub(super) async fn query_engine_cache_configs(

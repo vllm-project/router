@@ -8,13 +8,12 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::info;
 
-use super::metrics_meta::EngineCacheConfigs;
+use super::metrics_meta::{reported_prefix_hash, EngineCacheConfigs};
 use super::probe::WorkerDescriptor;
 use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
-use super::registration::incompatible_prefix_hash;
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
@@ -23,6 +22,7 @@ use crate::kv_index::{
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const OPTIONAL_METADATA_BUDGET: Duration = CONTROL_TIMEOUT.checked_div(4).unwrap();
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const MAX_PROBE_FAILURES: u8 = 3;
 const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
@@ -250,12 +250,7 @@ pub(super) struct LayoutWorkerProvider {
 }
 
 impl LayoutWorkerProvider {
-    fn fence_runtime_hashes(
-        &self,
-        worker: &str,
-        configs: &EngineCacheConfigs,
-        signal_tx: &tokio::sync::mpsc::Sender<IngestionSignal>,
-    ) {
+    fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
         let mut state = self.lifecycle.state.lock();
         let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
             return;
@@ -265,7 +260,11 @@ impl LayoutWorkerProvider {
             let Some(lease) = index.binding.as_ref().filter(|lease| lease.is_active()) else {
                 continue;
             };
-            let Some((expected, reported)) = incompatible_prefix_hash(layout, configs, rank) else {
+            let reported = reported_prefix_hash(configs, worker, rank);
+            let Some((expected, reported)) = layout
+                .rank_capability(rank)
+                .and_then(|contract| contract.reported_hash_mismatch(reported))
+            else {
                 continue;
             };
             tracing::warn!(
@@ -281,19 +280,17 @@ impl LayoutWorkerProvider {
         if let Some(info) = &mut state.info {
             info.ranks
                 .retain(|rank| !fenced.iter().any(|(fenced, _, _)| fenced == rank));
+            if !fenced.is_empty() && info.ranks.is_empty() {
+                tracing::warn!(
+                    worker,
+                    "No KV ranks remain after failed worker re-registration"
+                );
+            }
         }
         drop(state);
-        for (rank, index, lease) in fenced {
+        for (_, index, lease) in fenced {
             let _guard = lease.gate.lock();
             index.invalidate();
-            crate::kv_index::subscriber::emit(
-                &Some(signal_tx.clone()),
-                IngestionSignal::Invalidated {
-                    source: index.target.instance_id.clone(),
-                    dp_rank: rank,
-                    reason: "cache_contract",
-                },
-            );
         }
     }
 }
@@ -370,9 +367,7 @@ impl KvIndexSupervisor {
             .get(worker_url)
             .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
         {
-            previous
-                .provider
-                .fence_runtime_hashes(worker_url, configs, &self.signal_tx);
+            previous.provider.fence_runtime_hashes(worker_url, configs);
         }
     }
 

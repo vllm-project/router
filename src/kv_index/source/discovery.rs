@@ -164,6 +164,9 @@ pub(crate) struct WorkerDiscovery {
     base_models: Option<HashSet<String>>,
     pub(crate) hybrid: Option<CacheCapabilities>,
     pub(super) assumed_plain_full: bool,
+    /// Per-engine reports from discovery or the optional admission scrape.
+    /// None means no usable snapshot was collected, for example when probing
+    /// was inapplicable, skipped for budget, or failed.
     engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
@@ -231,8 +234,8 @@ pub struct KvIndexSupervisor {
     strict_recovery: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
-    /// Static KV event sources per prefill URL; these workers skip HTTP
-    /// discovery entirely.
+    /// Static KV event sources per prefill URL. A verified static layout can
+    /// still use the optional HTTP metrics probe for hash admission.
     static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
@@ -478,7 +481,7 @@ impl KvIndexSupervisor {
     /// Discover worker metadata and available hashes for a new registration.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
         let mut discovery = self.discover_for_role(worker_url, None).await;
-        self.probe_admission_hashes(worker_url, &mut discovery)
+        self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
         discovery
     }
@@ -571,7 +574,7 @@ impl KvIndexSupervisor {
                 .filter(|info| info.vllm_version.is_none())
             {
                 info.vllm_version = tokio::time::timeout(
-                    CONTROL_TIMEOUT / 4,
+                    lifecycle::OPTIONAL_METADATA_BUDGET,
                     probe::query_vllm_version(&self.client, base, self.api_key.as_deref()),
                 )
                 .await
@@ -596,7 +599,7 @@ impl KvIndexSupervisor {
         {
             // This optional metadata lookup must leave time to install the source.
             if let Ok(Ok(runtime)) = tokio::time::timeout(
-                CONTROL_TIMEOUT / 4,
+                lifecycle::OPTIONAL_METADATA_BUDGET,
                 probe::query_server_info_json(
                     &self.client,
                     split_worker_rank(worker_url).0,
@@ -1039,7 +1042,11 @@ async fn discover_full_attention_http_worker(
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
     let (server_info, base_models, engine_cache_configs) = match server {
-        Ok((info, base_models, configs)) => (Ok(info), base_models, configs),
+        Ok(metadata) => (
+            Ok(metadata.server_info),
+            metadata.base_models,
+            metadata.engine_cache_configs,
+        ),
         Err(error) => (Err(error), None, None),
     };
     let model_id = server_info

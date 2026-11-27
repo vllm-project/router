@@ -14,6 +14,23 @@ pub(crate) const CACHE_CONFIG_INFO: &str = "vllm:cache_config_info";
 
 pub(super) type EngineCacheConfigs = BTreeMap<u32, EngineCacheConfig>;
 
+pub(super) fn reported_prefix_hash<'a>(
+    configs: &'a EngineCacheConfigs,
+    worker_url: &str,
+    rank: u32,
+) -> Option<&'a str> {
+    configs
+        .get(&rank)
+        .or_else(|| {
+            // A pinned worker can expose a single engine with a local rank.
+            (configs.len() == 1 && super::split_worker_rank(worker_url).1 == Some(rank))
+                .then(|| configs.values().next())
+                .flatten()
+        })?
+        .prefix_caching_hash_algo
+        .as_deref()
+}
+
 /// The parts of one engine's `CacheConfig` the KV index needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EngineCacheConfig {

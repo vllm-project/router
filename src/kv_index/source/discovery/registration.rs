@@ -7,25 +7,15 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
-use super::metrics_meta::EngineCacheConfigs;
+use super::metrics_meta::reported_prefix_hash;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
-    CacheCapabilities, CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe,
-    WorkerDiscovery, WorkerKvInfo, WorkerSubs,
+    CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
+    WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
-
-pub(super) fn incompatible_prefix_hash<'a>(
-    layout: &'a CacheCapabilities,
-    configs: &'a EngineCacheConfigs,
-    rank: u32,
-) -> Option<(&'a str, &'a str)> {
-    let expected = layout.rank_capability(rank)?.hash_algorithm.as_str();
-    let reported = configs.get(&rank)?.prefix_caching_hash_algo.as_deref()?;
-    (expected != reported).then_some((expected, reported))
-}
 
 impl KvIndexSupervisor {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -190,10 +180,13 @@ impl KvIndexSupervisor {
         let mut incompatible_ranks = 0;
         event_sources.retain(|source| {
             let rank = source.dp_rank;
-            if let Some((expected, reported)) = discovery
+            let reported = discovery
                 .engine_cache_configs
                 .as_ref()
-                .and_then(|configs| incompatible_prefix_hash(&capability, configs, rank))
+                .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
+            if let Some((expected, reported)) = capability
+                .rank_capability(rank)
+                .and_then(|contract| contract.reported_hash_mismatch(reported))
             {
                 warn!(
                     worker_url,
