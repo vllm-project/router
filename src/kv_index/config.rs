@@ -533,15 +533,28 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                         }
                     }
                 }
-                for endpoint in sources
+                // Do not echo the endpoint itself: a rejected value may carry
+                // credentials or a token in its query string, which would land
+                // in startup diagnostics. The worker URL, kind and index
+                // still identify the entry.
+                for (kind, index, endpoint) in sources
                     .endpoints
                     .iter()
-                    .chain(sources.replay_endpoints.iter().flatten())
+                    .enumerate()
+                    .map(|(index, endpoint)| ("publish", index, endpoint))
+                    .chain(
+                        sources
+                            .replay_endpoints
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .map(|(index, endpoint)| ("replay", index, endpoint)),
+                    )
                 {
                     if let Err(reason) = validate_pd_kv_endpoint(endpoint) {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
-                                "pd_kv_event_sources['{url}'] endpoint '{endpoint}' is invalid: {reason}"
+                                "pd_kv_event_sources['{url}'] {kind} endpoint #{index} is invalid: {reason}"
                             ),
                         });
                     }
