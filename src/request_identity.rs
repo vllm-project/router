@@ -18,6 +18,10 @@ pub(crate) const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
 pub(crate) const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
 pub(crate) const CODEX_SESSION_HEADER: &str = "session-id";
 pub(crate) const CODEX_THREAD_HEADER: &str = "thread-id";
+pub(crate) const CODEX_SUBAGENT_HEADER: &str = "x-openai-subagent";
+pub(crate) const CODEX_PARENT_THREAD_HEADER: &str = "x-codex-parent-thread-id";
+pub(crate) const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+pub(crate) const CODEX_VERSION_HEADER: &str = "x-codex-version";
 pub(crate) const GENERIC_SESSION_HEADER: &str = "x-session-id";
 
 /// Provenance of a stable identity. Affinity routing preserves the source
@@ -327,7 +331,11 @@ pub(crate) fn framework_identity_headers(
             Some(CLAUDE_AGENT_HEADER),
             Some(CLAUDE_PARENT_AGENT_HEADER),
         ),
-        (CODEX_SESSION_HEADER, Some(CODEX_THREAD_HEADER), None),
+        (
+            CODEX_SESSION_HEADER,
+            Some(CODEX_THREAD_HEADER),
+            Some(CODEX_PARENT_THREAD_HEADER),
+        ),
         (GENERIC_SESSION_HEADER, None, None),
     ] {
         let Some(session_id) = read_nonempty_header(headers, session_header)? else {
