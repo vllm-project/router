@@ -118,7 +118,7 @@ struct LoadTrackedBody {
     /// Other HTTP streams retain their first-frame behavior.
     output_frame: Option<OutputFrameConsumer>,
     /// Set while the load holds a peer fetch slot on a successful SSE response:
-    /// watches the frames sent to the client for the first generated output.
+    /// watches the frames sent to the client for the first engine output.
     peer_output: Option<CompletionOutputObserver>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
@@ -127,7 +127,8 @@ struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
     /// Active-mode peer fetch slot against the source. Freed at the first SSE
-    /// event that carries generated output (the fetch ends during prefill) or,
+    /// event with a non-empty `choices` list (the engine's first output, so the
+    /// fetch, which ends during prefill, is over) or,
     /// for any other response, with the load. Transport chunks alone, such as
     /// SSE heartbeats, do not free it.
     peer_permit: Option<PeerFetchPermit>,
@@ -198,7 +199,7 @@ impl RequestLoadGuard {
 
     /// Move the KV slot to decode. The peer fetch slot is not freed here: some
     /// callers see only transport chunks, so `LoadTrackedBody` frees it on
-    /// generated output instead.
+    /// the first engine output instead.
     fn begin_decode(&self) {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
@@ -314,7 +315,7 @@ fn hold_request_load_with_output_frame(
     let (parts, body) = response.into_parts();
     let peer_output =
         (load.holds_peer_fetch() && parts.status.is_success() && is_sse(&parts.headers))
-            .then(CompletionOutputObserver::generated_output);
+            .then(CompletionOutputObserver::engine_output);
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
         load,
@@ -4252,7 +4253,7 @@ mod tests {
         assert_eq!(limiter.inflight("http://a"), 0);
 
         // Transport-level decode start (any chunk) does not free the slot;
-        // only generated output on the body does (see the next test).
+        // only engine output on the body does (see the next test).
         let decoding = guard(&limiter);
         decoding.begin_decode();
         assert_eq!(limiter.inflight("http://a"), 1);
@@ -4260,10 +4261,11 @@ mod tests {
         assert_eq!(limiter.inflight("http://a"), 0);
     }
 
-    /// The slot is freed by the first event with generated output, not by a
-    /// heartbeat or a role-only delta; a body that is not SSE keeps it to EOF.
+    /// The slot is freed by the first `choices` event (vLLM's role-only delta
+    /// comes after the engine's first output), not by a heartbeat or another
+    /// event without choices; a body that is not SSE keeps it to EOF.
     #[tokio::test]
-    async fn peer_fetch_slot_waits_for_generated_output_not_heartbeats() {
+    async fn peer_fetch_slot_waits_for_engine_output_not_heartbeats() {
         use bytes::Bytes;
         use http_body_util::BodyExt as _;
 
@@ -4291,16 +4293,13 @@ mod tests {
         }
 
         let (tx, mut body) = open("text/event-stream; charset=utf-8");
-        for frame in [
-            ": keepalive\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-        ] {
+        for frame in [": keepalive\n\n", "event: ping\ndata: {}\n\n"] {
             tx.send(Ok(Bytes::from(frame))).unwrap();
             next(&mut body).await;
             assert_eq!(limiter.inflight("http://a"), 1, "{frame:?} freed the slot");
         }
         tx.send(Ok(Bytes::from(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
         )))
         .unwrap();
         next(&mut body).await;

@@ -39,7 +39,7 @@ sequenceDiagram
         R->>R: 11. count vllm_router_peer_fetch_requests_total{outcome}
     end
     D-->>C: response
-    R->>R: 12. free the in-flight slot at the first streamed event with generated output, or when the response ends
+    R->>R: 12. free the in-flight slot at the first streamed event with a non-empty choices list, or when the response ends
 ```
 
 Steps 1 to 7 are the same in shadow and active mode, except that a shadow run with `ignore_capability` skips the capability check in step 5. Steps 8b to 12 exist only in active mode.
@@ -156,7 +156,7 @@ In `active` mode a planned request goes through these checks, in order. Each fai
 
 **Source fallback.** If the best-ranked source fails a source-level check, the next planned source is tried, and so on down the ranking; the first that passes is granted and its address is sent. The source-level labels are recorded only when no planned source could be granted, and the one recorded is the best-ranked source's failure. A request that falls back to a lower-ranked source therefore records none of them, and a request with a single planned source reports exactly the failure of that source. Only a source that passed the planner is a candidate: a peer the planner rejected is never tried. A source passed over takes no slot. The lower-ranked sources are checked against the registrations the planner saw, like the best one; a source the router cannot match to a worker in the selection snapshot is left out, while a source that is matched but has no registration is kept and fails as `no_peer_endpoint`. Each grant that uses a source other than the best is logged at `DEBUG` with its rank and URL.
 
-**Slot lifetime.** A granted source slot is held until prefill is over, since the fetch happens during prefill. On a successful SSE response it is freed at the first event that carries generated output: a choice with non-empty `text`, or a chat `delta` with non-empty `content`, `reasoning_content` or `reasoning`, or a non-empty `tool_calls` list. SSE comments (heartbeats), role-only deltas, usage-only events and error events do not free it. Any other response (non-streaming, an error status, or a stream the router does not recognize as one of these shapes) keeps the slot until the body ends or the client disconnects.
+**Slot lifetime.** A granted source slot is held until prefill is over, since the fetch happens during prefill. On a successful SSE response it is freed at the first event with a non-empty `choices` list. vLLM sends that event only after the engine's first output: for chat it is the role-only delta, for a completion the first text. SSE comments (heartbeats), events without `choices`, usage-only events (`choices: []`) and error events do not free it. Any other response (non-streaming, an error status, or a stream with no such event) keeps the slot until the body ends or the client disconnects.
 
 **Where capabilities come from.**
 - *Engine-reported:* a worker's `peer_lookup` record on `/kv_event_sources` gives both a capability and a peer address (host, port, engine id, TP/DCP/PP sizes). The record is described below.

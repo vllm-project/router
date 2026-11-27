@@ -10,11 +10,11 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 enum OutputRule {
     /// A Completion choice with non-empty `text`.
     CompletionText,
-    /// A Completion choice with non-empty `text`, or a chat choice whose
-    /// `delta` has non-empty `content`, `reasoning_content` or `reasoning`, or
-    /// a non-empty `tool_calls` list. A role-only delta, a usage-only event, a
-    /// finish without text and SSE comments (heartbeats) are not output.
-    GeneratedOutput,
+    /// Any event with a non-empty `choices` list. vLLM sends its first such
+    /// event (for chat, the role-only delta) only after the engine's first
+    /// output, so after prefill. SSE comments (heartbeats), usage-only events
+    /// (`choices: []`) and error events are not output.
+    EngineOutput,
 }
 
 pub(super) struct CompletionOutputObserver {
@@ -30,11 +30,11 @@ impl CompletionOutputObserver {
         Self::with_rule(disabled, OutputRule::CompletionText)
     }
 
-    /// Detects generated output on a Completion or chat stream. Used to free a
-    /// peer fetch source slot once prefill (and so the fetch) is over; a stream
-    /// in a shape this does not recognize keeps the slot until the body ends.
-    pub(super) fn generated_output() -> Self {
-        Self::with_rule(false, OutputRule::GeneratedOutput)
+    /// Detects the first engine output on an OpenAI-style stream. Used to free
+    /// a peer fetch source slot once prefill (and so the fetch) is over; a
+    /// stream without a `choices` event keeps the slot until the body ends.
+    pub(super) fn engine_output() -> Self {
+        Self::with_rule(false, OutputRule::EngineOutput)
     }
 
     fn with_rule(disabled: bool, rule: OutputRule) -> Self {
@@ -109,31 +109,15 @@ fn event_has_output(event: &[u8], rule: OutputRule) -> bool {
         && value
             .get("choices")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|choices| choices.iter().any(|choice| choice_has_output(choice, rule)))
-}
-
-fn choice_has_output(choice: &serde_json::Value, rule: OutputRule) -> bool {
-    let non_empty_str = |value: Option<&serde_json::Value>| {
-        value
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-    };
-    if non_empty_str(choice.get("text")) {
-        return true;
-    }
-    if rule == OutputRule::CompletionText {
-        return false;
-    }
-    let Some(delta) = choice.get("delta") else {
-        return false;
-    };
-    ["content", "reasoning_content", "reasoning"]
-        .iter()
-        .any(|field| non_empty_str(delta.get(*field)))
-        || delta
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|calls| !calls.is_empty())
+            .is_some_and(|choices| match rule {
+                OutputRule::EngineOutput => !choices.is_empty(),
+                OutputRule::CompletionText => choices.iter().any(|choice| {
+                    choice
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                }),
+            })
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -232,30 +216,26 @@ mod tests {
     }
 
     #[test]
-    fn generated_output_counts_chat_deltas_but_not_heartbeats_or_metadata() {
+    fn engine_output_is_any_choices_event_but_not_heartbeats_or_metadata() {
         for event in [
             ": keepalive\n\n",
             "event: ping\ndata: {}\n\n",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[]}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
             "data: {\"error\":{},\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
             "event: error\ndata: {\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"failed\"}}\n\n",
             "data: [DONE]\n\n",
         ] {
-            let mut observer = CompletionOutputObserver::generated_output();
+            let mut observer = CompletionOutputObserver::engine_output();
             assert!(!observer.observe(event.as_bytes()), "{event:?}");
         }
         for event in [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
             "data: {\"choices\":[{\"text\":\"completion\"}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"chat\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n",
         ] {
-            let mut observer = CompletionOutputObserver::generated_output();
+            let mut observer = CompletionOutputObserver::engine_output();
             assert!(observer.observe(event.as_bytes()), "{event:?}");
         }
     }
