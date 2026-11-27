@@ -35,6 +35,12 @@ pub(super) struct WorkerDescriptor {
 }
 
 impl WorkerDescriptor {
+    pub(super) fn supports_local_prefill(&self) -> bool {
+        self.hybrid
+            .as_ref()
+            .is_some_and(|layout| layout.nixl_pull_local_prefill == Some(true))
+    }
+
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()

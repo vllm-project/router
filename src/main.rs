@@ -210,7 +210,7 @@ struct CliArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
     #[command(flatten)]
-    pd_prefill_bypass: vllm_router_rs::config::PdPrefillBypassConfig,
+    pd_prefill_bypass: vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -696,7 +696,6 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
-            pd_prefill_bypass: self.pd_prefill_bypass,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -744,6 +743,7 @@ impl CliArgs {
         });
 
         ServerConfig {
+            pd_prefill_bypass: self.pd_prefill_bypass,
             host: self.host.clone(),
             port: self.port,
             router_config,
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn parses_prefill_bypass_alongside_worker_policy() {
-        use vllm_router_rs::config::PdPrefillBypassPolicy;
+        use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassPolicy;
 
         let args = CliArgs::try_parse_from([
             "vllm-router",

@@ -192,10 +192,6 @@ fn send_stream_chunk(
     output.send(tx, chunk, has_generated_output)
 }
 
-/// A local-prefill worker declined before generating any output.
-#[derive(Clone, Copy)]
-pub(crate) struct LocalPrefillRejected;
-
 fn grpc_status_code(status: &tonic::Status) -> StatusCode {
     match status.code() {
         tonic::Code::InvalidArgument
@@ -384,12 +380,6 @@ impl GrpcEngineBackend {
             Ok(proto) => proto,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
-        let local_prefill = handoff.kv_transfer_params.as_ref().is_some_and(|params| {
-            params
-                .get("max_local_prefill_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .is_some()
-        });
         if let Some(params) = &handoff.kv_transfer_params {
             if let Err(error) = set_kv_transfer_params(&mut proto, params) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
@@ -434,16 +424,7 @@ impl GrpcEngineBackend {
                         format!("grpc GenerateStream: {}", status.message()),
                     )
                         .into_response();
-                    if local_prefill
-                        && status.code() == tonic::Code::FailedPrecondition
-                        && status
-                            .metadata()
-                            .get("x-vllm-error-code")
-                            .and_then(|code| code.to_str().ok())
-                            == Some("local_prefill_limit_exceeded")
-                    {
-                        response.extensions_mut().insert(LocalPrefillRejected);
-                    }
+                    response.extensions_mut().insert(status);
                     return response;
                 }
                 Err(_) => {

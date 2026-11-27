@@ -4,7 +4,6 @@ use super::completion_route::reject_full_report;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_cached_tokens;
-use super::pd_prefill_bypass::{self, PrefillEstimate};
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
@@ -12,7 +11,7 @@ use super::router::{hold_request_load_until_body_done, prepare_error_status, Req
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
 use crate::backend::preprocess::{ADAPTER_FIELDS, NAMED_LORA_FIELD};
-use crate::config::{KvConnector, PdPrefillBypassConfig};
+use crate::config::KvConnector;
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
@@ -37,6 +36,10 @@ use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+mod prefill_bypass;
+use prefill_bypass::PrefillEstimate;
+pub use prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 type MooncakePrefillTable = HashMap<u16, HashMap<String, MooncakePrefillInfo>>;
@@ -1502,11 +1505,11 @@ impl VllmPDRouter {
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
             if let Some(estimate) = bypass {
                 if bypass_revision != Some(estimate.worker_revision)
-                    || !attempt.bypass_load_allows(
+                    || !self.prefill_bypass.load_allows(
                         loads,
+                        attempt.prefill_endpoint(),
                         &input.provisional_endpoint,
                         0,
-                        &self.prefill_bypass,
                         estimate,
                     )
                 {
@@ -1964,136 +1967,6 @@ impl VllmPDRouter {
         })
     }
 
-    /// Check the admitted Decode rank before dispatching Prefill.
-    #[allow(clippy::too_many_arguments)]
-    async fn prefill_bypass_target(
-        &self,
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
-        prefill: &Arc<dyn Worker>,
-        decode: &Arc<dyn Worker>,
-        attempt: &PdAttempt,
-        commit: Option<&DecodeCommitInput>,
-        pool: DecodePoolSource,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<Arc<dyn Worker>> {
-        if !matches!(self.kv_connector, KvConnector::Nixl)
-            || self.epd.is_some()
-            || !pd_prefill_bypass::eligible_request(path, request)
-            || self
-                .get_nixl_push_identity(prefill.base_url(), prefill.dp_rank())
-                .is_some()
-        {
-            return None;
-        }
-        let state = self.pd_router.kv_state.as_ref()?;
-        let policy = self.policy_registry.get_decode_policy();
-        let estimate = state
-            .prepare_local_prefill(
-                decode.as_ref(),
-                policy.as_ref(),
-                request,
-                path,
-                headers,
-                router_prompts,
-            )
-            .await?;
-        if !estimate.within_limit(self.prefill_bypass.max_tokens) {
-            return None;
-        }
-        if let Some(commit) = commit {
-            return self
-                .select_and_commit_decode(attempt, commit, request, headers, true, Some(estimate))
-                .await
-                .ok();
-        }
-        let endpoint = PdEndpoint::for_worker(decode.as_ref());
-        let mut live = self.live_decode_candidates(pool);
-        Self::retain_commit_candidates(
-            &mut live,
-            request.get("model").and_then(Value::as_str),
-            Some(&endpoint),
-        );
-        let worker = live.into_iter().find(|worker| {
-            (matches!(pool, DecodePoolSource::Discovery) || Arc::ptr_eq(worker, decode))
-                && state.local_prefill_revision(worker.as_ref()) == Some(estimate.worker_revision)
-        })?;
-        attempt
-            .reserved_decode_allows_bypass(&endpoint, &self.prefill_bypass, estimate)
-            .then_some(worker)
-    }
-
-    /// None is reserved for a typed refusal before generation.
-    async fn dispatch_http_local_prefill(
-        &self,
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
-        worker: &dyn Worker,
-        attempt: &PdAttempt,
-    ) -> Option<Response> {
-        let start = Instant::now();
-        let url = worker.endpoint_url(path);
-        let mut request = request.clone();
-        request["kv_transfer_params"] =
-            pd_prefill_bypass::local_params(self.prefill_bypass.max_tokens);
-        let builder = self
-            .pd_router
-            .client
-            .post(&url)
-            .bearer_auth(std::env::var("OPENAI_API_KEY").unwrap_or_default())
-            .header("X-Request-Id", Uuid::new_v4().to_string())
-            .json(&request);
-        let builder = dp_utils::add_dp_rank_header(builder, worker.dp_rank());
-        attempt.finish_prefill();
-        attempt.begin_decode();
-        let result = otel_http::send_client_request(
-            builder,
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
-        )
-        .await;
-        RouterMetrics::record_pd_decode_request(worker.base_url());
-        if let Ok(response) = &result {
-            if pd_prefill_bypass::http_rejected(response.status(), response.headers()) {
-                return None;
-            }
-        }
-        RouterMetrics::record_pd_request(path);
-        RouterMetrics::record_pd_request_duration(path, start.elapsed());
-        Some(match result {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    RouterMetrics::record_pd_decode_error(worker.base_url());
-                }
-                let mut headers = header_utils::preserve_response_headers(response.headers());
-                headers.remove(pd_prefill_bypass::ERROR_HEADER);
-                response_with_body(status, &headers, Body::from_stream(response.bytes_stream()))
-                    .unwrap_or_else(|error| (StatusCode::BAD_GATEWAY, error).into_response())
-            }
-            Err(error) => {
-                RouterMetrics::record_pd_decode_error(worker.base_url());
-                let status = if error.is_timeout() {
-                    StatusCode::GATEWAY_TIMEOUT
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                (
-                    status,
-                    format!("Decode request failed to {url}: {}", error_chain(&error)),
-                )
-                    .into_response()
-            }
-        })
-    }
-
     async fn process_vllm_request(
         &self,
         request: Value,
@@ -2473,46 +2346,24 @@ impl VllmPDRouter {
                     )
                     .await
                 {
-                    let start = Instant::now();
-                    attempt.finish_prefill();
-                    attempt.begin_decode();
-                    let response = self
-                        .grpc_frontend
-                        .dispatch_decode(
-                            worker.url(),
+                    if let Some(response) = self
+                        .dispatch_grpc_local_prefill(
                             prepared.clone(),
-                            Uuid::new_v4().to_string(),
-                            Some(pd_prefill_bypass::local_params(
-                                self.prefill_bypass.max_tokens,
-                            )),
+                            path,
+                            worker.as_ref(),
+                            &attempt,
                         )
-                        .await;
-                    RouterMetrics::record_pd_decode_request(worker.base_url());
-                    if response
-                        .extensions()
-                        .get::<crate::backend::grpc::LocalPrefillRejected>()
-                        .is_some()
+                        .await
                     {
-                        attempt.release();
-                        allow_bypass = false;
-                        workers = match self.available_grpc_workers() {
-                            Ok(workers) => workers,
-                            Err(response) => return *response,
-                        };
-                        continue;
+                        return attempt.track_response(response);
                     }
-                    RouterMetrics::record_pd_request(path);
-                    RouterMetrics::record_pd_request_duration(path, start.elapsed());
-                    if response.status().is_success() {
-                        record_grpc_decode_stream_failure(
-                            grpc_decode_outcome(&response),
-                            worker.base_url(),
-                        );
-                    } else {
-                        RouterMetrics::record_pd_decode_error(worker.base_url());
-                    }
-                    let response = own_grpc_decode(response, &attempt);
-                    return attempt.track_response(response);
+                    attempt.release();
+                    allow_bypass = false;
+                    workers = match self.available_grpc_workers() {
+                        Ok(workers) => workers,
+                        Err(response) => return *response,
+                    };
+                    continue;
                 }
             }
             let response = self
@@ -3492,7 +3343,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                prefill_bypass: ctx.router_config.pd_prefill_bypass,
+                prefill_bypass: ctx.pd_prefill_bypass,
                 // No static prefills in discovery mode; this stays empty.
                 // Runtime Mooncake registration is tracked in #209.
                 mooncake_prefill_info: Arc::new(HashMap::new()),
@@ -3612,7 +3463,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
-                prefill_bypass: ctx.router_config.pd_prefill_bypass,
+                prefill_bypass: ctx.pd_prefill_bypass,
                 mooncake_prefill_info: Arc::new(mooncake_prefill_info),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
@@ -5843,7 +5694,6 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
-            pd_prefill_bypass: Default::default(),
             ..Default::default()
         };
         let ctx = Arc::new(

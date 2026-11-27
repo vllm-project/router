@@ -311,7 +311,11 @@ impl PdKvState {
         }
     }
 
-    async fn credit_by_base(&self, bases: &[String], request: &Value) -> HashMap<String, bool> {
+    pub(super) async fn credit_by_base(
+        &self,
+        bases: &[String],
+        request: &Value,
+    ) -> HashMap<String, bool> {
         #[cfg(all(test, feature = "cpu", feature = "ready"))]
         let _wait = self.credit_gate.lock().await;
         self.supervisor
@@ -414,7 +418,7 @@ impl PdKvState {
     }
 
     /// Render the request against each base, or reuse the router's own ids.
-    async fn tokenize(
+    pub(super) async fn tokenize(
         &self,
         bases: Vec<String>,
         request: &Value,
@@ -549,44 +553,6 @@ impl PdKvState {
         self.supervisor.local_prefill_revision(
             worker.base_url(),
             u32::try_from(worker.dp_rank().unwrap_or(0)).ok()?,
-        )
-    }
-
-    pub(super) async fn prepare_local_prefill(
-        &self,
-        worker: &dyn Worker,
-        policy: &dyn LoadBalancingPolicy,
-        request: &Value,
-        route: &str,
-        headers: Option<&HeaderMap>,
-        router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<super::pd_prefill_bypass::PrefillEstimate> {
-        let worker_revision = self.local_prefill_revision(worker)?;
-        let policy = kv_aware_ops(policy)?;
-        if http_cache_read_fallback(request).is_some() {
-            return None;
-        }
-        let bases = vec![worker.base_url().to_owned()];
-        let verified = self.credit_by_base(&bases, request).await;
-        if verified.get(worker.base_url()) != Some(&true) {
-            return None;
-        }
-        let inputs = self
-            .tokenize(bases, request, route, headers, router_prompts)
-            .await;
-        let prompts = &inputs.get(worker.base_url())?.as_ref().ok()?.prompts;
-        let [prompt] = prompts.as_ref() else {
-            return None;
-        };
-        let estimates =
-            policy.estimate_decode_work(&[(worker, prompts, true)], &mut PromptHashes::new());
-        let remaining_tokens = usize::try_from(estimates.first()?.additional_tokens?).ok()?;
-        (self.local_prefill_revision(worker) == Some(worker_revision)).then_some(
-            super::pd_prefill_bypass::PrefillEstimate {
-                prompt_tokens: prompt.len(),
-                remaining_tokens,
-                worker_revision,
-            },
         )
     }
 

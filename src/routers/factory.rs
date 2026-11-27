@@ -150,7 +150,6 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
-            pd_prefill_bypass: Default::default(),
             // Worker lists stay empty on purpose: the prefill/decode policies
             // are wired before worker startup, and an empty set keeps this test
             // off the network (a populated set would block on the 600s health

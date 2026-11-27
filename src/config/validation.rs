@@ -28,30 +28,6 @@ impl ConfigValidator {
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
-        let bypass = &config.pd_prefill_bypass;
-        if !(0.0 < bypass.max_ratio && bypass.max_ratio <= 1.0) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "pd-prefill-bypass-max-ratio must be in (0, 1]".into(),
-            });
-        }
-        if bypass.max_tokens > 0 {
-            if !config.mode.is_pd_mode()
-                || config.kv_connector != KvConnector::Nixl
-                || !matches!(
-                    config.mode.get_decode_policy(&config.policy),
-                    PolicyConfig::KvAware { .. }
-                )
-            {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "prefill bypass requires vLLM P/D with NIXL and kv_aware Decode".into(),
-                });
-            }
-            if bypass.policy.uses_prefill_load() && bypass.p_busy_requests.unwrap_or(0) == 0 {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "the prefill bypass load policy requires a positive pd-prefill-bypass-p-busy-requests".into(),
-                });
-            }
-        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;

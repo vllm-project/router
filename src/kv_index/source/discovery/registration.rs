@@ -106,7 +106,6 @@ impl KvIndexSupervisor {
                     block_size,
                     ranks: vec![],
                     cache_key: None,
-                    nixl_pull_local_prefill: false,
                 });
             }
         };
@@ -122,7 +121,6 @@ impl KvIndexSupervisor {
                 block_size: None,
                 ranks: vec![],
                 cache_key: None,
-                nixl_pull_local_prefill: false,
             });
         };
         let Some(model_id) = model_id else {
@@ -131,7 +129,6 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
-                nixl_pull_local_prefill: false,
             });
         };
         let Some(capability) = discovery.hybrid else {
@@ -144,7 +141,6 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
-                nixl_pull_local_prefill: false,
             });
         };
         // Policy intervals use this unit to translate hits back into tokens.
@@ -344,7 +340,6 @@ impl KvIndexSupervisor {
             indexes,
             lifecycle: lifecycle.clone(),
         });
-        let nixl_pull_local_prefill = capability.nixl_pull_local_prefill == Some(true);
         self.monitor_hybrid_source(
             &provider,
             worker_url,
@@ -374,7 +369,6 @@ impl KvIndexSupervisor {
             block_size: Some(block_size),
             ranks,
             cache_key: Some(key),
-            nixl_pull_local_prefill,
         };
         {
             let mut state = lifecycle.state.lock();

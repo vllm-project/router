@@ -50,7 +50,7 @@ struct Router {
     kv_penalty_external: f64,
     kv_penalty_disk: f64,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
-    pd_prefill_bypass: config::PdPrefillBypassConfig,
+    pd_prefill_bypass: routers::http::vllm_pd_router::PdPrefillBypassConfig,
     pd_kv_events: Vec<String>,
     kv_event_source: Vec<String>,
     kv_event_replay_source: Vec<String>,
@@ -278,7 +278,6 @@ impl Router {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
-            pd_prefill_bypass: self.pd_prefill_bypass,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -514,7 +513,7 @@ impl Router {
             kv_penalty_external,
             kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
-            pd_prefill_bypass: config::PdPrefillBypassConfig {
+            pd_prefill_bypass: routers::http::vllm_pd_router::PdPrefillBypassConfig {
                 max_tokens: pd_prefill_bypass_max_tokens,
                 max_ratio: pd_prefill_bypass_max_ratio,
                 policy: clap::ValueEnum::from_str(&pd_prefill_bypass_policy, false)
@@ -641,6 +640,7 @@ impl Router {
         // Block on the async startup function
         runtime.block_on(async move {
             server::startup(server::ServerConfig {
+                pd_prefill_bypass: self.pd_prefill_bypass,
                 host: self.host.clone(),
                 port: self.port,
                 router_config,

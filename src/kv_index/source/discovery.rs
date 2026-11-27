@@ -151,7 +151,6 @@ pub struct WorkerKvInfo {
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
-    pub(crate) nixl_pull_local_prefill: bool,
 }
 
 pub(crate) struct WorkerDiscovery {
@@ -355,6 +354,23 @@ impl KvIndexSupervisor {
     /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
     /// base URL and fans it out to its DP ranks afterwards, so a declaration
     /// keyed by rank has to be merged here or it is never applied.
+    pub(crate) fn local_prefill_revision(&self, base: &str, rank: u32) -> Option<u64> {
+        if self.static_pd_sources.contains_key(base) {
+            return None;
+        }
+        let lifecycles = self.lifecycles.lock();
+        let lifecycle = lifecycles.get(base)?;
+        let state = lifecycle.state.lock();
+        let info = state.info.as_ref()?;
+        (lifecycle.trusted_at(&state, std::time::Instant::now)
+            && state
+                .descriptor
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.supports_local_prefill())
+            && info.ranks.contains(&rank))
+        .then_some(state.revision)
+    }
+
     fn resolved_static_source(&self, worker_url: &str) -> Option<WorkerDiscovery> {
         let exact = self.static_sources.get(worker_url);
         if split_worker_rank(worker_url).1.is_some() {
@@ -895,10 +911,6 @@ pub(crate) fn split_worker_rank(worker_url: &str) -> (&str, Option<u32>) {
 
 fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
     let model = config.model.trim().to_owned();
-    let mut layout = config.hybrid.clone();
-    if let Some(layout) = &mut layout {
-        layout.nixl_pull_local_prefill = None;
-    }
     let (_, rank_suffix) = split_worker_rank(worker_url);
     let server_info = ServerInfo {
         // Model/block size are declarations; the registry URL is not a boot ID.
@@ -924,7 +936,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
             }),
             model_id: Ok(Some(model)),
             base_models: None,
-            hybrid: layout,
+            hybrid: config.hybrid.clone(),
             assumed_plain_full: false,
         };
     }
@@ -966,7 +978,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         sources: Ok(sources),
         model_id: Ok(Some(model)),
         base_models: None,
-        hybrid: layout,
+        hybrid: config.hybrid.clone(),
         assumed_plain_full: config
             .hybrid
             .as_ref()

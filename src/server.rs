@@ -48,6 +48,7 @@ use tracing::{error, info, warn, Level};
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
+    pub pd_prefill_bypass: crate::routers::http::vllm_pd_router::PdPrefillBypassConfig,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -97,6 +98,7 @@ impl AppContext {
         Ok(Self {
             client,
             router_config,
+            pd_prefill_bypass: Default::default(),
             rate_limiter,
             worker_registry,
             policy_registry,
@@ -800,6 +802,7 @@ pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 2;
 
 pub struct ServerConfig {
     pub host: String,
+    pub pd_prefill_bypass: crate::routers::http::vllm_pd_router::PdPrefillBypassConfig,
     pub port: u16,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -970,6 +973,7 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    config.pd_prefill_bypass.validate(&config.router_config)?;
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)
@@ -1046,13 +1050,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Create the application context with all dependencies
     println!("DEBUG: Creating AppContext");
-    let app_context = AppContext::new(
+    let mut app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
         config.router_config.api_key_validation_urls.clone(),
     )?;
+    app_context.pd_prefill_bypass = config.pd_prefill_bypass;
     println!("DEBUG: AppContext created");
 
     let app_context = Arc::new(app_context);
