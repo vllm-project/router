@@ -16,6 +16,15 @@ impl ConfigValidator {
                 });
             }
         }
+        if config.session_affinity == SessionAffinityMode::Hard
+            && !(1..=31_536_000).contains(&config.session_affinity_ttl_secs)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "session_affinity_ttl_secs".to_string(),
+                value: config.session_affinity_ttl_secs.to_string(),
+                reason: "Must be between 1 and 31536000 seconds".to_string(),
+            });
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -1014,6 +1023,15 @@ mod tests {
 
         for ttl in [0, 31_536_001] {
             config.kv_aware_session_affinity_ttl_secs = Some(ttl);
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+
+        config.kv_aware_session_affinity_ttl_secs = None;
+        config.session_affinity = SessionAffinityMode::Hard;
+        config.session_affinity_ttl_secs = 7200;
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for ttl in [0, 31_536_001] {
+            config.session_affinity_ttl_secs = ttl;
             assert!(ConfigValidator::validate(&config).is_err());
         }
     }

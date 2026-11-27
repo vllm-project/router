@@ -191,6 +191,8 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         policy: PolicyConfig::RoundRobin,
         disable_circuit_breaker: true,
         kv_aware_session_affinity_ttl_secs: None,
+        session_affinity: vllm_router_rs::config::SessionAffinityMode::Off,
+        session_affinity_ttl_secs: 7200,
         retry: RetryConfig {
             max_retries: 2,
             initial_backoff_ms: 1,

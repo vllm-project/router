@@ -108,6 +108,8 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | Transfer credit for an authorized external KV source. Worker events alone cannot establish shared-pool residency. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
+| `--session-affinity` | `off, hard` | `off` | — | — | Hard pin in front of a stateless policy. `off` leaves current launch lines unchanged. |
+| `--session-affinity-ttl-secs` | `u64` | `7200` | — | — | Idle seconds before a hard session pin is forgotten (1–31536000). |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |

@@ -1681,6 +1681,75 @@ impl Router {
         supervisor.cache_eligible_workers(workers, model)
     }
 
+    /// First pick for the session module. An excluded URL is a failed retry
+    /// target: skip it here, and leave the stored pin where it is.
+    #[allow(clippy::too_many_arguments)]
+    fn affinity_first_pick(
+        policy: &dyn LoadBalancingPolicy,
+        available: &[Arc<dyn Worker>],
+        excluded: &[String],
+        counts: crate::session_affinity::SessionCounts<'_>,
+        tie_break: &str,
+        text: Option<&str>,
+        headers: Option<&crate::policies::RequestHeaders>,
+        token_ids: KvRequestTokens<'_>,
+        model_id: Option<&str>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+    ) -> Option<usize> {
+        let allowed = |url: &str| !excluded.iter().any(|item| item == url);
+        if policy.name() == "least_load" {
+            let healthy = crate::policies::get_healthy_worker_indices(available);
+            let loads: Vec<(usize, usize, String)> = healthy
+                .iter()
+                .filter_map(|&idx| {
+                    let url = available[idx].url();
+                    allowed(url).then(|| (idx, counts.get(url), url.to_string()))
+                })
+                .collect();
+            let idx = crate::policies::least_by_load(&loads, tie_break)?;
+            let url = available[idx].url();
+            RouterMetrics::record_processed_request(url);
+            RouterMetrics::record_policy_decision(policy.name(), url);
+            return Some(idx);
+        }
+        if excluded.is_empty() {
+            if let Some(cache) = policy
+                .as_any()
+                .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            {
+                return cache.select_worker_with_inputs(
+                    available, token_ids, model_id, lora_name, cache_salt, "regular",
+                );
+            }
+            return policy.select_worker_with_headers(available, text, headers);
+        }
+        let candidates: Vec<usize> = available
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| allowed(worker.url()))
+            .map(|(idx, _)| idx)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let subset: Vec<Arc<dyn Worker>> = candidates
+            .iter()
+            .map(|&idx| Arc::clone(&available[idx]))
+            .collect();
+        let chosen = if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache.select_worker_with_inputs(
+                &subset, token_ids, model_id, lora_name, cache_salt, "regular",
+            )?
+        } else {
+            policy.select_worker_with_headers(&subset, text, headers)?
+        };
+        candidates.get(chosen).copied()
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     #[allow(clippy::too_many_arguments)]
     fn select_worker_for_model(
@@ -1695,6 +1764,7 @@ impl Router {
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
+        session_key: Option<&str>,
     ) -> Option<SelectedWorker> {
         if available.is_empty() {
             return None;
@@ -1704,6 +1774,36 @@ impl Router {
 
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
+
+        let affinity = self.policy_registry.session_affinity();
+        if affinity.is_enabled() && crate::session_affinity::SessionAffinity::applies(policy.name())
+        {
+            let (idx, outcome) =
+                affinity.route(session_key, available, excluded_workers, |counts| {
+                    Self::affinity_first_pick(
+                        policy.as_ref(),
+                        available,
+                        excluded_workers,
+                        counts,
+                        session_key.unwrap_or(text.unwrap_or("")),
+                        text,
+                        request_headers.as_ref(),
+                        token_ids,
+                        model_id,
+                        lora_name,
+                        cache_salt,
+                    )
+                })?;
+            let worker = available.get(idx)?.clone();
+            if outcome == crate::session_affinity::AffinityOutcome::StickyHit {
+                RouterMetrics::record_processed_request(worker.url());
+                RouterMetrics::record_policy_decision(policy.name(), worker.url());
+            }
+            return Some(SelectedWorker {
+                worker,
+                kv_receipt: None,
+            });
+        }
 
         if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
@@ -2140,6 +2240,22 @@ impl Router {
                         lora_name,
                         cache_read_fallback.is_some(),
                     ));
+                    let session_key = crate::session_affinity::SessionAffinity::applies(policy.name())
+                        .then(|| {
+                            crate::request_identity::resolve_affinity_identity(
+                                headers,
+                                typed_req.affinity_identity(),
+                            )
+                            .ok()
+                            .flatten()
+                            .map(|identity| {
+                                crate::session_affinity::pin_key(
+                                    identity.source.as_str(),
+                                    &identity.program_id,
+                                )
+                            })
+                        })
+                        .flatten();
                     self.select_worker_for_model(
                         model_id,
                         &workers,
@@ -2155,6 +2271,7 @@ impl Router {
                         cache_salt,
                         affinity_key.as_ref(),
                         &excluded_workers,
+                        session_key.as_deref(),
                     )
                 };
                 let SelectedWorker { worker, kv_receipt } = match selected_worker {
@@ -3742,6 +3859,50 @@ impl RouterTrait for Router {
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
+                })
+        } else if self.policy_registry.session_affinity().is_enabled()
+            && crate::session_affinity::SessionAffinity::applies(policy.name())
+        {
+            let session_key = crate::request_identity::resolve_affinity_identity(
+                headers,
+                crate::request_identity::IdentityFields::from_body(&body),
+            )
+            .ok()
+            .flatten()
+            .map(|identity| {
+                crate::session_affinity::pin_key(identity.source.as_str(), &identity.program_id)
+            });
+            let request_headers = Self::headers_to_request_headers(headers);
+            let affinity = self.policy_registry.session_affinity();
+            affinity
+                .route(session_key.as_deref(), &workers, &[], |counts| {
+                    Self::affinity_first_pick(
+                        policy.as_ref(),
+                        &workers,
+                        &[],
+                        counts,
+                        session_key
+                            .as_deref()
+                            .unwrap_or(request_text.as_deref().unwrap_or("")),
+                        request_text.as_deref(),
+                        request_headers.as_ref(),
+                        request_tokens,
+                        model_id,
+                        lora_name,
+                        cache_salt,
+                    )
+                })
+                .and_then(|(idx, outcome)| {
+                    workers.get(idx).cloned().map(|worker| {
+                        if outcome == crate::session_affinity::AffinityOutcome::StickyHit {
+                            RouterMetrics::record_processed_request(worker.url());
+                            RouterMetrics::record_policy_decision(policy.name(), worker.url());
+                        }
+                        SelectedWorker {
+                            worker,
+                            kv_receipt: None,
+                        }
+                    })
                 })
         } else if let Some(ops) = kv_ops {
             let eligibility = self.kv_placement_eligibility(
@@ -8070,6 +8231,7 @@ mod tests {
                     None,
                     None,
                     &[],
+                    None,
                 )
                 .expect("Should select a worker");
             selected_urls.push(worker.worker.url().to_string());
@@ -8111,6 +8273,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .expect("Should select the remaining healthy worker");
 
@@ -8143,6 +8306,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         );
         assert!(
             result.is_none(),
@@ -8166,6 +8330,7 @@ mod tests {
                     None,
                     None,
                     excluded,
+                    None,
                 )
                 .expect("Should select a worker")
                 .worker
@@ -8198,6 +8363,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             ) {
                 worker_urls_seen.insert(worker.worker.url().to_string());
             }

@@ -209,6 +209,17 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+
+    /// Pin a session to the worker that served it. `off` leaves every current
+    /// launch line unchanged. `hard` never moves a pin because of load.
+    /// `kv_aware`, `sticky_least_loaded`, `consistent_hash`, and
+    /// `rendezvous_hash` keep their own placement.
+    #[arg(long, default_value = "off", value_parser = ["off", "hard"])]
+    session_affinity: String,
+
+    /// Idle seconds before a hard session pin is forgotten.
+    #[arg(long, default_value_t = 7200, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
+    session_affinity_ttl_secs: u64,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -695,6 +706,11 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            session_affinity: match self.session_affinity.as_str() {
+                "hard" => vllm_router_rs::config::SessionAffinityMode::Hard,
+                _ => vllm_router_rs::config::SessionAffinityMode::Off,
+            },
+            session_affinity_ttl_secs: self.session_affinity_ttl_secs,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
