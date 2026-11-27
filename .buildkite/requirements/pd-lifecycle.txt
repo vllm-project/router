@@ -1,0 +1,3 @@
+# HTTP clients only; do not install the router or change the engine image.
+requests>=2.25.0
+aiohttp

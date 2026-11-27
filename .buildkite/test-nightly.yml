@@ -348,9 +348,14 @@ steps:
     command: |
       set -euo pipefail
 
+      # Match the artifact glob: no old probe report if download fails early.
+      rm -f -- target/ci-logs/moriio-rdma-*/pd-lifecycle.json{,.tmp}
       bash .buildkite/scripts/install_packages.sh router-bin
 
       export MORIIO_READ_MODE="{{matrix.read_mode}}"
+      if [[ "$${RUN_PD_LIFECYCLE:-false}" == "true" && "{{matrix.read_mode}}" == "true" ]]; then
+        export VLLM_ROCM_USE_SKINNY_GEMM="$${VLLM_ROCM_USE_SKINNY_GEMM:-0}"
+      fi
       export MODEL_NAMES="Qwen/Qwen3-0.6B"
       export ROUTER_BIN="$$PWD/target/release/vllm-router"
       export LOG_DIR="$$PWD/target/ci-logs/moriio-rdma-{{matrix.read_mode}}"
