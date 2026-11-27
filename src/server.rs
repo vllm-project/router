@@ -952,6 +952,10 @@ pub fn build_app_with_wasm_middleware(
     };
 
     let base_app = base_app
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::http_request_metrics,
+        ))
         .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

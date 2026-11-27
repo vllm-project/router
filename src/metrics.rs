@@ -19,6 +19,14 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
+    describe_gauge!(
+        "vllm_router_active_requests",
+        "Active HTTP inference requests by registered worker model, including queueing and streaming"
+    );
+    describe_counter!(
+        "vllm_router_requests_cancelled_total",
+        "HTTP inference requests abandoned by the client, counted once at the outstanding stage"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",

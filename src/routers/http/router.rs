@@ -2,6 +2,7 @@ use super::completion_route::{prepare_completion_route, reject_full_report, Comp
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
+use super::request_metrics::{self, Phase};
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{
     http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
@@ -1785,6 +1786,10 @@ impl Router {
             }
         };
         let is_http = matches!(pool, Some(crate::backend::WorkerPoolKind::Http));
+        if pool == Some(crate::backend::WorkerPoolKind::Grpc) {
+            request_metrics::disable();
+        }
+        request_metrics::stream(is_stream);
         let raw_body = if is_http {
             raw_body
         } else {
@@ -2171,6 +2176,10 @@ impl Router {
                     };
                     debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
+                if is_http {
+                    request_metrics::worker(worker.as_ref());
+                    request_metrics::phase(Phase::Decode);
+                }
                 let load = RequestLoadGuard::from_selection(
                     worker.clone(),
                     kv_receipt,
@@ -2212,6 +2221,7 @@ impl Router {
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
+                request_metrics::phase(Phase::Routing);
                 RouterMetrics::record_retry(route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
             },
@@ -3643,6 +3653,7 @@ impl RouterTrait for Router {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        request_metrics::stream(is_stream);
         let lora_name = body
             .get("lora_name")
             .and_then(serde_json::Value::as_str)
@@ -3802,6 +3813,12 @@ impl RouterTrait for Router {
             )
                 .into_response();
         };
+        if crate::backend::is_grpc_url(worker.url()) {
+            request_metrics::disable();
+        } else {
+            request_metrics::worker(worker.as_ref());
+            request_metrics::phase(Phase::Decode);
+        }
         let url = worker.endpoint_url(path);
 
         let load_tracked = policy.tracks_request_load() || program_completion.is_some();

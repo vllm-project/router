@@ -1,3 +1,4 @@
+use super::request_metrics::{self, Phase};
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
 use super::completion_route::reject_full_report;
@@ -1555,6 +1556,12 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
     ) -> Option<Response> {
         let runtime = self.program_runtime.as_ref()?;
+        request_metrics::stream(
+            request
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
         let streaming = request
             .get("stream")
             .and_then(Value::as_bool)
@@ -1597,6 +1604,7 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
+        request_metrics::worker(decode_worker.as_ref());
         // Snapshot once per turn: upstream returns a Result now, and the
         // cold fallback below reuses the selection made from this snapshot.
         let prefill_candidates = match self.program_prefill_candidates() {
@@ -1938,6 +1946,7 @@ impl VllmPDRouter {
                 return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
             }
         };
+        request_metrics::worker(decode_worker.as_ref());
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
         let commit = attempt.decode_pending_commit().then(|| {
@@ -2432,6 +2441,7 @@ impl VllmPDRouter {
         prefill_request_builder =
             dp_utils::add_dp_rank_header(prefill_request_builder, prefill_dp_rank);
 
+        request_metrics::phase(Phase::Prefill);
         let prefill_response = otel_http::send_client_request(
             prefill_request_builder.json(&prefill_request),
             headers,
@@ -2454,6 +2464,7 @@ impl VllmPDRouter {
         // The whole P body has been consumed (or never started): do not hold P
         // admission capacity while D generates the response.
         drop(prefill_permit);
+        request_metrics::phase(Phase::Routing);
         let (status, content_type, prefill_bytes) = finished_prefill?;
         if !status.is_success() {
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -2613,6 +2624,8 @@ impl VllmPDRouter {
             dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
 
         attempt.begin_decode();
+        request_metrics::worker(decode_worker.as_ref());
+        request_metrics::phase(Phase::Decode);
         let decode_response = match otel_http::send_client_request(
             decode_request_builder.json(&decode_request),
             headers,
@@ -3013,6 +3026,8 @@ impl VllmPDRouter {
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
+        request_metrics::phase(Phase::Decode);
+        request_metrics::prefill_pending(true);
         let prefill_fut = async {
             // Hold the P admission slot until the prefill body is consumed, then
             // release it even if D is still running.
@@ -3032,6 +3047,7 @@ impl VllmPDRouter {
                 .finish_prefill_response(response, &prefill_base_url, &attempt)
                 .await;
             drop(prefill_permit);
+            request_metrics::prefill_pending(false);
             finished
         };
         attempt.begin_decode();
@@ -3515,6 +3531,7 @@ impl RouterTrait for VllmPDRouter {
             return response;
         }
         if !self.use_discovery && self.uses_grpc_pools() {
+            request_metrics::disable();
             return self.route_grpc_chat(headers, body).await;
         }
         if self.program_turn_enabled(headers, &body.other) {
@@ -3572,6 +3589,7 @@ impl RouterTrait for VllmPDRouter {
         }
         match serde_json::to_value(body) {
             Ok(request_json) if !self.use_discovery && self.uses_grpc_pools() => {
+                request_metrics::disable();
                 self.route_grpc_completion(headers, body, request_json)
                     .await
             }
@@ -3728,6 +3746,7 @@ impl RouterTrait for VllmPDRouter {
         );
 
         // Body is already a serde_json::Value, use it directly
+        request_metrics::stream(body.get("stream").and_then(Value::as_bool).unwrap_or(false));
         let request_json = body;
 
         if self.use_discovery {
@@ -3790,6 +3809,7 @@ impl RouterTrait for VllmPDRouter {
 
             let prefill_worker = &prefill_workers[prefill_idx];
             let decode_worker = &decode_workers[decode_idx];
+            request_metrics::worker(decode_worker.as_ref());
 
             // Mirrors the discovery path: a deferred commitment re-selects the
             // decode target once the Prefill response is in.

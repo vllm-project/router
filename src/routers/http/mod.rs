@@ -13,6 +13,7 @@ pub mod pd_router;
 pub mod pd_types;
 mod pd_warm_remote;
 mod program_adapter;
+pub(crate) mod request_metrics;
 pub mod router;
 mod sse;
 mod usage_merge;
