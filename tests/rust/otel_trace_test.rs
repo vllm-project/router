@@ -232,10 +232,20 @@ fn test_otel_distributed_tracing() {
             .to_str()
             .unwrap();
         let outgoing_parts: Vec<&str> = outgoing_tp.split('-').collect();
-        assert_eq!(outgoing_parts.len(), 4);
-        assert_eq!(outgoing_parts[1], upstream_trace_id);
+        assert_eq!(
+            outgoing_parts.len(),
+            4,
+            "outbound traceparent: {outgoing_tp}"
+        );
+        assert_eq!(
+            outgoing_parts[1], upstream_trace_id,
+            "outbound traceparent: {outgoing_tp}"
+        );
         // The current SDK preserves sampling, but drops the level-2 random hint.
-        assert_eq!(outgoing_parts[3], "01");
+        assert_eq!(
+            outgoing_parts[3], "01",
+            "outbound traceparent: {outgoing_tp}"
+        );
 
         let spans = exporter.get_finished_spans().unwrap();
         assert!(!spans.is_empty(), "expected a traced server span");

@@ -272,14 +272,6 @@ pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context
                 return None;
             }
             let (prefix, flags) = traceparent.rsplit_once('-')?;
-            // Do not turn invalid wire syntax into a valid remote parent.
-            if flags.len() != 2
-                || !flags
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            {
-                return None;
-            }
             // Only 03 requires a compatibility shim: SDK accepts 00/01/02.
             // Keep 04/09/ff (reserved flags) subject to SDK validation.
             if flags != "03" {
