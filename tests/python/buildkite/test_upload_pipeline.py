@@ -51,8 +51,7 @@ def test_render_inherits_shared_hardware_retry(name, upload_pipeline):
             assert all(isinstance(value, str) for value in expanded["env"].values())
         if "mirror_hardwares" in original:
             hardware_jobs += 1
-            assert "retry" not in original
-            assert expanded["retry"] == shared
+            assert expanded["retry"] == original.get("retry", shared)
             assert "mirror_hardwares" not in expanded
         else:
             assert expanded == original
@@ -108,10 +107,16 @@ def test_changing_the_shared_policy_updates_all_hardware_jobs(
     path = tmp_path / "hardware.yml"
     path.write_text(yaml.safe_dump(registry), encoding="utf-8")
     monkeypatch.setattr(upload_pipeline, "HARDWARE_PATH", path)
-    rendered = yaml.safe_load(
-        upload_pipeline.render(ROOT / ".buildkite" / "test-nightly.yml")
-    )
-    hardware_jobs = [step for step in _leaf_steps(rendered["steps"]) if "retry" in step]
+    pipeline = ROOT / ".buildkite" / "test-nightly.yml"
+    source = yaml.safe_load(pipeline.read_text(encoding="utf-8"))
+    rendered = yaml.safe_load(upload_pipeline.render(pipeline))
+    hardware_jobs = [
+        expanded
+        for original, expanded in zip(
+            _leaf_steps(source["steps"]), _leaf_steps(rendered["steps"]), strict=True
+        )
+        if "mirror_hardwares" in original and "retry" not in original
+    ]
     assert hardware_jobs
     assert all(step["retry"]["automatic"][0]["limit"] == 3 for step in hardware_jobs)
 
