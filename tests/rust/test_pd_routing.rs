@@ -268,19 +268,24 @@ mod test_pd_routing {
                 return (StatusCode::SERVICE_UNAVAILABLE, "injected encoder error").into_response();
             }
             let hash = body["messages"][0]["content"][0]["uuid"].as_str().unwrap();
-            let metadata = if body["model"] == "malformed-metadata" {
-                json!([1, 2, 3])
+            let entry = if body["model"] == "malformed-entry" {
+                json!([])
             } else {
-                json!({"image_grid_thw": [[1, 2, 3]]})
+                let metadata = if body["model"] == "malformed-metadata" {
+                    json!([1, 2, 3])
+                } else {
+                    json!({"image_grid_thw": [[1, 2, 3]]})
+                };
+                json!({
+                    "metadata": metadata,
+                    "peer_host": "encoder",
+                    "peer_port": 4321,
+                    "size_bytes": 128,
+                })
             };
             Json(json!({
                 "ec_transfer_params": {
-                    (format!("engine-{hash}")): {
-                        "metadata": metadata,
-                        "peer_host": "encoder",
-                        "peer_port": 4321,
-                        "size_bytes": 128,
-                    },
+                    (format!("engine-{hash}")): entry,
                 },
             }))
             .into_response()
@@ -420,6 +425,7 @@ mod test_pd_routing {
             ("missing-kv", false, StatusCode::INTERNAL_SERVER_ERROR),
             ("encoder-fail", false, StatusCode::SERVICE_UNAVAILABLE),
             ("malformed-metadata", false, StatusCode::BAD_GATEWAY),
+            ("malformed-entry", false, StatusCode::BAD_GATEWAY),
             ("bad-input", false, StatusCode::BAD_REQUEST),
         ] {
             seen.lock().unwrap().clear();
@@ -471,7 +477,7 @@ mod test_pd_routing {
             completed_batches += usize::from(model != "bad-input");
             assert_eq!(encoder.processed_requests(), completed_batches);
             assert_eq!(encoder.load(), 0);
-            if model == "malformed-metadata" {
+            if matches!(model, "malformed-metadata" | "malformed-entry") {
                 assert_eq!(circuit.total_successes(), successes_before);
                 assert_eq!(circuit.total_failures(), failures_before + 1);
             }
@@ -479,7 +485,7 @@ mod test_pd_routing {
                 phases,
                 match model {
                     "bad-input" => vec![],
-                    "encoder-fail" | "malformed-metadata" => vec!["E"],
+                    "encoder-fail" | "malformed-metadata" | "malformed-entry" => vec!["E"],
                     "test" => vec!["E", "P", "D"],
                     _ => vec!["E", "P"],
                 }

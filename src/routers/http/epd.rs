@@ -583,7 +583,7 @@ async fn encode_group(
     .await;
     worker.increment_processed();
     // Match consumer circuit semantics: client errors are reachable workers;
-    // transport failures, 5xx, unreadable JSON and invalid batch metadata fail.
+    // transport failures, 5xx, unreadable JSON and invalid transfer reports fail.
     let success = result
         .as_ref()
         .map_or_else(|(status, _)| status.is_client_error(), |_| true);
@@ -664,7 +664,13 @@ fn parse_batch_response(
             let Some((hash, reported)) = entry else {
                 return Ok(None);
             };
-            let metadata = match reported.get("metadata") {
+            let fields = reported.as_object().ok_or_else(|| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Encoder transfer entry must be a JSON object".into(),
+                )
+            })?;
+            let metadata = match fields.get("metadata") {
                 None => None,
                 Some(Value::Object(metadata)) if metadata.is_empty() => None,
                 Some(Value::Object(metadata)) => Some(flatten_metadata(metadata)?),
@@ -1370,6 +1376,36 @@ mod tests {
             (StatusCode::OK, r#"{"ec_transfer_params":true}"#, false),
             (
                 StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":{"peer_port":4321},"opaque":42}}"#,
+                true,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":null}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":[]}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":"bad"}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":42}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"ec_transfer_params":{"image-uuid":true}}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
                 r#"{"ec_transfer_params":{"hash":{"item_indices":[0,1]}}}"#,
                 true,
             ),
@@ -1427,9 +1463,10 @@ mod tests {
                 ));
             stage.worker_registry.register(worker.clone());
             let revision = stage.worker_registry.revision();
-            let result = stage
-                .prepare(&Client::new(), request(), "pd", None, None)
-                .await;
+            let mut input = request();
+            input["messages"][0]["content"][0]["uuid"] = json!("image-uuid");
+            input["messages"][0]["content"][2]["uuid"] = json!("image-uuid");
+            let result = stage.prepare(&Client::new(), input, "pd", None, None).await;
             assert_eq!(
                 result.is_ok(),
                 status.is_success() && success,
