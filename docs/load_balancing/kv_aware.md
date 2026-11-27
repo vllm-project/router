@@ -40,8 +40,6 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
-KV-aware Prefill prefix scoring for single-image HTTP chat requires `hash_lookahead_tokens` set to `0`.
-
 ### Set the event ports
 
 Run this in each worker terminal. The default live port is `5557`. Set `LIVE_PORT` to override it and choose a free `REPLAY_PORT` (the example uses `5558`). Reserve separate port ranges for workers on the same host because vLLM offsets fixed event ports by DP rank. For [P/D](#pd-routing), set each stage's ports first.
@@ -208,6 +206,7 @@ This Qwen3.5-4B HTTP example uses those four groups and one DP rank. Router disc
 For a manual layout, add only the fields the deployment needs.
 
 - `hash_block_size` (tokens) when Router cannot discover it. HTTP event discovery can read it from worker metrics.
+- `hash_lookahead_tokens` must match the worker. Single-image HTTP chat Prefill scoring requires `0`.
 - `partial_hash_hits: true` when the worker can reuse prefixes at boundaries inside a cache block.
 - `hash_seed` (string) when the worker uses a custom `PYTHONHASHSEED`. Use the same value.
 
