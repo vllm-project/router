@@ -1,6 +1,6 @@
 # Tuning DeepSeek V4 Flash on Ascend A3
 
-A jiuwenswarm operator wants to reduce **mean job completion time (JCT)** for 256 tasks served by DeepSeek V4 Flash on Ascend A3 at a maximum concurrency of 128. Across two runs of the same tasks, mean JCT fell from 4,325.22 s on the baseline to 3,665.82 s on the TTL run, **a 15.25% reduction**.
+A jiuwenswarm operator uses DeepSeek V4 Flash on Ascend A3 to run 256 tasks, with up to 128 active at once. The goal is to reduce **mean task duration after client admission**. This example measures job completion time (JCT) from when a task acquires a client concurrency slot until the task finishes. Across two runs of the same tasks, mean JCT fell from 4,325.22 s on the baseline to 3,665.82 s on the TTL run, **a 15.25% reduction**.
 
 Replay the same requests to see whether affinity alone lowers mean JCT versus native routing and whether full scheduling saves additional time.
 
@@ -16,7 +16,7 @@ Router http://127.0.0.1:3001, worker http://127.0.0.1:8000, worker metrics at /m
 Baseline run directory: results/baseline/
 TTL run directory: results/pt/
 Calibrate the cost models before the comparison. Replay the same baseline requests.jsonl on the isolated deployment with 256 tasks at concurrency 128, then compare the run summaries.
-Minimize mean JCT across all tasks. Report its reduction relative to native routing and report p95 JCT.
+Minimize mean task duration after client admission (JCT) across all tasks, including failures and timeouts. Report its reduction relative to native routing, p95 JCT, and wall time for the whole run.
 Use service targets for the minimum task completion rate and maximum client p95 time to first token (TTFT). For each unspecified limit, use its measured baseline on the same tasks with the same concurrency and timeout.
 Return the eligible routing mode with the lowest mean JCT and its config diff.
 ```
@@ -114,10 +114,13 @@ Replay the same requests on an isolated deployment at the same concurrency and t
 
 ## 3. Use the replay logs to evaluate and diagnose the configuration
 
-**Calculate mean JCT.** Set `RUN_DIR` to each run directory in turn. In `summary.json`, `.tasks.duration_seconds.mean` is the sum of the recorded durations for all 256 tasks divided by 256, including failures and timeouts. The relative reduction is `(baseline mean − candidate mean) / baseline mean`. Report p95 JCT to show the tail. Early failures can also shorten mean JCT, so check the completion rate (completed tasks divided by planned tasks) alongside client p95 TTFT.
+**Read task duration and batch wall time.** A task may wait for a free client slot before its timer starts. In `summary.json`, `.tasks.duration_seconds` gives the mean and p95 of the time **after** each task acquires its slot. The mean covers all 256 recorded tasks, including failures and timeouts. For elapsed time across the whole run, read `.run_wall_time_seconds`. [Replay executor timing](https://github.com/openJiuwen-ai/agent-infer/blob/f764c9a7c387eef632defa96fb3ccae6f654c0f9/agentinfer/agentbench/replay/executor.py#L87-L115)
+
+Set `RUN_DIR` to each run directory in turn. Calculate the relative reduction in mean task duration as `(baseline mean − candidate mean) / baseline mean`. Early failures can shorten the mean, so check the completion rate (completed tasks divided by planned tasks) and client p95 TTFT.
 
 ```bash
-jq '{jct_mean_s: .tasks.duration_seconds.mean, jct_p95_s: .tasks.duration_seconds.p95,
+jq '{task_seconds_after_client_admission: (.tasks.duration_seconds | {mean, p95}),
+     batch_wall_time_s: .run_wall_time_seconds,
      completed: .tasks.completed, ttft_p95_s: .requests.ttft_seconds.p95}' "$RUN_DIR/summary.json"
 ```
 
@@ -153,12 +156,15 @@ Change one factor per replay. Use the same requests and check mean JCT, completi
 
 Both runs used the same 256 tasks in the same order, a maximum concurrency of 128 and a 7,200 s timeout per task.
 
-| Example run (max concurrency 128) | Mean JCT | p95 JCT | Completed / planned (rate) | Client p95 TTFT |
-|---|---:|---:|---:|---:|
-| Baseline | 4,325.22 s | 7,217.03 s | 158/256 (61.72%) | 468.33 s |
-| TTL | 3,665.82 s | 7,217.97 s | 180/256 (70.31%) | 394.47 s |
+| Metric | Baseline | TTL |
+|---|---:|---:|
+| Mean task duration after client admission | 4,325.22 s | 3,665.82 s |
+| p95 task duration after client admission | 7,217.03 s | 7,217.97 s |
+| Whole-run wall time | 14,451.60 s | 12,185.16 s |
+| Completed / planned tasks (rate) | 158/256 (61.72%) | 180/256 (70.31%) |
+| Client p95 TTFT | 468.33 s | 394.47 s |
 
-The TTL run saved 659.40 s per task on average (about 11 minutes), completed 22 more tasks and reduced client p95 TTFT by 73.86 s. More than 5% of tasks hit the 7,200 s timeout in each run, so p95 JCT stayed near two hours. **Enable Program scheduling if a fixed replay reproduces the reduction in mean JCT and meets the completion rate and p95 TTFT targets.**
+After client admission, tasks in the TTL run took 659.40 s less on average (about 11 minutes). The TTL run completed 22 more tasks, reduced client p95 TTFT by 73.86 s and cut whole-run wall time by 15.68%. More than 5% of tasks hit the 7,200 s timeout in each run, so p95 JCT stayed near two hours. **Enable Program scheduling if a fixed replay reproduces the reduction in mean JCT and meets the completion rate and p95 TTFT targets.**
 
 ### Should other deployments enable Program scheduling?
 
