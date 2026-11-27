@@ -2382,6 +2382,20 @@ mod tests {
         ))
     }
 
+    /// Affinity credit `tenant` holds for `text` in a role policy's trees,
+    /// via CacheAwarePolicy's test-only read API.
+    fn role_policy_credit(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        text: &str,
+        tenant: &str,
+    ) -> usize {
+        policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+            .expect("these fixtures inject CacheAwarePolicy role policies")
+            .tenant_prefix_credit(text, tenant)
+    }
+
     #[test]
     fn test_registration_initializes_role_policy_trees() {
         let router = create_test_pd_router_with_cache_aware_roles();
@@ -2443,6 +2457,14 @@ mod tests {
             .expect("second identical selection");
         assert_eq!(repeated, pinned, "identical prompt must stay pinned");
 
+        // Sanity-check the credit probe before removing anything: the
+        // pinned URL must hold full-text affinity credit right now.
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            text.chars().count(),
+            "pinned worker must hold full-text credit before removal"
+        );
+
         // Remove whichever worker the prompt is pinned to and unbalance
         // the two remaining workers deterministically, so the assertion
         // below does not lean on least_loaded()'s tie-break placement.
@@ -2450,6 +2472,17 @@ mod tests {
             .remove_prefill_server(&pinned_url)
             .await
             .expect("remove prefill server");
+
+        // Inspect the role tree before any reselection: eviction must
+        // already have zeroed the retired URL's credit. This structural
+        // assertion is the real discriminant — a behavioral selection can
+        // no longer tell stale from cold on its own (both fall back to
+        // least_loaded and the stale branch self-heals mid-selection).
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            0,
+            "retired URL must hold no affinity credit after removal"
+        );
         let remaining: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.url() != pinned_url.as_str())
@@ -2463,14 +2496,14 @@ mod tests {
             .select_worker_with_headers(&remaining, Some(text), None)
             .expect("post-removal selection");
 
-        // Without eviction the stale tenant of the removed worker fails the
-        // position lookup and choose_from_affinity falls back to
-        // healthy.first() (index 0, the loaded worker). With eviction the
-        // prompt has no tenant again and the cold path picks the idle worker
-        // (index 1) via least_loaded().
+        // Behavioral tail: with the tree cleaned the prompt has no tenant
+        // again and the cold path picks the idle survivor (index 1) via
+        // least_loaded(). This alone can no longer discriminate eviction
+        // (see the structural assert above); it pins that removal routing
+        // recovers to least_loaded over the survivors.
         assert_eq!(
             selected, 1,
-            "stale tenants of removed workers must be evicted from role trees"
+            "post-removal routing must serve the prompt from an idle survivor"
         );
     }
 
@@ -2501,6 +2534,14 @@ mod tests {
             .expect("second identical selection");
         assert_eq!(repeated, pinned, "identical prompt must stay pinned");
 
+        // Sanity-check the credit probe before removing anything: the
+        // pinned URL must hold full-text affinity credit right now.
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            text.chars().count(),
+            "pinned decode worker must hold full-text credit before removal"
+        );
+
         // Remove whichever worker the prompt is pinned to and unbalance
         // the two remaining workers deterministically, so the assertion
         // below does not lean on least_loaded()'s tie-break placement.
@@ -2508,6 +2549,14 @@ mod tests {
             .remove_decode_server(&pinned_url)
             .await
             .expect("remove decode server");
+
+        // Inspect the decode role tree before any reselection: eviction
+        // must already have zeroed the retired URL's credit.
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            0,
+            "retired decode URL must hold no affinity credit after removal"
+        );
         let remaining: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.url() != pinned_url.as_str())
@@ -2521,14 +2570,13 @@ mod tests {
             .select_worker_with_headers(&remaining, Some(text), None)
             .expect("post-removal selection");
 
-        // Without eviction the stale tenant of the removed worker fails the
-        // position lookup and choose_from_affinity falls back to
-        // healthy.first() (index 0, the loaded worker). With eviction the
-        // prompt has no tenant again and the cold path picks the idle worker
-        // (index 1) via least_loaded().
+        // Behavioral tail: with the decode tree cleaned the prompt has no
+        // tenant again and the cold path picks the idle survivor (index 1)
+        // via least_loaded(). The structural assert above is what
+        // discriminates eviction; this pins the routing recovery.
         assert_eq!(
             selected, 1,
-            "stale tenants of removed decode workers must be evicted from role trees"
+            "post-removal routing must serve the prompt from an idle survivor"
         );
     }
 
@@ -2555,6 +2603,15 @@ mod tests {
             router.register_and_notify(worker.clone());
         }
 
+        // Steer the cold pin selection into the DP-expanded family:
+        // least_loaded must never reach the standalone workers, otherwise
+        // which worker wins the zero-load tie is random.
+        for standalone in &workers[2..] {
+            for _ in 0..5 {
+                standalone.increment_load();
+            }
+        }
+
         // Pin the shared prompt to a rank of the expanded family.
         let policy = router.policy_registry.get_decode_policy();
         let text = "shared prompt prefix for role policy affinity";
@@ -2564,6 +2621,12 @@ mod tests {
         assert!(
             workers[pinned].url().starts_with("http://decode-a:8000@"),
             "fixture expects the pin inside the DP-expanded family"
+        );
+        let pinned_url = workers[pinned].url().to_string();
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            text.chars().count(),
+            "pinned rank must hold full-text credit before removal"
         );
         let repeated = policy
             .select_worker_with_headers(&workers, Some(text), None)
@@ -2578,6 +2641,17 @@ mod tests {
             .remove_decode_server("http://decode-a:8000")
             .await
             .expect("remove DP-expanded decode servers");
+
+        // Inspect the decode role tree before any reselection: EVERY
+        // expanded rank of the family must have lost its credit, not just
+        // the one the prompt happened to be pinned to.
+        for rank in &workers[..2] {
+            assert_eq!(
+                role_policy_credit(&policy, text, rank.url()),
+                0,
+                "every expanded rank must be evicted from the decode role tree"
+            );
+        }
         let remaining: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| !w.url().starts_with("http://decode-a:8000@"))
@@ -2596,14 +2670,13 @@ mod tests {
             .select_worker_with_headers(&remaining, Some(text), None)
             .expect("post-removal selection");
 
-        // Without eviction the stale family-rank tenant fails the position
-        // and choose_from_affinity falls back to healthy.first() (index 0,
-        // the loaded worker). With eviction the prompt has no tenant again
-        // and the cold path picks the idle worker (index 1) via
-        // least_loaded().
+        // Behavioral tail: with the family ranks evicted the prompt has no
+        // tenant again and the cold path picks the idle survivor (index 1)
+        // via least_loaded(). The per-rank structural asserts above are
+        // what discriminate eviction; this pins the routing recovery.
         assert_eq!(
             selected, 1,
-            "DP-expanded ranks must be evicted from the decode role tree"
+            "post-removal routing must serve the prompt from an idle survivor"
         );
     }
 
@@ -2677,9 +2750,15 @@ mod tests {
         }
 
         // Steer the cold path onto the decode rank @1, then pin there via
-        // the decode role policy.
-        for _ in 0..5 {
-            workers[0].increment_load();
+        // the decode role policy: every other worker is loaded so
+        // least_loaded deterministically picks @1 instead of leaving the
+        // pin to a random zero-load tie.
+        for worker in &workers {
+            if worker.url() != "http://shared:8000@1" {
+                for _ in 0..5 {
+                    worker.increment_load();
+                }
+            }
         }
         let policy = router.policy_registry.get_decode_policy();
         let text = "shared prompt prefix for role policy affinity";
@@ -2695,12 +2774,36 @@ mod tests {
             .expect("second identical selection");
         assert_eq!(repeated, pinned, "identical prompt must stay pinned");
 
+        // Sanity-check the credit probe before removing anything. The pin
+        // lives on the decode rank's entry in the decode role tree.
+        assert_eq!(
+            role_policy_credit(&policy, text, workers[pinned].url()),
+            text.chars().count(),
+            "pinned decode rank must hold full-text credit before removal"
+        );
+
         // The bare family URL is not registered as-is, so the prefill
         // entry point routes to remove_dp_expanded_workers(url, "prefill").
         router
             .remove_prefill_server("http://shared:8000")
             .await
             .expect("remove shared-family servers");
+
+        // Inspect BOTH role trees before any reselection: the worker_type
+        // dispatch must clean each rank from the tree of its own role —
+        // the decode rank from the decode tree and the prefill rank from
+        // the prefill tree.
+        assert_eq!(
+            role_policy_credit(&policy, text, "http://shared:8000@1"),
+            0,
+            "decode rank must be evicted from the decode role tree"
+        );
+        let prefill_policy = router.policy_registry.get_prefill_policy();
+        assert_eq!(
+            role_policy_credit(&prefill_policy, text, "http://shared:8000@0"),
+            0,
+            "prefill rank must be evicted from the prefill role tree"
+        );
         let remaining: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| !w.url().starts_with("http://shared:8000@"))
@@ -2720,15 +2823,13 @@ mod tests {
             .select_worker_with_headers(&remaining, Some(text), None)
             .expect("post-removal selection");
 
-        // Without the worker_type dispatch the decode rank's tenant
-        // survives in the decode role tree, the position lookup fails
-        // against `remaining`, and choose_from_affinity falls back to
-        // healthy.first() (index 0, the loaded worker). With the
-        // dispatch the prompt has no tenant again and the cold path
-        // picks the idle worker (index 1) via least_loaded().
+        // Behavioral tail: with both trees cleaned the prompt cold-picks the
+        // idle survivor (index 1) via least_loaded(). The per-role
+        // structural asserts above are what discriminate the worker_type
+        // dispatch; this pins the routing recovery.
         assert_eq!(
             selected, 1,
-            "decode ranks of a mixed-role family must be evicted from the decode role tree"
+            "post-removal routing must serve the prompt from an idle survivor"
         );
     }
     #[tokio::test]
@@ -2759,6 +2860,13 @@ mod tests {
             .expect("second identical selection");
         assert_eq!(repeated, pinned, "identical prompt must stay pinned");
 
+        // Sanity-check the credit probe before removing anything.
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            text.chars().count(),
+            "pinned decode worker must hold full-text credit before removal"
+        );
+
         // The pinned URL is registered as-is, so this takes the exact-URL
         // branch of remove_prefill_server; the removed worker is a decode
         // worker spelled through the prefill entry point.
@@ -2766,6 +2874,15 @@ mod tests {
             .remove_prefill_server(&pinned_url)
             .await
             .expect("exact-URL removal through the prefill entry point");
+
+        // Inspect the decode role tree before any reselection: only the
+        // tree owning the removed worker (decode here, not the role named
+        // by the entry point) must have had the credit zeroed.
+        assert_eq!(
+            role_policy_credit(&policy, text, &pinned_url),
+            0,
+            "exact-URL removal must evict the credit from the tree owning the worker"
+        );
         let remaining: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.url() != pinned_url.as_str())
@@ -2780,15 +2897,14 @@ mod tests {
             .select_worker_with_headers(&remaining, Some(text), None)
             .expect("post-removal selection");
 
-        // If the exact branch evicted only the caller-named (prefill) role,
-        // the decode tree keeps the stale tenant, the position lookup fails
-        // against `remaining`, and choose_from_affinity falls back to
-        // healthy.first() (index 0, the loaded worker). Evicting by the
-        // worker's own type clears the decode tree and the cold path picks
-        // the idle worker (index 1) via least_loaded().
+        // Behavioral tail: with the decode tree cleaned the prompt has no
+        // tenant again and the cold path picks the idle survivor (index 1)
+        // via least_loaded(). The structural assert above is what
+        // discriminates eviction by the worker's own type; this pins the
+        // routing recovery.
         assert_eq!(
             selected, 1,
-            "exact-URL removal must evict role tenants by the removed worker's type"
+            "post-removal routing must serve the prompt from an idle survivor"
         );
     }
 
