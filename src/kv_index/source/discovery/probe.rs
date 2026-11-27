@@ -137,6 +137,7 @@ pub(super) fn grpc_kv_event_source_entries(
                     // The Control RPC has no per-source enable flag; it only
                     // returns sources when KV events are enabled.
                     enable_kv_cache_events: Some(true),
+                    peer_lookup: None,
                 },
             ))
         })

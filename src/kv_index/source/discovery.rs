@@ -100,6 +100,126 @@ pub struct KvEventSourceEntry {
     pub schema_version: Option<u32>,
     #[serde(default)]
     pub enable_kv_cache_events: Option<bool>,
+    /// Peer KV lookup record, when the engine reports one. Unknown to older
+    /// routers (no `deny_unknown_fields`); a malformed object is kept as a
+    /// default entry so `validate` drops it with a warning instead of failing
+    /// the whole discovery response.
+    #[serde(default, deserialize_with = "lenient_peer_lookup")]
+    pub peer_lookup: Option<PeerLookupEntry>,
+}
+
+fn lenient_peer_lookup<'de, D>(deserializer: D) -> Result<Option<PeerLookupEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
+}
+
+/// The engine's per-rank `peer_lookup` object, exactly as reported. Untrusted:
+/// it names a host and port the router may later send traffic to, so it is only
+/// used after [`PeerLookupEntry::validate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PeerLookupEntry {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub engine_id: String,
+    #[serde(default)]
+    pub side_channel_host: String,
+    #[serde(default)]
+    pub side_channel_port: u32,
+    #[serde(default)]
+    pub tp_size: u32,
+    #[serde(default)]
+    pub dcp_size: u32,
+    #[serde(default)]
+    pub pp_size: u32,
+    #[serde(default)]
+    pub connector: String,
+    #[serde(default)]
+    pub connector_version: String,
+    #[serde(default)]
+    pub layout_fingerprint: String,
+}
+
+/// A `peer_lookup` entry that passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerLookupRecord {
+    pub engine_id: String,
+    pub side_channel_host: String,
+    pub side_channel_port: u16,
+    pub tp_size: u32,
+    pub dcp_size: u32,
+    pub pp_size: u32,
+    pub connector: String,
+    pub connector_version: String,
+    pub layout_fingerprint: String,
+}
+
+impl PeerLookupEntry {
+    /// Reject disabled records, empty (or blank) strings, port 0 or above
+    /// 65535, and zero sizes.
+    pub fn validate(&self) -> Result<PeerLookupRecord, &'static str> {
+        if !self.enabled {
+            return Err("not enabled");
+        }
+        let strings = [
+            &self.engine_id,
+            &self.side_channel_host,
+            &self.connector,
+            &self.connector_version,
+            &self.layout_fingerprint,
+        ];
+        if strings.iter().any(|value| value.trim().is_empty()) {
+            return Err("empty string field");
+        }
+        let port = u16::try_from(self.side_channel_port)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or("side_channel_port out of range")?;
+        if self.tp_size == 0 || self.dcp_size == 0 || self.pp_size == 0 {
+            return Err("zero parallel size");
+        }
+        Ok(PeerLookupRecord {
+            engine_id: self.engine_id.clone(),
+            side_channel_host: self.side_channel_host.clone(),
+            side_channel_port: port,
+            tp_size: self.tp_size,
+            dcp_size: self.dcp_size,
+            pp_size: self.pp_size,
+            connector: self.connector.clone(),
+            connector_version: self.connector_version.clone(),
+            layout_fingerprint: self.layout_fingerprint.clone(),
+        })
+    }
+}
+
+/// Validated records by rank. An invalid record is dropped with one warning
+/// naming the worker and rank; the worker and its other ranks are unaffected.
+fn validated_peer_lookups(
+    worker_url: &str,
+    sources: &KvEventSourcesResponse,
+) -> HashMap<u32, PeerLookupRecord> {
+    let mut records = HashMap::new();
+    for (rank_str, entry) in sources {
+        let Some(peer) = &entry.peer_lookup else {
+            continue;
+        };
+        let Ok(rank) = rank_str.parse::<u32>() else {
+            continue;
+        };
+        match peer.validate() {
+            Ok(record) => {
+                records.insert(rank, record);
+            }
+            Err(reason) => warn!(
+                worker_url,
+                rank, reason, "kv_index: dropping invalid peer_lookup record"
+            ),
+        }
+    }
+    records
 }
 
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
@@ -151,6 +271,9 @@ pub struct WorkerKvInfo {
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
+    /// Validated `peer_lookup` records by DP rank. Empty when the engine
+    /// reports none.
+    pub peer_lookup: HashMap<u32, PeerLookupRecord>,
 }
 
 pub(crate) struct WorkerDiscovery {
@@ -952,6 +1075,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
                     encoding: Some("msgpack".to_owned()),
                     schema_version: Some(1),
                     enable_kv_cache_events: Some(true),
+                    peer_lookup: None,
                 },
             )
         })
@@ -1297,7 +1421,7 @@ fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String>
 }
 
 /// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
-fn worker_host(worker_url: &str) -> Option<String> {
+pub(crate) fn worker_host(worker_url: &str) -> Option<String> {
     let (worker_url, _) = split_worker_rank(worker_url);
     let with_scheme = if worker_url.contains("://") {
         worker_url.to_string()

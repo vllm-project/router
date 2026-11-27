@@ -12,6 +12,7 @@ mod pd_program_adapter;
 pub mod pd_router;
 pub mod pd_types;
 mod pd_warm_remote;
+mod peer_fetch;
 mod program_adapter;
 pub mod router;
 mod sse;

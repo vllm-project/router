@@ -248,6 +248,10 @@ If several candidate workers have the same lowest load, the policy picks one of 
 
 See the [KV-aware deployment guide](kv_aware.md) for worker requirements, routing modes and model recipes.
 
+### Peer fetch
+
+With `--peer-fetch-mode shadow` or `active`, `kv_aware` also plans peer KV fetches for colocated routing. See [Peer fetch](peer_fetch.md).
+
 ### P/D decode load
 
 Decode ranks workers by logical context tokens, with request count as the fallback when prompt length is unknown. To credit pages already on the Decode GPU, enable KV events on Decode workers. If event discovery is unavailable, supply their addresses with `--pd-kv-events`.

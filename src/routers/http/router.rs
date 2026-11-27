@@ -1,4 +1,6 @@
+use super::completion_output::CompletionOutputObserver;
 use super::completion_route::{prepare_completion_route, reject_full_report, CompletionRoute};
+use super::peer_fetch::{apply_peer_fetch, wants_prompt_logprobs, PeerFetchApply};
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
@@ -25,11 +27,12 @@ use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 use crate::policies::kv_aware_policy;
-use crate::policies::KvRequestTokens;
+use crate::policies::PeerFetchRequestOutcome;
 use crate::policies::{
     kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
-    PolicyRegistry,
+    PeerEndpoint, PeerFetchPermit, PolicyRegistry,
 };
+use crate::policies::{KvRequestTokens, QualifiedKvInput};
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
     ProgramSchedulerConfig, ProgramTarget, ScheduleError, TokenFacts,
@@ -114,12 +117,21 @@ struct LoadTrackedBody {
     /// gRPC and Completion streams report the frame containing model output.
     /// Other HTTP streams retain their first-frame behavior.
     output_frame: Option<OutputFrameConsumer>,
+    /// Set while the load holds a peer fetch slot on a successful SSE response:
+    /// watches the frames sent to the client for the first engine output.
+    peer_output: Option<CompletionOutputObserver>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
 
 struct RequestLoadState {
     worker: Option<Arc<dyn Worker>>,
     kv_slot: Option<KvRequestSlot>,
+    /// Active-mode peer fetch slot against the source. Freed at the first SSE
+    /// event with a non-empty `choices` list (the engine's first output, so the
+    /// fetch, which ends during prefill, is over) or,
+    /// for any other response, with the load. Transport chunks alone, such as
+    /// SSE heartbeats, do not free it.
+    peer_permit: Option<PeerFetchPermit>,
     released: AtomicBool,
 }
 
@@ -132,10 +144,19 @@ pub(super) struct RequestLoadGuard {
 
 impl RequestLoadGuard {
     pub(super) fn new(worker: Option<Arc<dyn Worker>>, kv_slot: Option<KvRequestSlot>) -> Self {
+        Self::with_peer_permit(worker, kv_slot, None)
+    }
+
+    fn with_peer_permit(
+        worker: Option<Arc<dyn Worker>>,
+        kv_slot: Option<KvRequestSlot>,
+        peer_permit: Option<PeerFetchPermit>,
+    ) -> Self {
         Self {
             state: Arc::new(RequestLoadState {
                 worker,
                 kv_slot,
+                peer_permit,
                 released: AtomicBool::new(false),
             }),
         }
@@ -153,16 +174,32 @@ impl RequestLoadGuard {
             }
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
-        Self::new(
-            tracked.then_some(worker),
-            receipt.and_then(|receipt| receipt.slot),
-        )
+        let (kv_slot, peer_permit) = match receipt {
+            Some(receipt) => (receipt.slot, receipt.peer_fetch.map(|grant| grant.permit)),
+            None => (None, None),
+        };
+        Self::with_peer_permit(tracked.then_some(worker), kv_slot, peer_permit)
+    }
+
+    /// Free the peer fetch slot before the request ends (the fetch was not
+    /// requested after all). Idempotent; `release` frees it too.
+    fn release_peer_fetch(&self) {
+        if let Some(permit) = &self.state.peer_permit {
+            permit.release();
+        }
+    }
+
+    fn holds_peer_fetch(&self) -> bool {
+        self.state.peer_permit.is_some()
     }
 
     fn tracks_worker(&self) -> bool {
         self.state.worker.is_some()
     }
 
+    /// Move the KV slot to decode. The peer fetch slot is not freed here: some
+    /// callers see only transport chunks, so `LoadTrackedBody` frees it on
+    /// the first engine output instead.
     fn begin_decode(&self) {
         if let Some(slot) = &self.state.kv_slot {
             slot.begin_decode();
@@ -176,6 +213,7 @@ impl RequestLoadGuard {
         if let Some(slot) = &self.state.kv_slot {
             slot.release();
         }
+        self.release_peer_fetch();
         if let Some(worker) = &self.state.worker {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
@@ -200,6 +238,16 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(bytes))) = &item {
+            if self
+                .peer_output
+                .as_mut()
+                .is_some_and(|observer| observer.observe(bytes))
+            {
+                self.peer_output = None;
+                self.load.release_peer_fetch();
+            }
+        }
         if matches!(&item, Poll::Ready(Some(Ok(_)))) {
             let output_started = self
                 .output_frame
@@ -265,13 +313,25 @@ fn hold_request_load_with_output_frame(
         });
     }
     let (parts, body) = response.into_parts();
+    let peer_output =
+        (load.holds_peer_fetch() && parts.status.is_success() && is_sse(&parts.headers))
+            .then(CompletionOutputObserver::engine_output);
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
         load,
         output_frame,
+        peer_output,
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 struct TypedDispatch<'a> {
@@ -282,6 +342,8 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Active mode: the source this attempt's destination should fetch from.
+    peer_fetch: Option<PeerEndpoint>,
     /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
     request_body: Option<serde_json::Value>,
 }
@@ -1689,8 +1751,7 @@ impl Router {
         available: &[Arc<dyn Worker>],
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-        token_ids: KvRequestTokens<'_>,
-        eligibility: Option<&[bool]>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
@@ -1710,12 +1771,11 @@ impl Router {
             // rewrite a still-valid binding.
             let receipt = kv_aware.select_worker_with_qualified_inputs(
                 available,
-                token_ids,
+                input,
                 lora_name,
                 cache_salt,
                 affinity_key,
                 excluded_workers,
-                eligibility,
             )?;
             return Some(SelectedWorker {
                 worker: available.get(receipt.worker_index)?.clone(),
@@ -1728,7 +1788,12 @@ impl Router {
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
         {
             cache.select_worker_with_inputs(
-                available, token_ids, model_id, lora_name, cache_salt, "regular",
+                available,
+                input.tokens,
+                model_id,
+                lora_name,
+                cache_salt,
+                "regular",
             )?
         } else {
             policy.select_worker_with_headers(available, text, request_headers.as_ref())?
@@ -2102,6 +2167,9 @@ impl Router {
                         .map(KvRequestTokens::PerWorker)
                         .unwrap_or(KvRequestTokens::Shared(None))
                 };
+                // The engine computes every prompt token for these requests, so
+                // a peer fetch could not help: keep placement, plan no fetch.
+                let allow_transfer_plan = !wants_prompt_logprobs(typed_req.grpc_request());
                 let selected_worker = if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
@@ -2124,12 +2192,15 @@ impl Router {
                         );
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
-                            request_tokens,
+                            QualifiedKvInput {
+                                tokens: request_tokens,
+                                eligibility: eligibility.as_deref(),
+                                allow_transfer_plan,
+                            },
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            eligibility.as_deref(),
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
@@ -2149,8 +2220,11 @@ impl Router {
                             text
                         }),
                         headers,
-                        request_tokens,
-                        eligibility.as_deref(),
+                        QualifiedKvInput {
+                            tokens: request_tokens,
+                            eligibility: eligibility.as_deref(),
+                            allow_transfer_plan,
+                        },
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
@@ -2176,6 +2250,12 @@ impl Router {
                     };
                     debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
+                // The permit rides in the load guard; the dispatch only needs
+                // the address.
+                let peer_fetch = kv_receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.peer_fetch.as_ref())
+                    .map(|grant| grant.endpoint.clone());
                 let load = RequestLoadGuard::from_selection(
                     worker.clone(),
                     kv_receipt,
@@ -2193,6 +2273,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            peer_fetch,
                             request_body: injected_body.clone(),
                         },
                         program_completion.clone(),
@@ -2361,6 +2442,39 @@ impl Router {
             .await
     }
 
+    /// Count an active-mode outcome; anything but `Applied` means the request
+    /// goes out without a fetch, so its source slot is freed right away.
+    fn record_peer_fetch(outcome: PeerFetchApply, load: &RequestLoadGuard) {
+        PeerFetchRequestOutcome::from(outcome).record();
+        if outcome != PeerFetchApply::Applied {
+            load.release_peer_fetch();
+        }
+    }
+
+    /// The body to send to the destination with peer fetch params added, built
+    /// from the client's original body for this attempt only. `None` when the
+    /// params were not added; the caller then sends the original body.
+    fn peer_fetch_body<T: serde::Serialize>(
+        typed_req: &T,
+        completion: Option<&CompletionRoute>,
+        source: &PeerEndpoint,
+        load: &RequestLoadGuard,
+    ) -> Option<serde_json::Value> {
+        // A raw Completion body is what the client sent byte for byte; parse
+        // that rather than the typed copy so nothing else about it changes.
+        let body = match completion.and_then(|completion| completion.raw_body.as_ref()) {
+            Some(raw) => serde_json::from_slice::<serde_json::Value>(raw).ok(),
+            None => serde_json::to_value(typed_req).ok(),
+        };
+        let Some(mut body) = body else {
+            Self::record_peer_fetch(PeerFetchApply::InvalidBody, load);
+            return None;
+        };
+        let outcome = apply_peer_fetch(&mut body, source);
+        Self::record_peer_fetch(outcome, load);
+        (outcome == PeerFetchApply::Applied).then_some(body)
+    }
+
     // Send typed request directly without conversion
     #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
@@ -2377,6 +2491,7 @@ impl Router {
             completion,
             load,
             prepared,
+            peer_fetch,
             request_body,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
@@ -2456,7 +2571,10 @@ impl Router {
                     }
                 };
 
-                // Use the original json_val without modification
+                let mut json_val = json_val;
+                if let Some(source) = &peer_fetch {
+                    Self::record_peer_fetch(apply_peer_fetch(&mut json_val, source), &load);
+                }
 
                 let request_url = format!("{}{}", worker_url_prefix, route);
                 (
@@ -2466,8 +2584,20 @@ impl Router {
                 )
             } else {
                 let request_url = format!("{}{}", worker_url, route);
+                // A usage-injected body replaces `typed_req`, so the fetch params
+                // go on top of it; if they cannot be applied it is still sent.
+                let peer_body = peer_fetch
+                    .as_ref()
+                    .and_then(|source| match request_body.clone() {
+                        Some(mut body) => {
+                            let outcome = apply_peer_fetch(&mut body, source);
+                            Self::record_peer_fetch(outcome, &load);
+                            (outcome == PeerFetchApply::Applied).then_some(body)
+                        }
+                        None => Self::peer_fetch_body(typed_req, completion, source, &load),
+                    });
                 (
-                    if let Some(body) = request_body.as_ref() {
+                    if let Some(body) = peer_body.as_ref().or(request_body.as_ref()) {
                         self.client.post(&request_url).json(body)
                     } else if let Some(completion) = completion {
                         completion.forward_request(&self.client, &request_url, headers, typed_req)
@@ -3733,12 +3863,17 @@ impl RouterTrait for Router {
                         );
                         ops.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
-                            request_tokens,
+                            QualifiedKvInput {
+                                tokens: request_tokens,
+                                eligibility: eligibility.as_deref(),
+                                // The proxy path does not inspect the body for prompt logprobs;
+                                // `apply_peer_fetch` catches them before the request is sent.
+                                allow_transfer_plan: true,
+                            },
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            eligibility.as_deref(),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
@@ -3752,12 +3887,17 @@ impl RouterTrait for Router {
             );
             ops.select_worker_with_qualified_inputs(
                 &workers,
-                request_tokens,
+                QualifiedKvInput {
+                    tokens: request_tokens,
+                    eligibility: eligibility.as_deref(),
+                    // The proxy path does not inspect the body for prompt logprobs;
+                    // `apply_peer_fetch` catches them before the request is sent.
+                    allow_transfer_plan: true,
+                },
                 lora_name,
                 cache_salt,
                 affinity_key.as_ref(),
                 &[],
-                eligibility.as_deref(),
             )
             .map(|receipt| SelectedWorker {
                 worker: workers[receipt.worker_index].clone(),
@@ -3810,6 +3950,10 @@ impl RouterTrait for Router {
         let url = worker.endpoint_url(path);
 
         let load_tracked = policy.tracks_request_load() || program_completion.is_some();
+        let peer_fetch = kv_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.peer_fetch.as_ref())
+            .map(|grant| grant.endpoint.clone());
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
 
@@ -3837,6 +3981,20 @@ impl RouterTrait for Router {
         } else {
             (body, None)
         };
+
+        // Active mode: only POST bodies on the generation routes carry
+        // `kv_transfer_params`, and the permit lives in `load` (freed at the
+        // first output frame, or when the response body ends), so without a
+        // guard there is no slot to hold.
+        let mut body = body;
+        if let (Some(source), Some(load)) = (&peer_fetch, &load) {
+            if *method == Method::POST {
+                Self::record_peer_fetch(apply_peer_fetch(&mut body, source), load);
+            } else {
+                debug_assert!(false, "peer fetch planned for a non-POST request");
+                load.release_peer_fetch();
+            }
+        }
 
         debug!("Transparent proxy: forwarding to {}", url);
 
@@ -4069,6 +4227,100 @@ mod tests {
     use crate::routers::http::program_adapter::MAX_SSE_LINE_BYTES;
     use std::collections::HashMap;
 
+    #[test]
+    fn load_guard_frees_the_peer_fetch_slot_on_release_early_release_and_drop() {
+        let limiter = crate::policies::PeerFetchLimiter::new(1);
+        let guard = |limiter: &Arc<crate::policies::PeerFetchLimiter>| {
+            let permit = limiter.try_acquire("http://a").expect("slot");
+            RequestLoadGuard::with_peer_permit(None, None, Some(permit))
+        };
+
+        let held = guard(&limiter);
+        assert!(limiter.try_acquire("http://a").is_none());
+        held.release();
+        assert_eq!(limiter.inflight("http://a"), 0);
+
+        // The client sent its own params: the slot goes back before the request ends.
+        let early = guard(&limiter);
+        early.release_peer_fetch();
+        assert_eq!(limiter.inflight("http://a"), 0);
+        drop(early);
+
+        // A cancelled request drops the guard without ever calling release.
+        let dropped = guard(&limiter);
+        assert_eq!(limiter.inflight("http://a"), 1);
+        drop(dropped);
+        assert_eq!(limiter.inflight("http://a"), 0);
+
+        // Transport-level decode start (any chunk) does not free the slot;
+        // only engine output on the body does (see the next test).
+        let decoding = guard(&limiter);
+        decoding.begin_decode();
+        assert_eq!(limiter.inflight("http://a"), 1);
+        decoding.release();
+        assert_eq!(limiter.inflight("http://a"), 0);
+    }
+
+    /// The slot is freed by the first `choices` event (vLLM's role-only delta
+    /// comes after the engine's first output), not by a heartbeat or another
+    /// event without choices; a body that is not SSE keeps it to EOF.
+    #[tokio::test]
+    async fn peer_fetch_slot_waits_for_engine_output_not_heartbeats() {
+        use bytes::Bytes;
+        use http_body_util::BodyExt as _;
+
+        let limiter = crate::policies::PeerFetchLimiter::new(1);
+        let open = |content_type: &'static str| {
+            let permit = limiter.try_acquire("http://a").expect("slot");
+            let load = RequestLoadGuard::with_peer_permit(None, None, Some(permit));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            (
+                tx,
+                hold_request_load_until_body_done(response, load).into_body(),
+            )
+        };
+        async fn next(body: &mut Body) -> Bytes {
+            body.frame()
+                .await
+                .expect("frame")
+                .expect("frame ok")
+                .into_data()
+                .expect("data")
+        }
+
+        let (tx, mut body) = open("text/event-stream; charset=utf-8");
+        for frame in [": keepalive\n\n", "event: ping\ndata: {}\n\n"] {
+            tx.send(Ok(Bytes::from(frame))).unwrap();
+            next(&mut body).await;
+            assert_eq!(limiter.inflight("http://a"), 1, "{frame:?} freed the slot");
+        }
+        tx.send(Ok(Bytes::from(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        )))
+        .unwrap();
+        next(&mut body).await;
+        assert_eq!(limiter.inflight("http://a"), 0, "output frees the slot");
+        drop(tx);
+        let _ = body.collect().await;
+
+        let (tx, mut body) = open("application/json");
+        tx.send(Ok(Bytes::from("{\"choices\":[{\"text\":\"done\"}]}")))
+            .unwrap();
+        next(&mut body).await;
+        assert_eq!(
+            limiter.inflight("http://a"),
+            1,
+            "a non-SSE body holds to EOF"
+        );
+        drop(tx);
+        assert!(body.frame().await.is_none());
+        assert_eq!(limiter.inflight("http://a"), 0);
+    }
+
     #[tokio::test]
     async fn non_kv_policy_does_not_probe_model_metadata_on_worker_add() {
         use crate::config::{PolicyConfig, RouterConfig};
@@ -4202,6 +4454,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -4415,6 +4668,7 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
+                peer_fetch: None,
             },
             worker_startup_timeout_secs: 5,
             ..Default::default()
@@ -4648,6 +4902,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 },
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
@@ -5312,6 +5567,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 }
             }));
             router.policy_registry.on_worker_added(
@@ -5444,6 +5700,7 @@ mod tests {
                     // a worker's load — the same state the old `load_incremented:
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
+                    peer_fetch: None,
                     prepared: None,
                     request_body: None,
                 },
@@ -6152,6 +6409,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             }));
         router
     }
@@ -6902,6 +7160,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             }));
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
@@ -6949,6 +7208,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             }));
 
         let request = serde_json::json!({"messages": []});
@@ -7127,6 +7387,7 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    peer_fetch: None,
                     request_body: None,
                 },
                 None,
@@ -7311,6 +7572,7 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        peer_fetch: None,
                         request_body: None,
                     },
                     None,
@@ -7761,6 +8023,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 }));
             let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "messages": [{"role": "user", "content": "hello"}], "stream": streaming,
@@ -7827,6 +8090,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             }));
         router.retry_config.max_retries = 0;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -8064,8 +8328,11 @@ mod tests {
                     &router.available_workers(None),
                     Some(r#"{"prompt": "test"}"#),
                     Some(&header_map),
-                    KvRequestTokens::Shared(None),
-                    None,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(None),
+                        eligibility: None,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
@@ -8105,8 +8372,11 @@ mod tests {
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 None,
-                KvRequestTokens::Shared(None),
-                None,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(None),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
                 None,
                 None,
                 None,
@@ -8137,8 +8407,11 @@ mod tests {
             &router.available_workers(None),
             Some(r#"{"prompt": "test"}"#),
             None,
-            KvRequestTokens::Shared(None),
-            None,
+            QualifiedKvInput {
+                tokens: KvRequestTokens::Shared(None),
+                eligibility: None,
+                allow_transfer_plan: true,
+            },
             None,
             None,
             None,
@@ -8160,8 +8433,11 @@ mod tests {
                     &router.available_workers(None),
                     Some(r#"{"prompt": "test"}"#),
                     None,
-                    KvRequestTokens::Shared(None),
-                    None,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(None),
+                        eligibility: None,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
@@ -8192,8 +8468,11 @@ mod tests {
                 &router.available_workers(None),
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
-                KvRequestTokens::Shared(None),
-                None,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(None),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
                 None,
                 None,
                 None,

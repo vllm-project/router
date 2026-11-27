@@ -5665,6 +5665,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
             ..Default::default()
@@ -6059,6 +6060,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 },
                 worker_startup_timeout_secs: 5,
                 ..RouterConfig::default()
@@ -6397,6 +6399,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             },
             worker_startup_timeout_secs: 5,
             ..RouterConfig::default()
@@ -6521,6 +6524,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 }),
                 discovery_address: None,
             },
@@ -6646,6 +6650,7 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
+                    peer_fetch: None,
                 }),
                 discovery_address: None,
             },

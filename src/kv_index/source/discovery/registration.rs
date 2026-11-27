@@ -11,8 +11,8 @@ use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
-    CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
-    WorkerKvInfo, WorkerSubs,
+    validated_peer_lookups, CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe,
+    WorkerDiscovery, WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
@@ -106,6 +106,7 @@ impl KvIndexSupervisor {
                     block_size,
                     ranks: vec![],
                     cache_key: None,
+                    peer_lookup: Default::default(),
                 });
             }
         };
@@ -121,6 +122,7 @@ impl KvIndexSupervisor {
                 block_size: None,
                 ranks: vec![],
                 cache_key: None,
+                peer_lookup: Default::default(),
             });
         };
         let Some(model_id) = model_id else {
@@ -129,6 +131,7 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
+                peer_lookup: Default::default(),
             });
         };
         let Some(capability) = discovery.hybrid else {
@@ -141,6 +144,7 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
+                peer_lookup: Default::default(),
             });
         };
         // Policy intervals use this unit to translate hits back into tokens.
@@ -369,6 +373,7 @@ impl KvIndexSupervisor {
             block_size: Some(block_size),
             ranks,
             cache_key: Some(key),
+            peer_lookup: validated_peer_lookups(worker_url, &sources),
         };
         {
             let mut state = lifecycle.state.lock();

@@ -4,8 +4,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PeerFetchConfig, PeerFetchMode,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -237,6 +237,38 @@ struct CliArgs {
     kv_penalty_external: f64,
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
+    /// Peer fetch planner for kv_aware: off, shadow (plan and report only), or
+    /// active (send kv_transfer_params so the destination engine fetches the prefix).
+    #[arg(long, default_value = "off", value_parser = ["off", "shadow", "active"])]
+    peer_fetch_mode: String,
+    /// Minimum blocks the source must hold beyond the destination.
+    #[arg(long, default_value_t = 64)]
+    peer_fetch_min_prefix_blocks: u32,
+    /// The source counts as busy at this many active requests.
+    #[arg(long, default_value_t = 1)]
+    peer_fetch_source_load_threshold: usize,
+    /// Transfer must cost less than this fraction of the prefill it saves.
+    #[arg(long, default_value_t = 0.8)]
+    peer_fetch_margin: f64,
+    /// Estimated prefill cost in microseconds per token.
+    #[arg(long, default_value_t = 50.0)]
+    peer_fetch_prefill_us_per_token: f64,
+    /// Estimated fixed transfer cost in milliseconds.
+    #[arg(long, default_value_t = 5.0)]
+    peer_fetch_fixed_ms: f64,
+    /// Estimated transfer cost in microseconds per token.
+    #[arg(long, default_value_t = 5.0)]
+    peer_fetch_us_per_token: f64,
+    /// Shadow mode only: plan without checking worker capability, to measure
+    /// what peer fetch would save once capabilities are declared.
+    #[arg(long)]
+    peer_fetch_ignore_capability: bool,
+    /// Active mode: most peer fetches in flight against one source worker.
+    #[arg(long, default_value_t = 4)]
+    peer_fetch_max_inflight_per_source: usize,
+    /// Declared peer-fetch capability for one worker; repeatable.
+    #[arg(long = "peer-fetch-capability", action = ArgAction::Append, value_name = "WORKER_URL=JSON")]
+    peer_fetch_capability: Vec<String>,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -452,6 +484,28 @@ impl CliArgs {
         map
     }
 
+    /// The `peer_fetch` block, or `None` when the mode is off so existing
+    /// invocations build exactly the config they did before.
+    fn peer_fetch_config(&self) -> Option<Box<PeerFetchConfig>> {
+        let mode = match self.peer_fetch_mode.as_str() {
+            "shadow" => PeerFetchMode::Shadow,
+            "active" => PeerFetchMode::Active,
+            _ => return None,
+        };
+        Some(Box::new(PeerFetchConfig {
+            mode,
+            min_prefix_blocks: self.peer_fetch_min_prefix_blocks,
+            source_load_threshold: self.peer_fetch_source_load_threshold,
+            margin: self.peer_fetch_margin,
+            prefill_us_per_token: self.peer_fetch_prefill_us_per_token,
+            transfer_fixed_ms: self.peer_fetch_fixed_ms,
+            transfer_us_per_token: self.peer_fetch_us_per_token,
+            ignore_capability: self.peer_fetch_ignore_capability,
+            max_inflight_per_source: self.peer_fetch_max_inflight_per_source,
+            capabilities: HashMap::new(),
+        }))
+    }
+
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
@@ -470,6 +524,7 @@ impl CliArgs {
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
                 static_kv_event_sources: Box::default(),
+                peer_fetch: self.peer_fetch_config(),
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -596,6 +651,26 @@ impl CliArgs {
         } else if !kv_sources.regular.is_empty() {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source and --kv-hybrid-layout require --policy kv_aware in regular mode".to_string(),
+            });
+        }
+
+        if self.peer_fetch_mode != "off" && !matches!(policy, PolicyConfig::KvAware { .. }) {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--peer-fetch-mode requires --policy kv_aware".to_string(),
+            });
+        }
+        let capabilities = vllm_router_rs::config::parse_static_transfer_capabilities(
+            &self.peer_fetch_capability,
+        )?;
+        if let PolicyConfig::KvAware {
+            peer_fetch: Some(block),
+            ..
+        } = &mut policy
+        {
+            block.capabilities = capabilities;
+        } else if !capabilities.is_empty() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--peer-fetch-capability requires --policy kv_aware and --peer-fetch-mode shadow or active".to_string(),
             });
         }
 
@@ -1122,5 +1197,132 @@ mod tests {
                 "should reject '{bad}'"
             );
         }
+    }
+
+    #[test]
+    fn peer_fetch_flags_map_into_the_kv_aware_config() {
+        let peer_fetch = |extra: &[&str]| {
+            let mut argv = vec!["vllm-router", "--policy", "kv_aware"];
+            argv.extend_from_slice(extra);
+            let args = CliArgs::try_parse_from(argv).unwrap();
+            match args.parse_policy("kv_aware") {
+                PolicyConfig::KvAware { peer_fetch, .. } => peer_fetch,
+                other => panic!("unexpected policy {other:?}"),
+            }
+        };
+        assert!(peer_fetch(&[]).is_none());
+        assert!(peer_fetch(&["--peer-fetch-mode", "off"]).is_none());
+
+        let block = peer_fetch(&["--peer-fetch-mode", "shadow"]).unwrap();
+        assert_eq!(
+            *block,
+            PeerFetchConfig {
+                mode: PeerFetchMode::Shadow,
+                ..Default::default()
+            }
+        );
+
+        let block = peer_fetch(&[
+            "--peer-fetch-mode",
+            "shadow",
+            "--peer-fetch-min-prefix-blocks",
+            "8",
+            "--peer-fetch-source-load-threshold",
+            "3",
+            "--peer-fetch-margin",
+            "0.5",
+            "--peer-fetch-prefill-us-per-token",
+            "40",
+            "--peer-fetch-fixed-ms",
+            "2.5",
+            "--peer-fetch-us-per-token",
+            "7",
+            "--peer-fetch-ignore-capability",
+            "--peer-fetch-max-inflight-per-source",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            *block,
+            PeerFetchConfig {
+                mode: PeerFetchMode::Shadow,
+                min_prefix_blocks: 8,
+                source_load_threshold: 3,
+                margin: 0.5,
+                prefill_us_per_token: 40.0,
+                transfer_fixed_ms: 2.5,
+                transfer_us_per_token: 7.0,
+                ignore_capability: true,
+                max_inflight_per_source: 2,
+                capabilities: HashMap::new(),
+            }
+        );
+
+        // Active is parsed; validation checks the rest of the block.
+        assert_eq!(
+            peer_fetch(&["--peer-fetch-mode", "active"]).unwrap().mode,
+            PeerFetchMode::Active
+        );
+        assert!(CliArgs::try_parse_from(["vllm-router", "--peer-fetch-mode", "loud"]).is_err());
+    }
+
+    #[test]
+    fn peer_fetch_capability_flag_fills_the_capability_table() {
+        let capability = r#"http://a:8000={"connector":"nixl","connector_version":"1","layout_fingerprint":"fp"}"#;
+        let config = |extra: &[&str]| {
+            let mut argv = vec!["vllm-router", "--worker-urls", "http://a:8000"];
+            argv.extend_from_slice(extra);
+            CliArgs::try_parse_from(argv)
+                .unwrap()
+                .to_router_config(vec![])
+        };
+
+        let router = config(&[
+            "--policy",
+            "kv_aware",
+            "--peer-fetch-mode",
+            "shadow",
+            "--peer-fetch-capability",
+            capability,
+        ])
+        .unwrap();
+        match router.policy {
+            PolicyConfig::KvAware {
+                peer_fetch: Some(block),
+                ..
+            } => assert_eq!(block.capabilities["http://a:8000"].layout_fingerprint, "fp"),
+            other => panic!("unexpected policy {other:?}"),
+        }
+
+        // Without a planner the table would be dropped silently, so refuse it.
+        for extra in [
+            &[
+                "--policy",
+                "kv_aware",
+                "--peer-fetch-capability",
+                capability,
+            ][..],
+            &[
+                "--policy",
+                "round_robin",
+                "--peer-fetch-capability",
+                capability,
+            ][..],
+        ] {
+            let error = config(extra).unwrap_err().to_string();
+            assert!(
+                error.contains("--peer-fetch-capability requires"),
+                "{error}"
+            );
+        }
+        assert!(config(&[
+            "--policy",
+            "kv_aware",
+            "--peer-fetch-mode",
+            "shadow",
+            "--peer-fetch-capability",
+            "http://a:8000={}",
+        ])
+        .is_err());
     }
 }

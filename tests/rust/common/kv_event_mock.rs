@@ -1,0 +1,807 @@
+//! Mock engine worker that publishes real KV events.
+//!
+//! Each [`KvEventMock`] is an axum HTTP server plus a ZMQ publisher, shaped like
+//! the control surface the router's KV discovery expects from a vLLM worker:
+//!
+//! * `GET /health` -> 200
+//! * `GET /get_server_info` -> `{model_id, instance_id, kv_block_size}`
+//! * `GET /server_info?config_format=json` -> native vLLM shape (model, block size)
+//! * `GET /kv_routing_capabilities` -> a plain `sha256_cbor` full-attention layout
+//!   for the DP rank (hash seed `"0"`), which the router needs before it subscribes
+//! * `GET /kv_event_sources` -> one `zmq`/`msgpack`/`schema_version: 1` entry for the DP rank,
+//!   with an optional `peer_lookup` object ([`KvEventMockConfig::peer_lookup`])
+//! * `POST /v1/completions` and `POST /v1/chat/completions` -> OpenAI-style replies
+//! * `POST /v1/chat/completions/render` -> the body's `mock_token_ids`, else 404
+//!
+//! The ZMQ socket is an XPUB so the mock can observe the router's subscription
+//! (the standard cure for the slow-joiner race: wait for the subscribe frame,
+//! then publish). Events are multipart `[topic, seq (i64 big-endian), msgpack
+//! [ts, [events], dp_rank]]`, built from the router's own wire types so a wire
+//! change breaks this mock instead of silently diverging from it.
+//!
+//! Requests are served after an optional delay. A request whose JSON body carries
+//! `"priority": HOLD_PRIORITY` blocks until [`KvEventMock::release_held`] (or
+//! drop), which keeps the router's per-worker `active_requests` /
+//! `active_prefill_tokens` counters raised for as long as a test needs.
+//!
+//! After [`KvEventMock::split_streams`], a `"stream": true` completion is
+//! answered as server-sent events: one output frame at once, then the closing
+//! `[DONE]` only after [`KvEventMock::release_stream_tails`] (or drop), so a
+//! test can hold a stream open after its first output frame. With
+//! [`KvEventMock::heartbeat_streams`] as well, the stream opens with an SSE
+//! comment (`: keepalive`) and the output frame waits for the tail release.
+//!
+//! The marker is `priority` (a real completions field the router models) rather
+//! than an invented one: the router withholds KV placement credit from requests
+//! carrying fields it does not understand, which would change the routing under
+//! test.
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{oneshot, watch};
+use vllm_router_rs::kv_index::request_hash::BlockKeyGenerator;
+use vllm_router_rs::kv_index::wire::{
+    AllBlocksCleared, BlockRemoved, BlockStored, ExternalBlockHash, KVEvent,
+};
+
+/// `priority` value that makes a completion request wait for `release_held`.
+pub const HOLD_PRIORITY: i64 = 424_242;
+
+/// Where a stored prefix lives, as the router's index will classify it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// `medium: GPU` -> `StorageTier::Device`.
+    Device,
+    /// `medium: CPU` -> `StorageTier::HostPinned`.
+    HostPinned,
+    /// `medium: STORAGE` -> `StorageTier::Disk`.
+    Disk,
+    /// A shared-pool copy: `ownership` set -> `StorageTier::External`.
+    External,
+}
+
+impl Residency {
+    fn medium(self) -> &'static str {
+        match self {
+            Residency::Device | Residency::External => "GPU",
+            Residency::HostPinned => "CPU",
+            Residency::Disk => "STORAGE",
+        }
+    }
+
+    fn locality(self) -> &'static str {
+        match self {
+            Residency::External => "REMOTE",
+            _ => "LOCAL",
+        }
+    }
+
+    fn ownership(self) -> Option<String> {
+        matches!(self, Residency::External).then(|| "pool".to_owned())
+    }
+}
+
+/// What the mock reports as the rank's `peer_lookup` record.
+#[derive(Debug, Clone)]
+pub struct PeerLookupMock {
+    pub layout_fingerprint: String,
+    pub enabled: bool,
+    /// Report `side_channel_port: 0`, which the router must drop.
+    pub invalid: bool,
+    /// Report this engine id and side-channel port instead of the defaults
+    /// (`<instance>-rank<rank>` and [`peer_port`]).
+    pub address: Option<(String, u16)>,
+    /// Report this side-channel host instead of [`PEER_HOST`].
+    pub host: Option<String>,
+}
+
+impl PeerLookupMock {
+    pub fn new(layout_fingerprint: &str) -> Self {
+        Self {
+            layout_fingerprint: layout_fingerprint.to_owned(),
+            enabled: true,
+            invalid: false,
+            address: None,
+            host: None,
+        }
+    }
+
+    /// Report `host` as the side-channel host, e.g. one that is not the
+    /// worker URL's host.
+    pub fn host(mut self, host: &str) -> Self {
+        self.host = Some(host.to_owned());
+        self
+    }
+
+    /// Report `engine_id` and `port`, as an engine that restarted would.
+    pub fn at(mut self, engine_id: &str, port: u16) -> Self {
+        self.address = Some((engine_id.to_owned(), port));
+        self
+    }
+
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    pub fn invalid(mut self) -> Self {
+        self.invalid = true;
+        self
+    }
+}
+
+/// Side-channel address the mock advertises for `dp_rank`.
+pub const PEER_HOST: &str = "127.0.0.1";
+pub fn peer_port(dp_rank: u32) -> u16 {
+    5600 + dp_rank as u16
+}
+
+/// What [`KvEventMock::store_prefix`] published, so it can be evicted later.
+#[derive(Debug, Clone)]
+pub struct StoredPrefix {
+    pub residency: Residency,
+    /// Engine block hashes (`sha256_cbor`, seed 0), as published.
+    pub hashes: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvEventMockConfig {
+    pub model: String,
+    pub instance_id: String,
+    pub block_size: u32,
+    pub dp_rank: u32,
+    pub topic: String,
+    /// Added to every non-held completion.
+    pub response_delay: Duration,
+    /// When set, `/kv_event_sources` carries a `peer_lookup` object for the rank.
+    pub peer_lookup: Option<PeerLookupMock>,
+}
+
+impl KvEventMockConfig {
+    pub fn new(instance_id: &str, model: &str, block_size: u32) -> Self {
+        Self {
+            model: model.to_owned(),
+            instance_id: instance_id.to_owned(),
+            block_size,
+            dp_rank: 0,
+            topic: "kv-events".to_owned(),
+            response_delay: Duration::ZERO,
+            peer_lookup: None,
+        }
+    }
+}
+
+struct MockState {
+    config: KvEventMockConfig,
+    /// The `peer_lookup` record served now; starts as `config.peer_lookup`.
+    peer_lookup: Mutex<Option<PeerLookupMock>>,
+    endpoint: String,
+    replay_endpoint: String,
+    /// `false` while held requests must wait; `true` releases them.
+    release: watch::Sender<bool>,
+    held_inflight: AtomicUsize,
+    /// Answer streaming completions as SSE with a held tail (see `split_streams`).
+    split_streams: AtomicBool,
+    /// Open split streams with a heartbeat and hold their output too.
+    heartbeat_streams: AtomicBool,
+    /// `false` while split stream tails must wait; `true` releases them.
+    tail_release: watch::Sender<bool>,
+    completions: AtomicUsize,
+    fail_next: AtomicUsize,
+    /// JSON body of every completion request, in arrival order.
+    bodies: Mutex<Vec<Value>>,
+}
+
+enum Command {
+    Publish {
+        events: Vec<KVEvent>,
+        done: oneshot::Sender<()>,
+    },
+    /// Consume a sequence number without publishing it (simulates a lost batch).
+    SkipSeq {
+        done: oneshot::Sender<()>,
+    },
+    Shutdown,
+}
+
+pub struct KvEventMock {
+    pub url: String,
+    state: Arc<MockState>,
+    commands: mpsc::Sender<Command>,
+    subscribed: Arc<AtomicBool>,
+    prefixes: Mutex<Vec<StoredPrefix>>,
+    server: tokio::task::JoinHandle<()>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KvEventMock {
+    pub async fn start(config: KvEventMockConfig) -> Self {
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::XPUB).expect("xpub socket");
+        // Report subscribe and unsubscribe frames, including duplicates.
+        socket.set_xpub_verbose(true).expect("xpub verbose");
+        socket.set_linger(0).expect("linger");
+        socket.bind("tcp://127.0.0.1:*").expect("bind xpub");
+        let endpoint = socket
+            .get_last_endpoint()
+            .expect("endpoint")
+            .expect("utf8 endpoint");
+        // The router requires a replay ROUTER per rank before it accepts the
+        // cache contract; it asks it for missed batches.
+        let replay = context.socket(zmq::ROUTER).expect("router socket");
+        replay.set_linger(0).expect("linger");
+        replay.bind("tcp://127.0.0.1:*").expect("bind replay");
+        let replay_endpoint = replay
+            .get_last_endpoint()
+            .expect("endpoint")
+            .expect("utf8 endpoint");
+
+        let (release, _) = watch::channel(false);
+        let (tail_release, _) = watch::channel(false);
+        let state = Arc::new(MockState {
+            config: config.clone(),
+            peer_lookup: Mutex::new(config.peer_lookup.clone()),
+            endpoint,
+            replay_endpoint,
+            release,
+            held_inflight: AtomicUsize::new(0),
+            split_streams: AtomicBool::new(false),
+            heartbeat_streams: AtomicBool::new(false),
+            tail_release,
+            completions: AtomicUsize::new(0),
+            fail_next: AtomicUsize::new(0),
+            bodies: Mutex::new(Vec::new()),
+        });
+
+        let (commands, command_rx) = mpsc::channel();
+        let subscribed = Arc::new(AtomicBool::new(false));
+        let publisher = {
+            let (topic, rank, subscribed) =
+                (config.topic.clone(), config.dp_rank, subscribed.clone());
+            std::thread::spawn(move || {
+                run_publisher(context, socket, replay, command_rx, topic, rank, subscribed)
+            })
+        };
+
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/get_server_info", get(get_server_info))
+            .route("/server_info", get(native_server_info))
+            .route("/kv_event_sources", get(kv_event_sources))
+            .route("/kv_routing_capabilities", get(kv_routing_capabilities))
+            .route("/v1/completions", post(completions))
+            .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/chat/completions/render", post(chat_render))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock http");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Self {
+            url,
+            state,
+            commands,
+            subscribed,
+            prefixes: Mutex::new(Vec::new()),
+            server,
+            publisher: Some(publisher),
+        }
+    }
+
+    pub fn config(&self) -> &KvEventMockConfig {
+        &self.state.config
+    }
+
+    /// Change the `peer_lookup` record `/kv_event_sources` reports from now on.
+    pub fn set_peer_lookup(&self, record: PeerLookupMock) {
+        *self.state.peer_lookup.lock().unwrap() = Some(record);
+    }
+
+    /// Forget that the router subscribed, so `wait_subscribed` waits for the
+    /// next subscription (after the router drops and re-adds this worker).
+    pub fn reset_subscribed(&self) {
+        self.subscribed.store(false, Ordering::Release);
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.state.config.block_size
+    }
+
+    /// Wait until the router's subscriber has attached to this publisher.
+    /// Publishing earlier would lose the batch (slow joiner).
+    pub async fn wait_subscribed(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.subscribed.load(Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "router never subscribed to {}",
+                self.state.endpoint
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn send(&self, events: Vec<KVEvent>) {
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Publish { events, done })
+            .expect("publisher thread alive");
+        wait.await.expect("publisher acked");
+    }
+
+    /// Publish a `BlockStored` for the first `blocks` blocks of `tokens`.
+    pub async fn store_prefix(
+        &self,
+        tokens: &[u32],
+        blocks: usize,
+        residency: Residency,
+    ) -> StoredPrefix {
+        let block_size = self.block_size() as usize;
+        assert!(
+            tokens.len() >= blocks * block_size,
+            "need {} tokens for {blocks} blocks, got {}",
+            blocks * block_size,
+            tokens.len()
+        );
+        // The router hashes prompts with the layout's contract, so the mock
+        // must publish the same engine hashes for the blocks to match.
+        let hashes: Vec<Vec<u8>> = BlockKeyGenerator::new(block_size, 0)
+            .generate_block_keys(&tokens[..blocks * block_size])
+            .into_iter()
+            .map(|hash| hash.to_vec())
+            .collect();
+        self.send(vec![KVEvent::BlockStored(BlockStored {
+            extra_keys: None,
+            block_hashes: hashes
+                .iter()
+                .cloned()
+                .map(ExternalBlockHash::Bytes)
+                .collect(),
+            parent_block_hash: None,
+            token_ids: tokens[..blocks * block_size].to_vec(),
+            block_size: self.block_size(),
+            lora_id: None,
+            medium: Some(residency.medium().into()),
+            lora_name: None,
+            group_idx: Some(0),
+            kv_cache_spec_kind: Some("full_attention".into()),
+            kv_cache_spec_sliding_window: None,
+            locality: Some(residency.locality().into()),
+            ownership: residency.ownership(),
+            lookahead_token_ids: None,
+        })])
+        .await;
+        let stored = StoredPrefix { residency, hashes };
+        self.prefixes.lock().unwrap().push(stored.clone());
+        stored
+    }
+
+    /// Publish a `BlockRemoved` for everything `stored` published.
+    pub async fn evict(&self, stored: &StoredPrefix) {
+        self.send(vec![KVEvent::BlockRemoved(BlockRemoved {
+            block_hashes: stored
+                .hashes
+                .iter()
+                .cloned()
+                .map(ExternalBlockHash::Bytes)
+                .collect(),
+            medium: Some(stored.residency.medium().into()),
+            group_idx: Some(0),
+            locality: Some(stored.residency.locality().into()),
+            ownership: stored.residency.ownership(),
+        })])
+        .await;
+        let hashes = &stored.hashes;
+        self.prefixes
+            .lock()
+            .unwrap()
+            .retain(|prefix| prefix.hashes != *hashes);
+    }
+
+    /// Publish `AllBlocksCleared`.
+    pub async fn clear_all(&self) {
+        self.send(vec![KVEvent::AllBlocksCleared(AllBlocksCleared {})])
+            .await;
+        self.prefixes.lock().unwrap().clear();
+    }
+
+    /// Lose one batch: the next published batch arrives with a sequence gap.
+    pub async fn skip_seq(&self) {
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::SkipSeq { done })
+            .expect("publisher thread alive");
+        wait.await.expect("publisher acked");
+    }
+
+    /// Number of completion requests that have reached this worker (held or not).
+    pub fn completions(&self) -> usize {
+        self.state.completions.load(Ordering::Acquire)
+    }
+
+    /// JSON bodies of the completion requests that reached this worker, in
+    /// arrival order (a body that is not JSON is recorded as `null`).
+    pub fn bodies(&self) -> Vec<Value> {
+        self.state.bodies.lock().unwrap().clone()
+    }
+
+    /// Held requests currently open on this worker.
+    pub fn held(&self) -> usize {
+        self.state.held_inflight.load(Ordering::Acquire)
+    }
+
+    /// Wait until exactly `count` held requests are open.
+    pub async fn wait_held(&self, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.held() != count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{}: expected {count} held requests, have {}",
+                self.state.config.instance_id,
+                self.held()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Answer the next `count` non-held completions with HTTP 500.
+    pub fn fail_next(&self, count: usize) {
+        self.state.fail_next.store(count, Ordering::Release);
+    }
+
+    /// Make later held requests wait again, after `release_held`.
+    pub fn rearm_held(&self) {
+        self.state.release.send_replace(false);
+    }
+
+    /// Let every held request finish.
+    pub fn release_held(&self) {
+        self.state.release.send_replace(true);
+    }
+
+    /// Answer later `"stream": true` completions as SSE: the first output frame
+    /// at once, the closing `[DONE]` only after `release_stream_tails`.
+    pub fn split_streams(&self) {
+        self.state.split_streams.store(true, Ordering::Release);
+    }
+
+    /// Split streams open with an SSE heartbeat (`: keepalive`) and send their
+    /// output frame, then `[DONE]`, only after `release_stream_tails`.
+    pub fn heartbeat_streams(&self) {
+        self.split_streams();
+        self.state.heartbeat_streams.store(true, Ordering::Release);
+    }
+
+    /// Let every held stream tail finish.
+    pub fn release_stream_tails(&self) {
+        self.state.tail_release.send_replace(true);
+    }
+}
+
+impl Drop for KvEventMock {
+    fn drop(&mut self) {
+        self.state.release.send_replace(true);
+        self.state.tail_release.send_replace(true);
+        let _ = self.commands.send(Command::Shutdown);
+        if let Some(thread) = self.publisher.take() {
+            let _ = thread.join();
+        }
+        self.server.abort();
+    }
+}
+
+fn run_publisher(
+    _context: zmq::Context,
+    socket: zmq::Socket,
+    replay: zmq::Socket,
+    commands: mpsc::Receiver<Command>,
+    topic: String,
+    dp_rank: u32,
+    subscribed: Arc<AtomicBool>,
+) {
+    let subscribe_frame = [b"\x01".as_slice(), topic.as_bytes()].concat();
+    let mut seq: i64 = 0;
+    // Every batch, published or skipped, so a replay request can be answered.
+    let mut history: Vec<(i64, Vec<u8>)> = Vec::new();
+    loop {
+        while let Ok(frame) = socket.recv_bytes(zmq::DONTWAIT) {
+            if frame == subscribe_frame {
+                subscribed.store(true, Ordering::Release);
+            }
+        }
+        // Replay protocol: `[peer, "", start_seq (u64 BE)]` in; each stored
+        // batch from `start_seq` as `[peer, "", topic, seq, payload]`, then
+        // `[peer, "", "", -1, ""]` to end the replay.
+        while let Ok(request) = replay.recv_multipart(zmq::DONTWAIT) {
+            let [peer, _, start] = request.as_slice() else {
+                continue;
+            };
+            let start = <[u8; 8]>::try_from(start.as_slice())
+                .map(|bytes| u64::from_be_bytes(bytes) as i64)
+                .unwrap_or(0);
+            for (batch_seq, payload) in history.iter().filter(|(s, _)| *s >= start) {
+                let _ = replay.send_multipart(
+                    [
+                        peer.as_slice(),
+                        b"",
+                        topic.as_bytes(),
+                        batch_seq.to_be_bytes().as_slice(),
+                        payload.as_slice(),
+                    ],
+                    0,
+                );
+            }
+            let _ = replay.send_multipart(
+                [
+                    peer.as_slice(),
+                    b"",
+                    b"",
+                    (-1_i64).to_be_bytes().as_slice(),
+                    b"",
+                ],
+                0,
+            );
+        }
+        match commands.recv_timeout(Duration::from_millis(2)) {
+            Ok(Command::Publish { events, done }) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs_f64())
+                    .unwrap_or(0.0);
+                let payload =
+                    rmp_serde::to_vec_named(&(ts, events, Some(dp_rank))).expect("encode batch");
+                socket
+                    .send_multipart(
+                        [
+                            topic.as_bytes(),
+                            seq.to_be_bytes().as_slice(),
+                            payload.as_slice(),
+                        ],
+                        0,
+                    )
+                    .expect("publish batch");
+                history.push((seq, payload));
+                seq += 1;
+                let _ = done.send(());
+            }
+            Ok(Command::SkipSeq { done }) => {
+                // Lost on the wire, not by the engine: the live socket never
+                // sends it, but replay can, as a real engine's buffer would.
+                let empty: Vec<KVEvent> = Vec::new();
+                let payload = rmp_serde::to_vec_named(&(0.0_f64, empty, Some(dp_rank)))
+                    .expect("encode batch");
+                history.push((seq, payload));
+                seq += 1;
+                let _ = done.send(());
+            }
+            Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+async fn get_server_info(State(state): State<Arc<MockState>>) -> Json<Value> {
+    Json(json!({
+        "model_id": state.config.model,
+        "instance_id": state.config.instance_id,
+        "kv_block_size": state.config.block_size,
+    }))
+}
+
+async fn native_server_info(State(state): State<Arc<MockState>>) -> Json<Value> {
+    Json(json!({"vllm_config": {
+        "model_config": {"model": state.config.model},
+        "cache_config": {"block_size": state.config.block_size},
+    }}))
+}
+
+/// The cache contract the router verifies before it subscribes: one plain
+/// full-attention group hashed with `sha256_cbor`, seed `"0"`.
+async fn kv_routing_capabilities(State(state): State<Arc<MockState>>) -> Json<Value> {
+    let block_size = state.config.block_size;
+    Json(json!({
+        "schema_version": 1, "adapters": [],
+        "ranks": [{
+            "rank": state.config.dp_rank, "declared_groups": 1,
+            "model": state.config.model, "weight_version": "default",
+            "publisher_topic": state.config.topic, "instance_topic": true,
+            "hash_algorithm": "sha256_cbor", "hash_seed": "0", "full_hashes": true,
+            "hash_block_size": block_size, "partial_hash_hits": false,
+            "hash_lookahead_tokens": 0, "speculative_tokens": 0,
+            "prefix_caching": true, "transfer": null,
+            "groups": [{
+                "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
+                "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
+            }]
+        }]
+    }))
+}
+
+async fn kv_event_sources(State(state): State<Arc<MockState>>) -> Json<Value> {
+    let mut entry = json!({
+        "endpoint": state.endpoint,
+        "replay_endpoint": state.replay_endpoint,
+        "topic": state.config.topic,
+        "publisher": "zmq",
+        "encoding": "msgpack",
+        "schema_version": 1,
+        "enable_kv_cache_events": true,
+    });
+    let peer_lookup = state.peer_lookup.lock().unwrap().clone();
+    if let Some(peer) = &peer_lookup {
+        let rank = state.config.dp_rank;
+        let (engine_id, port) = peer.address.clone().unwrap_or_else(|| {
+            (
+                format!("{}-rank{rank}", state.config.instance_id),
+                peer_port(rank),
+            )
+        });
+        entry["peer_lookup"] = json!({
+            "enabled": peer.enabled,
+            "engine_id": engine_id,
+            "side_channel_host": peer.host.as_deref().unwrap_or(PEER_HOST),
+            "side_channel_port": if peer.invalid { 0 } else { u32::from(port) },
+            "tp_size": 1, "dcp_size": 1, "pp_size": 1,
+            "connector": "nixl",
+            "connector_version": "1",
+            "layout_fingerprint": peer.layout_fingerprint,
+        });
+    }
+    Json(json!({ state.config.dp_rank.to_string(): entry }))
+}
+
+/// Shared by both completion routes. Returns the failure response when the
+/// worker was told to fail, otherwise waits (hold or delay) and returns `None`.
+async fn admit(state: &MockState, body: &Bytes) -> Option<Response> {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let held = parsed
+        .as_ref()
+        .is_some_and(|value| value["priority"].as_i64() == Some(HOLD_PRIORITY));
+    // Record before counting, so a test that sees the count also sees the body.
+    state
+        .bodies
+        .lock()
+        .unwrap()
+        .push(parsed.unwrap_or(Value::Null));
+    state.completions.fetch_add(1, Ordering::AcqRel);
+    if held {
+        state.held_inflight.fetch_add(1, Ordering::AcqRel);
+        let mut release = state.release.subscribe();
+        let _ = release.wait_for(|released| *released).await;
+        state.held_inflight.fetch_sub(1, Ordering::AcqRel);
+        return None;
+    }
+    let failing = state
+        .fail_next
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok();
+    if failing {
+        return Some((StatusCode::INTERNAL_SERVER_ERROR, "mock failure").into_response());
+    }
+    if !state.config.response_delay.is_zero() {
+        tokio::time::sleep(state.config.response_delay).await;
+    }
+    None
+}
+
+async fn completions(State(state): State<Arc<MockState>>, body: Bytes) -> Response {
+    if let Some(failure) = admit(&state, &body).await {
+        return failure;
+    }
+    let streaming = serde_json::from_slice::<Value>(&body)
+        .is_ok_and(|value| value["stream"].as_bool() == Some(true));
+    if streaming && state.split_streams.load(Ordering::Acquire) {
+        return split_stream(&state, false);
+    }
+    Json(json!({
+        "id": "cmpl-mock",
+        "object": "text_completion",
+        "created": 0,
+        "model": state.config.model,
+        "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }))
+    .into_response()
+}
+
+/// One output frame now; `[DONE]` once the test releases stream tails. A chat
+/// stream sends a chat delta instead of Completion text.
+fn split_stream(state: &MockState, chat: bool) -> Response {
+    use futures_util::StreamExt as _;
+    let frame = if chat {
+        json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": state.config.model,
+            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}],
+        })
+    } else {
+        json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": state.config.model,
+            "choices": [{"index": 0, "text": "ok", "finish_reason": null}],
+        })
+    };
+    let first = format!("data: {frame}\n\n");
+    let mut tail = state.tail_release.subscribe();
+    let stream = if state.heartbeat_streams.load(Ordering::Acquire) {
+        futures_util::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keepalive\n\n"))
+        })
+        .chain(futures_util::stream::once(async move {
+            let _ = tail.wait_for(|released| *released).await;
+            Ok(Bytes::from(format!("{first}data: [DONE]\n\n")))
+        }))
+        .boxed()
+    } else {
+        futures_util::stream::once(
+            async move { Ok::<_, std::convert::Infallible>(Bytes::from(first)) },
+        )
+        .chain(futures_util::stream::once(async move {
+            let _ = tail.wait_for(|released| *released).await;
+            Ok(Bytes::from_static(b"data: [DONE]\n\n"))
+        }))
+        .boxed()
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn chat_completions(State(state): State<Arc<MockState>>, body: Bytes) -> Response {
+    if let Some(failure) = admit(&state, &body).await {
+        return failure;
+    }
+    let streaming = serde_json::from_slice::<Value>(&body)
+        .is_ok_and(|value| value["stream"].as_bool() == Some(true));
+    if streaming && state.split_streams.load(Ordering::Acquire) {
+        return split_stream(&state, true);
+    }
+    Json(json!({
+        "id": "chatcmpl-mock",
+        "object": "chat.completion",
+        "created": 0,
+        "model": state.config.model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }))
+    .into_response()
+}
+
+/// The engine's chat render endpoint, for tests only: a body that carries
+/// `mock_token_ids` renders to exactly those ids. Any other body gets 404, so
+/// the router finds no tokens for it (as with an engine without render).
+async fn chat_render(body: Bytes) -> Response {
+    match serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("mock_token_ids").cloned())
+    {
+        Some(ids) if ids.is_array() => Json(json!({"token_ids": ids})).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}

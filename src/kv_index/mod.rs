@@ -28,7 +28,8 @@ pub mod storage;
 pub mod types;
 
 pub use discovery::{
-    CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
+    CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, PeerLookupEntry,
+    PeerLookupRecord, WorkerKvInfo,
 };
 pub use layout::{
     AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability, GroupRule, RankCapability,

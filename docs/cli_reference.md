@@ -107,6 +107,16 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | Transfer credit for an authorized external KV source. Worker events alone cannot establish shared-pool residency. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
+| `--peer-fetch-mode` | `off, shadow, active` | `off` | — | — | Peer fetch planner for kv_aware. `shadow` plans and reports only. `active` also adds peer-fetch parameters to the request sent to the destination worker. `active` needs colocated routing (PD routing is rejected), a source worker that reports `peer_lookup` on `/kv_event_sources`, and HTTP workers. |
+| `--peer-fetch-min-prefix-blocks` | `u32` | `64` | — | — | Minimum blocks the source must hold beyond the destination for a transfer plan. |
+| `--peer-fetch-source-load-threshold` | `usize` | `1` | — | — | Source counts as busy at this many active requests. |
+| `--peer-fetch-margin` | `f64` | `0.8` | — | — | Transfer must cost less than this fraction (0, 1] of the prefill it saves. |
+| `--peer-fetch-prefill-us-per-token` | `f64` | `50.0` | — | — | Estimated prefill cost in microseconds per token. |
+| `--peer-fetch-fixed-ms` | `f64` | `5.0` | — | — | Estimated fixed transfer cost in milliseconds. |
+| `--peer-fetch-us-per-token` | `f64` | `5.0` | — | — | Estimated transfer cost in microseconds per token. |
+| `--peer-fetch-ignore-capability` | `flag` | `false` | — | — | Shadow mode only: plan without checking worker capability, to measure what peer fetch would save once capabilities are declared. Rejected in active mode. |
+| `--peer-fetch-max-inflight-per-source` | `usize` | `4` | — | — | Most peer fetches allowed at once against one source worker in `active` mode. Must be greater than 0. |
+| `--peer-fetch-capability` | `string (repeatable)` | `[]` | — | — | Declared peer-fetch capability as `WORKER_URL=JSON` (`connector`, `connector_version`, `layout_fingerprint`, optional `can_export`/`can_import`, and an optional `side_channel_host` that active mode trusts instead of the worker URL's host); repeatable, one entry per worker. Needs `--peer-fetch-mode shadow` or `active`. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |

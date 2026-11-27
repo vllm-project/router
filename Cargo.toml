@@ -213,6 +213,10 @@ name = "grpc_vs_http_e2e"
 path = "tests/rust/grpc_vs_http_e2e.rs"
 
 [[test]]
+name = "peer_fetch_shadow"
+path = "tests/rust/peer_fetch_shadow.rs"
+
+[[test]]
 name = "otel_config_test"
 path = "tests/rust/otel_config_test.rs"
 

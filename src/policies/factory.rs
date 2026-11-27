@@ -1,11 +1,15 @@
 //! Factory for creating load balancing policies
 
+use super::peer_fetch_capability::parse_static_capabilities;
+use super::CostRulePeerFetchPlanner;
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LoadBalancingPolicy, PeerFetchRules, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
+use crate::config::types::{PeerFetchConfig, PeerFetchMode};
 use crate::config::PolicyConfig;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Factory for creating policy instances
@@ -48,6 +52,7 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                peer_fetch,
                 ..
             } => {
                 let mut policy = KvAwarePolicy::new(CostParams {
@@ -63,7 +68,14 @@ impl PolicyFactory {
                 if let Some(table) = kv_affinity_table {
                     policy = policy.with_shared_affinity(Arc::clone(table));
                 }
-                Arc::new(policy)
+                // Only the PD stage policies come through here, and validation
+                // rejects a non-off peer_fetch block for them, so this flag is
+                // never consulted; the registry passes its shared one instead.
+                Arc::new(Self::apply_peer_fetch_config(
+                    policy,
+                    peer_fetch.as_deref(),
+                    &Arc::new(AtomicBool::new(true)),
+                ))
             }
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
                 // Note: virtual_nodes parameter is available but not currently used
@@ -73,6 +85,49 @@ impl PolicyFactory {
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
+    }
+
+    /// Install the transfer planner and static capabilities when the
+    /// config asks for it. Shared by the factory and the registry. With no
+    /// block or `mode: off` the policy is returned untouched.
+    ///
+    /// In active mode the policy shares `peer_fetch_enabled`, the kill switch
+    /// flag: the registry passes its own so one switch covers every policy it
+    /// builds.
+    pub(crate) fn apply_peer_fetch_config(
+        policy: KvAwarePolicy,
+        config: Option<&PeerFetchConfig>,
+        peer_fetch_enabled: &Arc<AtomicBool>,
+    ) -> KvAwarePolicy {
+        let Some(config) = config.filter(|c| c.mode != PeerFetchMode::Off) else {
+            return policy;
+        };
+        // Validation rejects bad capability tables at startup; a failure here
+        // means the config skipped validation, so fall back to no declarations.
+        let capabilities = match parse_static_capabilities(&config.capabilities) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                tracing::warn!(%error, "ignoring invalid peer_fetch capabilities");
+                Default::default()
+            }
+        };
+        if config.ignore_capability {
+            tracing::warn!(
+                "peer_fetch shadow mode is ignoring worker capability: plans may include \
+                 pairs that active mode rejects as `incompatible`"
+            );
+        }
+        let policy = policy.with_transfer_planner(Arc::new(CostRulePeerFetchPlanner {
+            policy: PeerFetchRules::from(config),
+        }));
+        policy.register_static_capabilities(capabilities);
+        if config.mode == PeerFetchMode::Active {
+            return policy.with_shared_peer_fetch(
+                config.max_inflight_per_source,
+                Arc::clone(peer_fetch_enabled),
+            );
+        }
+        policy
     }
 
     /// Create a policy by name (for dynamic loading)
@@ -137,6 +192,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             },
             None,
         );
@@ -168,6 +224,7 @@ mod tests {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
+            peer_fetch: None,
         };
 
         // Without a shared table the factory-built policy must NOT report

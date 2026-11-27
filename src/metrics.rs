@@ -84,6 +84,29 @@ pub fn init_metrics() {
         "KV-aware placement lookups and reasons for skipping them"
     );
     describe_counter!(
+        "vllm_router_peer_fetch_plans_total",
+        "Peer fetch planner outcomes (planned or the reason no plan was made)"
+    );
+    describe_counter!(
+        "vllm_router_peer_fetch_requests_total",
+        "Active-mode peer fetch requests: sent with peer fetch params, or why not \
+         (no_peer_endpoint, untrusted_endpoint, inflight_cap, grpc_destination, registration_changed, \
+         client_params_present, prompt_logprobs, invalid_body)"
+    );
+    describe_gauge!(
+        "vllm_router_peer_fetch_enabled",
+        "Active-mode peer KV fetch kill switch: 1 when enabled, 0 when disabled \
+         through /peer_fetch"
+    );
+    describe_histogram!(
+        "vllm_router_peer_fetch_estimated_saved_ms",
+        "Estimated prefill milliseconds saved by a planned peer fetch"
+    );
+    describe_histogram!(
+        "vllm_router_peer_fetch_estimated_cost_ms",
+        "Estimated milliseconds of the fetch and wait paths when the transfer cost rule was evaluated"
+    );
+    describe_counter!(
         "vllm_router_kv_source_recovery_events_total",
         "KV event source recovery events by mode and reason"
     );
@@ -572,6 +595,9 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
     ];
     const RATIO_BUCKETS: &[f64] = &[0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0];
     const REQUEST_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+    const MILLISECOND_BUCKETS: &[f64] = &[
+        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0,
+    ];
 
     let exact = |name: &str| Matcher::Full(name.to_string());
     let set = |builder: PrometheusBuilder, name: &str, buckets: &[f64]| {
@@ -619,6 +645,12 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         "vllm_router_agent_aware_admission_backend_waiting_requests",
     ] {
         builder = set(builder, name, REQUEST_BUCKETS);
+    }
+    for name in [
+        "vllm_router_peer_fetch_estimated_saved_ms",
+        "vllm_router_peer_fetch_estimated_cost_ms",
+    ] {
+        builder = set(builder, name, MILLISECOND_BUCKETS);
     }
     set(
         builder,
@@ -682,6 +714,29 @@ impl RouterMetrics {
 
     pub fn record_kv_placement_lookup(result: &'static str) {
         kv_placement_lookup_counter(result).increment(1);
+    }
+    /// Planner outcome for one selection. Call through
+    /// `PeerFetchPlanOutcome::record`, which owns the label set.
+    pub fn record_peer_fetch_plan(outcome: &'static str) {
+        counter!("vllm_router_peer_fetch_plans_total", "outcome" => outcome).increment(1);
+    }
+    /// Active-mode outcome for a planned request. Call through
+    /// `PeerFetchRequestOutcome::record`, which owns the label set.
+    pub fn record_peer_fetch_request(outcome: &'static str) {
+        counter!("vllm_router_peer_fetch_requests_total", "outcome" => outcome).increment(1);
+    }
+    /// State of the active-mode peer fetch kill switch (1 enabled, 0 disabled).
+    pub fn set_peer_fetch_enabled(enabled: bool) {
+        gauge!("vllm_router_peer_fetch_enabled").set(if enabled { 1.0 } else { 0.0 });
+    }
+    /// Estimated prefill milliseconds saved by a planned transfer.
+    pub fn record_peer_fetch_estimated_saved_ms(saved_ms: f64) {
+        histogram!("vllm_router_peer_fetch_estimated_saved_ms").record(saved_ms);
+    }
+    /// Estimated cost of the two compared paths. Call through
+    /// `PeerFetchCostPath::record`, which owns the label set.
+    pub fn record_peer_fetch_estimated_cost_ms(path: &'static str, cost_ms: f64) {
+        histogram!("vllm_router_peer_fetch_estimated_cost_ms", "path" => path).record(cost_ms);
     }
 
     pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {

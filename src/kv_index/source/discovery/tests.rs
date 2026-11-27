@@ -1129,6 +1129,7 @@ fn declared_full_worker(
                 encoding: Some("msgpack".into()),
                 schema_version: Some(1),
                 enable_kv_cache_events: Some(true),
+                peer_lookup: None,
                 ..Default::default()
             },
         )])),
@@ -2356,4 +2357,98 @@ fn adapter_names_are_not_served_base_models() {
     assert!(worker_serves_base_model(&worker, "qwen35"));
     assert!(worker_serves_base_model(&worker, "alias-a"));
     assert!(!worker_serves_base_model(&worker, "lora1"));
+}
+
+fn peer_json() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": true,
+        "engine_id": "engine-0",
+        "side_channel_host": "10.0.0.5",
+        "side_channel_port": 5600,
+        "tp_size": 2, "dcp_size": 1, "pp_size": 1,
+        "connector": "nixl",
+        "connector_version": "1",
+        "layout_fingerprint": "fp"
+    })
+}
+
+fn parse_entry(peer: serde_json::Value) -> KvEventSourceEntry {
+    serde_json::from_value(serde_json::json!({"endpoint": "tcp://x:1", "peer_lookup": peer}))
+        .unwrap()
+}
+
+#[test]
+fn peer_lookup_valid_record_parses_and_validates() {
+    let record = parse_entry(peer_json())
+        .peer_lookup
+        .unwrap()
+        .validate()
+        .unwrap();
+    assert_eq!(record.engine_id, "engine-0");
+    assert_eq!(record.side_channel_host, "10.0.0.5");
+    assert_eq!(record.side_channel_port, 5600);
+    assert_eq!((record.tp_size, record.dcp_size, record.pp_size), (2, 1, 1));
+    assert_eq!(record.layout_fingerprint, "fp");
+}
+
+#[test]
+fn peer_lookup_invalid_records_are_rejected() {
+    let cases: [(&str, serde_json::Value); 11] = [
+        ("enabled", serde_json::json!(false)),
+        ("engine_id", serde_json::json!("")),
+        ("side_channel_host", serde_json::json!("  ")),
+        ("connector", serde_json::json!("")),
+        ("connector_version", serde_json::json!("")),
+        ("layout_fingerprint", serde_json::json!("")),
+        ("side_channel_port", serde_json::json!(0)),
+        ("side_channel_port", serde_json::json!(70_000)),
+        ("tp_size", serde_json::json!(0)),
+        ("dcp_size", serde_json::json!(0)),
+        ("pp_size", serde_json::json!(0)),
+    ];
+    for (field, bad) in cases {
+        let mut json = peer_json();
+        json[field] = bad.clone();
+        let entry = parse_entry(json).peer_lookup.unwrap();
+        assert!(entry.validate().is_err(), "{field}={bad} must be rejected");
+    }
+    // A missing field takes the zero value and is rejected too.
+    let entry = parse_entry(serde_json::json!({"enabled": true})).peer_lookup;
+    assert!(entry.unwrap().validate().is_err());
+}
+
+#[test]
+fn peer_lookup_unknown_keys_absent_and_malformed_objects() {
+    let mut json = peer_json();
+    json["future_field"] = serde_json::json!({"a": 1});
+    assert!(parse_entry(json).peer_lookup.unwrap().validate().is_ok());
+
+    let absent: KvEventSourceEntry =
+        serde_json::from_value(serde_json::json!({"endpoint": "tcp://x:1"})).unwrap();
+    assert!(absent.peer_lookup.is_none());
+    let null = parse_entry(serde_json::Value::Null);
+    assert!(null.peer_lookup.is_none());
+
+    // A malformed record must not fail the entry (or the whole response).
+    let mut json = peer_json();
+    json["side_channel_port"] = serde_json::json!("not a port");
+    let entry = parse_entry(json);
+    assert_eq!(entry.endpoint, "tcp://x:1");
+    assert!(entry.peer_lookup.unwrap().validate().is_err());
+    let not_object = parse_entry(serde_json::json!("nope"));
+    assert!(not_object.peer_lookup.unwrap().validate().is_err());
+}
+
+#[test]
+fn validated_peer_lookups_keep_valid_ranks_and_drop_invalid_ones() {
+    let mut bad = peer_json();
+    bad["side_channel_port"] = serde_json::json!(0);
+    let sources: KvEventSourcesResponse = HashMap::from([
+        ("0".to_string(), parse_entry(peer_json())),
+        ("1".to_string(), parse_entry(bad)),
+        ("2".to_string(), KvEventSourceEntry::default()),
+    ]);
+    let records = validated_peer_lookups("http://w", &sources);
+    assert_eq!(records.len(), 1);
+    assert!(records.contains_key(&0));
 }

@@ -154,6 +154,7 @@ impl Router {
                     kv_penalty_external: self.kv_penalty_external,
                     kv_penalty_disk: self.kv_penalty_disk,
                     static_kv_event_sources: Box::default(),
+                    peer_fetch: None,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5, // Default value

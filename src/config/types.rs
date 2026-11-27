@@ -1148,6 +1148,9 @@ pub enum PolicyConfig {
         /// endpoint does not expose /kv_event_sources.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         static_kv_event_sources: Box<HashMap<String, StaticKvEventSources>>,
+        /// Optional KV transfer planning. Absent means off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_fetch: Option<Box<PeerFetchConfig>>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -1172,6 +1175,151 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
+}
+
+/// KV transfer planner mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerFetchMode {
+    /// No planner is built.
+    #[default]
+    Off,
+    /// Plans are computed and reported; routing and requests are unchanged.
+    Shadow,
+    /// Plans are acted on: the request sent to the destination carries
+    /// `kv_transfer_params` so its engine fetches the prefix from the source.
+    /// Can be switched back to shadow at runtime (`POST /peer_fetch`, via
+    /// `PolicyRegistry::set_peer_fetch_enabled_if_active`).
+    Active,
+}
+
+/// Settings for the peer fetch planner. `PeerFetchRules::from(&config)` (in
+/// `policies::peer_fetch`) is the only way to build a planner policy:
+/// `enabled` is derived from `mode`. The planner checks worker capability in
+/// both modes, so a default shadow run predicts active mode;
+/// `ignore_capability` (shadow only) drops the check to measure what peer
+/// fetch would save once capabilities are declared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeerFetchConfig {
+    pub mode: PeerFetchMode,
+    pub min_prefix_blocks: u32,
+    pub source_load_threshold: usize,
+    pub margin: f64,
+    pub prefill_us_per_token: f64,
+    pub transfer_fixed_ms: f64,
+    pub transfer_us_per_token: f64,
+    /// Shadow mode only: plan on a shared cache identity alone, without the
+    /// capability check. Validation rejects it in active mode.
+    pub ignore_capability: bool,
+    /// Active mode: most peer fetches in flight against one source worker.
+    /// Requests over the cap are sent without peer params.
+    pub max_inflight_per_source: usize,
+    /// Declared per-worker capability, keyed by worker URL.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub capabilities: HashMap<String, StaticTransferCapability>,
+}
+
+impl Default for PeerFetchConfig {
+    fn default() -> Self {
+        Self {
+            mode: PeerFetchMode::Off,
+            min_prefix_blocks: 64,
+            source_load_threshold: 1,
+            margin: 0.8,
+            prefill_us_per_token: 50.0,
+            transfer_fixed_ms: 5.0,
+            transfer_us_per_token: 5.0,
+            ignore_capability: false,
+            max_inflight_per_source: 4,
+            capabilities: HashMap::new(),
+        }
+    }
+}
+
+impl PeerFetchConfig {
+    /// True when the margin is in (0, 1] and every cost constant is finite and >= 0.
+    pub fn cost_constants_valid(&self) -> bool {
+        peer_fetch_cost_constants_valid(
+            self.margin,
+            self.prefill_us_per_token,
+            self.transfer_fixed_ms,
+            self.transfer_us_per_token,
+        )
+    }
+}
+
+/// The numeric rule shared by `PeerFetchConfig` and the planner policy built
+/// from it.
+pub fn peer_fetch_cost_constants_valid(
+    margin: f64,
+    prefill_us_per_token: f64,
+    transfer_fixed_ms: f64,
+    transfer_us_per_token: f64,
+) -> bool {
+    [
+        prefill_us_per_token,
+        transfer_fixed_ms,
+        transfer_us_per_token,
+    ]
+    .into_iter()
+    .all(|value| value.is_finite() && value >= 0.0)
+        && margin.is_finite()
+        && margin > 0.0
+        && margin <= 1.0
+}
+
+/// One worker's declared KV transfer capability, as written in config.
+///
+/// Besides engine-reported capabilities, the operator can state one per worker
+/// URL. Nothing here is verified against the engine: a wrong entry makes the
+/// planner's `Incompatible` check wrong, so a fingerprint must be identical on
+/// workers with the same model, KV dtype, TP/PP shape, block size and
+/// quantization, and different otherwise. A shadow run with
+/// `ignore_capability` does not need this at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StaticTransferCapability {
+    #[serde(default = "default_true")]
+    pub can_export: bool,
+    #[serde(default = "default_true")]
+    pub can_import: bool,
+    /// Transport name, e.g. "nixl".
+    pub connector: String,
+    pub connector_version: String,
+    /// Operator-chosen label; equal labels mean compatible KV layouts.
+    pub layout_fingerprint: String,
+    /// Active mode: the side-channel host this worker's engine may report, for
+    /// a side channel on another address than the worker URL (e.g. a separate
+    /// NIC). Without it, the reported host must be the worker URL's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_channel_host: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl StaticTransferCapability {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("connector", &self.connector),
+            ("connector_version", &self.connector_version),
+            ("layout_fingerprint", &self.layout_fingerprint),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} is empty"));
+            }
+        }
+        if self
+            .side_channel_host
+            .as_deref()
+            .is_some_and(|host| host.trim().is_empty())
+        {
+            return Err("side_channel_host is empty".into());
+        }
+        Ok(())
+    }
 }
 
 impl PolicyConfig {
@@ -1658,6 +1806,7 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.4,
                 static_kv_event_sources: Default::default(),
+                peer_fetch: None,
             },
         );
         config.pd_kv_event_sources.insert(
@@ -2641,5 +2790,42 @@ mod tests {
             PolicyConfig::RoundRobin => {} // Success
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    #[test]
+    fn peer_fetch_is_off_by_default_and_round_trips() {
+        let policy: PolicyConfig = serde_json::from_str(r#"{"type":"kv_aware"}"#).unwrap();
+        let PolicyConfig::KvAware { peer_fetch, .. } = &policy else {
+            panic!("expected kv_aware");
+        };
+        assert!(peer_fetch.is_none());
+        // No block is emitted when absent, so old and new configs match.
+        assert!(!serde_json::to_string(&policy)
+            .unwrap()
+            .contains("peer_fetch"));
+
+        let defaults: PeerFetchConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults, PeerFetchConfig::default());
+        assert_eq!(defaults.mode, PeerFetchMode::Off);
+        assert!(defaults.cost_constants_valid());
+
+        let json = r#"{"type":"kv_aware","peer_fetch":{"mode":"shadow","min_prefix_blocks":8,
+            "margin":0.5,"capabilities":{"http://a":{"connector":"nixl",
+            "connector_version":"1","layout_fingerprint":"fp"}}}}"#;
+        let parsed: PolicyConfig = serde_json::from_str(json).unwrap();
+        let again: PolicyConfig =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        for config in [parsed, again] {
+            let PolicyConfig::KvAware { peer_fetch, .. } = config else {
+                panic!("expected kv_aware");
+            };
+            let block = peer_fetch.unwrap();
+            assert_eq!(block.mode, PeerFetchMode::Shadow);
+            assert_eq!((block.min_prefix_blocks, block.margin), (8, 0.5));
+            assert_eq!(block.capabilities["http://a"].layout_fingerprint, "fp");
+        }
+
+        assert!(serde_json::from_str::<PeerFetchConfig>(r#"{"mode":"shadow","typo":1}"#).is_err());
+        assert!(serde_json::from_str::<PeerFetchConfig>(r#"{"mode":"loud"}"#).is_err());
     }
 }

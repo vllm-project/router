@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,10 +13,18 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
+use super::kv_cost::{credited_tokens, request_prefill_tokens};
+pub use super::kv_cost::{CandidateView, CostParams, LoadSample, TransferCredits};
+use super::peer_directory::{PeerDirectory, PeerRegistration};
+use super::peer_fetch::{
+    PeerEndpoint, PeerFetchCostPath, PeerFetchGrant, PeerFetchLimiter, PeerFetchOutcome,
+    PeerFetchPlan, PeerFetchPlanOutcome, PeerFetchPlanner, PeerFetchPlannerInput,
+    PeerFetchRequestOutcome, PeerFetchSkip, PeerInput, TransferCapability,
+};
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
-use crate::core::Worker;
+use crate::core::{ConnectionMode, Worker};
 use crate::kv_index::{
-    CacheKey, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup, StorageTier,
+    CacheKey, PeerLookupRecord, PromptKey, RequestHashCache, RoutableTarget, SharedPrefixLookup,
     TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
@@ -35,9 +43,13 @@ pub enum KvRequestTokens<'a> {
 
 /// Request-local placement qualification; it restricts credit, not candidacy.
 #[derive(Clone, Copy)]
-pub(crate) struct QualifiedKvInput<'a> {
-    pub(crate) tokens: KvRequestTokens<'a>,
-    pub(crate) eligibility: Option<&'a [bool]>,
+pub struct QualifiedKvInput<'a> {
+    pub tokens: KvRequestTokens<'a>,
+    pub eligibility: Option<&'a [bool]>,
+    /// Whether transfer planning may run after destination selection.
+    /// `false` still picks the destination but plans no source to fetch
+    /// from, so the request takes no source permit.
+    pub allow_transfer_plan: bool,
 }
 
 impl QualifiedKvInput<'_> {
@@ -230,23 +242,21 @@ pub trait KvAwareOps: Send + Sync {
     /// slice, before health filtering. The built-in policy treats `None` as
     /// unrestricted. Implementers without this extension return `None` without
     /// querying or reserving, rather than silently ignoring a supplied mask.
-    #[allow(clippy::too_many_arguments)]
     fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
-        tokens: KvRequestTokens<'_>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-        eligibility: Option<&[bool]>,
     ) -> Option<KvSelectionReceipt> {
-        if eligibility.is_some() {
+        if input.eligibility.is_some() {
             return None;
         }
         self.select_worker_with_inputs(
             workers,
-            tokens,
+            input.tokens,
             lora_name,
             cache_salt,
             affinity_key,
@@ -339,12 +349,6 @@ impl std::fmt::Debug for KvRequestSlot {
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LoadSample {
-    pub active_prefill_tokens: u64,
-    pub active_requests: usize,
 }
 
 pub trait LoadProvider: Send + Sync {
@@ -474,70 +478,6 @@ impl SlotManager for InMemorySlotManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TransferCredits {
-    pub device: f64,
-    pub host_pinned: f64,
-    pub external: f64,
-    pub disk: f64,
-}
-
-impl Default for TransferCredits {
-    fn default() -> Self {
-        Self {
-            device: 1.0,
-            host_pinned: 0.8,
-            external: 0.6,
-            disk: 0.3,
-        }
-    }
-}
-
-impl TransferCredits {
-    fn for_tier(self, tier: StorageTier) -> f64 {
-        match tier {
-            StorageTier::Device => self.device,
-            StorageTier::HostPinned => self.host_pinned,
-            StorageTier::External => self.external,
-            StorageTier::Disk => self.disk,
-        }
-    }
-
-    fn valid(self) -> bool {
-        self.device == 1.0
-            && [self.host_pinned, self.external, self.disk]
-                .into_iter()
-                .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CostParams {
-    pub router_temperature: f64,
-    pub transfer_credits: TransferCredits,
-    pub block_size: u32,
-}
-
-impl Default for CostParams {
-    fn default() -> Self {
-        Self {
-            router_temperature: 0.0,
-            transfer_credits: TransferCredits::default(),
-            block_size: 16,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CandidateView<'a> {
-    pub target: &'a RoutableTarget,
-    pub matches: &'a [TierMatch],
-    pub load: LoadSample,
-    pub input_tokens: usize,
-    /// Sum of independently matched batch prompts, when this is a batch.
-    pub prefill_tokens: Option<u64>,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CostComponents {
     pub ptoken: u64,
@@ -554,12 +494,17 @@ pub struct CostDecision {
 
 /// Result of an admitted KV-aware selection. Worker load is already reserved;
 /// the router owns its release together with the optional request slot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
+    /// Active mode only: where the destination should fetch the transfer from,
+    /// with the granted source's in-flight slot. `None` in shadow mode, when
+    /// there is no plan, when the destination changed or a request-level check
+    /// stopped the fetch, or when no planned source could be granted.
+    pub(crate) peer_fetch: Option<PeerFetchGrant>,
 }
 
 /// Fixed bound of the affinity table shared by every policy instance.
@@ -800,60 +745,6 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
     fn pick(&self, costs: &[f64]) -> Option<usize>;
 }
 
-/// Device prefix plus one external continuation, matching vLLM's two-segment
-/// reuse rule. The return value is in tokens and can be fractional because a
-/// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
-    let device_blocks = crate::kv_index::layout::full_attention_prefix(
-        candidate
-            .matches
-            .iter()
-            .filter(|hit| hit.tier == StorageTier::Device)
-            .flat_map(|hit| hit.segments.iter().copied()),
-    )
-    // vLLM must recompute the last prompt token to obtain logits. Local
-    // GPU prefix reuse is block-aligned, so never credit its final block
-    // when that block ends at the prompt boundary.
-    .min(
-        candidate
-            .input_tokens
-            .saturating_sub(1)
-            .checked_div(params.block_size as usize)
-            .unwrap_or(0)
-            .min(u32::MAX as usize) as u32,
-    );
-
-    let mut best_continuation = 0.0_f64;
-    for hit in candidate
-        .matches
-        .iter()
-        .filter(|hit| hit.tier != StorageTier::Device)
-    {
-        for &(start, end) in &hit.segments {
-            if start <= device_blocks && device_blocks < end {
-                let blocks = end - device_blocks;
-                let credit = params.transfer_credits.for_tier(hit.tier);
-                best_continuation = best_continuation.max(f64::from(blocks) * credit);
-            }
-        }
-    }
-
-    let credited_blocks = f64::from(device_blocks) + best_continuation;
-    // External reuse may have a different alignment, but it cannot eliminate
-    // the last-token logits work either.
-    (credited_blocks * f64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as f64)
-}
-
-fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
-    if let Some(tokens) = candidate.prefill_tokens {
-        return tokens;
-    }
-    // Round remaining work up: a fractional transfer credit never erases a
-    // whole token of compute that was not fully credited.
-    ((candidate.input_tokens as f64 - credited_tokens(candidate, params)).max(0.0)).ceil() as u64
-}
-
 pub fn cost_components(candidate: &CandidateView<'_>, params: &CostParams) -> CostComponents {
     let new_prefill_tokens = request_prefill_tokens(candidate, params);
     CostComponents {
@@ -1060,6 +951,12 @@ struct SelectionPlan {
     grouped: Vec<Vec<TierMatch>>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
+    /// Unfiltered index hits (all targets) from each candidate's own prompt
+    /// lookup, aligned by position. `Some` only when a transfer planner is set,
+    /// the candidate has exactly one prompt, and its lookup was allowed to
+    /// credit; `None` means the candidate's prompt residency is unknown.
+    /// Empty when no planner is set, so read it with `get`.
+    peer_hits: Vec<Option<Arc<[TierMatch]>>>,
     has_tokens: bool,
 }
 
@@ -1081,8 +978,62 @@ pub struct KvAwarePolicy {
     affinity: Arc<KvAffinityTable>,
     /// Serializes load sampling, selection, and reservation.
     selection_lock: Mutex<()>,
+    /// Test-only: the plan of the latest successful selection.
+    #[cfg(test)]
+    last_transfer_plan: Mutex<Option<PeerFetchPlan>>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
+    /// Opt-in transfer planner; `None` leaves selection untouched.
+    transfer_planner: Option<Arc<dyn PeerFetchPlanner>>,
+    /// Peer transfer registrations; mutated under `selection_lock`, except
+    /// the lock-free `pin_trusted_host` (see `peer_directory`).
+    peers: PeerDirectory,
+    /// Source of `PeerFetchPlan::plan_id`; starts at 1 so 0 means unassigned.
+    next_transfer_plan_id: AtomicU64,
+    /// Active-mode peer fetch; `None` unless the policy was built active.
+    peer_fetch: Option<PeerFetchState>,
+}
+
+/// The registrations a transfer plan was checked against. The grant
+/// revalidates them so a fetch never targets a worker the planner did not see.
+struct PlannedPeers<'a> {
+    destination: PlannedPeer<'a>,
+    /// Every qualifying source in rank order with the plan made for it; the
+    /// grant uses the first one that passes its send-time checks. Never
+    /// empty.
+    sources: Vec<(PeerFetchPlan, PlannedPeer<'a>)>,
+}
+
+/// One worker as the planner saw it.
+struct PlannedPeer<'a> {
+    url: &'a str,
+    /// The worker's `TargetBinding::generation` in the plan's snapshot.
+    generation: u64,
+    registration: Option<Arc<PeerRegistration>>,
+}
+
+/// What `plan_transfer_for_pick` plans from: the selection snapshot plus the
+/// picked position.
+struct PlanInputs<'a, 'w> {
+    planner: &'a dyn PeerFetchPlanner,
+    workers: &'w [Arc<dyn Worker>],
+    plan: &'a SelectionPlan,
+    candidates: &'a [CandidateView<'a>],
+    /// Index of the picked candidate.
+    position: usize,
+    /// The pick came from a session binding, so no transfer is planned.
+    used_binding: bool,
+    /// Whether the candidate at an index is excluded as a source.
+    excluded: &'a dyn Fn(usize) -> bool,
+}
+
+/// Active-mode state: the per-source cap and the runtime kill switch.
+#[derive(Debug)]
+struct PeerFetchState {
+    limiter: Arc<PeerFetchLimiter>,
+    /// Kill switch. Policies built by a `PolicyRegistry` share the
+    /// registry's flag, so one store flips all of them.
+    enabled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -1136,14 +1087,159 @@ impl KvAwarePolicy {
             decode_tie_cursor: AtomicU64::new(0),
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
+            #[cfg(test)]
+            last_transfer_plan: Mutex::new(None),
             next_generation: AtomicU64::new(1),
+            transfer_planner: None,
+            peers: PeerDirectory::new(),
+            next_transfer_plan_id: AtomicU64::new(1),
+            peer_fetch: None,
+        }
+    }
+
+    /// Build the policy in active mode: planned requests get a peer fetch
+    /// grant, at most `max_inflight_per_source` at a time per source worker.
+    /// `enabled` is the kill switch flag, owned by the caller: every policy
+    /// built with the same flag is enabled and disabled together, and the
+    /// flag's current value applies from the start.
+    pub(crate) fn with_shared_peer_fetch(
+        mut self,
+        max_inflight_per_source: usize,
+        enabled: Arc<AtomicBool>,
+    ) -> Self {
+        self.peer_fetch = Some(PeerFetchState {
+            limiter: PeerFetchLimiter::new(max_inflight_per_source),
+            enabled,
+        });
+        self
+    }
+
+    /// Whether the policy was built in active mode, whatever the current
+    /// state of its kill switch.
+    pub fn is_peer_fetch_active_mode(&self) -> bool {
+        self.peer_fetch.is_some()
+    }
+
+    /// Whether planned requests are currently acted on (active mode) rather
+    /// than only reported (shadow mode).
+    pub fn peer_fetch_enabled(&self) -> bool {
+        self.peer_fetch
+            .as_ref()
+            .is_some_and(|state| state.enabled.load(Ordering::Acquire))
+    }
+
+    /// Runtime kill switch: `false` drops back to shadow mode for requests
+    /// selected from now on (in-flight fetches finish normally); `true`
+    /// re-enables active mode. Returns the resulting state. The flag may be
+    /// shared: a policy built by a `PolicyRegistry` stores to the registry's
+    /// flag, which flips every active policy that registry built (see
+    /// `PolicyRegistry::set_peer_fetch_enabled`). A policy that was not built
+    /// active has no peer fetch state, so it stays as built and this returns
+    /// `false`. Test-only: production uses
+    /// `PolicyRegistry::set_peer_fetch_enabled_if_active`.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn set_peer_fetch_enabled(&self, enabled: bool) -> bool {
+        match &self.peer_fetch {
+            Some(state) => {
+                super::store_peer_fetch_enabled(&state.enabled, enabled);
+                enabled
+            }
+            None => false,
+        }
+    }
+
+    /// In-flight peer fetches against a source worker (test and diagnostics).
+    pub fn peer_fetch_inflight(&self, source_url: &str) -> usize {
+        self.peer_fetch
+            .as_ref()
+            .map_or(0, |state| state.limiter.inflight(source_url))
+    }
+
+    /// Enable transfer planning. Plans are attached to receipts
+    /// but never change routing.
+    pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn PeerFetchPlanner>) -> Self {
+        self.transfer_planner = Some(planner);
+        self
+    }
+
+    /// Whether a shadow transfer planner is installed.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) fn has_transfer_planner(&self) -> bool {
+        self.transfer_planner.is_some()
+    }
+
+    /// Declare what a worker can do for KV transfer. Replaced on re-register;
+    /// the worker's reported endpoint is kept.
+    /// Survives `unregister_target`: only engine-reported capabilities are
+    /// dropped when a worker is removed.
+    pub fn register_transfer_capability(
+        &self,
+        worker_url: impl Into<String>,
+        capability: TransferCapability,
+    ) {
+        let worker_url = worker_url.into();
+        let _guard = self.selection_lock.lock();
+        self.peers
+            .register_transfer_capability(&worker_url, capability);
+    }
+
+    /// Apply (or clear, with `None`) the engine's validated peer-lookup record
+    /// for a registered worker. Runs under the selection lock that register
+    /// and unregister use, and ignores a worker that is no longer registered,
+    /// so a late discovery result cannot resurrect entries for a removed one.
+    ///
+    /// A static capability for the worker wins over the engine record (an
+    /// operator override); the address is still stored. With `None`, only an
+    /// engine-sourced capability is removed. Tests only: production applies
+    /// records through `apply_peer_lookup_locked`.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn apply_peer_lookup(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
+        let _guard = self.selection_lock.lock();
+        self.apply_peer_lookup_locked(worker_url, record);
+    }
+
+    /// `apply_peer_lookup` for a caller that holds `selection_lock`.
+    fn apply_peer_lookup_locked(&self, worker_url: &str, record: Option<&PeerLookupRecord>) {
+        if !self.targets.contains_key(worker_url) {
+            return;
+        }
+        self.peers.apply_lookup(worker_url, record);
+    }
+
+    /// Where `worker_url` accepts peer KV fetches, if its engine reported a
+    /// valid record. A capability without an address can be planned but not
+    /// fetched; active mode requires this on the source.
+    pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
+        self.peers.peer_endpoint(worker_url)
+    }
+
+    /// Register a pre-validated capability table (see
+    /// `peer_fetch_capability::parse_static_capabilities`). Workers not in the
+    /// table keep whatever they had.
+    pub fn register_static_capabilities(
+        &self,
+        capabilities: impl IntoIterator<Item = (String, (TransferCapability, Option<Arc<str>>))>,
+    ) {
+        for (url, (capability, pin)) in capabilities {
+            if let Some(pin) = pin {
+                self.peers.pin_trusted_host(url.clone(), pin);
+            }
+            self.register_transfer_capability(url, capability);
         }
     }
 
     pub fn register_target(&self, worker_url: impl Into<String>, target: RoutableTarget) {
         let _guard = self.selection_lock.lock();
+        self.register_target_locked(worker_url.into(), target);
+    }
+
+    /// `register_target` for a caller that holds `selection_lock`.
+    fn register_target_locked(&self, worker_url: String, target: RoutableTarget) {
         self.targets.insert(
-            worker_url.into(),
+            worker_url,
             Arc::new(TargetBinding {
                 target,
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
@@ -1162,11 +1258,28 @@ impl KvAwarePolicy {
         cache_key: CacheKey,
         matches: Arc<dyn TieredMatchProvider>,
     ) {
-        let shared_prefix = matches.shared_prefix_lookup(target.dp_rank);
         let _guard = self.selection_lock.lock();
-        let block_size = cache_key.block_size;
-        self.targets.insert(
+        self.register_target_with_cache_identity_locked(
             worker_url.into(),
+            target,
+            cache_key,
+            matches,
+        );
+    }
+
+    /// `register_target_with_cache_identity` for a caller that holds
+    /// `selection_lock`.
+    fn register_target_with_cache_identity_locked(
+        &self,
+        worker_url: String,
+        target: RoutableTarget,
+        cache_key: CacheKey,
+        matches: Arc<dyn TieredMatchProvider>,
+    ) {
+        let block_size = cache_key.block_size;
+        let shared_prefix = matches.shared_prefix_lookup(target.dp_rank);
+        self.targets.insert(
+            worker_url,
             Arc::new(TargetBinding {
                 target,
                 generation: self.next_generation.fetch_add(1, Ordering::AcqRel),
@@ -1180,6 +1293,9 @@ impl KvAwarePolicy {
 
     pub fn unregister_target(&self, worker_url: &str) {
         let _guard = self.selection_lock.lock();
+        // Static capabilities are operator config and outlive the worker; only
+        // an engine-reported one is dropped with it.
+        self.peers.drop_engine_owned(worker_url);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
                 slot_manager.unregister_target(&binding.target);
@@ -1332,6 +1448,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
                 eligibility: None,
+                allow_transfer_plan: true,
             },
             lora_name,
             cache_salt,
@@ -1382,6 +1499,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility: None,
+                allow_transfer_plan: true,
             },
             lora_name,
             cache_salt,
@@ -1426,6 +1544,7 @@ impl KvAwarePolicy {
                         .map(|tokens| tokens.unwrap_or(max_known_input))
                         .collect(),
                     prefill_tokens: vec![None; count],
+                    peer_hits: Vec::new(),
                     has_tokens: max_known_input > 0,
                 }
             } else {
@@ -1525,6 +1644,8 @@ impl KvAwarePolicy {
                 "KV prefix decision"
             );
             // Reserve the actual target's slot and worker load before unlocking.
+            // This is all the routing state the selection changes, so it is the
+            // only work that must stay serialized with the pick above.
             let slot = self.slot_manager.as_ref().map(|manager| {
                 manager.begin_prefill(&target, new_prefill_tokens);
                 KvRequestSlot::new(manager.clone(), target, new_prefill_tokens, record.take())
@@ -1538,14 +1659,296 @@ impl KvAwarePolicy {
             if let Some(worker) = workers.get(worker_index) {
                 worker.increment_load();
             }
+            drop(guard);
+            // Planning and the grant read only the snapshot (`plan`,
+            // `candidates`) plus self-synchronized state (`DashMap`s, the
+            // limiter, an atomic id), so they run outside the lock. If a
+            // source unregisters in between, the grant sees a changed
+            // registration and falls back to the next planned source; if none
+            // can be granted the request goes out unchanged.
+            let transfer = self.transfer_planner.as_deref().and_then(|planner| {
+                if !input.allow_transfer_plan {
+                    PeerFetchPlanOutcome::Skipped(PeerFetchSkip::PromptLogprobs).record();
+                    return None;
+                }
+                self.plan_transfer_for_pick(PlanInputs {
+                    planner,
+                    workers,
+                    plan: &plan,
+                    candidates: &candidates,
+                    position,
+                    used_binding,
+                    excluded: &excluded,
+                })
+            });
+            #[cfg(test)]
+            {
+                *self.last_transfer_plan.lock() =
+                    transfer.as_ref().map(|(transfer, _)| transfer.clone());
+            }
+            let grpc_destination = workers
+                .get(worker_index)
+                .is_some_and(|w| w.connection_mode() == ConnectionMode::Grpc);
+            let peer_fetch = transfer.as_ref().and_then(|(transfer, planned)| {
+                self.peer_fetch_grant(transfer, planned, grpc_destination)
+            });
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
                 decision,
                 slot,
+                peer_fetch,
             });
         }
         None
+    }
+
+    /// Active mode: turn a plan into a fetch address and an in-flight slot.
+    /// `None` (counted) when the destination registration changed since
+    /// planning (`registration_changed`), or when no ranked source could be
+    /// granted: each is tried in rank order and the first that passes its
+    /// send-time checks wins. When none does, the top source's failure is
+    /// counted (`registration_changed`, `no_peer_endpoint`,
+    /// `untrusted_endpoint` or `inflight_cap`), so a policy with a single
+    /// qualifying source reports what it always did. `None` (not counted) in
+    /// shadow mode. The endpoint comes from the registration the planner
+    /// checked, never a fresh lookup. Does not need `selection_lock`: it reads
+    /// `peers`, `targets` and the limiter, which synchronize themselves.
+    fn peer_fetch_grant(
+        &self,
+        transfer: &PeerFetchPlan,
+        planned: &PlannedPeers<'_>,
+        grpc_destination: bool,
+    ) -> Option<PeerFetchGrant> {
+        let state = self
+            .peer_fetch
+            .as_ref()
+            .filter(|state| state.enabled.load(Ordering::Acquire))?;
+        // The HTTP send path cannot add fetch params for a gRPC destination,
+        // so a slot taken here would be held for nothing.
+        if grpc_destination {
+            PeerFetchRequestOutcome::GrpcDestination.record();
+            return None;
+        }
+        // Discovery or unregistration may have replaced the destination's
+        // record after the planner checked it. Skip rather than fetch into a
+        // worker the plan did not cover. Checked before any source so no slot
+        // is taken for a fetch that cannot happen.
+        if !self.planned_peer_is_current(&planned.destination) {
+            PeerFetchRequestOutcome::RegistrationChanged.record();
+            tracing::debug!(
+                plan_id = transfer.plan_id,
+                changed = "destination",
+                "KV transfer skipped: registration changed since planning"
+            );
+            return None;
+        }
+        let mut top_failure = None;
+        for (rank, (_, source)) in planned.sources.iter().enumerate() {
+            match self.grant_from_source(state, transfer.plan_id, source) {
+                Ok(grant) => {
+                    if rank > 0 {
+                        tracing::debug!(
+                            plan_id = transfer.plan_id,
+                            rank,
+                            source = source.url,
+                            "KV transfer falling back to a lower-ranked source"
+                        );
+                    }
+                    return Some(grant);
+                }
+                Err(failure) => {
+                    top_failure.get_or_insert(failure);
+                }
+            }
+        }
+        top_failure?.record();
+        None
+    }
+
+    /// The send-time checks for one source, in order: its registration is
+    /// still the planned one, it reports an endpoint, the endpoint's host is
+    /// trusted for it, and it has a free in-flight slot. Returns the first
+    /// failure without recording it: the caller counts only the top source's
+    /// failure, and only when no source can be granted. The untrusted-endpoint
+    /// WARN is logged for every source tried, since a misreported host is
+    /// worth an operator's attention even when another source covers for it.
+    fn grant_from_source(
+        &self,
+        state: &PeerFetchState,
+        plan_id: u64,
+        source: &PlannedPeer<'_>,
+    ) -> Result<PeerFetchGrant, PeerFetchRequestOutcome> {
+        // Discovery or unregistration may have replaced the source's record
+        // after the planner checked it. Skip rather than fetch from a worker
+        // the plan did not cover.
+        if !self.planned_peer_is_current(source) {
+            tracing::debug!(
+                plan_id,
+                changed = "source",
+                source = source.url,
+                "KV transfer source skipped: registration changed since planning"
+            );
+            return Err(PeerFetchRequestOutcome::RegistrationChanged);
+        }
+        let Some(endpoint) = source
+            .registration
+            .as_ref()
+            .and_then(|reg| reg.endpoint.clone())
+        else {
+            return Err(PeerFetchRequestOutcome::NoPeerEndpoint);
+        };
+        if !self.peers.endpoint_is_trusted(source.url, &endpoint) {
+            tracing::warn!(
+                plan_id,
+                source = source.url,
+                host = %endpoint.host,
+                "peer fetch skipped: reported side-channel host is not trusted for this worker"
+            );
+            return Err(PeerFetchRequestOutcome::UntrustedEndpoint);
+        }
+        let Some(permit) = state.limiter.try_acquire(source.url) else {
+            return Err(PeerFetchRequestOutcome::InflightCap);
+        };
+        Ok(PeerFetchGrant { endpoint, permit })
+    }
+
+    /// Whether the worker's registration epoch and target generation still
+    /// match what the planner saw. Both absent counts as unchanged, and a
+    /// never-registered worker (generation 0) must still be unregistered.
+    fn planned_peer_is_current(&self, peer: &PlannedPeer<'_>) -> bool {
+        let epoch_matches = match (self.peers.epoch_of(peer.url), &peer.registration) {
+            (None, None) => true,
+            (Some(current), Some(planned)) => current == planned.epoch,
+            _ => false,
+        };
+        epoch_matches
+            && self
+                .targets
+                .get(peer.url)
+                .map_or(peer.generation == 0, |binding| {
+                    binding.generation == peer.generation
+                })
+    }
+
+    /// Ask the planner whether a peer fetch is worth it for the picked
+    /// position. Pure computation over the selection snapshot (needs no
+    /// `selection_lock`); records the outcome and never touches routing. In
+    /// shadow mode the plan is only reported; in active mode the caller turns it
+    /// into a fetch grant, revalidating the returned `PlannedPeers`.
+    fn plan_transfer_for_pick<'w>(
+        &self,
+        inputs: PlanInputs<'_, 'w>,
+    ) -> Option<(PeerFetchPlan, PlannedPeers<'w>)> {
+        let PlanInputs {
+            planner,
+            workers,
+            plan,
+            candidates,
+            position,
+            used_binding,
+            excluded,
+        } = inputs;
+        let mut registrations: Vec<Option<Arc<PeerRegistration>>> = Vec::new();
+        let outcome = if used_binding {
+            PeerFetchOutcome::skip(PeerFetchSkip::SessionBinding)
+        } else if !plan.has_tokens {
+            // Also covers the load-only fallback attempt.
+            PeerFetchOutcome::skip(PeerFetchSkip::MissingTokens)
+        } else {
+            // Clone each registration's `Arc` so no map ref is held while
+            // planning; writers replace whole records, so each peer's
+            // capability is read from one consistent snapshot.
+            registrations = plan
+                .healthy
+                .iter()
+                .map(|&index| self.peers.registration(workers[index].url()))
+                .collect();
+            let peers: Vec<PeerInput<'_>> = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, candidate)| PeerInput {
+                    candidate,
+                    cache_key: plan.bindings[i].cache_key.as_ref(),
+                    capability: registrations[i]
+                        .as_deref()
+                        .and_then(|reg| reg.capability.as_ref()),
+                    excluded: excluded(i),
+                })
+                .collect();
+            planner.plan(&PeerFetchPlannerInput {
+                peers: &peers,
+                picked: position,
+                destination_hits: plan
+                    .peer_hits
+                    .get(position)
+                    .and_then(|hits| hits.as_deref()),
+                cost_params: &self.params,
+            })
+        };
+        if let Some(estimate) = &outcome.estimate {
+            PeerFetchCostPath::Fetch.record(estimate.fetch_ms);
+            PeerFetchCostPath::Wait.record(estimate.wait_ms);
+        }
+        match outcome.result {
+            Ok(mut plans) => {
+                // One id per request: every candidate source shares it.
+                let plan_id = self.next_transfer_plan_id.fetch_add(1, Ordering::Relaxed);
+                for plan in &mut plans {
+                    plan.plan_id = plan_id;
+                }
+                // Metrics and logs describe the top plan; the rest are only
+                // fallbacks for the grant.
+                debug_assert!(!plans.is_empty(), "planner returned no plans");
+                let transfer = plans.first().cloned()?;
+                PeerFetchPlanOutcome::Planned.record();
+                crate::metrics::RouterMetrics::record_peer_fetch_estimated_saved_ms(
+                    transfer.estimated_saved_prefill_ms,
+                );
+                tracing::debug!(
+                    plan_id,
+                    source = %transfer.source.instance_id,
+                    destination = %transfer.destination.instance_id,
+                    credited_tokens = transfer.credited_tokens,
+                    candidate_sources = plans.len(),
+                    "KV transfer plan"
+                );
+                // Record what the planner saw for each end, by position. A
+                // source that cannot be resolved is dropped, so the grant
+                // never tries a worker the plan did not cover.
+                let planned_peer = |target: &RoutableTarget| {
+                    let position = plan
+                        .bindings
+                        .iter()
+                        .position(|binding| &binding.target == target)?;
+                    Some(PlannedPeer {
+                        url: workers[*plan.healthy.get(position)?].url(),
+                        generation: plan.bindings[position].generation,
+                        registration: registrations.get(position)?.clone(),
+                    })
+                };
+                let destination = planned_peer(&transfer.destination)?;
+                let sources: Vec<_> = plans
+                    .into_iter()
+                    .filter_map(|source_plan| {
+                        let source = planned_peer(&source_plan.source)?;
+                        Some((source_plan, source))
+                    })
+                    .collect();
+                (!sources.is_empty()).then_some((
+                    transfer,
+                    PlannedPeers {
+                        destination,
+                        sources,
+                    },
+                ))
+            }
+            Err(skip) => {
+                PeerFetchPlanOutcome::Skipped(skip).record();
+                tracing::debug!(skip = skip.label(), "KV transfer plan skipped");
+                None
+            }
+        }
     }
 
     /// Position of a record's target among the plan's healthy bindings while
@@ -1646,6 +2049,7 @@ impl KvAwarePolicy {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("missing_tokens");
         }
         let mut lookups = crate::metrics::PlacementLookups::default();
+        let keep_peer_hits = self.transfer_planner.is_some();
         let mut query_cache = PromptHashes::default();
         query_cache.hashes.stop_at_gap = self.prefix_scoring;
         query_cache.hashes.single_target = healthy
@@ -1695,12 +2099,24 @@ impl KvAwarePolicy {
                     .count()
             });
             lookups.record_count("miss", count as u64);
+            // Every eligible rank confirmed a miss, so residency is known and
+            // empty: the planner sees no longer peer prefix rather than an
+            // unknown destination.
+            let peer_hits = if keep_peer_hits {
+                healthy
+                    .iter()
+                    .map(|&i| input.allows_credit(i, workers.len()).then(|| Arc::from([])))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             return Some(SelectionPlan {
                 healthy,
                 bindings,
                 grouped: vec![Vec::new(); size],
                 input_tokens: vec![tokens.len(); size],
                 prefill_tokens: vec![None; size],
+                peer_hits,
                 has_tokens,
             });
         }
@@ -1708,7 +2124,7 @@ impl KvAwarePolicy {
         let mut grouped = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
-        for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
+        for ((binding, prompts), &worker_index) in bindings.iter().zip(&prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
             let mut single_matches = Vec::new();
@@ -1761,14 +2177,102 @@ impl KvAwarePolicy {
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
         }
+        let peer_hits = if keep_peer_hits && has_tokens && credit_fallback.is_none() {
+            let hashes = &mut query_cache.hashes;
+            Self::destination_prompt_hits(
+                &bindings,
+                &healthy,
+                &prompts,
+                &grouped,
+                |index| input.allows_credit(index, workers.len()),
+                |binding, tokens| {
+                    // A peer asked a different prompt: look the destination's
+                    // prompt up against the peer, outside the placement
+                    // metrics, which count only routing lookups.
+                    let tokens = hashes.canonical_prompt(tokens);
+                    let mut hits = binding.matches.matches_with_cache(
+                        tokens,
+                        binding.block_size,
+                        lora_name,
+                        binding.target.dp_rank,
+                        hashes,
+                    );
+                    hits.retain(|hit| hit.target == binding.target);
+                    hits
+                },
+            )
+        } else {
+            Vec::new()
+        };
         Some(SelectionPlan {
             healthy,
             bindings,
             grouped,
             input_tokens,
             prefill_tokens,
+            peer_hits,
             has_tokens,
         })
+    }
+
+    /// Each candidate's own prompt as seen across every worker that shares its
+    /// cache identity, for the transfer planner. Lookups are target-scoped, so
+    /// a candidate's lookup holds only its own hits. For a peer asked the same
+    /// prompt, its per-target matches are reused; for a peer asked a different
+    /// prompt, `lookup` reads the destination's prompt against that peer.
+    /// Together that is what one unscoped lookup of the prompt returned before
+    /// providers were target-scoped. Peers whose credit is not allowed are left
+    /// out. `Some` only for a candidate with exactly one prompt whose lookup
+    /// was allowed to credit; `None` means its prompt residency is unknown.
+    fn destination_prompt_hits<'t>(
+        bindings: &[WorkerBinding],
+        healthy: &[usize],
+        prompts: &[WorkerPrompts<'t>],
+        grouped: &[Vec<TierMatch>],
+        allows_credit: impl Fn(usize) -> bool,
+        mut lookup: impl FnMut(&TargetBinding, &'t [u32]) -> Vec<TierMatch>,
+    ) -> Vec<Option<Arc<[TierMatch]>>> {
+        let known: Vec<Option<&'t [u32]>> = prompts
+            .iter()
+            .zip(healthy)
+            .map(|(prompts, &index)| prompts.single().filter(|_| allows_credit(index)))
+            .collect();
+        let same_prompt = |a: &[u32], b: &[u32]| std::ptr::eq(a, b) || a == b;
+        // Destinations with the same identity and prompt share one result.
+        let mut results: Vec<(usize, Arc<[TierMatch]>)> = Vec::new();
+        let mut out = Vec::with_capacity(known.len());
+        for position in 0..known.len() {
+            let Some(tokens) = known[position] else {
+                out.push(None);
+                continue;
+            };
+            let key = &bindings[position].cache_key;
+            if let Some((_, hits)) = results.iter().find(|(first, _)| {
+                bindings[*first].cache_key == *key
+                    && known[*first].is_some_and(|ids| same_prompt(ids, tokens))
+            }) {
+                out.push(Some(Arc::clone(hits)));
+                continue;
+            }
+            let mut hits = Vec::new();
+            for peer in 0..known.len() {
+                let Some(ids) = known[peer] else {
+                    continue;
+                };
+                if bindings[peer].cache_key != *key {
+                    continue;
+                }
+                if same_prompt(ids, tokens) {
+                    hits.extend(grouped[peer].iter().cloned());
+                } else {
+                    hits.extend(lookup(&bindings[peer], tokens));
+                }
+            }
+            let hits: Arc<[TierMatch]> = Arc::from(hits);
+            results.push((position, Arc::clone(&hits)));
+            out.push(Some(hits));
+        }
+        out
     }
 
     fn candidate_views<'p>(
@@ -1929,6 +2433,19 @@ impl KvAwarePolicy {
                 components: components[position],
             },
         )
+    }
+
+    /// The pick and cost decision a selection would make for `token_ids` right
+    /// now, without reserving anything. Used by the peer fetch end-to-end tests
+    /// to wait for the index to converge.
+    #[doc(hidden)]
+    pub fn decision_for(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        token_ids: Option<&[u32]>,
+    ) -> Option<CostDecision> {
+        self.select_worker_pure(workers, token_ids, None, None)
+            .map(|(_, decision)| decision)
     }
 }
 
@@ -2137,6 +2654,7 @@ impl KvAwareOps for KvAwarePolicy {
                             prefill_tokens: None,
                         },
                         &params,
+                        0,
                     ) as u64;
                     let reused = if nixl_pull {
                         binding.matches.nixl_decode_credit(
@@ -2323,12 +2841,26 @@ impl KvAwareOps for KvAwarePolicy {
             ),
             dp_rank: worker.dp_rank().unwrap_or(0) as u32,
         };
+        // Each registered worker is one (URL, DP rank): attach the record whose
+        // rank matches, rank 0 for a worker without a dp_rank.
+        let rank = worker.dp_rank().unwrap_or(0) as u32;
+        // One lock acquisition covers the target and its peer registration.
+        let _guard = self.selection_lock.lock();
         match (info.and_then(|info| info.cache_key.clone()), matches) {
             (Some(cache_key), Some(matches)) => {
-                self.register_target_with_cache_identity(worker.url(), target, cache_key, matches);
+                self.register_target_with_cache_identity_locked(
+                    worker.url().to_owned(),
+                    target,
+                    cache_key,
+                    matches,
+                );
             }
-            _ => self.register_target(worker.url(), target),
+            _ => self.register_target_locked(worker.url().to_owned(), target),
         }
+        self.apply_peer_lookup_locked(
+            worker.url(),
+            info.and_then(|info| info.peer_lookup.get(&rank)),
+        );
     }
 
     fn unregister_worker(&self, worker_url: &str) {
@@ -2338,20 +2870,16 @@ impl KvAwareOps for KvAwarePolicy {
     fn select_worker_with_qualified_inputs(
         &self,
         workers: &[Arc<dyn Worker>],
-        tokens: KvRequestTokens<'_>,
+        input: QualifiedKvInput<'_>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
-        eligibility: Option<&[bool]>,
     ) -> Option<KvSelectionReceipt> {
         KvAwarePolicy::select_worker_with_qualified_inputs(
             self,
             workers,
-            QualifiedKvInput {
-                tokens,
-                eligibility,
-            },
+            input,
             lora_name,
             cache_salt,
             affinity_key,
@@ -2360,11 +2888,21 @@ impl KvAwareOps for KvAwarePolicy {
     }
 }
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+impl KvAwarePolicy {
+    /// Plan of the latest successful selection (`None` when none was made).
+    fn last_transfer_plan(&self) -> Option<PeerFetchPlan> {
+        self.last_transfer_plan.lock().clone()
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
+    use crate::kv_index::StorageTier;
     use crate::request_identity::{resolve_affinity_identity, IdentityFields};
     use http::HeaderMap;
     use serde_json::Value as JsonValue;
@@ -2518,6 +3056,7 @@ mod tests {
                     QualifiedKvInput {
                         tokens: KvRequestTokens::PerWorker(inputs),
                         eligibility: None,
+                        allow_transfer_plan: true,
                     },
                     None,
                     None,
@@ -2747,6 +3286,7 @@ mod tests {
                         QualifiedKvInput {
                             tokens: KvRequestTokens::Shared(Some(&ids)),
                             eligibility: Some(&[allowed]),
+                            allow_transfer_plan: true,
                         },
                         None,
                         None,
@@ -2826,6 +3366,7 @@ mod tests {
                     QualifiedKvInput {
                         tokens: KvRequestTokens::Shared(Some(&ids)),
                         eligibility: None,
+                        allow_transfer_plan: true,
                     },
                     None,
                     None,
@@ -2923,12 +3464,15 @@ mod tests {
                     .unwrap()
                     .select_worker_with_qualified_inputs(
                         &workers,
-                        KvRequestTokens::Shared(Some(&ids)),
+                        QualifiedKvInput {
+                            tokens: KvRequestTokens::Shared(Some(&ids)),
+                            eligibility: Some(mask),
+                            allow_transfer_plan: true,
+                        },
                         None,
                         None,
                         None,
                         excluded,
-                        Some(mask),
                     )
                     .unwrap_or_else(|| panic!("{case}: no worker selected for {mask:?}"))
             };
@@ -2962,6 +3506,7 @@ mod tests {
                             QualifiedKvInput {
                                 tokens: KvRequestTokens::Shared(Some(&ids)),
                                 eligibility: Some(&mask),
+                                allow_transfer_plan: true,
                             },
                             None,
                             None,
@@ -3204,7 +3749,7 @@ mod tests {
                 input_tokens: tokens,
             };
             assert_eq!(
-                credited_tokens(&candidate, &params),
+                credited_tokens(&candidate, &params, 0),
                 cached as f64,
                 "tokens={tokens}"
             );
@@ -3790,12 +4335,15 @@ mod tests {
             assert!(ops
                 .select_worker_with_qualified_inputs(
                     &workers,
-                    KvRequestTokens::Shared(Some(&[1, 2])),
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(Some(&[1, 2])),
+                        eligibility,
+                        allow_transfer_plan: true,
+                    },
                     None,
                     None,
                     None,
                     &[],
-                    eligibility,
                 )
                 .is_none());
         }
@@ -5077,6 +5625,1586 @@ mod tests {
                     as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    // Transfer planning ------------------------------------
+
+    struct FixedLoad(HashMap<RoutableTarget, LoadSample>);
+    impl LoadProvider for FixedLoad {
+        fn sample(&self, target: &RoutableTarget) -> LoadSample {
+            self.0.get(target).copied().unwrap_or_default()
+        }
+    }
+
+    struct FixedMatches(Vec<TierMatch>);
+    impl TieredMatchProvider for FixedMatches {
+        fn matches(&self, _: &[u32], _: u32, _: Option<&str>, _: u32) -> Vec<TierMatch> {
+            self.0.clone()
+        }
+    }
+
+    /// One worker (`target`) holds `held` on device. A query matches the full
+    /// blocks it shares with `held` from the start, as a chained-hash index
+    /// would.
+    struct PrefixMatches {
+        target: RoutableTarget,
+        held: Vec<u32>,
+    }
+    impl TieredMatchProvider for PrefixMatches {
+        fn matches(
+            &self,
+            tokens: &[u32],
+            block_size: u32,
+            _: Option<&str>,
+            _: u32,
+        ) -> Vec<TierMatch> {
+            let shared = tokens
+                .iter()
+                .zip(&self.held)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let blocks = (shared / block_size as usize) as u32;
+            if blocks == 0 {
+                return Vec::new();
+            }
+            vec![tier_match(
+                &self.target,
+                StorageTier::Device,
+                &[(0, blocks)],
+            )]
+        }
+    }
+
+    fn transfer_policy() -> crate::policies::PeerFetchRules {
+        crate::policies::PeerFetchRules {
+            enabled: true,
+            min_prefix_blocks: 4,
+            require_capability: false,
+            transfer_fixed_ms: 0.0,
+            ..crate::policies::PeerFetchRules::from(
+                &crate::config::types::PeerFetchConfig::default(),
+            )
+        }
+    }
+
+    fn capability(fingerprint: &str) -> TransferCapability {
+        TransferCapability {
+            can_export: true,
+            can_import: true,
+            connector: Arc::from("nixl"),
+            connector_version: Arc::from("1"),
+            layout_fingerprint: Arc::from(fingerprint),
+        }
+    }
+
+    /// Busy worker `a` holds 16 device blocks (32 tokens) of a 40-token prompt;
+    /// idle worker `b` holds nothing. `b` is the pick.
+    fn transfer_fixture(
+        planner: bool,
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        transfer_fixture_with_urls(planner, ["http://a", "http://b"])
+    }
+
+    fn transfer_fixture_with_urls(
+        planner: bool,
+        urls: [&str; 2],
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let workers: Vec<Arc<dyn Worker>> = urls
+            .iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let targets: Vec<_> = workers.iter().map(|w| target(w.url(), 0)).collect();
+        let load = FixedLoad(HashMap::from([(
+            targets[0].clone(),
+            LoadSample {
+                active_prefill_tokens: 100_000,
+                active_requests: 8,
+            },
+        )]));
+        let params = CostParams {
+            block_size: 2,
+            ..CostParams::default()
+        };
+        let mut policy = KvAwarePolicy::with_components(
+            Arc::new(FixedMatches(vec![])),
+            Arc::new(load),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(0.0)),
+            params,
+        );
+        if planner {
+            policy =
+                policy.with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
+                    policy: transfer_policy(),
+                }));
+        }
+        let matches = Arc::new(FixedMatches(vec![tier_match(
+            &targets[0],
+            StorageTier::Device,
+            &[(0, 16)],
+        )]));
+        for (worker, target) in workers.iter().zip(&targets) {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("m"),
+                    block_size: 2,
+                },
+                matches.clone(),
+            );
+        }
+        (policy, workers, targets)
+    }
+
+    fn transfer_ids() -> Vec<u32> {
+        (0..40).collect()
+    }
+
+    #[test]
+    fn no_planner_leaves_receipts_without_a_transfer() {
+        let (policy, workers, _) = transfer_fixture(false);
+        let ids = transfer_ids();
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert_eq!(receipt.worker_index, 1);
+        assert!(policy.last_transfer_plan().is_none());
+    }
+
+    #[test]
+    fn planner_attaches_shadow_plan_without_changing_the_selection() {
+        let ids = transfer_ids();
+        let (baseline, workers, _) = transfer_fixture(false);
+        let expected = baseline
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        release_receipt(&workers, &expected);
+
+        let (policy, workers, targets) = transfer_fixture(true);
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert_eq!(receipt.worker_index, expected.worker_index);
+        assert_eq!(receipt.new_prefill_tokens, expected.new_prefill_tokens);
+        assert_eq!(receipt.decision, expected.decision);
+        let plan = policy.last_transfer_plan().expect("plan");
+        assert_eq!(plan.source, targets[0]);
+        assert_eq!(plan.destination, targets[1]);
+        assert_eq!(plan.blocks, (0, 16));
+        assert_eq!(plan.credited_tokens, 32);
+        assert_eq!(plan.plan_id, 1);
+        release_receipt(&workers, &receipt);
+        let _again = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert_eq!(policy.last_transfer_plan().unwrap().plan_id, 2);
+    }
+
+    fn peer_endpoint(engine_id: &str, port: u16) -> PeerEndpoint {
+        PeerEndpoint {
+            engine_id: Arc::from(engine_id),
+            host: Arc::from("10.0.0.1"),
+            port,
+            tp_size: 1,
+            dcp_size: 1,
+            pp_size: 1,
+        }
+    }
+
+    /// The capability recorded for `url`, whatever its source.
+    fn capability_of(policy: &KvAwarePolicy, url: &str) -> Option<TransferCapability> {
+        policy
+            .peers
+            .peer_regs
+            .get(url)
+            .and_then(|reg| reg.capability.clone())
+    }
+
+    /// Whether any worker's capability came from an engine record.
+    fn any_engine_owned(policy: &KvAwarePolicy) -> bool {
+        policy.peers.peer_regs.iter().any(|reg| reg.engine_owned)
+    }
+
+    /// Pin `url`'s side-channel host, as `--peer-fetch-capability` would, so a
+    /// fixture address that is not the worker URL's host passes the trust check.
+    fn pin_host(policy: &KvAwarePolicy, url: &str, host: &str) {
+        policy
+            .peers
+            .trusted_hosts
+            .insert(url.to_owned(), Arc::from(host));
+    }
+
+    /// Replace only the endpoint of `url`'s record, with a new `Arc` and epoch.
+    fn set_endpoint(policy: &KvAwarePolicy, url: &str, endpoint: Option<PeerEndpoint>) {
+        let current = policy.peers.peer_regs.get(url).map(|reg| Arc::clone(&reg));
+        let capability = current.as_ref().and_then(|reg| reg.capability.clone());
+        let engine_owned = current.as_ref().is_some_and(|reg| reg.engine_owned);
+        if capability.is_none() && endpoint.is_none() {
+            policy.peers.peer_regs.remove(url);
+            return;
+        }
+        policy.peers.peer_regs.insert(
+            url.to_owned(),
+            Arc::new(PeerRegistration {
+                epoch: policy.peers.next_peer_epoch.fetch_add(1, Ordering::AcqRel),
+                capability,
+                endpoint,
+                engine_owned,
+            }),
+        );
+    }
+
+    /// `transfer_fixture` with the planner and active mode on, and `a` (the
+    /// source) reporting a peer address.
+    fn active_fixture(
+        max_inflight: usize,
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let (policy, workers, targets) = transfer_fixture(true);
+        let policy = policy.with_shared_peer_fetch(max_inflight, Arc::new(AtomicBool::new(true)));
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
+        pin_host(&policy, "http://a", "10.0.0.1");
+        (policy, workers, targets)
+    }
+
+    fn select(policy: &KvAwarePolicy, workers: &[Arc<dyn Worker>]) -> KvSelectionReceipt {
+        policy
+            .select_worker_with_receipt(workers, Some(&transfer_ids()), None, None, None, &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn active_mode_grants_the_sources_address_for_a_plan() {
+        let (policy, workers, _) = active_fixture(4);
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        let grant = receipt.peer_fetch.as_ref().expect("grant");
+        assert_eq!(grant.endpoint, peer_endpoint("engine-a", 5600));
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    /// Value of `metric{outcome="<outcome>"}` in a rendered Prometheus exposition.
+    fn outcome_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        metric: &str,
+        outcome: &str,
+    ) -> u64 {
+        let label = format!("outcome=\"{outcome}\"");
+        handle
+            .render()
+            .lines()
+            .find(|line| line.starts_with(metric) && line.contains(&label))
+            .and_then(|line| line.rsplit(' ').next())
+            .map_or(0, |value| value.parse().expect("counter value"))
+    }
+
+    const PLANS_TOTAL: &str = "vllm_router_peer_fetch_plans_total";
+    const REQUESTS_TOTAL: &str = "vllm_router_peer_fetch_requests_total";
+
+    #[test]
+    fn grpc_destination_plans_but_takes_no_slot() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(
+            outcome_count(&handle, REQUESTS_TOTAL, "grpc_destination"),
+            1
+        );
+    }
+
+    /// A salted request skips the KV lookup, so the destination's residency is
+    /// unknown, not empty: the planner must report `unknown_destination_input`
+    /// rather than reason from an empty hit list (`no_peer` and friends).
+    #[test]
+    fn salted_request_reports_unknown_destination_input() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (policy, workers, _) = active_fixture(4);
+        let receipt = policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&transfer_ids()),
+                None,
+                Some("tenant"),
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(receipt.peer_fetch.is_none());
+        assert!(policy.last_transfer_plan().is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(
+            outcome_count(&handle, PLANS_TOTAL, "unknown_destination_input"),
+            1
+        );
+
+        // An empty salt is no salt: the same request is planned.
+        let _ = policy
+            .select_worker_with_receipt(&workers, Some(&transfer_ids()), None, Some(""), None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_some());
+    }
+
+    #[test]
+    fn shadow_mode_never_grants_even_with_an_address() {
+        let (policy, workers, _) = transfer_fixture(true);
+        set_endpoint(&policy, "http://a", Some(peer_endpoint("engine-a", 5600)));
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert!(!policy.peer_fetch_enabled());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    #[test]
+    fn active_mode_without_a_source_address_plans_but_does_not_grant() {
+        let (policy, workers, _) = active_fixture(4);
+        set_endpoint(&policy, "http://a", None);
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    /// An engine record for `fingerprint` reachable at `engine_id`:`port`.
+    fn engine_record(engine_id: &str, fingerprint: &str, port: u16) -> PeerLookupRecord {
+        PeerLookupRecord {
+            engine_id: engine_id.into(),
+            ..peer_record(fingerprint, port)
+        }
+    }
+
+    /// Active policy whose source `a` and destination `b` both hold engine
+    /// records, applied through the public API.
+    fn planned_grant_fixture() -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let (policy, workers, _) = transfer_fixture(true);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
+        policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
+        policy.apply_peer_lookup("http://b", Some(&engine_record("engine-b", "fp", 5700)));
+        pin_host(&policy, "http://a", "10.0.0.5");
+        (policy, workers)
+    }
+
+    /// Plan the picked destination (`b`) through the production planner and
+    /// return the plan with the registrations it saw.
+    fn plan_for_grant<'w>(
+        policy: &KvAwarePolicy,
+        workers: &'w [Arc<dyn Worker>],
+    ) -> (PeerFetchPlan, PlannedPeers<'w>) {
+        plan_for_grant_at(policy, workers, "http://b")
+    }
+
+    /// [`plan_for_grant`] with the destination at `destination_url`.
+    fn plan_for_grant_at<'w>(
+        policy: &KvAwarePolicy,
+        workers: &'w [Arc<dyn Worker>],
+        destination_url: &str,
+    ) -> (PeerFetchPlan, PlannedPeers<'w>) {
+        let ids = transfer_ids();
+        let plan = policy
+            .prepare_selection(
+                workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
+                None,
+                None,
+            )
+            .expect("snapshot");
+        let candidates = policy.candidate_views(workers, &plan);
+        let position = plan
+            .healthy
+            .iter()
+            .position(|&index| workers[index].url() == destination_url)
+            .expect("destination");
+        policy
+            .plan_transfer_for_pick(PlanInputs {
+                planner: policy.transfer_planner.as_deref().expect("planner"),
+                workers,
+                plan: &plan,
+                candidates: &candidates,
+                position,
+                used_binding: false,
+                excluded: &|_| false,
+            })
+            .expect("plan")
+    }
+
+    /// `registration_changed` count in a rendered Prometheus exposition.
+    fn registration_changed_count(handle: &metrics_exporter_prometheus::PrometheusHandle) -> u64 {
+        handle
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("vllm_router_peer_fetch_requests_total")
+                    && line.contains("outcome=\"registration_changed\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .map_or(0, |value| value.parse().expect("counter value"))
+    }
+
+    /// The grant must refuse: no grant, no slot on `a`, and exactly one
+    /// `registration_changed` count.
+    fn assert_grant_refused_as_changed(
+        policy: &KvAwarePolicy,
+        transfer: &PeerFetchPlan,
+        planned: &PlannedPeers<'_>,
+    ) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(registration_changed_count(&handle), 0);
+        assert!(policy.peer_fetch_grant(transfer, planned, false).is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(registration_changed_count(&handle), 1);
+    }
+
+    #[test]
+    fn grant_skips_when_source_endpoint_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        // The engine restarted: new engine id and port, same layout.
+        policy.apply_peer_lookup("http://a", Some(&engine_record("a-rank0", "fp", 5601)));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_source_capability_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.register_transfer_capability("http://a", capability("other-layout"));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_source_was_reregistered_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let epoch = policy.peers.peer_regs.get("http://a").unwrap().epoch;
+        let generation = policy.targets.get("http://a").unwrap().generation;
+        // Same target, same record: only the generation moves.
+        policy.register_target("http://a", transfer.source.clone());
+        assert_eq!(policy.peers.peer_regs.get("http://a").unwrap().epoch, epoch);
+        assert!(policy.targets.get("http://a").unwrap().generation > generation);
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_skips_when_destination_record_changed_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.apply_peer_lookup("http://b", Some(&engine_record("b-new", "fp-new", 5800)));
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    /// Selection plans outside the lock, so the source can unregister between
+    /// the snapshot and the grant. Driving that interleaving deterministically
+    /// is impractical, so this calls the grant directly on a plan made earlier,
+    /// after the source was unregistered: no grant, no limiter slot.
+    #[test]
+    fn grant_skips_when_source_unregistered_after_planning() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        policy.unregister_target("http://a");
+        assert_grant_refused_as_changed(&policy, &transfer, &planned);
+    }
+
+    #[test]
+    fn grant_uses_the_planned_endpoint_when_nothing_changed() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let grant = policy
+            .peer_fetch_grant(&transfer, &planned, false)
+            .expect("grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-a");
+        assert_eq!(grant.endpoint.port, 5600);
+        assert_eq!(
+            Some(grant.endpoint.clone()),
+            planned.sources[0]
+                .1
+                .registration
+                .as_ref()
+                .and_then(|reg| reg.endpoint.clone())
+        );
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn grant_survives_an_identical_record_being_reapplied() {
+        let (policy, workers) = planned_grant_fixture();
+        let (transfer, planned) = plan_for_grant(&policy, &workers);
+        let epoch = policy.peers.peer_regs.get("http://a").unwrap().epoch;
+        policy.apply_peer_lookup("http://a", Some(&engine_record("engine-a", "fp", 5600)));
+        assert_eq!(policy.peers.peer_regs.get("http://a").unwrap().epoch, epoch);
+        let grant = policy
+            .peer_fetch_grant(&transfer, &planned, false)
+            .expect("grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-a");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    /// Active policy over `a`, `b` and `c`. `a` and `b` are busy and hold 16
+    /// and 12 device blocks of a 40-token prompt, so `a` ranks first as a
+    /// source; idle `c` holds nothing and is the pick. All three report an
+    /// engine record, and `a` and `b` report the pinned side-channel host.
+    fn fallback_fixture(max_inflight: usize) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b", "http://c"]
+            .iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let targets: Vec<_> = workers.iter().map(|w| target(w.url(), 0)).collect();
+        let busy = LoadSample {
+            active_prefill_tokens: 100_000,
+            active_requests: 8,
+        };
+        let load = FixedLoad(HashMap::from([
+            (targets[0].clone(), busy),
+            (targets[1].clone(), busy),
+        ]));
+        let policy = KvAwarePolicy::with_components(
+            Arc::new(FixedMatches(vec![])),
+            Arc::new(load),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(0.0)),
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+        )
+        .with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
+            policy: transfer_policy(),
+        }))
+        .with_shared_peer_fetch(max_inflight, Arc::new(AtomicBool::new(true)));
+        let matches = Arc::new(FixedMatches(vec![
+            tier_match(&targets[0], StorageTier::Device, &[(0, 16)]),
+            tier_match(&targets[1], StorageTier::Device, &[(0, 12)]),
+        ]));
+        for (worker, target) in workers.iter().zip(&targets) {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("m"),
+                    block_size: 2,
+                },
+                matches.clone(),
+            );
+        }
+        for (url, engine) in [("a", "engine-a"), ("b", "engine-b"), ("c", "engine-c")] {
+            policy.apply_peer_lookup(
+                &format!("http://{url}"),
+                Some(&engine_record(engine, "fp", 5600)),
+            );
+        }
+        pin_host(&policy, "http://a", "10.0.0.5");
+        pin_host(&policy, "http://b", "10.0.0.5");
+        (policy, workers)
+    }
+
+    /// Plan the fallback fixture's pick (`c`) and check the ranking.
+    fn plan_fallback<'w>(
+        policy: &KvAwarePolicy,
+        workers: &'w [Arc<dyn Worker>],
+    ) -> (PeerFetchPlan, PlannedPeers<'w>) {
+        let (transfer, planned) = plan_for_grant_at(policy, workers, "http://c");
+        let urls: Vec<_> = planned.sources.iter().map(|(_, peer)| peer.url).collect();
+        assert_eq!(urls, ["http://a", "http://b"]);
+        assert_eq!(transfer.source, planned.sources[0].0.source);
+        assert!(planned
+            .sources
+            .iter()
+            .all(|(plan, _)| plan.plan_id == transfer.plan_id));
+        (transfer, planned)
+    }
+
+    /// Run `grant` against a fresh recorder and return its result with a
+    /// counter reader for the request outcomes.
+    fn grant_with_counts(
+        policy: &KvAwarePolicy,
+        transfer: &PeerFetchPlan,
+        planned: &PlannedPeers<'_>,
+    ) -> (Option<PeerFetchGrant>, Vec<(&'static str, u64)>) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let grant = policy.peer_fetch_grant(transfer, planned, false);
+        let counts = [
+            "registration_changed",
+            "no_peer_endpoint",
+            "untrusted_endpoint",
+            "inflight_cap",
+        ]
+        .map(|label| (label, outcome_count(&handle, REQUESTS_TOTAL, label)))
+        .to_vec();
+        (grant, counts)
+    }
+
+    fn count_of(counts: &[(&'static str, u64)], label: &str) -> u64 {
+        counts
+            .iter()
+            .find(|(name, _)| *name == label)
+            .expect("label")
+            .1
+    }
+
+    fn assert_no_failure_recorded(counts: &[(&'static str, u64)]) {
+        assert!(counts.iter().all(|(_, count)| *count == 0), "{counts:?}");
+    }
+
+    #[test]
+    fn grant_falls_back_to_the_next_source_when_the_top_one_is_at_its_cap() {
+        let (policy, workers) = fallback_fixture(1);
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        let _held = policy
+            .peer_fetch
+            .as_ref()
+            .unwrap()
+            .limiter
+            .try_acquire("http://a")
+            .expect("slot");
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        let grant = grant.expect("fallback grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-b");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+        assert_eq!(policy.peer_fetch_inflight("http://b"), 1);
+        assert_no_failure_recorded(&counts);
+    }
+
+    #[test]
+    fn grant_records_the_cap_once_when_every_source_is_at_it() {
+        let (policy, workers) = fallback_fixture(1);
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        let limiter = &policy.peer_fetch.as_ref().unwrap().limiter;
+        let _held_a = limiter.try_acquire("http://a").expect("slot");
+        let _held_b = limiter.try_acquire("http://b").expect("slot");
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        assert!(grant.is_none());
+        assert_eq!(count_of(&counts, "inflight_cap"), 1);
+        assert_eq!(
+            counts.iter().map(|(_, count)| count).sum::<u64>(),
+            1,
+            "{counts:?}"
+        );
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+        assert_eq!(policy.peer_fetch_inflight("http://b"), 1);
+    }
+
+    #[test]
+    fn grant_falls_back_when_the_top_sources_registration_changed() {
+        let (policy, workers) = fallback_fixture(4);
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        policy.apply_peer_lookup("http://a", Some(&engine_record("a-rank0", "fp", 5601)));
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        let grant = grant.expect("fallback grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-b");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(policy.peer_fetch_inflight("http://b"), 1);
+        assert_no_failure_recorded(&counts);
+    }
+
+    #[test]
+    fn grant_falls_back_when_the_top_source_has_no_endpoint() {
+        let (policy, workers) = fallback_fixture(4);
+        set_endpoint(&policy, "http://a", None);
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        let grant = grant.expect("fallback grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-b");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_no_failure_recorded(&counts);
+    }
+
+    #[test]
+    fn grant_falls_back_when_the_top_sources_endpoint_is_untrusted() {
+        let (policy, workers) = fallback_fixture(4);
+        set_endpoint(
+            &policy,
+            "http://a",
+            Some(PeerEndpoint {
+                host: Arc::from("10.0.0.9"),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        let grant = grant.expect("fallback grant");
+        assert_eq!(&*grant.endpoint.engine_id, "engine-b");
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(policy.peer_fetch_inflight("http://b"), 1);
+        assert_no_failure_recorded(&counts);
+    }
+
+    #[test]
+    fn grant_records_the_top_sources_failure_when_no_source_is_usable() {
+        let (policy, workers) = fallback_fixture(1);
+        // Top source untrusted, second at its cap: the top source's label wins.
+        set_endpoint(
+            &policy,
+            "http://a",
+            Some(PeerEndpoint {
+                host: Arc::from("10.0.0.9"),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        let _held = policy
+            .peer_fetch
+            .as_ref()
+            .unwrap()
+            .limiter
+            .try_acquire("http://b")
+            .expect("slot");
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        assert!(grant.is_none());
+        assert_eq!(count_of(&counts, "untrusted_endpoint"), 1);
+        assert_eq!(count_of(&counts, "inflight_cap"), 0);
+    }
+
+    #[test]
+    fn grant_checks_the_destination_before_trying_any_source() {
+        let (policy, workers) = fallback_fixture(1);
+        let (transfer, planned) = plan_fallback(&policy, &workers);
+        // Both sources are at their cap: were they tried first, `inflight_cap`
+        // would be the recorded failure.
+        let limiter = &policy.peer_fetch.as_ref().unwrap().limiter;
+        let _held_a = limiter.try_acquire("http://a").expect("slot");
+        let _held_b = limiter.try_acquire("http://b").expect("slot");
+        policy.apply_peer_lookup("http://c", Some(&engine_record("c-new", "fp-new", 5800)));
+        let (grant, counts) = grant_with_counts(&policy, &transfer, &planned);
+        assert!(grant.is_none());
+        assert_eq!(count_of(&counts, "registration_changed"), 1);
+        assert_eq!(count_of(&counts, "inflight_cap"), 0);
+        assert_eq!(
+            counts.iter().map(|(_, count)| count).sum::<u64>(),
+            1,
+            "{counts:?}"
+        );
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+        assert_eq!(policy.peer_fetch_inflight("http://b"), 1);
+    }
+
+    #[test]
+    fn several_qualifying_sources_record_the_plan_metrics_once() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (policy, workers) = fallback_fixture(4);
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 2, "c is the destination");
+        assert_eq!(outcome_count(&handle, PLANS_TOTAL, "planned"), 1);
+        let rendered = handle.render();
+        let count_of_series = |prefix: &str, label: Option<&str>| -> u64 {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(prefix) && label.is_none_or(|label| line.contains(label))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .map_or(0, |value| value.parse::<f64>().expect("count") as u64)
+        };
+        assert_eq!(
+            count_of_series("vllm_router_peer_fetch_estimated_saved_ms_count", None),
+            1
+        );
+        for path in ["fetch", "wait"] {
+            assert_eq!(
+                count_of_series(
+                    "vllm_router_peer_fetch_estimated_cost_ms_count",
+                    Some(&format!("path=\"{path}\""))
+                ),
+                1,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_worker_binds_generation_and_record_together() {
+        let (policy, workers, targets) = transfer_fixture(true);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
+        let mut info = peer_info(&[(0, engine_record("engine-a", "fp", 5600))]);
+        info.cache_key = Some(CacheKey {
+            model: Arc::from("m"),
+            block_size: 2,
+        });
+        KvAwareOps::register_worker(
+            &policy,
+            workers[0].as_ref(),
+            Some(&info),
+            Some(Arc::new(FixedMatches(vec![tier_match(
+                &targets[0],
+                StorageTier::Device,
+                &[(0, 16)],
+            )]))),
+        );
+        let ids = transfer_ids();
+        let plan = policy
+            .prepare_selection(
+                &workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                    allow_transfer_plan: true,
+                },
+                None,
+                None,
+            )
+            .expect("snapshot");
+        let position = plan
+            .healthy
+            .iter()
+            .position(|&index| workers[index].url() == "http://a")
+            .expect("registered worker");
+        assert_eq!(
+            plan.bindings[position].generation,
+            policy.targets.get("http://a").unwrap().generation
+        );
+        let current = Arc::clone(&policy.peers.peer_regs.get("http://a").expect("record"));
+        assert_eq!(&*current.endpoint.as_ref().unwrap().engine_id, "engine-a");
+        // The planner clones the same Arc the registration stored.
+        let (_, planned) = plan_for_grant(&policy, &workers);
+        assert_eq!(
+            planned.sources[0].1.generation,
+            policy.targets.get("http://a").unwrap().generation
+        );
+        assert!(Arc::ptr_eq(
+            planned.sources[0].1.registration.as_ref().expect("planned"),
+            &current
+        ));
+    }
+
+    #[test]
+    fn a_request_that_skips_transfer_keeps_its_worker_but_takes_no_permit() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (policy, workers, _) = active_fixture(1);
+        let ids = transfer_ids();
+        let skipped = policy
+            .select_worker_with_qualified_inputs(
+                &workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                    allow_transfer_plan: false,
+                },
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(skipped.peer_fetch.is_none());
+        assert!(policy.last_transfer_plan().is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        assert_eq!(outcome_count(&handle, PLANS_TOTAL, "prompt_logprobs"), 1);
+
+        // Same worker as a request that may fetch, and the cap is still free.
+        let fetching = select(&policy, &workers);
+        assert_eq!(fetching.worker_index, skipped.worker_index);
+        assert!(fetching.peer_fetch.is_some());
+    }
+
+    /// Active policy over two workers at real hosts, with source `a` reporting
+    /// a side channel on `reported_host`.
+    fn trust_fixture(reported_host: &str) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let (policy, workers, _) =
+            transfer_fixture_with_urls(true, ["http://10.0.0.1:8000", "http://10.0.0.2:8000"]);
+        let policy = policy.with_shared_peer_fetch(4, Arc::new(AtomicBool::new(true)));
+        set_endpoint(
+            &policy,
+            "http://10.0.0.1:8000",
+            Some(PeerEndpoint {
+                host: Arc::from(reported_host),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        (policy, workers)
+    }
+
+    /// Select once and return the grant (if any), the source's slots and the
+    /// `untrusted_endpoint` count.
+    fn trust_outcome(
+        policy: &KvAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+    ) -> (Option<PeerFetchGrant>, usize, u64) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let receipt = select(policy, workers);
+        assert!(policy.last_transfer_plan().is_some(), "the pair is planned");
+        (
+            receipt.peer_fetch,
+            policy.peer_fetch_inflight("http://10.0.0.1:8000"),
+            outcome_count(&handle, REQUESTS_TOTAL, "untrusted_endpoint"),
+        )
+    }
+
+    #[test]
+    fn grant_needs_the_reported_host_to_be_the_worker_url_host() {
+        let (policy, workers) = trust_fixture("10.0.0.1");
+        let (grant, slots, untrusted) = trust_outcome(&policy, &workers);
+        assert_eq!(&*grant.expect("grant").endpoint.host, "10.0.0.1");
+        assert_eq!((slots, untrusted), (1, 0));
+
+        let (policy, workers) = trust_fixture("10.0.0.9");
+        let (grant, slots, untrusted) = trust_outcome(&policy, &workers);
+        assert!(grant.is_none());
+        assert_eq!((slots, untrusted), (0, 1));
+    }
+
+    #[test]
+    fn a_pinned_host_replaces_the_worker_url_host() {
+        let pinned = |reported: &str, pin: &str| {
+            let (policy, workers) = trust_fixture(reported);
+            // Through the production path: a static capability with a pin.
+            policy.register_static_capabilities([(
+                "http://10.0.0.1:8000".to_owned(),
+                (capability("fp"), Some(Arc::from(pin))),
+            )]);
+            trust_outcome(&policy, &workers)
+        };
+        // A side channel on another NIC, pinned by the operator: fetched.
+        let (grant, slots, untrusted) = pinned("192.168.7.1", "192.168.7.1");
+        assert!(grant.is_some());
+        assert_eq!((slots, untrusted), (1, 0));
+        // With a pin, the worker URL's host is no longer enough.
+        let (grant, slots, untrusted) = pinned("10.0.0.1", "192.168.7.1");
+        assert!(grant.is_none());
+        assert_eq!((slots, untrusted), (0, 1));
+    }
+
+    #[test]
+    fn a_pin_survives_unregister() {
+        let (policy, _) = trust_fixture("192.168.7.1");
+        policy.register_static_capabilities([(
+            "http://10.0.0.1:8000".to_owned(),
+            (capability("fp"), Some(Arc::from("192.168.7.1"))),
+        )]);
+        policy.unregister_target("http://10.0.0.1:8000");
+        assert_eq!(
+            policy
+                .peers
+                .trusted_hosts
+                .get("http://10.0.0.1:8000")
+                .as_deref()
+                .map(|h| &**h),
+            Some("192.168.7.1")
+        );
+    }
+
+    #[test]
+    fn shadow_mode_ignores_an_untrusted_host() {
+        let (policy, workers, _) =
+            transfer_fixture_with_urls(true, ["http://10.0.0.1:8000", "http://10.0.0.2:8000"]);
+        set_endpoint(
+            &policy,
+            "http://10.0.0.1:8000",
+            Some(PeerEndpoint {
+                host: Arc::from("10.0.0.9"),
+                ..peer_endpoint("engine-a", 5600)
+            }),
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(
+            outcome_count(&handle, REQUESTS_TOTAL, "untrusted_endpoint"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_endpoint_is_the_sources_not_the_destinations() {
+        let (policy, workers, _) = active_fixture(4);
+        set_endpoint(&policy, "http://b", Some(peer_endpoint("engine-b", 5700)));
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 1, "b is the destination");
+        assert_eq!(
+            receipt
+                .peer_fetch
+                .as_ref()
+                .unwrap()
+                .endpoint
+                .engine_id
+                .as_ref(),
+            "engine-a"
+        );
+    }
+
+    #[test]
+    fn the_in_flight_cap_holds_until_the_receipt_is_dropped() {
+        let (policy, workers, _) = active_fixture(1);
+        let first = select(&policy, &workers);
+        assert!(first.peer_fetch.is_some());
+
+        // Over the cap: still planned, but no grant.
+        let second = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some());
+        assert!(second.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+
+        drop(first);
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+        let third = select(&policy, &workers);
+        assert!(third.peer_fetch.is_some());
+    }
+
+    #[test]
+    fn kill_switch_returns_to_shadow_and_back() {
+        let (policy, workers, _) = active_fixture(4);
+        assert!(policy.peer_fetch_enabled());
+
+        assert!(!policy.set_peer_fetch_enabled(false));
+        let receipt = select(&policy, &workers);
+        assert!(policy.last_transfer_plan().is_some(), "planning continues");
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+
+        assert!(policy.set_peer_fetch_enabled(true));
+        assert!(select(&policy, &workers).peer_fetch.is_some());
+    }
+
+    #[test]
+    fn a_policy_not_built_active_cannot_be_switched_on() {
+        let (policy, _, _) = transfer_fixture(true);
+        assert!(!policy.set_peer_fetch_enabled(true));
+        assert!(!policy.peer_fetch_enabled());
+    }
+
+    /// Busy worker `a` holds all of `a_prompt` in a real index; idle `b` holds
+    /// nothing. Each worker is asked about its own entry in `inputs`.
+    fn per_worker_transfer_fixture(
+        a_prompt: &[u32],
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+            .iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let targets: Vec<_> = workers.iter().map(|w| target(w.url(), 0)).collect();
+        let load = FixedLoad(HashMap::from([(
+            targets[0].clone(),
+            LoadSample {
+                active_prefill_tokens: 100_000,
+                active_requests: 8,
+            },
+        )]));
+        let provider = Arc::new(PrefixMatches {
+            target: targets[0].clone(),
+            held: a_prompt.to_vec(),
+        });
+        let policy = KvAwarePolicy::with_components(
+            provider.clone(),
+            Arc::new(load),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(TemperaturePicker::new(0.0)),
+            CostParams {
+                block_size: 2,
+                ..CostParams::default()
+            },
+        )
+        .with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
+            policy: transfer_policy(),
+        }));
+        for (worker, target) in workers.iter().zip(&targets) {
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target.clone(),
+                CacheKey {
+                    model: Arc::from("m"),
+                    block_size: 2,
+                },
+                provider.clone(),
+            );
+        }
+        (policy, workers, targets)
+    }
+
+    /// 40-token prompt that shares its first `shared_tokens` tokens with
+    /// `transfer_ids()` and diverges afterwards.
+    fn diverging_ids(shared_tokens: usize) -> Vec<u32> {
+        (0..40u32)
+            .map(|i| {
+                if (i as usize) < shared_tokens {
+                    i
+                } else {
+                    1000 + i
+                }
+            })
+            .collect()
+    }
+
+    fn per_worker_transfer(
+        a_prompt: Vec<u32>,
+        b_prompt: Option<Vec<u32>>,
+    ) -> (
+        KvSelectionReceipt,
+        Vec<RoutableTarget>,
+        Option<PeerFetchPlan>,
+    ) {
+        let (policy, workers, targets) = per_worker_transfer_fixture(&a_prompt);
+        let mut inputs = WorkerTokenInputs::new();
+        inputs.insert(workers[0].base_url().into(), Arc::from(vec![a_prompt]));
+        if let Some(prompt) = b_prompt {
+            inputs.insert(workers[1].base_url().into(), Arc::from(vec![prompt]));
+        }
+        let receipt = policy
+            .select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        (receipt, targets, policy.last_transfer_plan())
+    }
+
+    #[test]
+    fn per_worker_plan_credits_only_the_shared_part_of_the_destination_prompt() {
+        // `a` caches its whole 20-block prompt; `b`'s prompt shares 6 blocks.
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
+        assert_eq!(receipt.worker_index, 1);
+        let plan = plan.expect("shared part is planned");
+        assert_eq!(plan.source, targets[0]);
+        assert_eq!(plan.destination, targets[1]);
+        assert_eq!(plan.blocks, (0, 6));
+        assert_eq!(plan.credited_tokens, 12);
+
+        // Only 3 shared blocks: below `min_prefix_blocks`, so no plan.
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
+        assert_eq!(receipt.worker_index, 1);
+        assert!(plan.is_none());
+
+        // Fully disjoint prompts: nothing to fetch.
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
+        assert_eq!(receipt.worker_index, 1);
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn per_worker_identical_prompts_plan_like_shared_tokens() {
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
+        assert_eq!(receipt.worker_index, 1);
+        let plan = plan.expect("plan");
+        assert_eq!(plan.source, targets[0]);
+        assert_eq!(plan.blocks, (0, 20));
+        assert_eq!(plan.credited_tokens, 39);
+    }
+
+    #[test]
+    fn per_worker_destination_without_a_prompt_gets_no_plan() {
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), None);
+        assert_eq!(receipt.worker_index, 1);
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn shadow_plan_requires_registered_capabilities_when_configured() {
+        let ids = transfer_ids();
+        let (mut policy, workers, _) = transfer_fixture(true);
+        policy =
+            policy.with_transfer_planner(Arc::new(crate::policies::CostRulePeerFetchPlanner {
+                policy: crate::policies::PeerFetchRules {
+                    require_capability: true,
+                    ..transfer_policy()
+                },
+            }));
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_none());
+        release_receipt(&workers, &receipt);
+
+        policy.register_transfer_capability("http://a", capability("x"));
+        policy.register_transfer_capability("http://b", capability("x"));
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_some());
+        release_receipt(&workers, &receipt);
+
+        policy.register_transfer_capability("http://b", capability("y"));
+        let receipt = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_none());
+        release_receipt(&workers, &receipt);
+
+        // Static capabilities are operator config and survive unregister.
+        policy.unregister_target("http://a");
+        assert!(capability_of(&policy, "http://a").is_some());
+        assert!(capability_of(&policy, "http://b").is_some());
+    }
+
+    #[test]
+    fn static_capability_survives_unregister_and_reregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        policy.register_transfer_capability("http://a", capability("static"));
+
+        policy.unregister_target("http://a");
+        assert_eq!(
+            &*capability_of(&policy, "http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        assert!(capability_of(&policy, "http://a").is_some());
+        assert!(!any_engine_owned(&policy));
+    }
+
+    #[test]
+    fn engine_capability_is_removed_on_unregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(
+            &policy,
+            worker.as_ref(),
+            Some(&peer_info(&[(0, peer_record("engine", 5600))])),
+            None,
+        );
+        assert!(capability_of(&policy, "http://a").is_some());
+
+        policy.unregister_target("http://a");
+        assert!(capability_of(&policy, "http://a").is_none());
+        assert!(!any_engine_owned(&policy));
+    }
+
+    #[test]
+    fn session_binding_and_missing_tokens_skip_the_planner() {
+        let ids = transfer_ids();
+        let (policy, workers, _) = transfer_fixture(true);
+        let key = affinity_key("session-a");
+        let first = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_some());
+        release_receipt(&workers, &first);
+        let second = policy
+            .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
+            .unwrap();
+        assert_eq!(second.worker_index, first.worker_index);
+        assert!(policy.last_transfer_plan().is_none());
+        release_receipt(&workers, &second);
+
+        let load_only = policy
+            .select_worker_with_receipt(&workers, None, None, None, None, &[])
+            .unwrap();
+        assert!(policy.last_transfer_plan().is_none());
+        release_receipt(&workers, &load_only);
+    }
+
+    fn kv_aware_config(
+        peer_fetch: Option<crate::config::types::PeerFetchConfig>,
+    ) -> crate::config::PolicyConfig {
+        crate::config::PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+            peer_fetch: peer_fetch.map(Box::new),
+        }
+    }
+
+    fn transfer_block(
+        mode: crate::config::types::PeerFetchMode,
+    ) -> crate::config::types::PeerFetchConfig {
+        crate::config::types::PeerFetchConfig {
+            mode,
+            min_prefix_blocks: 4,
+            transfer_fixed_ms: 0.0,
+            // The fixture registers no capabilities, so shadow plans on cache
+            // identity alone; active mode cannot drop the check.
+            ignore_capability: mode == crate::config::types::PeerFetchMode::Shadow,
+            ..Default::default()
+        }
+    }
+
+    fn built_policy(
+        config: &crate::config::PolicyConfig,
+    ) -> Arc<dyn crate::policies::LoadBalancingPolicy> {
+        crate::policies::PolicyFactory::create_from_config(config, None)
+    }
+
+    #[test]
+    fn factory_builds_a_planner_only_for_shadow_mode() {
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
+        for (config, expect_planner) in [
+            (kv_aware_config(None), false),
+            (kv_aware_config(Some(transfer_block(Off))), false),
+            (kv_aware_config(Some(transfer_block(Shadow))), true),
+        ] {
+            let policy = built_policy(&config);
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            assert_eq!(policy.transfer_planner.is_some(), expect_planner);
+        }
+
+        // The registry path shares the helper.
+        let registry_policy =
+            crate::policies::PolicyRegistry::new(kv_aware_config(Some(transfer_block(Shadow))))
+                .get_default_policy();
+        let registry_policy = registry_policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .unwrap();
+        assert!(registry_policy.transfer_planner.is_some());
+    }
+
+    #[test]
+    fn configured_capabilities_reach_the_policy_only_in_shadow_mode() {
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
+        let capabilities = HashMap::from([(
+            "http://a".to_string(),
+            crate::config::types::StaticTransferCapability {
+                can_export: true,
+                can_import: false,
+                connector: "nixl".into(),
+                connector_version: "1".into(),
+                layout_fingerprint: "fp".into(),
+                side_channel_host: None,
+            },
+        )]);
+        for (mode, expected) in [(Shadow, true), (Off, false)] {
+            let mut block = transfer_block(mode);
+            block.capabilities = capabilities.clone();
+            let policy = built_policy(&kv_aware_config(Some(block)));
+            let policy = policy.as_any().downcast_ref::<KvAwarePolicy>().unwrap();
+            let registered = capability_of(policy, "http://a");
+            assert_eq!(registered.is_some(), expected);
+            if let Some(capability) = registered {
+                assert!(capability.can_export && !capability.can_import);
+                assert_eq!(&*capability.layout_fingerprint, "fp");
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_mode_from_config_picks_exactly_what_off_picks() {
+        use crate::config::types::PeerFetchMode::{Off, Shadow};
+        let ids = transfer_ids();
+        let mut picks = Vec::new();
+        for mode in [Off, Shadow] {
+            let (base, workers, _) = transfer_fixture(false);
+            let policy = crate::policies::PolicyFactory::apply_peer_fetch_config(
+                base,
+                Some(&transfer_block(mode)),
+                &Arc::new(AtomicBool::new(true)),
+            );
+            let mut sequence = Vec::new();
+            for _ in 0..3 {
+                let receipt = policy
+                    .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
+                    .unwrap();
+                sequence.push((
+                    receipt.worker_index,
+                    receipt.new_prefill_tokens,
+                    receipt.decision.clone(),
+                    policy.last_transfer_plan().is_some(),
+                ));
+                release_receipt(&workers, &receipt);
+            }
+            picks.push(sequence);
+        }
+        // Same worker, tokens and decision; only the shadow run carries a plan.
+        for (off, shadow) in picks[0].iter().zip(&picks[1]) {
+            assert_eq!((off.0, off.1, &off.2), (shadow.0, shadow.1, &shadow.2));
+            assert!(!off.3 && shadow.3);
+        }
+    }
+
+    fn peer_record(fingerprint: &str, port: u16) -> PeerLookupRecord {
+        PeerLookupRecord {
+            engine_id: "engine".into(),
+            side_channel_host: "10.0.0.5".into(),
+            side_channel_port: port,
+            tp_size: 2,
+            dcp_size: 1,
+            pp_size: 1,
+            connector: "nixl".into(),
+            connector_version: "1".into(),
+            layout_fingerprint: fingerprint.into(),
+        }
+    }
+
+    fn peer_info(records: &[(u32, PeerLookupRecord)]) -> WorkerKvInfo {
+        WorkerKvInfo {
+            peer_lookup: records.iter().cloned().collect(),
+            ..WorkerKvInfo::default()
+        }
+    }
+
+    #[test]
+    fn engine_peer_record_registers_capability_and_address_for_its_rank() {
+        let policy = KvAwarePolicy::default();
+        let rank0: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://w:8000".into(),
+            0,
+            2,
+            WorkerType::Regular,
+        ));
+        let rank1: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://w:8000".into(),
+            1,
+            2,
+            WorkerType::Regular,
+        ));
+        let info = peer_info(&[(0, peer_record("fp0", 5600)), (1, peer_record("fp1", 5601))]);
+        for worker in [&rank0, &rank1] {
+            KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        }
+        for (worker, fingerprint, port) in [(&rank0, "fp0", 5600), (&rank1, "fp1", 5601)] {
+            let capability = capability_of(&policy, worker.url()).unwrap();
+            assert!(capability.can_export && capability.can_import);
+            assert_eq!(&*capability.connector, "nixl");
+            assert_eq!(&*capability.connector_version, "1");
+            assert_eq!(&*capability.layout_fingerprint, fingerprint);
+            let endpoint = policy.peer_endpoint(worker.url()).unwrap();
+            assert_eq!((&*endpoint.host, endpoint.port), ("10.0.0.5", port));
+            assert_eq!(&*endpoint.engine_id, "engine");
+            assert_eq!(
+                (endpoint.tp_size, endpoint.dcp_size, endpoint.pp_size),
+                (2, 1, 1)
+            );
+        }
+
+        // A worker without dp_rank takes rank 0; a rank with no record gets none.
+        let plain: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://p:8000".into(),
+            WorkerType::Regular,
+        ));
+        KvAwareOps::register_worker(&policy, plain.as_ref(), Some(&info), None);
+        assert_eq!(
+            &*capability_of(&policy, "http://p:8000")
+                .unwrap()
+                .layout_fingerprint,
+            "fp0"
+        );
+        let missing: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://m:8000".into(),
+            3,
+            4,
+            WorkerType::Regular,
+        ));
+        KvAwareOps::register_worker(&policy, missing.as_ref(), Some(&info), None);
+        assert!(policy.peer_endpoint(missing.url()).is_none());
+        assert!(capability_of(&policy, missing.url()).is_none());
+    }
+
+    #[test]
+    fn static_capability_wins_over_engine_record_but_address_is_kept() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        policy.register_transfer_capability("http://a", capability("static"));
+        let info = peer_info(&[(0, peer_record("engine", 5600))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        assert_eq!(
+            &*capability_of(&policy, "http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+        assert_eq!(policy.peer_endpoint("http://a").unwrap().port, 5600);
+
+        // Re-discovery without a record leaves the static entry alone.
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        assert_eq!(
+            &*capability_of(&policy, "http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+        assert!(policy.peer_endpoint("http://a").is_none());
+
+        // A static declaration made after an engine record replaces it for good.
+        let engine_first = KvAwarePolicy::default();
+        KvAwareOps::register_worker(&engine_first, worker.as_ref(), Some(&info), None);
+        engine_first.register_transfer_capability("http://a", capability("static"));
+        KvAwareOps::register_worker(&engine_first, worker.as_ref(), None, None);
+        assert!(capability_of(&engine_first, "http://a").is_some());
+    }
+
+    #[test]
+    fn failed_rediscovery_clears_engine_sourced_entries() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        let info = peer_info(&[(0, peer_record("one", 5600))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&info), None);
+        assert!(capability_of(&policy, "http://a").is_some());
+
+        // A changed record replaces the engine-sourced capability.
+        let changed = peer_info(&[(0, peer_record("two", 5700))]);
+        KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
+        assert_eq!(
+            &*capability_of(&policy, "http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "two"
+        );
+        assert_eq!(policy.peer_endpoint("http://a").unwrap().port, 5700);
+
+        // No valid record (empty map, or no info at all) removes both.
+        for info in [Some(WorkerKvInfo::default()), None] {
+            KvAwareOps::register_worker(&policy, worker.as_ref(), Some(&changed), None);
+            assert!(policy.peer_endpoint("http://a").is_some());
+            KvAwareOps::register_worker(&policy, worker.as_ref(), info.as_ref(), None);
+            assert!(capability_of(&policy, "http://a").is_none());
+            assert!(policy.peer_endpoint("http://a").is_none());
+        }
+    }
+
+    #[test]
+    fn late_peer_apply_after_unregister_is_ignored_and_unregister_clears_both() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        let record = peer_record("fp", 5600);
+        KvAwareOps::register_worker(
+            &policy,
+            worker.as_ref(),
+            Some(&peer_info(&[(0, record.clone())])),
+            None,
+        );
+        assert!(policy.peer_endpoint("http://a").is_some());
+
+        policy.unregister_target("http://a");
+        assert!(capability_of(&policy, "http://a").is_none());
+        assert!(policy.peer_endpoint("http://a").is_none());
+
+        // A discovery result that lands after removal must not resurrect them.
+        policy.apply_peer_lookup("http://a", Some(&record));
+        assert!(capability_of(&policy, "http://a").is_none());
+        assert!(policy.peer_endpoint("http://a").is_none());
+        assert!(!any_engine_owned(&policy));
     }
 
     /// A Decode pool whose engines publish KV events: each worker gets a cache

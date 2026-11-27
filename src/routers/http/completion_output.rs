@@ -1,23 +1,49 @@
-//! Conservative model-output detection for proxied Completion SSE streams.
+//! Conservative model-output detection for proxied Completion SSE streams,
+//! and for any OpenAI-style generation stream that holds a peer fetch slot.
 
 use super::sse::{sse_lines, FrameScanner};
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+/// What a complete event must carry to count as model output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputRule {
+    /// A Completion choice with non-empty `text`.
+    CompletionText,
+    /// Any event with a non-empty `choices` list. vLLM sends its first such
+    /// event (for chat, the role-only delta) only after the engine's first
+    /// output, so after prefill. SSE comments (heartbeats), usage-only events
+    /// (`choices: []`) and error events are not output.
+    EngineOutput,
+}
 
 pub(super) struct CompletionOutputObserver {
     event: Vec<u8>,
     scanner: FrameScanner,
     first_event: bool,
     stopped: bool,
+    rule: OutputRule,
 }
 
 impl CompletionOutputObserver {
     pub(super) fn new(disabled: bool) -> Self {
+        Self::with_rule(disabled, OutputRule::CompletionText)
+    }
+
+    /// Detects the first engine output on an OpenAI-style stream. Used to free
+    /// a peer fetch source slot once prefill (and so the fetch) is over; a
+    /// stream without a `choices` event keeps the slot until the body ends.
+    pub(super) fn engine_output() -> Self {
+        Self::with_rule(false, OutputRule::EngineOutput)
+    }
+
+    fn with_rule(disabled: bool, rule: OutputRule) -> Self {
         Self {
             event: Vec::new(),
             scanner: FrameScanner::default(),
             first_event: true,
             stopped: disabled,
+            rule,
         }
     }
 
@@ -48,7 +74,7 @@ impl CompletionOutputObserver {
                 } else {
                     &self.event
                 };
-                let output = event_has_output(event);
+                let output = event_has_output(event, self.rule);
                 self.event.clear();
                 if output {
                     self.stopped = true;
@@ -60,7 +86,7 @@ impl CompletionOutputObserver {
     }
 }
 
-fn event_has_output(event: &[u8]) -> bool {
+fn event_has_output(event: &[u8], rule: OutputRule) -> bool {
     let mut data = Vec::new();
     let mut event_type = None;
     for (line, _) in sse_lines(event) {
@@ -83,13 +109,14 @@ fn event_has_output(event: &[u8]) -> bool {
         && value
             .get("choices")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|choices| {
-                choices.iter().any(|choice| {
+            .is_some_and(|choices| match rule {
+                OutputRule::EngineOutput => !choices.is_empty(),
+                OutputRule::CompletionText => choices.iter().any(|choice| {
                     choice
                         .get("text")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|text| !text.is_empty())
-                })
+                }),
             })
 }
 
@@ -186,6 +213,31 @@ mod tests {
             assert!(!observer.observe(event.as_bytes()), "{event:?}");
         }
         assert!(observer.observe(b"data: {\"choices\":[{\"text\":\"yes\"}]}\n\n"));
+    }
+
+    #[test]
+    fn engine_output_is_any_choices_event_but_not_heartbeats_or_metadata() {
+        for event in [
+            ": keepalive\n\n",
+            "event: ping\ndata: {}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
+            "data: {\"error\":{},\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
+            "event: error\ndata: {\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"failed\"}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            let mut observer = CompletionOutputObserver::engine_output();
+            assert!(!observer.observe(event.as_bytes()), "{event:?}");
+        }
+        for event in [
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"completion\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"chat\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n",
+        ] {
+            let mut observer = CompletionOutputObserver::engine_output();
+            assert!(observer.observe(event.as_bytes()), "{event:?}");
+        }
     }
 
     #[test]
