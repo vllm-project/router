@@ -93,7 +93,7 @@ def worker_startup(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("protocol", ["http", "grpc"])
-@pytest.mark.parametrize("deployment", ["colocated", "1p1d_nixl"])
+@pytest.mark.parametrize("deployment", ["merge", "1p1d_nixl"])
 def test_hybrid_worker_startup_order_and_timeouts(worker_startup, protocol, deployment):
     run = worker_startup
     stack = run.start(protocol, deployment)

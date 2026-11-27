@@ -47,7 +47,7 @@
     }
   },
   "deployments": [
-    "colocated",
+    "merge",
     "1p1d_nixl"
   ]
 }

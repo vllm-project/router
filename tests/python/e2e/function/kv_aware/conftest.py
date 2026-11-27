@@ -69,14 +69,14 @@ def kv_aware_router(kv_aware_two_workers):
 
 @pytest.fixture
 def hybrid_kv_aware_stack(request, tmp_path):
-    """Run colocated or 1P1D workers with explicit KV sources and debug logs."""
+    """Run P/D merge or 1P1D workers with explicit KV sources and debug logs."""
     from tests.python.e2e.function.helpers import launch
     from tests.python.e2e.function.kv_aware.config import kv_aware_gpu_pool
 
     case, protocol, deployment = request.param
     model = case["model"]
     assert protocol in ("http", "grpc")
-    assert deployment in ("colocated", "1p1d_nixl")
+    assert deployment in ("merge", "1p1d_nixl")
     pd = deployment == "1p1d_nixl"
     worker_count = case["worker_count"]
     assert worker_count == 2, "Hybrid routing probes require two workers"

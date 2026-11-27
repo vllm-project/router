@@ -61,7 +61,7 @@ _DRAFTS = "vllm:spec_decode_num_drafts_total"
 def _hybrid_parameters(deployment: str):
     parameters = []
     for name, case in load_hybrid_kv_aware_cases().items():
-        if deployment not in case.get("deployments", ("colocated",)):
+        if deployment not in case.get("deployments", ("merge",)):
             continue
         for protocol in case["protocols"]:
             parameters.append(
@@ -227,7 +227,7 @@ def _prime_prefixes(session, stack, prompts, scored_workers):
 
 @pytest.mark.e2e
 @pytest.mark.parametrize(
-    "hybrid_kv_aware_stack", _hybrid_parameters("colocated"), indirect=True
+    "hybrid_kv_aware_stack", _hybrid_parameters("merge"), indirect=True
 )
 def test_kv_aware_hybrid_prefix_reuse(hybrid_kv_aware_stack):
     stack = hybrid_kv_aware_stack
