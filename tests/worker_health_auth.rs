@@ -119,6 +119,7 @@ async fn check_pd_health(key: Option<&str>, dp_size: usize) {
 
 #[tokio::test]
 async fn pd_health_auth_sends_key_to_startup_runtime_and_dynamic_workers() {
+    check_pd_health(Some("worker-key"), 1).await;
     check_pd_health(Some("worker-key"), 2).await;
 }
 

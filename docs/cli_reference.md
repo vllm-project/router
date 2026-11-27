@@ -141,12 +141,13 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
 
-When `--api-key` is set, P/D startup and runtime health checks send the shared
-credential to every static or dynamically discovered P/D worker. Restrict the
-ZMQ registration listener and Kubernetes namespace/selectors to trusted worker
-deployments.
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
