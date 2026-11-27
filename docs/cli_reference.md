@@ -141,7 +141,13 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
+
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
@@ -268,10 +274,12 @@ has tracing support.
 | `--api-key` | `string` | `unset` | `string` | `unset` | Bearer token for supported HTTP worker calls and [configured gRPC workers](backend/grpc.md#worker-authentication). |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-Regular HTTP worker health checks use `--api-key`. HTTP worker calls to
-`POST /flush_cache` and `GET /get_load` omit the token. HTTP health checks
-for P/D workers and for workers registered through `--enable-igw` also omit
-it. Clients authenticate to the router separately with
+Regular HTTP worker health checks and HTTP health probes for static and
+Kubernetes-registered P/D workers use `--api-key`. HTTP worker calls to
+`POST /flush_cache` and `GET /get_load` omit the token, as do health checks
+for workers registered through `--enable-igw`.
+Configured gRPC transports use the token for health, inference and control RPCs.
+Clients authenticate to the router separately with
 `--api-key-validation-urls`.
 
 The startup wait and `add_worker` always probe `/health`, regardless of

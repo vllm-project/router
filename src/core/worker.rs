@@ -373,7 +373,7 @@ impl BasicWorker {
         self
     }
 
-    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    /// Set the API key sent as a bearer token on this worker's health checks.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.api_key = api_key;
         self
@@ -580,7 +580,7 @@ impl DPAwareWorker {
         self
     }
 
-    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    /// Set the API key sent as a bearer token on this worker's health checks.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.base_worker = self.base_worker.with_worker_api_key(api_key);
         self

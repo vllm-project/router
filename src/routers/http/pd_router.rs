@@ -1056,7 +1056,7 @@ impl PdRouterBase {
         worker_type: WorkerType,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
-        let api_key = self.worker_auth.grpc_key_for(&url);
+        let api_key = self.worker_auth.key_for(&url);
         self.wait_for_server_health(&url, api_key.as_deref())
             .await?;
 
@@ -1280,21 +1280,13 @@ impl PdRouterBase {
                 .chain(decode_urls.iter())
                 .map(String::as_str),
         )?;
-        if ctx.router_config.api_key.is_some()
-            && prefill_base_urls
-                .iter()
-                .chain(&decode_urls)
-                .any(|url| !crate::backend::is_grpc_url(url))
-        {
-            warn!("--api-key is not applied to HTTP P/D worker health checks yet");
-        }
         for urls in [&prefill_base_urls, &decode_urls] {
             if !urls.is_empty() {
                 crate::routers::http::router::Router::wait_for_healthy_workers_with_auth(
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
-                    |url| worker_auth.grpc_key_for(url),
+                    |url| worker_auth.key_for(url),
                 )
                 .await?;
             }
@@ -1324,7 +1316,7 @@ impl PdRouterBase {
                 url,
                 dp_size,
                 worker_type,
-                worker_auth.grpc_key_for(url),
+                worker_auth.key_for(url),
                 &core_cb_config,
                 Some(&health_config),
             )? {
