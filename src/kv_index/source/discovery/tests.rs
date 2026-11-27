@@ -2119,7 +2119,12 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     assert!(!old.active.load(Ordering::Acquire));
     let load_only = supervisor.lifecycle_for_worker(&worker.url);
     assert!(!load_only.active.load(Ordering::Acquire));
-    assert!(!load_only.state.lock().trusted);
+    {
+        let mut state = load_only.state.lock();
+        state.trusted = false;
+        state.checked = None;
+    }
+    assert!(!load_only.layout_rebind_due());
     assert!(supervisor.match_provider_for_worker(&worker.url).is_none());
 
     let bases = std::slice::from_ref(&worker.url);
