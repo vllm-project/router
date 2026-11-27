@@ -139,6 +139,7 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
+| `--preparation-timeout-secs` | `u64` | `1` | — | — | Per-request budget for pre-dispatch token preparation (/render, then the /tokenize fallback); large-prompt PD pools raise it to cover their largest body. Effective values are clamped to `[1, 3600]` seconds. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. When `--api-key` is set, initial and periodic HTTP health probes

@@ -42,6 +42,9 @@ pub(super) struct PdKvState {
     worker_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
     nixl_decode_replay: bool,
+    // Per-call budget for pre-dispatch token preparation, resolved by
+    // start() from `RouterConfig::preparation_timeout_secs`.
+    preparation_timeout: Duration,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
 }
@@ -67,6 +70,7 @@ impl PdKvState {
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
         allow_hybrid_layouts: bool,
+        preparation_timeout_secs: u64,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.worker_pairs = (!pairs.is_empty()).then(|| {
@@ -78,6 +82,8 @@ impl PdKvState {
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
+        state.preparation_timeout =
+            crate::backend::preprocess::preparation_budget(preparation_timeout_secs);
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
         state.supervisor.set_pd_connector(connector);
@@ -127,6 +133,8 @@ impl PdKvState {
             worker_pairs: None,
             allow_hybrid_layouts: true,
             nixl_decode_replay: false,
+            // Upstream default; start() overrides the budget from config.
+            preparation_timeout: Duration::from_secs(1),
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
         }
@@ -432,7 +440,7 @@ impl PdKvState {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    self.preparation_timeout,
                 )
                 .await
             }
@@ -1186,6 +1194,7 @@ mod kv_input_tests {
             Some(decode_policy.clone()),
             false,
             true,
+            1,
         )
         .await;
         tokio::join!(

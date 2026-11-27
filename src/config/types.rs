@@ -47,6 +47,15 @@ pub struct RouterConfig {
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
+    /// Per-call budget (seconds) for pre-dispatch token preparation
+    /// (/render, then the /tokenize fallback). Default 1 preserves upstream
+    /// behavior; large-prompt stacks raise it to cover their largest body
+    /// (a ~400K-token prompt renders in ~1s on our serving stack). Effective
+    /// values are floored at 1s and capped at 3600s: the request path adds
+    /// the resolved budget to a Tokio Instant, which oversized values would
+    /// panic.
+    #[serde(default = "default_preparation_timeout_secs")]
+    pub preparation_timeout_secs: u64,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
@@ -129,6 +138,10 @@ fn default_history_backend() -> HistoryBackend {
 }
 
 fn default_intra_node_data_parallel_size() -> usize {
+    1
+}
+
+fn default_preparation_timeout_secs() -> u64 {
     1
 }
 
@@ -1399,6 +1412,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
+            preparation_timeout_secs: 1,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,
@@ -2297,6 +2311,7 @@ mod tests {
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
+            preparation_timeout_secs: 1,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -2369,6 +2384,7 @@ mod tests {
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
+            preparation_timeout_secs: 1,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -2432,6 +2448,7 @@ mod tests {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,
+            preparation_timeout_secs: 1,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
