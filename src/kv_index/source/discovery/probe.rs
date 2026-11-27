@@ -499,6 +499,7 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+#[derive(Debug)]
 pub(super) struct WorkerMetadata {
     pub(super) server_info: ServerInfo,
     pub(super) base_models: Option<HashSet<String>>,
