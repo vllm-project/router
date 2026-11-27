@@ -168,6 +168,11 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
+    /// Prefer PD Prefill ranks below this Router-local in-flight request threshold.
+    /// Zero disables the preference. If every candidate reaches it, use the original pool.
+    #[arg(long, default_value_t = 0)]
+    pd_prefill_max_inflight_per_rank: usize,
+
     /// Specific policy for decode nodes in PD mode (defaults to --policy).
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
     decode_policy: Option<String>,
@@ -694,6 +699,7 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            pd_prefill_max_inflight_per_rank: self.pd_prefill_max_inflight_per_rank,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -1001,11 +1007,14 @@ mod tests {
             "kv_aware",
             "--kv-aware-session-affinity-ttl-secs",
             "1800",
+            "--pd-prefill-max-inflight-per-rank",
+            "8",
         ])
         .unwrap();
         assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+        assert_eq!(args.pd_prefill_max_inflight_per_rank, 8);
     }
 
     #[test]

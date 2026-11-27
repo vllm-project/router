@@ -13,6 +13,8 @@ pub(crate) mod source;
 pub use source::discovery;
 pub use source::events::{subscriber, wire};
 
+pub mod capacity;
+
 /// Local observation ownership only; this is not an authenticated engine epoch.
 /// Stream generations instead fence snapshots across resets of the same owner.
 pub(crate) fn next_owner_incarnation() -> u64 {

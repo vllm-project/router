@@ -464,6 +464,13 @@ fn finalize_decode_body(
     }
 }
 
+/// Sequences one Decode endpoint runs for this request. `n` and `best_of` both fork sequences, and each attends over the whole prompt.
+fn requested_sequences(request: &Value) -> u64 {
+    let n = request.get("n").and_then(Value::as_u64).unwrap_or(1);
+    let best_of = request.get("best_of").and_then(Value::as_u64).unwrap_or(1);
+    n.max(best_of).max(1)
+}
+
 impl VllmPDRouter {
     /// Match the worker's base URL, stripping only the routing @rank suffix.
     fn mooncake_prefill_target(
@@ -1286,9 +1293,28 @@ impl VllmPDRouter {
         // The prepared selection gates deferral; token inputs are retained so
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
+        // Capacity is measured, not configured: refresh the Decode pool's samples before selecting. The scrape is bounded and runs outside every lock, and a base that is not due costs nothing.
+        let decode_bases: Vec<String> = decode_workers
+            .iter()
+            .map(|worker| worker.base_url().to_owned())
+            .collect();
+        self.pd_router
+            .capacity
+            .refresh(&self.pd_router.client, &decode_bases)
+            .await;
+        // Prompt length, when the router rendered it: the ceiling must not charge zero for a request it cannot credit.
+        let capacity_add_tokens = prefill_inputs.as_ref().and_then(|inputs| {
+            inputs
+                .values()
+                .next()
+                .and_then(|input| input.prompts.as_ref())
+                .map(|prompts| prompts.iter().map(|prompt| prompt.len() as u64).sum())
+        });
+        let capacity_add_sequences = requested_sequences(request);
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: prefill_inputs.as_ref(),
+            prefill_max_inflight_per_rank: 0,
             model_id,
             legacy_policy_input: text.as_deref(),
             prefill_cache: prefill_cache.as_ref(),
@@ -1297,6 +1323,9 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
+            capacity: Some(&self.pd_router.capacity),
+            capacity_add_tokens,
+            capacity_add_sequences,
             decode_context: decode_context.as_ref(),
             route: path,
             probe: false,
@@ -1478,6 +1507,7 @@ impl VllmPDRouter {
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
+            prefill_max_inflight_per_rank: 0,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
             prefill_cache: None,
@@ -1486,6 +1516,12 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
+            capacity: Some(&self.pd_router.capacity),
+            capacity_add_tokens: input
+                .router_prompts
+                .as_ref()
+                .map(|prompts| prompts.iter().map(|prompt| prompt.len() as u64).sum()),
+            capacity_add_sequences: requested_sequences(request),
             decode_context: decode_context.as_ref(),
             route: &input.route,
             probe: false,
@@ -7787,15 +7823,22 @@ mod tests {
                 .fallback(|| async { axum::Json(json!({"kv_transfer_params": {}})) }),
         )
         .await;
-        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
-            let signal = signal.clone();
-            let resume = resume.clone();
-            async move {
-                signal.notify_one();
-                resume.notified().await;
-                axum::Json(json!({"output": []}))
-            }
-        }))
+        let decode_url = spawn_test_server(axum::Router::new().fallback(
+            move |request: axum::extract::Request| {
+                let signal = signal.clone();
+                let resume = resume.clone();
+                async move {
+                    // Admission scrapes `/metrics` before selecting; that probe must not be
+                    // mistaken for the Decode call this test waits on.
+                    if request.uri().path() == "/metrics" {
+                        return axum::response::Response::new(axum::body::Body::from(""));
+                    }
+                    signal.notify_one();
+                    resume.notified().await;
+                    axum::Json(json!({"output": []})).into_response()
+                }
+            },
+        ))
         .await;
         let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
             prefill_url,

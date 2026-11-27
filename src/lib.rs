@@ -93,6 +93,7 @@ struct Router {
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
+    pd_prefill_max_inflight_per_rank: usize,
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
     // Retry configuration
@@ -277,6 +278,7 @@ impl Router {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            pd_prefill_max_inflight_per_rank: self.pd_prefill_max_inflight_per_rank,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -396,7 +398,8 @@ impl Router {
         kv_event_strict_recovery = false,
         kv_hybrid_layout = None,
         kv_event_topic = vec![],
-        pd_pair = vec![]
+        pd_pair = vec![],
+        pd_prefill_max_inflight_per_rank = 0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -478,6 +481,7 @@ impl Router {
         kv_hybrid_layout: Option<std::path::PathBuf>,
         kv_event_topic: Vec<String>,
         pd_pair: Vec<String>,
+        pd_prefill_max_inflight_per_rank: usize,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -547,6 +551,7 @@ impl Router {
             decode_urls,
             prefill_policy,
             decode_policy,
+            pd_prefill_max_inflight_per_rank,
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,
