@@ -462,7 +462,6 @@ impl Inference for MockVllmRs {
                                 .map(|frame| frame.candidates.clone())
                                 .unwrap_or_default(),
                             finish_info,
-                            ..Default::default()
                         }),
                     }))
                     .await;
