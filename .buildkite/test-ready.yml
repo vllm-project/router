@@ -137,7 +137,7 @@ steps:
     command: |
       pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
         --confcutdir=tests/python/e2e/function/kv_aware \
-        -m e2e -v -s
+        --require-gpu-platform=cuda -m "e2e and L4 and cards_2" -v -s
     depends_on:
       - "upload-ready-pipeline"
       - "image-build"
