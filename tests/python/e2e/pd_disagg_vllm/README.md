@@ -1,0 +1,279 @@
+# P/D Disaggregation Integration Tests using vLLM
+
+This directory contains integration tests for Prefill/Decode (P/D) disaggregation using vLLM's NixlConnector and ROCm MoRI backends.
+
+## Overview
+
+These tests validate that the vLLM router correctly handles P/D disaggregated inference, where:
+- **Prefill instances** handle the initial prompt processing and KV cache generation
+- **Decode instances** handle token generation using the transferred KV cache
+- **Router** manages request routing between prefill and decode instances
+
+## Test Components
+
+### 1. `run_accuracy_test.sh`
+Main test script that:
+- Launches vLLM prefill and decode instances in Docker containers
+- Starts the vLLM router with P/D disaggregation enabled
+- Runs accuracy validation tests
+- Cleans up resources after completion
+
+**Configuration variables:**
+- `VLLM_DOCKER_IMAGE`: Docker image to use (default: `vllm/vllm-openai:latest`)
+- `MODEL_NAMES`: Model to test (default: `meta-llama/Llama-3.2-1B-Instruct`)
+- `NUM_PREFILL_INSTANCES`: Number of prefill instances (default: 1)
+- `NUM_DECODE_INSTANCES`: Number of decode instances (default: 1)
+- `PREFILLER_TP_SIZE`: Tensor parallelism for prefill (default: 1)
+- `DECODER_TP_SIZE`: Tensor parallelism for decode (default: 1)
+- `GPU_MEMORY_UTILIZATION`: GPU memory utilization (default: 0.6)
+- `KV_BUFFER_DEVICE`: KV buffer device - `cuda` or `cpu` (default: `cuda`)
+
+### 2. `test_pd_accuracy.py`
+Python script that validates accuracy by:
+- Testing non-streaming completions
+- Testing streaming completions
+- Validating response structure and content
+- Checking router health
+
+### 3. `tp_config_sweep_test.sh`
+Wrapper script that runs tests with multiple TP configurations:
+- TP=2 for both prefill and decode
+- TP=1 for prefill, TP=2 for decode (asymmetric)
+- Baseline single TP configuration
+- Various block size configurations
+
+### 4. ROCm MoRI runners
+
+`run_moriio_accuracy_test.sh` runs TP1 prefill and TP1 decode on two GPUs of
+one ROCm host with MoRI's xGMI backend. `run_moriio_rdma_accuracy_test.sh` runs
+prefill on the coordinator and decode on a second ROCm host over GPU-memory
+RDMA. Both runners cover MoRI read and write modes, Router discovery, sanity
+requests, and a bounded GSM8K accuracy evaluation with `Qwen/Qwen3-0.6B`.
+
+The two-node runner requires the coordinator's `vllm-router-rocm-worker` SSH
+alias, the pinned ROCm vLLM image and model cache on both hosts, and access to
+`/dev/kfd`, `/dev/dri`, and `/dev/infiniband`. For example:
+
+```bash
+MORIIO_READ_MODE=true bash ./run_moriio_accuracy_test.sh
+MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
+```
+
+## Running Tests
+
+### Prerequisites
+
+The following examples use the NVIDIA/Nixl runner. ROCm requirements are
+listed under [ROCm MoRI runners](#4-rocm-mori-runners).
+
+- Docker installed and running
+- NVIDIA Docker runtime configured
+- At least 4 GPUs available (for full test suite)
+- vLLM router binary built and in PATH
+
+### Quick Start
+
+Run all tests with default configuration:
+```bash
+cd tests/python/e2e/pd_disagg_vllm
+./tp_config_sweep_test.sh
+```
+
+### Run Single Configuration
+
+Run with specific settings:
+```bash
+GPU_MEMORY_UTILIZATION=0.6 \
+PREFILLER_TP_SIZE=2 \
+DECODER_TP_SIZE=2 \
+./run_accuracy_test.sh
+```
+
+### Custom Docker Image
+
+Use a specific vLLM Docker image:
+```bash
+VLLM_DOCKER_IMAGE=vllm/vllm-openai:v0.6.0 \
+./run_accuracy_test.sh
+```
+
+### Test Different Models
+
+Test with a different model:
+```bash
+MODEL_NAMES=Qwen/Qwen2.5-1.5B-Instruct \
+GPU_MEMORY_UTILIZATION=0.6 \
+./run_accuracy_test.sh
+```
+
+### Enable FlashInfer Backend
+
+Test with FlashInfer attention backend:
+```bash
+TEST_FLASHINFER=1 ./tp_config_sweep_test.sh
+```
+
+### Optional MoRI RDMA lifecycle validation
+
+After acquiring the shared host lease on an allocated two-host pair, run
+from this test directory (see [ROCm prerequisites](#4-rocm-mori-runners)):
+
+```bash
+HSA_NO_SCRATCH_RECLAIM=0 VLLM_ROCM_USE_SKINNY_GEMM=0 MORIIO_READ_MODE=true \
+RUN_PD_LIFECYCLE=true SMOKE_ONLY=false \
+bash ./run_moriio_rdma_accuracy_test.sh
+```
+
+The current pinned image needs `VLLM_ROCM_USE_SKINNY_GEMM=0` for the validated
+read-mode path. When the L3 matrix opts into the lifecycle probe, its read leg
+defaults this value to `0`; the conditional does not alter the write leg. The
+standalone launcher forwards only a non-empty caller override.
+
+The existing eval container runs completion, full-stream, active-client-disconnect,
+and recovery waves, before the normal accuracy evaluation. Defaults are
+`PD_PROBE_CONCURRENCY="1 2 4 8"`, `PD_PROBE_ROUNDS=2`, and
+`PD_PROBE_TIMEOUT=60` seconds per request. The probe stops at the first failed
+wave without retrying or increasing concurrency. Test read and write mode in
+separate allocated runs. `SKIP_LM_EVAL=true` selects diagnostics without the
+accuracy evaluation; `SMOKE_ONLY=true` with the probe is rejected before launch.
+Default CI scheduling, accuracy concurrency, and thresholds are unchanged.
+
+## Test Flow
+
+1. **Setup Phase**
+   - Creates Docker network for container communication
+   - Pulls vLLM Docker image
+   - Cleans up any existing containers
+
+2. **Launch Prefill Instances**
+   - Starts prefill containers with NixlConnector enabled
+   - Configures bootstrap ports for KV transfer
+   - Waits for health checks to pass
+
+3. **Launch Decode Instances**
+   - Starts decode containers with NixlConnector enabled
+   - Connects to prefill instances via KV transfer
+   - Waits for health checks to pass
+
+4. **Launch Router**
+   - Starts router with P/D disaggregation mode
+   - Registers prefill and decode instance URLs
+   - Validates router startup
+
+5. **Run Accuracy Tests**
+   - Sends completion requests through router
+   - Validates response accuracy and structure
+   - Tests streaming functionality
+
+6. **Cleanup**
+   - Stops all Docker containers
+   - Removes Docker network
+   - Reports test results
+
+### MoRI lifecycle results
+
+`LOG_DIR/pd-lifecycle.json` records each phase, outcome, and HTTP error status,
+with an atomic checkpoint after each wave. `status=running` means incomplete,
+not passed. Full streams need non-empty text, a normal finish reason, and
+`[DONE]`. Requests that finish before disconnection are recorded as `untested`.
+The probe continues past an inconclusive wave, but fails at the end if no wave
+observed a live disconnect. A recovery completion wave follows each disconnect
+wave unless a request has failed. The existing RDMA artifact glob includes the
+report alongside P/D/router logs.
+
+A pass demonstrates client-visible progress after disconnects, not engine abort
+propagation, KV reclamation, absence of leaks, or semantic accuracy. Inspect
+engine errors and resource trends separately; cached GPU memory need not return
+to zero. A timeout is a failure, not proof of server-side timeout handling.
+This is MoRIIO qualification, not UMBP, multi-P/D, or gRPC coverage.
+
+## GPU Requirements
+
+The tests automatically calculate GPU assignments:
+- Prefill instances use GPUs 0 through (N_prefill * TP_prefill - 1)
+- Decode instances use subsequent GPUs
+
+Example for `PREFILLER_TP_SIZE=2 DECODER_TP_SIZE=2`:
+- Prefill instance 0: GPUs 0-1
+- Decode instance 0: GPUs 2-3
+
+### Supported GPU Types
+
+| GPU Type | Memory | Recommended Model | Notes |
+|----------|--------|-------------------|-------|
+| L4 | 24GB | Llama-3.2-1B-Instruct | Default for CI |
+| A100 | 40GB/80GB | Meta-Llama-3.1-8B-Instruct | Larger models OK |
+| H100 | 80GB | Meta-Llama-3.1-70B-Instruct (with TP) | Best performance |
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VLLM_DOCKER_IMAGE` | vLLM Docker image | `vllm/vllm-openai:latest` |
+| `MODEL_NAMES` | Model to test | `meta-llama/Llama-3.2-1B-Instruct` |
+| `NUM_PREFILL_INSTANCES` | Number of prefill instances | `1` |
+| `NUM_DECODE_INSTANCES` | Number of decode instances | `1` |
+| `PREFILLER_TP_SIZE` | Prefill tensor parallelism | `1` |
+| `DECODER_TP_SIZE` | Decode tensor parallelism | `1` |
+| `GPU_MEMORY_UTILIZATION` | GPU memory utilization | `0.6` |
+| `PREFILL_BLOCK_SIZE` | Prefill block size | `128` |
+| `DECODE_BLOCK_SIZE` | Decode block size | `128` |
+| `KV_BUFFER_DEVICE` | KV buffer device | `cuda` |
+| `TEST_FLASHINFER` | Enable FlashInfer tests | (unset) |
+
+## Troubleshooting
+
+### Containers fail to start
+Check Docker logs:
+```bash
+docker logs vllm_prefill_0
+docker logs vllm_decode_0
+```
+
+### GPU out of memory
+Reduce `GPU_MEMORY_UTILIZATION`:
+```bash
+GPU_MEMORY_UTILIZATION=0.4 ./run_accuracy_test.sh
+```
+
+Or use a smaller model:
+```bash
+MODEL_NAMES=facebook/opt-125m ./run_accuracy_test.sh
+```
+
+### Port conflicts
+Change base ports:
+```bash
+PREFILL_BASE_PORT=9100 \
+DECODE_BASE_PORT=9200 \
+ROUTER_PORT=9300 \
+./run_accuracy_test.sh
+```
+
+### Clean up manually
+If tests fail and leave containers running:
+```bash
+docker rm -f $(docker ps -a -q --filter "name=vllm_")
+docker network rm vllm_pd_test_network
+```
+
+## CI/CD Integration
+
+The NVIDIA tests are integrated into the Buildkite pipeline. L1 runs one completion from `.buildkite/test-ready.yml`. Full GSM8K runs from `.buildkite/test-nightly.yml`.
+
+The NVIDIA tests run on a 4-GPU (L4) queue with a 30-minute timeout:
+- Uses Llama-3.2-1B-Instruct (fits well on L4 GPUs)
+- Tests multiple TP configurations
+- Validates both streaming and non-streaming requests
+
+### Opting into MoRI RDMA lifecycle checks
+
+To opt in on the existing L3 RDMA jobs, set `RUN_PD_LIFECYCLE=true` in a
+scheduled default-branch `NIGHTLY=1` build or a PR build labeled `nightly-test`.
+For a manual default-branch build, also set `RUN_ROCM_RDMA=1` and `NIGHTLY=1`.
+
+## References
+
+- [vLLM P/D Disaggregation Documentation](https://docs.vllm.ai/en/latest/serving/disaggregated_prefill_decode.html)
+- [NixlConnector KV Transfer](https://github.com/vllm-project/vllm/tree/main/vllm/distributed/kv_transfer)
+- [vLLM Router Documentation](../../README.md)

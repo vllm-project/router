@@ -165,7 +165,8 @@ impl Sequence {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::tokenizer::mock::MockTokenizer;

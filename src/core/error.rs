@@ -61,7 +61,8 @@ impl From<reqwest::Error> for WorkerError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::error::Error;

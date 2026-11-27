@@ -236,6 +236,7 @@ The router supports multiple load balancing policies:
 | `consistent_hash` | Routes same session/user to same worker | Yes | Multi-turn chat, KV cache reuse |
 | `power_of_two` | Picks least loaded of two random workers | No | Load-sensitive workloads |
 | `cache_aware` | Optimizes for prefix cache hits | Yes | Repeated prompts, few-shot |
+| [`kv_aware`](docs/load_balancing/kv_aware.md) | Scores observed KV reuse and worker load | Optional | Full and hybrid attention in colocated and P/D deployments |
 
 ```bash
 # Example: Using consistent_hash with HTTP header for session affinity
@@ -247,7 +248,11 @@ curl -X POST http://router:8000/v1/chat/completions \
 
 For detailed configuration options, hash key priorities, and usage examples, see [Load Balancing Documentation](docs/load_balancing/README.md).
 
-For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling.md).
+For the optional agent metadata contract, scheduling enablement, request-scoped hints, and engine KV-control boundary, see [Program Scheduling](docs/program_scheduling/program-scheduling.md).
+
+For agent and harness integration with workflow-conditioned return-time TTL, see [Agent integration for workflow TTL prediction](docs/program_scheduling/agent-integration.md).
+
+For Program-scoped PD scheduling (D-rank affinity, admission, bounded prefill permits) and warm remote KV reuse with automatic TTL, see [PD Program Scheduling](docs/program_scheduling/pd-program-scheduling.md).
 
 ## Advanced Features
 
@@ -266,11 +271,11 @@ vllm-router \
 
 ### Command Line Arguments Reference
 
-#### Service Discovery
-- `--service-discovery`: Enable Kubernetes service discovery
-- `--service-discovery-port`: Port for worker URLs (default: 8000)
-- `--service-discovery-namespace`: Kubernetes namespace to watch
-- `--selector`: Label selectors for regular mode (format: `key1=value1 key2=value2`)
+See the [complete CLI reference](docs/cli_reference.md) for server and worker
+configuration, routing policies, PD disaggregation, Program scheduling, service
+discovery, reliability, observability, authentication and middleware options.
+It lists types, accepted values, defaults and repeatable arguments separately
+for the Rust binary and Python launcher, whose supported options differ.
 
 ## Development
 

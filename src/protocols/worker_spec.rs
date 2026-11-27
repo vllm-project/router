@@ -135,31 +135,4 @@ pub struct WorkerErrorResponse {
     pub code: String,
 }
 
-/// Server info response from /get_server_info endpoint
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ServerInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u32>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<f32>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_type: Option<String>,
-
-    // KV-cache fields for kv_index discovery. All optional + aliased so a
-    // response lacking them (older vLLM, or endpoint that omits them) degrades
-    // gracefully instead of failing to parse.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance_id: Option<String>,
-    #[serde(default, alias = "block_size", skip_serializing_if = "Option::is_none")]
-    pub kv_block_size: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_attention_block_size: Option<u32>,
-}
+pub use crate::kv_index::discovery::ServerInfo;

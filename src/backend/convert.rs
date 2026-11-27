@@ -1,11 +1,49 @@
 //! OpenAI chat fields → `vllm-proto` `GenerateRequest`.
 //!
-//! This version always sets `prompt = TokenIds`. Proto also has text /
-//! `media` / KV-transfer fields; they are unused here. Sampling-default
-//! merge still lives in worker `vllm-text`; this only fills proto.
+//! This version always sets `prompt = TokenIds`. Proto also has text and
+//! `media` fields; they are unused here. KV-transfer fields are set only by
+//! the P/D router. Sampling-default merge still lives in worker `vllm-text`;
+//! this only fills proto.
 
 use crate::backend::pb;
-use crate::protocols::spec::{ChatCompletionRequest, StringOrArray};
+use crate::protocols::spec::{
+    ChatCompletionRequest, CompletionRequest, GenerationRequest, PromptInput, StringOrArray,
+};
+
+/// Passthrough keys the gRPC pipeline forwards to the worker. Anything else is
+/// rejected: a field the adapter cannot express must not be dropped silently.
+const SUPPORTED_OTHER: [&str; 7] = [
+    "add_special_tokens",
+    "cache_salt",
+    "documents",
+    "lora_name",
+    "priority",
+    "truncate_prompt_tokens",
+    "watermarking",
+];
+
+/// Completions-only response option; never part of the chat shape.
+const RETURN_TOKEN_IDS: &str = "return_token_ids";
+
+// Consumed by routing, never sent as generation options.
+const ROUTING_ONLY: [&str; 4] = ["vllm_xargs", "agent_hint", "session_id", "user_id"];
+
+fn ensure_supported_other<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    endpoint: &str,
+) -> Result<(), String> {
+    let unsupported: Vec<&str> = keys
+        .filter(|key| !SUPPORTED_OTHER.contains(key) && !ROUTING_ONLY.contains(key))
+        .collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported gRPC {endpoint} fields: {}",
+            unsupported.join(", ")
+        ))
+    }
+}
 
 pub fn requires_worker_output_text(request: &ChatCompletionRequest) -> bool {
     !request.no_stop_trim
@@ -49,28 +87,12 @@ pub fn chat_to_generate_request(
                 .to_string(),
         );
     }
-    let supported_other = [
-        "add_special_tokens",
-        "cache_salt",
-        "documents",
-        "lora_name",
-        "priority",
-        "truncate_prompt_tokens",
-        "watermarking",
-    ];
-    let unsupported: Vec<_> = request
-        .other
-        .keys()
-        .filter(|key| !supported_other.contains(&key.as_str()))
-        .cloned()
-        .collect();
-    if !unsupported.is_empty() {
-        return Err(format!(
-            "unsupported gRPC chat fields: {}",
-            unsupported.join(", ")
-        ));
-    }
+    ensure_supported_other(request.other.keys().map(String::as_str), "chat")?;
     other_bool(request, "add_special_tokens")?;
+    // Validate types before using the same scope as routing.
+    other_string(request, "lora_name")?;
+    other_string(request, "cache_salt")?;
+    let (lora_name, cache_salt) = request.cache_identity();
     let max_new_tokens = request
         .max_completion_tokens
         .or(request.max_tokens)
@@ -150,9 +172,7 @@ pub fn chat_to_generate_request(
             ..Default::default()
         }),
         kv: Some(pb::KvCacheParameters {
-            cache_salt: other_string(request, "cache_salt")?
-                .unwrap_or_default()
-                .to_string(),
+            cache_salt: cache_salt.unwrap_or_default().to_string(),
             ..Default::default()
         }),
         truncate_prompt_tokens: other_u32(request, "truncate_prompt_tokens")?.unwrap_or(0),
@@ -164,9 +184,7 @@ pub fn chat_to_generate_request(
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_string),
-        lora_name: other_string(request, "lora_name")?
-            .unwrap_or_default()
-            .to_string(),
+        lora_name: lora_name.unwrap_or_default().to_string(),
         watermarking: other_bool(request, "watermarking")?,
         ..Default::default()
     })
@@ -295,12 +313,397 @@ fn other_i32(request: &ChatCompletionRequest, key: &str) -> Result<Option<i32>, 
         .transpose()
 }
 
-#[cfg(test)]
+/// Turn a chat request into the prefill leg of a P/D pair: one sampled token,
+/// with the connector's `kv_transfer_params`.
+pub fn limit_to_prefill(proto: &mut pb::GenerateRequest) {
+    let stopping = proto.stopping.get_or_insert_with(Default::default);
+    stopping.max_new_tokens = 1;
+    stopping.min_new_tokens = 1;
+}
+
+pub fn set_kv_transfer_params(
+    proto: &mut pb::GenerateRequest,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    proto
+        .kv
+        .get_or_insert_with(Default::default)
+        .kv_transfer_params = Some(json_to_proto_struct(params)?);
+    Ok(())
+}
+
+/// protobuf `Struct` numbers are `f64`; integers above 2^53 lose precision.
+pub fn json_to_proto_struct(value: &serde_json::Value) -> Result<prost_types::Struct, String> {
+    match json_to_proto_value(value).kind {
+        Some(prost_types::value::Kind::StructValue(fields)) => Ok(fields),
+        _ => Err("kv_transfer_params must be a JSON object".to_string()),
+    }
+}
+
+fn json_to_proto_value(value: &serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    let kind = match value {
+        Value::Null => Kind::NullValue(prost_types::NullValue::NullValue as i32),
+        Value::Bool(value) => Kind::BoolValue(*value),
+        Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        Value::String(value) => Kind::StringValue(value.clone()),
+        Value::Array(items) => Kind::ListValue(prost_types::ListValue {
+            values: items.iter().map(json_to_proto_value).collect(),
+        }),
+        Value::Object(map) => Kind::StructValue(prost_types::Struct {
+            fields: map
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_proto_value(value)))
+                .collect(),
+        }),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+/// Whole numbers come back as JSON integers, so block ids and ports keep the
+/// shape the HTTP connector JSON uses.
+pub fn proto_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    use serde_json::Value;
+
+    const MAX_EXACT_INTEGER: f64 = 9_007_199_254_740_992.0;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => Value::Null,
+        Some(Kind::BoolValue(value)) => Value::Bool(*value),
+        Some(Kind::NumberValue(value)) => {
+            if value.fract() == 0.0 && value.abs() <= MAX_EXACT_INTEGER {
+                Value::from(*value as i64)
+            } else {
+                serde_json::Number::from_f64(*value).map_or(Value::Null, Value::Number)
+            }
+        }
+        Some(Kind::StringValue(value)) => Value::String(value.clone()),
+        Some(Kind::ListValue(list)) => {
+            Value::Array(list.values.iter().map(proto_value_to_json).collect())
+        }
+        Some(Kind::StructValue(fields)) => proto_struct_to_json(fields),
+    }
+}
+
+/// One prompt sequence after lowering, before any router-side tokenize.
+///
+/// Text prompts are encoded by the frontend (once, outside policy and
+/// retry); client ids pass through untouched. A batched request lowers to
+/// one entry per prompt, in client order; dispatching more than one is
+/// Stage 3's fan-out, not this lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionPrompt {
+    Ids(Vec<u32>),
+    Text(String),
+}
+
+/// A `/v1/completions` request lowered onto the gRPC pipeline: token ids only.
+///
+/// This is the lower the gRPC P/D completions path shares (`#563`): it reads
+/// `token_ids` straight off the result, so this struct keeps that field and
+/// this function keeps rejecting anything but a single `list[int]`.
+#[derive(Debug)]
+pub struct PreparedCompletion {
+    pub chat: ChatCompletionRequest,
+    pub token_ids: Vec<u32>,
+    pub emit_token_ids: bool,
+}
+
+/// A `/v1/completions` request lowered for the regular-pool path: one entry
+/// per prompt sequence, text included.
+///
+/// Only `EngineFrontend::prepare_completions` calls this lower; the gRPC P/D
+/// route never does, so a `Text` entry can never reach it.
+#[derive(Debug)]
+pub struct PreparedCompletionPrompts {
+    pub chat: ChatCompletionRequest,
+    pub prompts: Vec<CompletionPrompt>,
+    pub emit_token_ids: bool,
+}
+
+fn completion_ids(ids: &[i32]) -> Result<Vec<u32>, String> {
+    ids.iter()
+        .map(|id| {
+            u32::try_from(*id)
+                .map_err(|_| format!("prompt token ids must be non-negative 32-bit integers: {id}"))
+        })
+        .collect()
+}
+
+/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+///
+/// The gRPC wire protocol is token_ids-only. Token-id prompts go straight
+/// through; text prompts are lowered to `CompletionPrompt::Text` for the
+/// frontend to encode once with the model tokenizer — no chat template is
+/// applied. Fields without a chat-shape equivalent are rejected — dropping
+/// them would answer a different request than the client sent.
+///
+/// Regular-pool path only: the gRPC P/D completions path (`#563`) calls the
+/// token-id-only `prepare_grpc_completion` instead, so text never flows
+/// through a function that path reads.
+pub fn prepare_grpc_completion_prompts(
+    request: &CompletionRequest,
+) -> Result<PreparedCompletionPrompts, String> {
+    let prompts = match &request.prompt {
+        PromptInput::String(text) => vec![CompletionPrompt::Text(text.clone())],
+        PromptInput::StringArray(texts) => {
+            if texts.is_empty() {
+                return Err("completion prompt must not be empty".to_string());
+            }
+            texts.iter().cloned().map(CompletionPrompt::Text).collect()
+        }
+        PromptInput::IntArray(ids) => {
+            if ids.is_empty() {
+                return Err("completion prompt token_ids must not be empty".to_string());
+            }
+            vec![CompletionPrompt::Ids(completion_ids(ids)?)]
+        }
+        PromptInput::IntBatch(batch) => {
+            if batch.is_empty() {
+                return Err("completion prompt must not be empty".to_string());
+            }
+            batch
+                .iter()
+                .map(|ids| {
+                    if ids.is_empty() {
+                        return Err("completion prompt token_ids must not be empty".to_string());
+                    }
+                    completion_ids(ids).map(CompletionPrompt::Ids)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    let rejected: [(&str, bool, Option<&str>); 7] = [
+        ("suffix", request.suffix.is_some(), None),
+        ("best_of", request.best_of.is_some(), None),
+        (
+            "json_schema",
+            request.json_schema.is_some(),
+            Some("use regex or ebnf"),
+        ),
+        ("logprobs", request.logprobs.is_some(), None),
+        ("echo", request.echo, None),
+        ("return_hidden_states", request.return_hidden_states, None),
+        ("n > 1", request.n.unwrap_or(1) > 1, Some("use n=1")),
+    ];
+    if let Some((field, _, hint)) = rejected.iter().find(|(_, present, _)| *present) {
+        let hint = hint.map(|hint| format!("; {hint}")).unwrap_or_default();
+        return Err(format!(
+            "{field} is not supported by the gRPC /v1/completions path{hint}"
+        ));
+    }
+    if request.other.contains_key("documents") {
+        return Err("documents is not supported by the gRPC /v1/completions path".to_string());
+    }
+    // Router-side only: the adapter asks the worker for ids unconditionally, so
+    // this gates what the reply writes back rather than the wire request.
+    let emit_token_ids = match request.other.get(RETURN_TOKEN_IDS) {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "return_token_ids must be a boolean".to_string())?,
+    };
+    ensure_supported_other(
+        request
+            .other
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != RETURN_TOKEN_IDS),
+        "/v1/completions",
+    )?;
+    let other = request
+        .other
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != RETURN_TOKEN_IDS && !ROUTING_ONLY.contains(&key.as_str())
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let chat = ChatCompletionRequest {
+        model: request.model.clone(),
+        messages: Vec::new(),
+        temperature: request.temperature,
+        top_p: request.top_p,
+        n: request.n,
+        stream: request.stream,
+        stream_options: request.stream_options.clone(),
+        stop: request.stop.clone(),
+        max_tokens: request.max_tokens,
+        max_completion_tokens: None,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        logit_bias: request.logit_bias.clone(),
+        user: request.user.clone(),
+        seed: request.seed,
+        logprobs: false,
+        top_logprobs: None,
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        functions: None,
+        function_call: None,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        min_tokens: request.min_tokens,
+        repetition_penalty: request.repetition_penalty,
+        regex: request.regex.clone(),
+        ebnf: request.ebnf.clone(),
+        stop_token_ids: request.stop_token_ids.clone(),
+        no_stop_trim: request.no_stop_trim,
+        ignore_eos: request.ignore_eos,
+        add_generation_prompt: None,
+        continue_final_message: false,
+        skip_special_tokens: request.skip_special_tokens,
+        lora_path: request.lora_path.clone(),
+        session_params: request.session_params.clone(),
+        chat_template_kwargs: None,
+        return_hidden_states: false,
+        echo: None,
+        reasoning_effort: None,
+        structured_outputs: None,
+        other,
+        ..Default::default()
+    };
+    Ok(PreparedCompletionPrompts {
+        chat,
+        prompts,
+        emit_token_ids,
+    })
+}
+
+/// Completions → chat shape, prompt ids, and response options for a gRPC pool.
+///
+/// Token ids only: this is the lower the gRPC P/D completions path (`#563`)
+/// shares — it reads `lowered.token_ids` straight off the result. Text and
+/// batched prompts are rejected here; text goes through
+/// `prepare_grpc_completion_prompts` on the regular-pool path, which the P/D
+/// route never calls.
+pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCompletion, String> {
+    let PromptInput::IntArray(ids) = &request.prompt else {
+        return Err(
+            "gRPC /v1/completions requires a single token-id prompt (list[int])".to_string(),
+        );
+    };
+    if ids.is_empty() {
+        return Err("completion prompt token_ids must not be empty".to_string());
+    }
+    let lowered = prepare_grpc_completion_prompts(request)?;
+    let PreparedCompletionPrompts {
+        chat,
+        mut prompts,
+        emit_token_ids,
+    } = lowered;
+    let token_ids = match prompts.pop() {
+        Some(CompletionPrompt::Ids(ids)) if prompts.is_empty() => ids,
+        // An `IntArray` lowers to exactly one `Ids` entry.
+        _ => unreachable!("IntArray lowers to exactly one Ids prompt"),
+    };
+    Ok(PreparedCompletion {
+        chat,
+        token_ids,
+        emit_token_ids,
+    })
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     fn chat(json: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(json).unwrap()
+    }
+
+    fn completion_request(prompt: serde_json::Value) -> CompletionRequest {
+        serde_json::from_value(serde_json::json!({"prompt": prompt})).unwrap()
+    }
+
+    #[test]
+    fn completion_prompts_lowering_accepts_all_four_prompt_forms() {
+        let request = completion_request(serde_json::json!("hello"));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![CompletionPrompt::Text("hello".to_string())]
+        );
+
+        let request = completion_request(serde_json::json!(["first", "second"]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![
+                CompletionPrompt::Text("first".to_string()),
+                CompletionPrompt::Text("second".to_string()),
+            ]
+        );
+
+        let request = completion_request(serde_json::json!([1, 2]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(lowered.prompts, vec![CompletionPrompt::Ids(vec![1, 2])]);
+
+        let request = completion_request(serde_json::json!([[1], [2, 3]]));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![
+                CompletionPrompt::Ids(vec![1]),
+                CompletionPrompt::Ids(vec![2, 3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn completion_prompts_lowering_rejects_empty_and_negative_prompts() {
+        for prompt in [
+            serde_json::json!([]),
+            serde_json::json!([[]]),
+            serde_json::json!([[1], []]),
+        ] {
+            let request = completion_request(prompt);
+            let error = prepare_grpc_completion_prompts(&request).unwrap_err();
+            assert!(error.contains("must not be empty"), "{error}");
+        }
+        for prompt in [serde_json::json!([1, -2]), serde_json::json!([[1], [-1]])] {
+            let request = completion_request(prompt);
+            let error = prepare_grpc_completion_prompts(&request).unwrap_err();
+            assert!(error.contains("non-negative 32-bit integers"), "{error}");
+        }
+    }
+
+    #[test]
+    fn completion_routing_metadata_preserves_worker_cache_scope() {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": [1, 2], "lora_name": "adapter", "cache_salt": "tenant",
+            "session_id": "s", "user_id": "u", "agent_hint": {"agent_id": "a"},
+            "vllm_xargs": {"agentic_context": {"session_id": "s"}},
+            "session_params": {"session_id": "typed-session"}, "return_token_ids": true
+        }))
+        .unwrap();
+        let prepared = prepare_grpc_completion(&request).unwrap();
+        assert_eq!(prepared.token_ids, vec![1, 2]);
+        assert!(prepared.emit_token_ids);
+        assert_eq!(prepared.chat.cache_identity(), request.cache_identity());
+        assert_eq!(prepared.chat.session_params, request.session_params);
+        for key in ROUTING_ONLY {
+            assert!(!prepared.chat.other.contains_key(key));
+        }
+        let proto =
+            chat_to_generate_request(&prepared.chat, prepared.token_ids, "r".into()).unwrap();
+        assert_eq!(proto.lora_name, "adapter");
+        assert_eq!(proto.kv.unwrap().cache_salt, "tenant");
     }
 
     #[test]
@@ -324,6 +727,35 @@ mod tests {
         assert_eq!(proto.temperature, Some(0.2));
         assert_eq!(proto.model, "qwen");
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    fn vllm_xargs_is_accepted_as_router_plane_identity_and_dropped() {
+        // The canonical Program identity travels in `vllm_xargs`; the gRPC
+        // adapter must accept it for the HTTP layer to read, and must not
+        // forward it as an Engine field.
+        let req = chat(serde_json::json!({
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "vllm_xargs": {"agentic_context": {
+                "program_id": "program-a",
+                "expected_resume": true
+            }}
+        }));
+        let proto = chat_to_generate_request(&req, vec![5, 6], "req-2".into()).unwrap();
+        match proto.prompt.unwrap() {
+            pb::generate_request::Prompt::TokenIds(ids) => assert_eq!(ids.ids, vec![5, 6]),
+            other => panic!("expected token_ids, got {other:?}"),
+        }
+        // The typed request still exposes the identity to the scheduler.
+        let payload =
+            crate::protocols::spec::GenerationRequest::extract_program_identity_payload(&req)
+                .unwrap();
+        assert_eq!(
+            payload["vllm_xargs"]["agentic_context"]["program_id"],
+            "program-a"
+        );
     }
 
     #[test]
@@ -430,5 +862,165 @@ mod tests {
         }));
         let proto = chat_to_generate_request(&visible, vec![1], "r".into()).unwrap();
         assert_eq!(proto.response.unwrap().output_text, Some(false));
+    }
+
+    #[test]
+    fn kv_transfer_params_round_trip_through_proto_struct() {
+        let params = serde_json::json!({
+            "do_remote_prefill": true,
+            "do_remote_decode": false,
+            "remote_block_ids": [[7, 8], [9]],
+            "remote_engine_id": "P",
+            "remote_port": 5600,
+            "remote_host": null,
+            "ratio": 0.5,
+        });
+        let proto = json_to_proto_struct(&params).unwrap();
+        assert_eq!(proto_struct_to_json(&proto), params);
+        assert!(json_to_proto_struct(&serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn prefill_leg_samples_one_token_and_carries_kv_params() {
+        let req = chat(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "cache_salt": "salt"
+        }));
+        let mut proto = chat_to_generate_request(&req, vec![1, 2], "r".into()).unwrap();
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, &serde_json::json!({"do_remote_decode": true})).unwrap();
+        let stopping = proto.stopping.unwrap();
+        assert_eq!((stopping.max_new_tokens, stopping.min_new_tokens), (1, 1));
+        let kv = proto.kv.unwrap();
+        assert_eq!(kv.cache_salt, "salt");
+        assert_eq!(
+            proto_struct_to_json(kv.kv_transfer_params.as_ref().unwrap()),
+            serde_json::json!({"do_remote_decode": true})
+        );
+    }
+
+    fn completion(json: serde_json::Value) -> CompletionRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn lowers_completion_onto_chat_shape() {
+        let req = completion(serde_json::json!({
+            "model": "qwen",
+            "prompt": [1, 2, 3],
+            "max_tokens": 16,
+            "temperature": 0.3,
+            "top_k": 10,
+            "stop": ["END"],
+            "return_token_ids": true
+        }));
+        let prepared = prepare_grpc_completion(&req).unwrap();
+        assert_eq!(prepared.token_ids, vec![1, 2, 3]);
+        assert!(prepared.emit_token_ids);
+        assert_eq!(prepared.chat.max_tokens, Some(16));
+        assert_eq!(prepared.chat.top_k, Some(10));
+        assert!(prepared.chat.messages.is_empty());
+        assert!(prepared.chat.stop.is_some());
+    }
+
+    #[test]
+    fn token_ids_are_withheld_unless_requested() {
+        let default =
+            prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1]}))).unwrap();
+        assert!(!default.emit_token_ids);
+
+        let explicit_false = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": false
+        })))
+        .unwrap();
+        assert!(!explicit_false.emit_token_ids);
+
+        let wrong_type = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": "yes"
+        })))
+        .unwrap_err();
+        assert!(wrong_type.contains("boolean"), "{wrong_type}");
+    }
+
+    #[test]
+    fn rejects_fields_the_grpc_adapter_cannot_express() {
+        for (body, field) in [
+            (
+                serde_json::json!({"prompt": [1], "suffix": "tail"}),
+                "suffix",
+            ),
+            (serde_json::json!({"prompt": [1], "best_of": 3}), "best_of"),
+            (serde_json::json!({"prompt": [1], "n": 2}), "n > 1"),
+            (
+                serde_json::json!({"prompt": [1], "json_schema": "{\"type\":\"object\"}"}),
+                "json_schema",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "logprobs": 3}),
+                "logprobs",
+            ),
+            (serde_json::json!({"prompt": [1], "echo": true}), "echo"),
+            (
+                serde_json::json!({"prompt": [1], "return_hidden_states": true}),
+                "return_hidden_states",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "documents": [{"content": "x"}]}),
+                "documents",
+            ),
+        ] {
+            let err = prepare_grpc_completion(&completion(body)).unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
+
+        let off = completion(serde_json::json!({"prompt": [1], "echo": false}));
+        assert!(!prepare_grpc_completion(&off)
+            .unwrap()
+            .chat
+            .echo
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn rejects_unknown_passthrough_fields_instead_of_dropping_them() {
+        let err = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "guided_decoding_backend": "xgrammar"
+        })))
+        .unwrap_err();
+        assert!(err.contains("guided_decoding_backend"), "{err}");
+
+        let chat_err = chat_to_generate_request(
+            &chat(serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "guided_decoding_backend": "xgrammar"
+            })),
+            vec![1],
+            "r".into(),
+        )
+        .unwrap_err();
+        assert!(chat_err.contains("guided_decoding_backend"), "{chat_err}");
+    }
+
+    #[test]
+    fn accepts_text_prompts_but_rejects_negative_ids() {
+        // Stage 1: a text prompt lowers to `Text` for the frontend to encode,
+        // on the regular-pool path only; the shared token-id lower still
+        // rejects it for not being `list[int]`.
+        let request = completion(serde_json::json!({"prompt": "hello"}));
+        let lowered = prepare_grpc_completion_prompts(&request).unwrap();
+        assert_eq!(
+            lowered.prompts,
+            vec![CompletionPrompt::Text("hello".to_string())]
+        );
+        let text = prepare_grpc_completion(&request).unwrap_err();
+        assert!(text.contains("list[int]"), "{text}");
+
+        let negative = prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1, -2]})))
+            .unwrap_err();
+        assert!(negative.contains("non-negative"), "{negative}");
     }
 }

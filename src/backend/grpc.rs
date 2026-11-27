@@ -13,36 +13,183 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::convert::{chat_to_generate_request, requires_worker_output_text};
-use super::detect::{grpc_connect_uri, parse_dp_rank};
-use super::openai::{
-    final_response, finish_reason_name, format_sse, now_secs, stream_chunk, stream_usage_chunk,
-    SSE_DONE,
+use super::convert::{
+    chat_to_generate_request, limit_to_prefill, proto_struct_to_json, requires_worker_output_text,
+    set_kv_transfer_params,
 };
+use super::detect::{grpc_connect_uri, parse_dp_rank};
+use super::frontend::{PreparedRequest, ResponseShape};
+use super::openai::{
+    completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
+    sse_usage_chunk, SSE_DONE,
+};
+use super::outcome::{EngineOutcomeObserver, EngineUsage};
+use super::pb::control_client::ControlClient;
+use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
-use super::preprocess::{FrontendHandle, TokenizeOut};
+use super::pb::AbortRequest;
+use super::stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer};
 use super::vllm_frontend::{decode_stream, emit_detok, DynTokenizer, IncrementalDecoderTrait};
-use crate::protocols::spec::{ChatCompletionRequest, Usage};
+use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
+const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// P/D fields layered on a prepared chat. Default is a colocated request.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct KvHandoff {
+    /// Engine `GenerateRequest.request_id`; the OpenAI response id is separate.
+    pub engine_request_id: Option<String>,
+    pub kv_transfer_params: Option<serde_json::Value>,
+}
+
+/// Sends `Control.Abort` for a P/D engine request if dropped before
+/// [`disarm`](Self::disarm). A vLLM worker notices a cancelled RPC only at its
+/// next send, so one waiting on KV would otherwise keep the request running.
+///
+/// vLLM registers a request before it answers the RPC, and an Abort for an
+/// unregistered id is a no-op. A leg dropped before its answer may race its
+/// own registration, so it gets a second Abort after a short delay.
+struct EngineAbortGuard {
+    target: Option<(Channel, String)>,
+    timeout: Duration,
+    answered: bool,
+}
+
+impl EngineAbortGuard {
+    fn new(channel: &Channel, engine_request_id: Option<&str>, timeout: Duration) -> Self {
+        Self {
+            target: engine_request_id.map(|id| (channel.clone(), id.to_string())),
+            timeout,
+            answered: false,
+        }
+    }
+
+    fn answered(&mut self) {
+        self.answered = true;
+    }
+
+    fn disarm(mut self) {
+        self.target = None;
+    }
+}
+
+impl Drop for EngineAbortGuard {
+    fn drop(&mut self) {
+        let Some((channel, request_id)) = self.target.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let timeout = self.timeout;
+        let retry = !self.answered;
+        runtime.spawn(async move {
+            send_engine_abort(&channel, &request_id, timeout).await;
+            if retry {
+                tokio::time::sleep(ENGINE_ABORT_RETRY_DELAY).await;
+                send_engine_abort(&channel, &request_id, timeout).await;
+            }
+        });
+    }
+}
+
+async fn send_engine_abort(channel: &Channel, request_id: &str, timeout: Duration) {
+    let request = AbortRequest {
+        request_ids: vec![request_id.to_string()],
+    };
+    let result =
+        tokio::time::timeout(timeout, ControlClient::new(channel.clone()).abort(request)).await;
+    match result {
+        Ok(Ok(_)) => debug!(%request_id, "grpc Control.Abort sent"),
+        Ok(Err(status)) => {
+            debug!(%request_id, code = ?status.code(), msg = %status.message(), "grpc Control.Abort failed")
+        }
+        Err(_) => debug!(%request_id, "grpc Control.Abort timed out"),
+    }
+}
 
 #[derive(Clone)]
-pub struct GrpcStreamTask(Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>);
+pub struct GrpcStreamTask {
+    handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    output_frame: Option<OutputFrameConsumer>,
+    failed: Option<watch::Receiver<bool>>,
+}
 
 impl GrpcStreamTask {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(handle))))
+        Self {
+            handle: Arc::new(std::sync::Mutex::new(Some(handle))),
+            output_frame: None,
+            failed: None,
+        }
+    }
+
+    pub(crate) fn with_output_frame(
+        handle: tokio::task::JoinHandle<()>,
+        output_frame: OutputFrameConsumer,
+    ) -> Self {
+        Self {
+            handle: Arc::new(std::sync::Mutex::new(Some(handle))),
+            output_frame: Some(output_frame),
+            failed: None,
+        }
+    }
+
+    fn with_failure(mut self, failed: watch::Receiver<bool>) -> Self {
+        self.failed = Some(failed);
+        self
+    }
+
+    /// Resolves once the producer has queued an error frame and stopped.
+    /// Stays pending for a stream that finishes cleanly.
+    pub(crate) fn failure(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let outcome = self.outcome();
+        async move {
+            if !outcome.await {
+                std::future::pending::<()>().await
+            }
+        }
+    }
+
+    /// Resolves once the producer stops: `true` if it queued an error frame,
+    /// `false` if it finished cleanly or was dropped.
+    pub(crate) fn outcome(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
+        let failed = self.failed.clone();
+        async move {
+            match failed {
+                Some(mut failed) => failed.wait_for(|failed| *failed).await.is_ok(),
+                None => false,
+            }
+        }
     }
 
     pub fn take(&self) -> Option<tokio::task::JoinHandle<()>> {
-        self.0.lock().ok()?.take()
+        self.handle.lock().ok()?.take()
     }
+
+    pub(crate) fn output_frame(&self) -> Option<OutputFrameConsumer> {
+        self.output_frame.clone()
+    }
+}
+
+fn send_stream_chunk(
+    tx: &mpsc::UnboundedSender<Result<String, std::io::Error>>,
+    output: &mut OutputFrameProducer,
+    chunk: String,
+    has_generated_output: bool,
+) -> bool {
+    output.send(tx, chunk, has_generated_output)
 }
 
 fn grpc_status_code(status: &tonic::Status) -> StatusCode {
@@ -61,7 +208,7 @@ fn grpc_status_code(status: &tonic::Status) -> StatusCode {
 
 #[derive(Clone)]
 pub struct GrpcEngineBackend {
-    clients: Arc<DashMap<String, InferenceClient<Channel>>>,
+    clients: Arc<DashMap<String, Channel>>,
     connect_timeout: Duration,
     request_timeout: Duration,
 }
@@ -97,7 +244,7 @@ impl GrpcEngineBackend {
         }
     }
 
-    async fn client_for(&self, worker_url: &str) -> Result<InferenceClient<Channel>, String> {
+    async fn channel_for(&self, worker_url: &str) -> Result<Channel, String> {
         let uri = grpc_connect_uri(worker_url)?;
         if let Some(hit) = self.clients.get(&uri) {
             return Ok(hit.clone());
@@ -108,9 +255,8 @@ impl GrpcEngineBackend {
             .connect()
             .await
             .map_err(|e| format!("grpc connect {uri}: {e}"))?;
-        let client = InferenceClient::new(channel);
-        self.clients.insert(uri, client.clone());
-        Ok(client)
+        self.clients.insert(uri, channel.clone());
+        Ok(channel)
     }
 
     pub fn remove_client(&self, worker_url: &str) {
@@ -119,45 +265,138 @@ impl GrpcEngineBackend {
         }
     }
 
-    pub async fn dispatch_prepared(
+    /// P/D prefill leg as unary `Generate`. Returns the engine's
+    /// `FinishInfo.kv_transfer_params`, which the decode leg consumes.
+    pub(crate) async fn prefill_prepared(
         &self,
         worker_url: &str,
-        request: &ChatCompletionRequest,
-        tokenized: TokenizeOut,
-        handle: FrontendHandle,
-        resolve_ms: f64,
-        t_req: Instant,
+        prepared: &PreparedRequest,
+        engine_request_id: String,
+        kv_transfer_params: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, Response> {
+        let mut proto = chat_to_generate_request(
+            prepared.request.as_ref(),
+            prepared.tokenized.token_ids.as_ref().to_vec(),
+            engine_request_id.clone(),
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
+        limit_to_prefill(&mut proto);
+        set_kv_transfer_params(&mut proto, kv_transfer_params)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+
+        let channel = self.channel_for(worker_url).await.map_err(|error| {
+            error!(error = %error, "grpc prefill connect failed");
+            (StatusCode::BAD_GATEWAY, error).into_response()
+        })?;
+        let abort = EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
+        let mut tonic_req = tonic::Request::new(proto);
+        tonic_req.set_timeout(self.request_timeout);
+        if let Some(rank) = parse_dp_rank(worker_url) {
+            tonic_req
+                .metadata_mut()
+                .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
+        }
+        let response = match tokio::time::timeout(self.request_timeout, client.generate(tonic_req))
+            .await
+        {
+            Ok(Ok(response)) => {
+                abort.disarm();
+                response.into_inner()
+            }
+            Ok(Err(status)) => {
+                abort.disarm();
+                warn!(code = ?status.code(), msg = %status.message(), "prefill Generate failed");
+                return Err((
+                    grpc_status_code(&status),
+                    format!("grpc Generate: {}", status.message()),
+                )
+                    .into_response());
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "grpc Generate exceeded request timeout",
+                )
+                    .into_response());
+            }
+        };
+        let finish = response.outputs.and_then(|outputs| outputs.finish_info);
+        if finish
+            .as_ref()
+            .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32)
+        {
+            warn!(%engine_request_id, "prefill Generate finished aborted");
+            return Err((StatusCode::BAD_GATEWAY, "grpc Generate: prefill aborted").into_response());
+        }
+        Ok(finish
+            .and_then(|finish| finish.kv_transfer_params)
+            .map(|params| proto_struct_to_json(&params)))
+    }
+
+    pub(crate) async fn dispatch_prepared(
+        &self,
+        worker_url: &str,
+        prepared: PreparedRequest,
+        on_first_output: Option<FirstOutputCallback>,
+        handoff: KvHandoff,
+        observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
     ) -> Response {
+        let PreparedRequest {
+            request,
+            tokenized,
+            handle,
+            resolve_ms,
+            t_req,
+            shape,
+            emit_token_ids,
+        } = prepared;
+        let request = request.as_ref();
         let n_prompt_tokens = tokenized.token_ids.len();
         let adapt_ms = tokenized.adapt_ms;
         let template_ms = tokenized.template_ms;
         let encode_ms = tokenized.encode_ms;
         let frontend_ms = tokenized.frontend_ms();
         let encode_backend = tokenized.encode_backend;
+        let cached_tokens = tokenized.cached_tokens;
 
-        let request_id = format!("chatcmpl-{}", Uuid::new_v4());
+        let request_id = match shape {
+            ResponseShape::Chat => format!("chatcmpl-{}", Uuid::new_v4()),
+            ResponseShape::Completion => format!("cmpl-{}", Uuid::new_v4()),
+        };
         let model = request.model.clone().unwrap_or_else(|| "unknown".into());
         let created = now_secs();
         let skip_special = request.skip_special_tokens;
         let detok_tokenizer = handle.tokenizer();
         let detok_prompt_ids = tokenized.token_ids.clone();
-        let proto = match chat_to_generate_request(
+        let abort_request_id = handoff.engine_request_id.clone();
+        let mut proto = match chat_to_generate_request(
             request,
             tokenized.token_ids.as_ref().to_vec(),
-            request_id.clone(),
+            handoff
+                .engine_request_id
+                .unwrap_or_else(|| request_id.clone()),
         ) {
             Ok(proto) => proto,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+        if let Some(params) = &handoff.kv_transfer_params {
+            if let Err(error) = set_kv_transfer_params(&mut proto, params) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+        }
 
         let t_connect = Instant::now();
-        let mut client = match self.client_for(worker_url).await {
+        let channel = match self.channel_for(worker_url).await {
             Ok(c) => c,
             Err(e) => {
                 error!(error = %e, "grpc backend connect failed");
                 return (StatusCode::BAD_GATEWAY, e).into_response();
             }
         };
+        let mut abort =
+            EngineAbortGuard::new(&channel, abort_request_id.as_deref(), self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
         let grpc_connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
 
         let mut tonic_req = tonic::Request::new(proto);
@@ -173,8 +412,12 @@ impl GrpcEngineBackend {
             match tokio::time::timeout(self.request_timeout, client.generate_stream(tonic_req))
                 .await
             {
-                Ok(Ok(s)) => s.into_inner(),
+                Ok(Ok(s)) => {
+                    abort.answered();
+                    s.into_inner()
+                }
                 Ok(Err(status)) => {
+                    abort.disarm();
                     warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
                     return (
                         grpc_status_code(&status),
@@ -201,6 +444,7 @@ impl GrpcEngineBackend {
             "adapt_ms": adapt_ms,
             "template_ms": template_ms,
             "encode_ms": encode_ms,
+            "encode_cached_tokens": cached_tokens,
             "frontend_ms": frontend_ms,
             "xfer_ms": xfer_ms,
             "grpc_connect_ms": grpc_connect_ms,
@@ -220,9 +464,15 @@ impl GrpcEngineBackend {
                 .as_ref()
                 .and_then(|options| options.include_usage)
                 .unwrap_or(false),
+            shape,
+            emit_token_ids,
             request_timeout: self.request_timeout,
             stages,
             t_req,
+            on_first_output,
+            fail_on_abort: abort_request_id.is_some(),
+            abort,
+            observer,
         };
         if request.stream {
             stream_openai(stream, reply, n_prompt_tokens).await
@@ -245,9 +495,17 @@ struct ChatReply {
     skip_special: bool,
     prefer_worker_text: bool,
     include_usage: bool,
+    shape: ResponseShape,
+    emit_token_ids: bool,
     request_timeout: Duration,
     stages: serde_json::Value,
     t_req: Instant,
+    on_first_output: Option<FirstOutputCallback>,
+    /// A P/D decode leg reports an `abort` finish as an error, so the push
+    /// path can cancel P instead of returning an aborted reply as success.
+    fail_on_abort: bool,
+    abort: EngineAbortGuard,
+    observer: Option<std::sync::Arc<EngineOutcomeObserver>>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -271,6 +529,21 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
     }
 }
 
+/// Settle the producer's terminal `finish_reason` for a streaming attempt.
+///
+/// The body ends normally after `finish_reason="abort"`, so the attempt must
+/// record an error (and therefore settle as failed) rather than succeeding on
+/// EOF.
+fn record_finish_outcome(observer: Option<&EngineOutcomeObserver>, finish: Option<&str>) -> bool {
+    let aborted = finish == Some("abort");
+    if aborted {
+        if let Some(observer) = observer {
+            observer.record_error();
+        }
+    }
+    !aborted
+}
+
 async fn stream_openai(
     mut stream: tonic::Streaming<super::pb::GenerateResponse>,
     reply: ChatReply,
@@ -285,109 +558,198 @@ async fn stream_openai(
         skip_special,
         prefer_worker_text,
         include_usage,
+        shape,
+        emit_token_ids,
         request_timeout,
         mut stages,
         t_req,
+        on_first_output: _,
+        fail_on_abort: _,
+        abort,
+        observer,
     } = reply;
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
     let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
+    let (mut producer_output_frame, output_frame) = output_frame_tracking();
+    let (failed_tx, failed_rx) = watch::channel(false);
     let producer = tokio::spawn(async move {
-        let mut detok = tok
-            .as_ref()
-            .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
-        let mut first = true;
-        let mut first_token_logged = false;
-        let mut prompt_tokens = n_prompt_tokens as u32;
-        let mut completion_tokens = 0u32;
-        loop {
-            let item = match tokio::time::timeout(request_timeout, stream.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = tx.send(Ok(
-                        "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
-                            .to_string(),
-                    ));
-                    return;
-                }
-            };
-            match item {
-                Ok(msg) => {
-                    if stages.get("first_grpc_msg_ms").is_none() {
-                        stages["first_grpc_msg_ms"] =
-                            serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    if let Some(info) = &msg.prompt_info {
-                        prompt_tokens = info.num_prompt_tokens;
-                    }
-                    if let Some(outputs) = &msg.outputs {
-                        completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
-                    }
-                    let (text, finish) =
-                        match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
-                            Ok(output) => output,
-                            Err(error) => {
-                                let _ = tx.send(Ok(format!(
-                                    "data: {{\"error\":{}}}\n\n",
-                                    serde_json::to_string(&error).unwrap_or_default()
-                                )));
-                                return;
-                            }
-                        };
-                    if !first_token_logged && !text.is_empty() {
-                        stages["first_token_ms"] =
-                            serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
-                        stages["first_detok_ms"] = stages["first_token_ms"].clone();
-                        fill_engine_ms(&mut stages);
-                        if stages_on {
-                            info!(%stages, "grpc generate stages");
-                            let _ = tx.send(Ok(format!(": router-stages {stages}\n\n")));
+        let finished = async {
+            let mut detok = tok
+                .as_ref()
+                .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
+            let mut first = true;
+            let mut first_token_logged = false;
+            let mut prompt_tokens = n_prompt_tokens as u32;
+            let mut engine_prompt_tokens: Option<u32> = None;
+            let mut completion_tokens = 0u32;
+            loop {
+                let item = match tokio::time::timeout(request_timeout, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if let Some(observer) = &observer {
+                            observer.record_error();
                         }
-                        first_token_logged = true;
-                    }
-                    if !text.is_empty() || finish.is_some() || first {
-                        let chunk = stream_chunk(
-                            &request_id,
-                            &model,
-                            created,
-                            &text,
-                            first,
-                            finish.clone(),
-                            None,
+                        let _ = send_stream_chunk(
+                            &tx,
+                            &mut producer_output_frame,
+                            "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
+                                .to_string(),
+                            false,
                         );
-                        if tx.send(Ok(format_sse(&chunk))).is_err() {
-                            break;
-                        }
-                        first = false;
+                        return false;
                     }
-                    if finish.is_some() {
-                        if include_usage {
-                            let usage = Usage {
-                                prompt_tokens,
-                                completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                                completion_tokens_details: None,
+                };
+                match item {
+                    Ok(msg) => {
+                        if stages.get("first_grpc_msg_ms").is_none() {
+                            stages["first_grpc_msg_ms"] =
+                                serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        if let Some(info) = &msg.prompt_info {
+                            prompt_tokens = info.num_prompt_tokens;
+                            engine_prompt_tokens = Some(info.num_prompt_tokens);
+                        }
+                        if let Some(outputs) = &msg.outputs {
+                            completion_tokens =
+                                completion_tokens.saturating_add(outputs.num_tokens);
+                        }
+                        let (text, finish) =
+                            match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
+                                Ok(output) => output,
+                                Err(error) => {
+                                    if let Some(observer) = &observer {
+                                        observer.record_error();
+                                    }
+                                    let _ = send_stream_chunk(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        format!(
+                                            "data: {{\"error\":{}}}\n\n",
+                                            serde_json::to_string(&error).unwrap_or_default()
+                                        ),
+                                        false,
+                                    );
+                                    return false;
+                                }
                             };
-                            let chunk = stream_usage_chunk(&request_id, &model, created, usage);
-                            let _ = tx.send(Ok(format_sse(&chunk)));
+                        let generated_output = has_generated_output(&msg, &text);
+                        if !first_token_logged && !text.is_empty() {
+                            stages["first_token_ms"] =
+                                serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
+                            stages["first_detok_ms"] = stages["first_token_ms"].clone();
+                            fill_engine_ms(&mut stages);
+                            if stages_on {
+                                info!(%stages, "grpc generate stages");
+                                let _ = send_stream_chunk(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    format!(": router-stages {stages}\n\n"),
+                                    false,
+                                );
+                            }
+                            first_token_logged = true;
                         }
-                        let _ = tx.send(Ok(SSE_DONE.to_string()));
-                        return;
+                        // Ids alone qualify: the decoder buffers byte-fallback
+                        // fragments, so text can be empty while the frame holds
+                        // tokens a token-exact client still needs.
+                        let output_token_ids = if emit_token_ids {
+                            msg.outputs
+                                .as_ref()
+                                .map(|outputs| outputs.token_ids.clone())
+                                .filter(|ids| !ids.is_empty())
+                        } else {
+                            None
+                        };
+                        if !text.is_empty()
+                            || output_token_ids.is_some()
+                            || finish.is_some()
+                            || (first && shape == ResponseShape::Chat)
+                        {
+                            let line = sse_chunk(
+                                shape,
+                                &request_id,
+                                &model,
+                                created,
+                                &text,
+                                first,
+                                finish.clone(),
+                                output_token_ids,
+                            );
+                            if !send_stream_chunk(
+                                &tx,
+                                &mut producer_output_frame,
+                                line,
+                                generated_output,
+                            ) {
+                                break;
+                            }
+                            first = false;
+                        }
+                        if finish.is_some() {
+                            if let Some(observer) = &observer {
+                                observer.record_usage(EngineUsage {
+                                    prompt_tokens: engine_prompt_tokens
+                                        .map(|tokens| tokens as usize),
+                                    completion_tokens: completion_tokens as usize,
+                                });
+                            }
+                            if include_usage {
+                                let usage = Usage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens: prompt_tokens + completion_tokens,
+                                    completion_tokens_details: None,
+                                };
+                                let line =
+                                    sse_usage_chunk(shape, &request_id, &model, created, usage);
+                                let _ =
+                                    send_stream_chunk(&tx, &mut producer_output_frame, line, false);
+                            }
+                            let _ = send_stream_chunk(
+                                &tx,
+                                &mut producer_output_frame,
+                                SSE_DONE.to_string(),
+                                false,
+                            );
+                            return record_finish_outcome(observer.as_deref(), finish.as_deref());
+                        }
                     }
-                }
-                Err(status) => {
-                    let _ = tx.send(Ok(format!(
-                        "data: {{\"error\":{}}}\n\n",
-                        serde_json::to_string(status.message()).unwrap_or_default()
-                    )));
-                    return;
+                    Err(status) => {
+                        if let Some(observer) = &observer {
+                            observer.record_error();
+                        }
+                        let _ = send_stream_chunk(
+                            &tx,
+                            &mut producer_output_frame,
+                            format!(
+                                "data: {{\"error\":{}}}\n\n",
+                                serde_json::to_string(status.message()).unwrap_or_default()
+                            ),
+                            false,
+                        );
+                        return false;
+                    }
                 }
             }
+            if let Some(observer) = &observer {
+                observer.record_error();
+            }
+            let _ = send_stream_chunk(
+                &tx,
+                &mut producer_output_frame,
+                "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
+                false,
+            );
+            false
         }
-        let _ = tx.send(Ok(
-            "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
-        ));
+        .await;
+        if finished {
+            abort.disarm();
+        } else {
+            failed_tx.send_replace(true);
+        }
     });
 
     let body = Body::from_stream(UnboundedReceiverStream::new(rx));
@@ -403,7 +765,7 @@ async fn stream_openai(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     response
         .extensions_mut()
-        .insert(GrpcStreamTask::new(producer));
+        .insert(GrpcStreamTask::with_output_frame(producer, output_frame).with_failure(failed_rx));
     response
 }
 
@@ -420,22 +782,34 @@ async fn collect_openai(
         skip_special,
         prefer_worker_text,
         include_usage: _,
+        shape,
+        emit_token_ids,
         request_timeout,
         mut stages,
         t_req,
+        on_first_output,
+        fail_on_abort,
+        abort,
+        observer,
     } = reply;
     let mut detok = tok
         .as_ref()
         .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
     let mut text = String::new();
+    let mut token_ids: Vec<u32> = Vec::new();
     let mut finish = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
+    let mut engine_prompt_tokens: Option<u32> = None;
     let mut completion_tokens = 0u32;
+    let mut first_output_seen = false;
     loop {
         let item = match tokio::time::timeout(request_timeout, stream.next()).await {
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(_) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
                     "gRPC stream exceeded request timeout",
@@ -451,14 +825,24 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
+                    engine_prompt_tokens = Some(info.num_prompt_tokens);
                 }
                 let (delta, reason) =
                     match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
                         Ok(output) => output,
                         Err(error) => {
+                            if let Some(observer) = &observer {
+                                observer.record_error();
+                            }
                             return (StatusCode::BAD_GATEWAY, error).into_response();
                         }
                     };
+                notify_first_output(
+                    &msg,
+                    &delta,
+                    &mut first_output_seen,
+                    on_first_output.as_ref(),
+                );
                 if stages.get("first_token_ms").is_none() && !delta.is_empty() {
                     stages["first_token_ms"] =
                         serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
@@ -468,12 +852,18 @@ async fn collect_openai(
                 text.push_str(&delta);
                 if let Some(outputs) = &msg.outputs {
                     completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                    if emit_token_ids {
+                        token_ids.extend_from_slice(&outputs.token_ids);
+                    }
                 }
                 if reason.is_some() {
                     finish = reason;
                 }
             }
             Err(status) => {
+                if let Some(observer) = &observer {
+                    observer.record_error();
+                }
                 return (
                     StatusCode::BAD_GATEWAY,
                     format!("grpc stream: {}", status.message()),
@@ -483,28 +873,78 @@ async fn collect_openai(
         }
     }
     if finish.is_none() {
+        if let Some(observer) = &observer {
+            observer.record_error();
+        }
         return (
             StatusCode::BAD_GATEWAY,
             "gRPC stream closed before finish_info",
         )
             .into_response();
     }
-    let body = final_response(
-        &request_id,
-        &model,
-        created,
-        text,
-        finish,
-        prompt_tokens,
-        completion_tokens,
-    );
-    let mut resp = (StatusCode::OK, axum::Json(body)).into_response();
+    if let Some(observer) = &observer {
+        observer.record_usage(EngineUsage {
+            prompt_tokens: engine_prompt_tokens.map(|tokens| tokens as usize),
+            completion_tokens: completion_tokens as usize,
+        });
+    }
+    abort.disarm();
+    // Program settlement must see aborts even when this adapter preserves the
+    // regular (non-PD) HTTP response status for compatibility.
+    let succeeded = record_finish_outcome(observer.as_deref(), finish.as_deref());
+    if fail_on_abort && !succeeded {
+        warn!(%request_id, "gRPC decode finished aborted");
+        return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
+    }
+    let mut resp = match shape {
+        ResponseShape::Chat => axum::Json(final_response(
+            &request_id,
+            &model,
+            created,
+            text,
+            finish,
+            prompt_tokens,
+            completion_tokens,
+        ))
+        .into_response(),
+        ResponseShape::Completion => axum::Json(completion_final_response(
+            &request_id,
+            &model,
+            created,
+            text,
+            finish,
+            prompt_tokens,
+            completion_tokens,
+            emit_token_ids.then_some(token_ids),
+            emit_token_ids.then(|| prompt_ids.to_vec()),
+        ))
+        .into_response(),
+    };
     if crate::backend::stages_enabled() {
         resp.headers_mut()
             .insert("x-router-stages", stages_header(&stages));
         info!(%stages, "grpc generate stages");
     }
     resp
+}
+
+fn notify_first_output(
+    msg: &super::pb::GenerateResponse,
+    text: &str,
+    first_output_seen: &mut bool,
+    callback: Option<&FirstOutputCallback>,
+) {
+    let aborted = msg
+        .outputs
+        .as_ref()
+        .and_then(|output| output.finish_info.as_ref())
+        .is_some_and(|finish| finish.finish_reason == FinishReason::Aborted as i32);
+    if !*first_output_seen && !aborted && has_generated_output(msg, text) {
+        *first_output_seen = true;
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
 }
 
 fn output_text_and_finish(
@@ -539,7 +979,7 @@ fn output_text_and_finish(
                 .flush(None)
                 .map_err(|error| format!("detokenization flush failed: {error}"))?;
             if let Some(last) = last {
-                decoded.push_str(&last);
+                decoded.push_str(&last.text);
             }
         }
     }
@@ -549,4 +989,121 @@ fn output_text_and_finish(
         decoded
     };
     Ok((text, finish))
+}
+
+fn has_generated_output(msg: &super::pb::GenerateResponse, text: &str) -> bool {
+    msg.outputs.as_ref().is_some_and(|outputs| {
+        outputs.num_tokens > 0 || !outputs.token_ids.is_empty() || !text.is_empty()
+    })
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn prompt_info_does_not_count_as_generated_output() {
+        let prompt_info = GenerateResponse {
+            prompt_info: Some(PromptInfo {
+                num_prompt_tokens: 32,
+                ..Default::default()
+            }),
+            outputs: None,
+        };
+        assert!(!has_generated_output(&prompt_info, ""));
+
+        let decode_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decode_started_callback = decode_started.clone();
+        let callback: FirstOutputCallback = Arc::new(move || {
+            decode_started_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut first_output_seen = false;
+        notify_first_output(&prompt_info, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 0);
+
+        let output = GenerateResponse {
+            prompt_info: None,
+            outputs: Some(SequenceOutput {
+                num_tokens: 1,
+                token_ids: vec![42],
+                ..Default::default()
+            }),
+        };
+        assert!(has_generated_output(&output, ""));
+        notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        notify_first_output(&output, "", &mut first_output_seen, Some(&callback));
+        assert_eq!(decode_started.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn aborted_response_does_not_notify_first_output() {
+        let aborted = GenerateResponse {
+            outputs: Some(SequenceOutput {
+                num_tokens: 1,
+                token_ids: vec![42],
+                finish_info: Some(super::super::pb::FinishInfo {
+                    finish_reason: FinishReason::Aborted as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            prompt_info: None,
+        };
+        let decode_started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let decode_started_callback = decode_started.clone();
+        let callback: FirstOutputCallback = Arc::new(move || {
+            decode_started_callback.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut first_output_seen = false;
+        notify_first_output(&aborted, "", &mut first_output_seen, Some(&callback));
+        assert!(!first_output_seen);
+        assert_eq!(decode_started.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn output_frame_latches_to_the_first_generated_response() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut producer, mut consumer) = output_frame_tracking();
+
+        assert!(send_stream_chunk(
+            &tx,
+            &mut producer,
+            "prompt info".into(),
+            false,
+        ));
+        assert!(!consumer.on_frame());
+
+        assert!(send_stream_chunk(
+            &tx,
+            &mut producer,
+            "first token".into(),
+            true,
+        ));
+        assert!(consumer.on_frame());
+
+        assert!(send_stream_chunk(
+            &tx,
+            &mut producer,
+            "second token".into(),
+            true,
+        ));
+        assert!(consumer.on_frame());
+    }
+
+    #[test]
+    fn abort_finish_records_an_error_and_fails_the_round() {
+        let observer = EngineOutcomeObserver::default();
+        assert!(!record_finish_outcome(Some(&observer), Some("abort")));
+        assert!(observer.failed());
+
+        let observer = EngineOutcomeObserver::default();
+        assert!(record_finish_outcome(Some(&observer), Some("stop")));
+        assert!(!observer.failed());
+
+        // No observer still reports the aborted round as failed.
+        assert!(!record_finish_outcome(None, Some("abort")));
+    }
 }

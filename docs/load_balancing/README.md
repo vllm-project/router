@@ -14,6 +14,7 @@ the policy is the same for `grpc://host:port`.
 | `consistent_hash` | Multi-turn conversations, KV cache reuse | Yes | No |
 | `power_of_two` | Load-sensitive workloads | No | Yes |
 | `cache_aware` | Prefix caching optimization | Yes (cache-based) | Yes |
+| `kv_aware` | KV reuse and stage-aware load scoring | Optional | Yes |
 
 ---
 
@@ -214,28 +215,54 @@ vllm-router --policy cache_aware \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `cache_threshold` | 0.5 | Minimum prefix match ratio to use cache-based routing |
+| `cache_threshold` | 0.5 | Minimum prefix match ratio over the full input |
 | `balance_abs_threshold` | 32 | Absolute load difference threshold for load balancing |
 | `balance_rel_threshold` | 1.1 | Relative load ratio threshold for load balancing |
 | `eviction_interval_secs` | 30 | Interval for cache eviction |
-| `max_tree_size` | 10000 | Maximum nodes per radix tree |
+| `max_tree_size` | 33,554,432 (`2^25`) | Character budget per worker per model |
+
+Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyond it between cycles. This character budget is not a memory limit; actual memory usage also includes tree overhead and scales with the number of workers and models.
 
 ### Behavior
 
 1. **Balanced mode** (when load is even):
    - Find worker with highest prefix match for the request
    - If match rate > `cache_threshold`: route to that worker (cache hit)
-   - Otherwise: route to worker with smallest tree (most cache capacity)
+   - Otherwise: route to worker with lowest load
 
 2. **Imbalanced mode** (when load is skewed):
    - Route to worker with lowest load (shortest queue)
    - Still updates the tree to maintain cache state
+
+If several candidate workers have the same lowest load, the policy picks one of them uniformly at random.
 
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)
 - When prefix caching is enabled on vLLM workers
 - Multi-tenant deployments with distinct prompt patterns
+
+---
+
+## KV Aware
+
+See the [KV-aware deployment guide](kv_aware.md) for worker requirements, routing modes and model recipes.
+
+### P/D decode load
+
+Decode ranks workers by logical context tokens, with request count as the fallback when prompt length is unknown. To credit pages already on the Decode GPU, enable KV events on Decode workers. If event discovery is unavailable, supply their addresses with `--pd-kv-events`.
+
+gRPC and HTTP token-ID prompts can receive this credit. HTTP text and chat requests use full context tokens. The decision metric reports `context_tokens_marginal` when the Router can price every candidate, and `context_tokens` when it uses full context tokens.
+
+### Session affinity
+
+Affinity is off by default. Add `--kv-aware-session-affinity-ttl-secs 1800` to retain bindings for 30 minutes of inactivity.
+
+Send the same `x-session-id` header or `session_params.session_id` on each turn; agent metadata and framework session headers take precedence.
+
+In P/D mode, affinity applies only to decode. A busy decoder may be replaced by a less busy one; prefill is selected independently for each request.
+
+Multiple router replicas need ingress stickiness to preserve affinity.
 
 ---
 
@@ -276,6 +303,7 @@ vllm-router --policy cache_aware \
 | Batch inference with no state | `round_robin` |
 | Variable request complexity | `power_of_two` |
 | Repeated system prompts / few-shot | `cache_aware` |
+| Repeated prefixes with worker KV events | `kv_aware` |
 | Simple testing / development | `random` |
 
 ---
@@ -295,4 +323,9 @@ vllm-router \
 
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Use `round_robin` or `power_of_two` for load distribution
+- **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+
+`grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
+warns at startup when a worker reports an older `engine_version`, and
+`power_of_two` uses the router's local load counts for them. See
+[gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).

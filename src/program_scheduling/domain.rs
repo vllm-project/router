@@ -5,7 +5,10 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::ProgramRequestHints;
+use super::{
+    output_length::PendingOutputPrediction, prediction_profile::ReturnTimeKey, ContextTokens,
+    ProgramRequestHints,
+};
 
 /// Whether a Program currently owns logical admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,43 +86,68 @@ pub struct ProgramTarget {
 /// Immutable proof that one retained request was admitted to a target.
 #[derive(Debug, Clone)]
 pub struct ProgramDispatch {
+    attempt_id: u64,
     program: ProgramRef,
     /// Target selected by the accepted admission or resume transition.
     pub target_id: String,
     placement_epoch: u64,
     request_arrived_at: Instant,
     dispatched_at: Instant,
-    estimated_context_tokens: usize,
+    context: ContextTokens,
     placement_start_request: bool,
     routing_text: Option<String>,
     request_hints: ProgramRequestHints,
+    expected_resume: bool,
+    pending_output_prediction: Option<PendingOutputPrediction>,
+    return_time_keys: Vec<ReturnTimeKey>,
 }
 
 impl ProgramDispatch {
     /// Construct a dispatch after admission has atomically committed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        attempt_id: u64,
         program: ProgramRef,
         target_id: String,
         placement_epoch: u64,
         request_arrived_at: Instant,
         dispatched_at: Instant,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         placement_start_request: bool,
         routing_text: Option<String>,
         request_hints: ProgramRequestHints,
     ) -> Self {
         Self {
+            attempt_id,
             program,
             target_id,
             placement_epoch,
             request_arrived_at,
             dispatched_at,
-            estimated_context_tokens,
+            context,
             placement_start_request,
             routing_text,
             request_hints,
+            expected_resume: true,
+            pending_output_prediction: None,
+            return_time_keys: Vec::new(),
         }
+    }
+
+    pub(crate) fn attach_prediction_context(
+        &mut self,
+        expected_resume: bool,
+        pending_output_prediction: Option<PendingOutputPrediction>,
+        return_time_keys: Vec<ReturnTimeKey>,
+    ) {
+        self.expected_resume = expected_resume;
+        self.pending_output_prediction = pending_output_prediction;
+        self.return_time_keys = return_time_keys;
+    }
+
+    /// Unique Router-owned attempt, fencing duplicate completion within a placement.
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt_id
     }
 
     /// Exact Program generation associated with this request attempt.
@@ -142,9 +170,34 @@ impl ProgramDispatch {
         self.dispatched_at
     }
 
-    /// Arrival-time context estimate for completion fallback.
-    pub fn estimated_context_tokens(&self) -> usize {
-        self.estimated_context_tokens
+    /// Applied arrival-time context demand for completion fallback.
+    pub fn context_tokens(&self) -> usize {
+        self.context.tokens()
+    }
+
+    /// Provenance of the applied context demand.
+    pub fn context_token_source(&self) -> super::TokenFactSource {
+        self.context.source()
+    }
+
+    /// Full arrival-time token facts for this attempt.
+    pub fn context_facts(&self) -> super::ContextTokens {
+        self.context
+    }
+
+    /// Fingerprint of a prepared count, when this attempt carried one.
+    pub fn context_token_fingerprint(&self) -> Option<super::TokenizerFingerprint> {
+        self.context.fingerprint()
+    }
+
+    /// Shadow counterfactual recorded at arrival, when shadow mode was active.
+    pub fn shadow_context_tokens(&self) -> Option<usize> {
+        self.context.shadow_tokens()
+    }
+
+    /// Prepared counterfactual with provenance, when shadow mode was active.
+    pub fn shadow_context_facts(&self) -> Option<super::TokenFacts> {
+        self.context.shadow_facts()
     }
 
     /// Whether this is the first request after admission or resume.
@@ -160,6 +213,20 @@ impl ProgramDispatch {
     /// Request-scoped metadata that affected admission and completion TTL.
     pub fn request_hints(&self) -> &ProgramRequestHints {
         &self.request_hints
+    }
+
+    /// Whether upstream expects another model request after this request completes.
+    pub fn expected_resume(&self) -> bool {
+        self.expected_resume
+    }
+
+    pub(crate) fn pending_output_prediction(&self) -> Option<&PendingOutputPrediction> {
+        self.pending_output_prediction.as_ref()
+    }
+
+    /// Arrival-time workflow keys, independent of later Program mutations.
+    pub(crate) fn return_time_keys(&self) -> &[ReturnTimeKey] {
+        &self.return_time_keys
     }
 
     /// Stable privacy-preserving Program identifier for logs and metrics.
@@ -197,7 +264,8 @@ impl From<Option<usize>> for ProgramUsageObservation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -4,10 +4,15 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
+use super::output_length::PendingOutputPrediction;
+use super::prediction_profile::PredictionProfileStore;
+use super::return_time::PendingReturnPrediction;
 use super::{
-    ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
+    ContextTokens, ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
+    TokenCountMode, TokenizerFingerprint,
 };
+use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +31,17 @@ pub enum ProgramResumeOrder {
 /// Complete opt-in Program scheduler configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgramSchedulerConfig {
+    /// PD enforces serial turns and immediate capacity even after force timeout.
+    pub pd_mode: bool,
+    pub pd_explicit_ttl: bool,
+    /// PD treats native occupancy and Program reservations as overlapping KV.
+    pub pd_exclusive_capacity_accounting: bool,
+    /// Configured P prefill permits; also the tightened cap under P KV pressure.
+    pub pd_prefill_permits: usize,
+    /// P KV-usage watermark above which the Program-count cap tightens.
+    pub pd_prefill_kv_high: f64,
+    /// P KV-cache sampling window used for guard freshness.
+    pub pd_prefill_kv_window: Duration,
     /// Metadata source that opts an individual request into Program scheduling.
     pub enable_key: ProgramSchedulingEnableKey,
     /// Preserve Program identity and binding but bypass Router admission.
@@ -42,6 +58,16 @@ pub struct ProgramSchedulerConfig {
     pub hash_virtual_nodes: u32,
     /// Coarse Program-count guard when explicit token capacity is unavailable.
     pub max_active_programs_per_target: usize,
+    /// Input-token fact source used for admission, growth, and TTL cost.
+    pub token_count_mode: TokenCountMode,
+    /// Model pools allowed to apply prepared exact counts. Empty means all.
+    pub token_count_model_pools: Vec<String>,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    pub token_count_verification_settlements: usize,
+    /// Text endpoints allowed to apply Router-tokenized exact counts.
+    pub exact_text_endpoints: Vec<String>,
+    /// HTTP metrics endpoint override keyed by Program target base URL.
+    pub metrics_base_urls: BTreeMap<String, String>,
     /// Backend observation and periodic scheduling interval.
     pub metrics_interval: Duration,
     /// Block admission at or above this native waiting-request count.
@@ -58,11 +84,19 @@ pub struct ProgramSchedulerConfig {
     pub shared_prefix_freshness_kv_turnovers: f64,
     /// Rank-local Progress-TTL formulas and calibration.
     pub progress_ttl: ProgressTtlConfig,
+    /// Optional offline-seeded shadow predictors.
+    pub prediction_profile: PredictionProfileConfig,
 }
 
 impl Default for ProgramSchedulerConfig {
     fn default() -> Self {
         Self {
+            pd_mode: false,
+            pd_explicit_ttl: false,
+            pd_exclusive_capacity_accounting: true,
+            pd_prefill_permits: 1,
+            pd_prefill_kv_high: 0.85,
+            pd_prefill_kv_window: Duration::from_secs(10),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
             global_queue: false,
@@ -71,6 +105,11 @@ impl Default for ProgramSchedulerConfig {
             binding_strategy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
             max_active_programs_per_target: 64,
+            token_count_mode: TokenCountMode::default(),
+            token_count_model_pools: Vec::new(),
+            token_count_verification_settlements: 1,
+            exact_text_endpoints: Vec::new(),
+            metrics_base_urls: BTreeMap::new(),
             metrics_interval: Duration::from_secs(1),
             admission_waiting_request_threshold: 1,
             queue_timeout: Duration::from_secs(600),
@@ -79,13 +118,62 @@ impl Default for ProgramSchedulerConfig {
             shared_prefix_freshness_warmup: Duration::from_secs(100),
             shared_prefix_freshness_kv_turnovers: 2.0,
             progress_ttl: ProgressTtlConfig::default(),
+            prediction_profile: PredictionProfileConfig::default(),
         }
     }
 }
 
+/// Resolve an optional admission bound: zero means "auto".
+///
+/// Two Programs per configured P prefill permit covers the short tool gaps
+/// between turns; the permit count is the configured proxy for the per-target
+/// decode slot count. The clamp keeps pathological configurations bounded.
+pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    (2 * prefill_permits.max(1)).clamp(4, 64)
+}
+
 impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
     fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
+        Self::from_program_config(config, false)
+    }
+}
+
+impl ProgramSchedulerConfig {
+    /// Build the scheduler config for one routing mode. PD mode comes from the
+    /// active `--vllm-pd-disaggregation` route, not from a second config flag.
+    pub fn from_program_config(
+        config: &crate::config::types::ProgramSchedulingConfig,
+        pd_mode: bool,
+    ) -> Self {
+        // Auto sizing is a PD-mode concept. A regular-mode config that omitted
+        // the fields deserializes the zero defaults; keep the historical
+        // 64-Program cap and 1-request overload gate for those deployments.
+        let permits = config.pd.max_prefill_requests_per_target;
+        let max_active_programs_per_target = if config.max_active_programs_per_target > 0 {
+            config.max_active_programs_per_target
+        } else if pd_mode {
+            resolve_auto_limit(0, permits)
+        } else {
+            64
+        };
+        let admission_waiting_request_threshold = if config.admission_waiting_request_threshold > 0
+        {
+            config.admission_waiting_request_threshold
+        } else if pd_mode {
+            resolve_auto_limit(0, permits)
+        } else {
+            1
+        };
         Self {
+            pd_mode,
+            pd_explicit_ttl: config.pd.explicit_ttl,
+            pd_exclusive_capacity_accounting: config.pd.exclusive_capacity_accounting,
+            pd_prefill_permits: config.pd.max_prefill_requests_per_target.max(1),
+            pd_prefill_kv_high: config.pd.prefill_kv_high_watermark,
+            pd_prefill_kv_window: Duration::from_secs_f64(config.pd.prefill_kv_window_seconds),
             enable_key: config.enable_key,
             binding_only: config.binding_only,
             global_queue: config.global_queue,
@@ -93,9 +181,14 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
             binding_strategy: config.binding_strategy,
             hash_virtual_nodes: config.hash_virtual_nodes,
-            max_active_programs_per_target: config.max_active_programs_per_target,
+            max_active_programs_per_target,
+            token_count_mode: config.token_count_mode,
+            token_count_model_pools: config.token_count_model_pools.clone(),
+            token_count_verification_settlements: config.token_count_verification_settlements,
+            exact_text_endpoints: config.exact_text_endpoints.clone(),
+            metrics_base_urls: config.metrics_base_urls.clone(),
             metrics_interval: Duration::from_secs_f64(config.metrics_interval_seconds),
-            admission_waiting_request_threshold: config.admission_waiting_request_threshold,
+            admission_waiting_request_threshold,
             queue_timeout: Duration::from_secs_f64(config.queue_timeout_seconds),
             force_resume_timeout: Duration::from_secs_f64(config.force_resume_timeout_seconds),
             paused_retention_ttl: Duration::from_secs_f64(config.paused_retention_ttl_seconds),
@@ -109,12 +202,14 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 max_acting_ttl: Duration::from_secs_f64(config.max_acting_ttl_seconds),
                 high_watermark_ratio: config.high_watermark_ratio,
                 low_watermark_ratio: config.low_watermark_ratio,
+                capacity_repair_policy: config.capacity_repair_policy,
                 max_segment_rounds: config.max_segment_rounds,
                 stats_window_size: config.stats_window_size,
                 enable_batch_gain_admission: config.enable_batch_gain_admission,
                 prefill: config.prefill_cost_model,
                 decode: config.decode_throughput_model,
             },
+            prediction_profile: config.prediction_profile.clone(),
         }
     }
 }
@@ -151,12 +246,16 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) agent_id: Option<String>,
     pub(crate) parent_program_id: Option<String>,
     pub(crate) blocks_parent: bool,
+    pub(crate) expected_resume: bool,
     pub(crate) agent_role: Option<String>,
     pub(crate) spawn_reason: Option<String>,
+    pub(crate) workflow_profile_id: Option<String>,
+    pub(crate) profile_version: Option<String>,
     pub(crate) step_id: u64,
     pub(crate) home_target: Option<String>,
     pub(crate) last_target: Option<String>,
-    pub(crate) estimated_context_tokens: usize,
+    /// Input-token demand currently reserved in the rank ledger and its provenance.
+    pub(crate) context: ContextTokens,
     pub(crate) output_token_reservation: Option<usize>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
@@ -174,6 +273,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) lifetime_generated_tokens: usize,
     pub(crate) last_request_finished_at: Option<Instant>,
     pub(crate) last_cache_miss_impact_seconds: f64,
+    pub(crate) last_applied_acting_ttl: Duration,
     pub(crate) acting_since: Option<Instant>,
     pub(crate) ttl_deadline: Option<Instant>,
     pub(crate) queued_at: Option<Instant>,
@@ -186,6 +286,10 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_pause_reason: Option<ProgramPauseReason>,
     pub(crate) pause_when_idle: bool,
     pub(crate) terminate_when_idle: bool,
+    pub(crate) pending_return_prediction: Option<PendingReturnPrediction>,
+    pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
+    pub(crate) last_return_actual_seconds: Option<f64>,
+    pub(crate) last_output_actual_tokens: Option<usize>,
 }
 
 impl ProgramDecisionState {
@@ -193,7 +297,7 @@ impl ProgramDecisionState {
         placement_key: String,
         placement_hash_key: String,
         home_target: Option<String>,
-        estimated_context_tokens: usize,
+        context: ContextTokens,
         now: Instant,
     ) -> Self {
         Self {
@@ -204,12 +308,15 @@ impl ProgramDecisionState {
             agent_id: None,
             parent_program_id: None,
             blocks_parent: false,
+            expected_resume: true,
             agent_role: None,
             spawn_reason: None,
+            workflow_profile_id: None,
+            profile_version: None,
             step_id: 0,
             last_target: home_target.clone(),
             home_target,
-            estimated_context_tokens,
+            context,
             output_token_reservation: None,
             context_shrink_observations: 0,
             completed_requests: 0,
@@ -227,6 +334,7 @@ impl ProgramDecisionState {
             lifetime_generated_tokens: 0,
             last_request_finished_at: None,
             last_cache_miss_impact_seconds: 0.0,
+            last_applied_acting_ttl: Duration::ZERO,
             acting_since: None,
             ttl_deadline: None,
             queued_at: Some(now),
@@ -239,6 +347,10 @@ impl ProgramDecisionState {
             last_pause_reason: None,
             pause_when_idle: false,
             terminate_when_idle: false,
+            pending_return_prediction: None,
+            latest_output_prediction: None,
+            last_return_actual_seconds: None,
+            last_output_actual_tokens: None,
         }
     }
 
@@ -251,7 +363,8 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> f64 {
-        self.estimated_context_tokens
+        self.context
+            .tokens()
             .saturating_sub(self.shared_prefix_tokens)
             .saturating_add(
                 expected_output_tokens
@@ -260,17 +373,53 @@ impl ProgramDecisionState {
             ) as f64
     }
 
-    pub(crate) fn observe_completed_context(&mut self, observed_context_tokens: usize) {
+    /// Private KV footprint for an explicit request-scoped context estimate.
+    ///
+    /// Admission of a queued turn must charge that turn's own prompt, not the
+    /// largest prompt of any later turn already retained behind it.
+    pub(crate) fn private_tokens_from_context(
+        &self,
+        context_tokens: usize,
+        decode_buffer_tokens: usize,
+        expected_output_tokens: Option<usize>,
+    ) -> f64 {
+        context_tokens
+            .saturating_sub(self.shared_prefix_tokens)
+            .saturating_add(
+                expected_output_tokens
+                    .or(self.output_token_reservation)
+                    .unwrap_or(decode_buffer_tokens),
+            ) as f64
+    }
+
+    /// Update the ledger size while retaining the arrival's token provenance.
+    pub(crate) fn set_context_tokens(&mut self, tokens: usize) {
+        self.context.tokens = tokens;
+        self.context_shrink_observations = 0;
+    }
+
+    /// Reconcile an Engine-observed context with the current ledger demand.
+    ///
+    /// Trusted prepared counts may replace an older estimate immediately when
+    /// no other attempt of this Program can still grow the context. Estimated
+    /// inputs and overlapping attempts keep the two-shrink-confirmation rule so
+    /// a smaller observed count cannot undercount concurrent requests.
+    pub(crate) fn observe_completed_context(
+        &mut self,
+        observed_context_tokens: usize,
+        trusted_prepared: bool,
+        context_is_quiescent: bool,
+    ) {
         const SHRINK_CONFIRMATIONS: u8 = 2;
-        if observed_context_tokens >= self.estimated_context_tokens {
-            self.estimated_context_tokens = observed_context_tokens;
-            self.context_shrink_observations = 0;
+        if observed_context_tokens >= self.context.tokens()
+            || (trusted_prepared && context_is_quiescent)
+        {
+            self.set_context_tokens(observed_context_tokens);
             return;
         }
         self.context_shrink_observations = self.context_shrink_observations.saturating_add(1);
         if self.context_shrink_observations >= SHRINK_CONFIRMATIONS {
-            self.estimated_context_tokens = observed_context_tokens;
-            self.context_shrink_observations = 0;
+            self.set_context_tokens(observed_context_tokens);
         }
     }
 }
@@ -324,7 +473,52 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
     pub(crate) rank_factors: HashMap<String, ProgressTtlFactors>,
+    pub(crate) prediction_profiles: PredictionProfileStore,
+    pub(crate) next_prediction_snapshot_at: Instant,
     pub(crate) lineage: ProgramLineage,
+    /// Fingerprints whose prepared counts disagreed with Engine usage.
+    ///
+    /// Ordered by revocation time and bounded so a pathological workload cannot
+    /// grow scheduler memory without limit.
+    pub(crate) revoked_token_fingerprints: BTreeMap<TokenizerFingerprint, Instant>,
+    /// Model pools whose revocation set hit its bound. Absence from the set
+    /// means "trusted", so evicting old fingerprints would fail open; instead
+    /// prepared facts for a saturated pool fall back to estimation until the
+    /// Router restarts, while other pools keep their exact facts.
+    pub(crate) token_fingerprint_saturated_pools: BTreeSet<String>,
+    /// Total revocations, including entries evicted from the bounded map.
+    pub(crate) token_fingerprint_revocations: u64,
+    /// Fingerprints with at least one matching Engine settlement.
+    ///
+    /// Value: `(matching_settlements, verification_sequence)`. The sequence is
+    /// used to evict the oldest entry when the map grows past its bound.
+    pub(crate) verified_token_fingerprints: BTreeMap<TokenizerFingerprint, (usize, u64)>,
+    /// Monotonic sequence for verified-fingerprint eviction.
+    pub(crate) token_fingerprint_verification_sequence: u64,
+    /// Consecutive successful settlements without Engine prompt usage, per
+    /// pool. Entries reaching the threshold stay disabled until restart.
+    pub(crate) token_usage_misses: BTreeMap<String, u8>,
+    /// Fail closed if the bounded pool-observation map fills.
+    pub(crate) token_usage_tracking_saturated: bool,
+    /// Most recent P-side KV-cache pressure sample.
+    pub(crate) prefill_pressure: Option<PrefillPressure>,
+    /// Per-P-target metrics samples, keyed by base URL.
+    pub(crate) prefill_targets: HashMap<String, PrefillTargetObservation>,
+}
+
+/// P KV-cache usage as seen from the prefill engines.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillPressure {
+    pub(crate) kv_usage: f64,
+    pub(crate) observed_at: Instant,
+}
+
+/// One prefill target's metrics sample, used by the warm-read pressure gates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillTargetObservation {
+    pub(crate) kv_usage: Option<f64>,
+    pub(crate) running_requests: Option<usize>,
+    pub(crate) observed_at: Instant,
 }
 
 impl ProgramSchedulerState {
@@ -341,12 +535,36 @@ impl ProgramSchedulerState {
             global_queues: HashMap::new(),
             observations: HashMap::new(),
             rank_factors: HashMap::new(),
+            prediction_profiles: PredictionProfileStore::empty(
+                config
+                    .prediction_profile
+                    .return_time_bucket_bounds_seconds
+                    .clone(),
+                config
+                    .prediction_profile
+                    .output_length_bucket_bounds_tokens
+                    .clone(),
+                config.prediction_profile.max_keys,
+                config.prediction_profile.stability_window_size,
+            ),
+            next_prediction_snapshot_at: Instant::now()
+                + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
             lineage: ProgramLineage::default(),
+            revoked_token_fingerprints: BTreeMap::new(),
+            token_fingerprint_saturated_pools: BTreeSet::new(),
+            token_fingerprint_revocations: 0,
+            verified_token_fingerprints: BTreeMap::new(),
+            token_fingerprint_verification_sequence: 0,
+            token_usage_misses: BTreeMap::new(),
+            token_usage_tracking_saturated: false,
+            prefill_pressure: None,
+            prefill_targets: HashMap::new(),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{DecodeThroughputModel, PrefillCostModel};
@@ -366,20 +584,77 @@ mod tests {
     }
 
     #[test]
+    fn auto_admission_limits_follow_the_prefill_permits() {
+        assert_eq!(resolve_auto_limit(0, 4), 8);
+        assert_eq!(resolve_auto_limit(0, 1), 4);
+        assert_eq!(resolve_auto_limit(0, 64), 64);
+        assert_eq!(resolve_auto_limit(3, 4), 3);
+        assert_eq!(resolve_auto_limit(96, 4), 96);
+
+        let parsed: crate::config::types::ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
+        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
+        assert_eq!(runtime.max_active_programs_per_target, 8);
+        assert_eq!(runtime.admission_waiting_request_threshold, 8);
+        assert!(runtime.pd_exclusive_capacity_accounting);
+        assert_eq!(runtime.pd_prefill_permits, 4);
+        assert_eq!(runtime.pd_prefill_kv_high, 0.85);
+
+        // Regular deployments deserialize the zero defaults but must keep the
+        // historical admission pool and overload gate.
+        let regular: crate::config::types::ProgramSchedulingConfig =
+            serde_json::from_str("{}").unwrap();
+        let runtime = ProgramSchedulerConfig::from(&regular);
+        assert!(!runtime.pd_mode);
+        assert_eq!(runtime.max_active_programs_per_target, 64);
+        assert_eq!(runtime.admission_waiting_request_threshold, 1);
+    }
+
+    #[test]
     fn context_shrink_requires_two_authoritative_observations() {
         let now = Instant::now();
         let mut state = ProgramDecisionState::new(
             "task".into(),
             "hash".into(),
             Some("rank-0".into()),
-            100,
+            ContextTokens::estimated(100),
             now,
         );
-        state.observe_completed_context(80);
-        assert_eq!(state.estimated_context_tokens, 100);
-        state.observe_completed_context(80);
-        assert_eq!(state.estimated_context_tokens, 80);
-        state.observe_completed_context(120);
-        assert_eq!(state.estimated_context_tokens, 120);
+        state.observe_completed_context(80, false, true);
+        assert_eq!(state.context.tokens(), 100);
+        state.observe_completed_context(80, false, true);
+        assert_eq!(state.context.tokens(), 80);
+        state.observe_completed_context(120, false, true);
+        assert_eq!(state.context.tokens(), 120);
+    }
+
+    #[test]
+    fn trusted_prepared_context_may_shrink_immediately() {
+        let now = Instant::now();
+        let mut state = ProgramDecisionState::new(
+            "task".into(),
+            "hash".into(),
+            Some("rank-0".into()),
+            ContextTokens::estimated(100_000),
+            now,
+        );
+        state.observe_completed_context(80_000, true, true);
+        assert_eq!(state.context.tokens(), 80_000);
+    }
+
+    #[test]
+    fn trusted_prepared_context_keeps_overlap_confirmation() {
+        let now = Instant::now();
+        let mut state = ProgramDecisionState::new(
+            "task".into(),
+            "hash".into(),
+            Some("rank-0".into()),
+            ContextTokens::estimated(100_000),
+            now,
+        );
+        state.observe_completed_context(80_000, true, false);
+        assert_eq!(state.context.tokens(), 100_000);
+        state.observe_completed_context(80_000, true, false);
+        assert_eq!(state.context.tokens(), 80_000);
     }
 }

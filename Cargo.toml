@@ -1,6 +1,6 @@
 [package]
 name = "vllm_router_rs"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 
 [lib]
@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = [
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
+smallvec = "1"
 bytes = "1.8.0"
 rand = "0.9.2"
 reqwest = { version = "0.13", features = ["stream", "blocking", "json"] }
@@ -36,7 +37,9 @@ futures-util = "0.3"
 futures = "0.3"
 pyo3 = { version = "0.26", features = ["extension-module"] }
 dashmap = "6.1.0"
+scc = "3.8.8"
 http = "1.1.0"
+mime = "0.3"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
@@ -62,6 +65,9 @@ ulid = "1.2.1"
 parking_lot = "0.12.4"
 thiserror = "2.0.12"
 regex = "1.10"
+aho-corasick = "1.1"
+foldhash = "0.2"
+hashbrown = "0.16"
 url = "2.5.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
@@ -96,13 +102,26 @@ async-channel = "2"
 # tonic 0.12 copy for traces.
 tonic = { version = "0.14", features = ["transport"] }
 tonic-health = "0.14"
+tonic-prost = "0.14"
 vllm-proto = "0.2"
+prost = "0.14"
+# `kv_transfer_params` is a protobuf `Struct`.
+prost-types = "0.14"
 # Rust crates in the vLLM tree (not pip). Unpublished on crates.io; Cargo
 # finds the package by name under rust/src/. Override with a path patch
 # to a local checkout if you already have the rust workspace.
-vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
-vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
-vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
+vllm-chat = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.30.0" }
+
+[features]
+# Every Rust test file is gated on these. `cargo test` compiles a group
+# only when its features are passed, for example `--features cpu,ready`.
+cpu = []
+ready = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
 
 [dev-dependencies]
 libc = "0.2"
@@ -141,6 +160,173 @@ path = "benches/routing_input.rs"
 name = "otel_disabled_path"
 harness = false
 path = "benches/otel_disabled_path.rs"
+
+# Cargo auto-discovers only tests/*.rs. Integration tests live under tests/rust/.
+# Adding a file there requires a matching [[test]] entry; pre-commit hook
+# check-rust-tests enforces that.
+[[test]]
+name = "api_endpoints_test"
+path = "tests/rust/api_endpoints_test.rs"
+
+[[test]]
+name = "bench_corpus_test"
+path = "tests/rust/bench_corpus_test.rs"
+
+[[test]]
+name = "benchmark_integration"
+path = "tests/rust/benchmark_integration.rs"
+
+[[test]]
+name = "cache_aware_backward_compat_test"
+path = "tests/rust/cache_aware_backward_compat_test.rs"
+
+[[test]]
+name = "completion_preparation"
+path = "tests/rust/completion_preparation.rs"
+
+[[test]]
+name = "grpc_completion_frontend"
+path = "tests/rust/grpc_completion_frontend.rs"
+
+[[test]]
+name = "grpc_frontend_bench"
+path = "tests/rust/grpc_frontend_bench.rs"
+
+[[test]]
+name = "grpc_frontend_l0"
+path = "tests/rust/grpc_frontend_l0.rs"
+
+[[test]]
+name = "grpc_frontend_l1"
+path = "tests/rust/grpc_frontend_l1.rs"
+
+[[test]]
+name = "grpc_pd_routing"
+path = "tests/rust/grpc_pd_routing.rs"
+
+[[test]]
+name = "grpc_policy_routing"
+path = "tests/rust/grpc_policy_routing.rs"
+
+[[test]]
+name = "grpc_vs_http_e2e"
+path = "tests/rust/grpc_vs_http_e2e.rs"
+
+[[test]]
+name = "otel_config_test"
+path = "tests/rust/otel_config_test.rs"
+
+[[test]]
+name = "otel_disabled_path_test"
+path = "tests/rust/otel_disabled_path_test.rs"
+
+[[test]]
+name = "otel_integration_test"
+path = "tests/rust/otel_integration_test.rs"
+
+[[test]]
+name = "otel_openai_test"
+path = "tests/rust/otel_openai_test.rs"
+
+[[test]]
+name = "otel_trace_test"
+path = "tests/rust/otel_trace_test.rs"
+
+[[test]]
+name = "policy_registry_integration"
+path = "tests/rust/policy_registry_integration.rs"
+
+[[test]]
+name = "request_formats_test"
+path = "tests/rust/request_formats_test.rs"
+
+[[test]]
+name = "responses_api_test"
+path = "tests/rust/responses_api_test.rs"
+
+[[test]]
+name = "router_overhead_bench"
+path = "tests/rust/router_overhead_bench.rs"
+
+[[test]]
+name = "routing_edge_cases_test"
+path = "tests/rust/routing_edge_cases_test.rs"
+
+[[test]]
+name = "streaming_tests"
+path = "tests/rust/streaming_tests.rs"
+
+[[test]]
+name = "test_admission_fallback"
+path = "tests/rust/test_admission_fallback.rs"
+
+[[test]]
+name = "test_chat_template"
+path = "tests/rust/test_chat_template.rs"
+
+[[test]]
+name = "test_chat_template_loading"
+path = "tests/rust/test_chat_template_loading.rs"
+
+[[test]]
+name = "test_consistent_hash_policy"
+path = "tests/rust/test_consistent_hash_policy.rs"
+
+[[test]]
+name = "test_dp_routing"
+path = "tests/rust/test_dp_routing.rs"
+
+[[test]]
+name = "test_epd_failure_timing"
+path = "tests/rust/test_epd_failure_timing.rs"
+
+[[test]]
+name = "test_extra_args_chat"
+path = "tests/rust/test_extra_args_chat.rs"
+
+[[test]]
+name = "test_openai_routing"
+path = "tests/rust/test_openai_routing.rs"
+
+[[test]]
+name = "test_pd_warm_remote"
+path = "tests/rust/test_pd_warm_remote.rs"
+
+[[test]]
+name = "test_pd_program_scheduling"
+path = "tests/rust/test_pd_program_scheduling.rs"
+
+[[test]]
+name = "test_pd_routing"
+path = "tests/rust/test_pd_routing.rs"
+
+[[test]]
+name = "test_prompt_input"
+path = "tests/rust/test_prompt_input.rs"
+
+[[test]]
+name = "test_sticky_least_loaded_pd"
+path = "tests/rust/test_sticky_least_loaded_pd.rs"
+
+[[test]]
+name = "test_transparent_proxy_routing"
+path = "tests/rust/test_transparent_proxy_routing.rs"
+
+[[test]]
+name = "test_wasm_middleware"
+path = "tests/rust/test_wasm_middleware.rs"
+
+[[test]]
+name = "tokenizer_cache_integration"
+path = "tests/rust/tokenizer_cache_integration.rs"
+
+[[test]]
+name = "tokenizer_cache_metrics"
+path = "tests/rust/tokenizer_cache_metrics.rs"
+
+[[test]]
+name = "tokenizer_integration"
+path = "tests/rust/tokenizer_integration.rs"
 
 [profile.release]
 lto = "thin"

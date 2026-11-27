@@ -1,50 +1,71 @@
 //! Multi-tier KV cache placement index, fed by engine events.
 
-mod admit;
-mod decode;
-pub mod discovery;
-mod endpoints;
-pub mod indexer;
-pub mod subscriber;
-pub mod types;
-pub mod wire;
+pub(crate) mod config;
+pub use config::apply_kv_layout_file;
+pub mod request_hash;
+mod routing_provider;
+pub(crate) use routing_provider::PromptKey;
+pub use routing_provider::TieredMatchProvider;
+#[doc(hidden)]
+pub use routing_provider::{RequestHashCache, SharedPrefixLookup};
+pub(crate) mod source;
 
-pub use admit::validate_device_batch;
-pub use decode::decode_batch;
+pub use source::discovery;
+pub use source::events::{subscriber, wire};
+
+/// Local observation ownership only; this is not an authenticated engine epoch.
+/// Stream generations instead fence snapshots across resets of the same owner.
+pub(crate) fn next_owner_incarnation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let value = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(value, u64::MAX, "KV owner generation exhausted");
+    value
+}
+
+pub(crate) mod layout;
+pub mod storage;
+pub mod types;
+
 pub use discovery::{
     CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
 };
-pub use endpoints::{parse_endpoint_mapping, resolve_endpoints};
-pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
-pub use subscriber::local_hashes;
-pub use types::{
-    CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
-    StorageTier,
+pub use layout::{
+    AdapterCapability, CacheCapabilities, CacheGroup, GroupCapability, GroupRule, RankCapability,
 };
+pub use source::binding::SourceBinding;
+pub(crate) use source::endpoints::canonical_endpoint;
+pub use source::events::decode::decode_batch;
+pub use source::events::event_stream::{
+    EventStream, EventSubscriberHandle, StreamError, StreamLease,
+};
+pub use source::SourceError;
+pub use storage::KvBlockIndexer;
+pub use types::{ResidencyOwner, RoutableTarget, SourceId, StorageTier, TierMatch};
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
-/// Read-only tiered-match contract the policy and cost model consume.
-/// `KvBlockIndexer` implements this.
-pub trait TieredMatchProvider: Send + Sync {
-    fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
+// Out-of-band loss fence: advisory queue overflow can never leave warm state trusted.
+static SIGNAL_LOSS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn signal_loss_epoch() -> u64 {
+    SIGNAL_LOSS_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+pub(crate) fn record_signal_loss() {
+    SIGNAL_LOSS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
-/// Raw signals ingestion emits; the trust arbiter consumes these. The
-/// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
+/// Ingestion continuity signals. Loss also fences the index
+/// synchronously, independently of this advisory channel.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
-    Advance {
+    Invalidated {
         source: SourceId,
-        last_seq: i64,
+        dp_rank: u32,
+        reason: &'static str,
     },
     Gap {
         source: SourceId,
         from_seq: i64,
         to_seq: i64,
-    },
-    ReplayApplied {
-        source: SourceId,
-        replay_seq: i64,
     },
     IncarnationReset {
         source: SourceId,

@@ -25,7 +25,7 @@ build: ## Build the project in release mode
 
 test: ## Run all tests
 	@echo "Running tests..."
-	@cargo test
+	@cargo test --features cpu,ready
 
 bench: ## Run full benchmark suite
 	@echo "Running full benchmarks..."

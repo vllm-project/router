@@ -8,29 +8,32 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
 
+pub use crate::kv_index::discovery::{
+    get_grpc_kv_event_sources, GrpcKvEventSourcesResponse as KvEventSourcesResponse,
+};
+
 use super::detect::grpc_connect_uri;
 use super::pb::{
     control_client::ControlClient, GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
 };
 
-async fn control_client(
+pub(crate) async fn control_channel(
     worker_url: &str,
     timeout: Duration,
-) -> Result<ControlClient<Channel>, String> {
+) -> Result<Channel, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let channel = Channel::from_shared(uri.clone())
+    Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
         .connect_timeout(timeout)
         .timeout(timeout)
         .connect()
         .await
-        .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
-    Ok(ControlClient::new(channel))
+        .map_err(|e| format!("grpc control connect {uri}: {e}"))
 }
 
 pub async fn get_grpc_model_info(worker_url: &str, timeout: Duration) -> Result<ModelInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, timeout).await?);
     tokio::time::timeout(timeout, client.get_model_info(GetModelInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetModelInfo timeout {uri}"))?
@@ -43,7 +46,7 @@ pub async fn get_grpc_server_info(
     timeout: Duration,
 ) -> Result<ServerInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, timeout).await?);
     tokio::time::timeout(timeout, client.get_server_info(GetServerInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetServerInfo timeout {uri}"))?
@@ -63,6 +66,50 @@ pub fn model_info_json(info: &ModelInfo) -> Value {
         "reasoning_parser": info.reasoning_parser,
         "tool_call_parser": info.tool_call_parser,
     })
+}
+
+/// True when `version` is a dotted release older than 0.30.0.
+/// Values that are not a release, such as the test mock's `"mock"`, are false.
+pub fn grpc_engine_version_older_than_0_30(version: &str) -> bool {
+    let raw = version.trim().trim_start_matches(['v', 'V']);
+    if !raw.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut numbers = raw
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().unwrap_or(0));
+    let major = numbers.next().unwrap_or(0);
+    let minor = numbers.next().unwrap_or(0);
+    let patch = numbers.next().unwrap_or(0);
+    (major, minor, patch) < (0, 30, 0)
+}
+
+/// Log when a gRPC P/D worker will abort every decode. Health checks pass on
+/// vLLM 0.29.x; the float-port failure only shows up on the first request.
+pub async fn warn_old_grpc_pd_workers<'a>(urls: impl IntoIterator<Item = &'a str>) {
+    for url in urls {
+        if !crate::backend::is_grpc_url(url) {
+            continue;
+        }
+        match get_grpc_server_info(url, Duration::from_secs(2)).await {
+            Ok(info) if grpc_engine_version_older_than_0_30(&info.engine_version) => {
+                tracing::warn!(
+                    worker = %url,
+                    engine_version = %info.engine_version,
+                    "gRPC P/D worker is older than vLLM 0.30.0; every decode aborts because connector ports and block ids arrive as floats. Upgrade the worker. Upgrading the router does not fix this."
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    worker = %url,
+                    %error,
+                    "could not read the gRPC P/D worker engine version"
+                );
+            }
+        }
+    }
 }
 
 pub fn server_info_json(info: &ServerInfo) -> Value {
@@ -119,7 +166,8 @@ pub fn openai_models_json(info: &ModelInfo) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::backend::pb::{ParallelismInfo, RlCapabilities};
@@ -191,5 +239,16 @@ mod tests {
         assert_eq!(server_json["parallelism"]["tensor_parallel_size"], 2);
         assert_eq!(server_json["rl_capabilities"]["sleep_mode_enabled"], true);
         assert_eq!(server_json["effective_attention_block_size"], 128);
+    }
+
+    #[test]
+    fn old_grpc_engine_versions_are_the_ones_before_0_30() {
+        assert!(grpc_engine_version_older_than_0_30("0.29.0"));
+        assert!(grpc_engine_version_older_than_0_30("v0.29.1"));
+        assert!(grpc_engine_version_older_than_0_30("0.29.0+cu129"));
+        assert!(!grpc_engine_version_older_than_0_30("0.30.0"));
+        assert!(!grpc_engine_version_older_than_0_30("0.32.0"));
+        assert!(!grpc_engine_version_older_than_0_30("mock"));
+        assert!(!grpc_engine_version_older_than_0_30(""));
     }
 }

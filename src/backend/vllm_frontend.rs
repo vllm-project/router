@@ -11,9 +11,11 @@ use vllm_chat::{
     ChatToolChoice, GenerationPromptMode, LoadModelBackendsOptions, LoadedModelBackends,
     ReasoningEffort, ResolvedToolContext, SamplingParams,
 };
-use vllm_text::TextDecodeOptions;
+use vllm_text::{Prompt, TextDecodeOptions};
 
-use super::encode_cache::{deterministic_model, FrontendCache, PromptEncoder};
+use super::encode_cache::{FrontendCache, PromptEncoder};
+use super::l1_encode_cache::{load_boundary_matcher, L1Cache, L1Encoder};
+use super::tokenizer_determinism::deterministic_model;
 use vllm_tokenizer::{IncrementalDecoder, Tokenizer};
 
 pub use vllm_chat::ChatMessage as UpstreamChatMessage;
@@ -31,6 +33,7 @@ impl VllmFrontend {
         model_id: &str,
         default_chat_template_kwargs: HashMap<String, Value>,
         cache: Option<Arc<FrontendCache>>,
+        l1_cache: Option<Arc<L1Cache>>,
     ) -> vllm_chat::Result<Self> {
         let backends = load_model_backends(
             model_id,
@@ -56,7 +59,26 @@ impl VllmFrontend {
         } else {
             None
         };
-        let encoder = PromptEncoder::new(model_id, backends.text_backend.tokenizer(), cache);
+        let tokenizer = backends.text_backend.tokenizer();
+        let l1 = match l1_cache {
+            Some(l1_cache) => {
+                let matcher = load_boundary_matcher(model_id)
+                    .await
+                    .and_then(|matcher| matcher.probed(tokenizer.as_ref()));
+                match matcher {
+                    Ok(matcher) => {
+                        tracing::info!(model_id, boundaries = ?matcher.tokens(), "L1 enabled");
+                        Some(L1Encoder::new(model_id, l1_cache, matcher))
+                    }
+                    Err(error) => {
+                        tracing::warn!(model_id, %error, "L1 disabled for this model");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let encoder = PromptEncoder::new(model_id, tokenizer, cache).with_l1_cache(l1);
         Ok(Self {
             backends: Arc::new(backends),
             encoder,
@@ -75,24 +97,46 @@ impl VllmFrontend {
             .default_temperature)
     }
 
+    /// Returns IDs, cached token count, template ms and encode ms.
     pub fn chat_tokenize_timed(
         &self,
         request: &ChatRequest,
-    ) -> vllm_chat::Result<(Vec<u32>, f64, f64)> {
+    ) -> vllm_chat::Result<(Arc<[u32]>, usize, f64, f64)> {
         let t0 = Instant::now();
         let rendered = self.backends.chat_backend.chat_renderer().render(request)?;
         let template_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let ids = self
+        let encoded = self
             .encoder
-            .encode(
+            .encode_detailed(
                 rendered.prompt,
                 request.add_special_tokens,
                 request.cache_salt.as_deref(),
             )
             .map_err(|error| vllm_chat::Error::ChatTemplate(error.to_string()))?;
         let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        Ok((ids, template_ms, encode_ms))
+        Ok((encoded.ids, encoded.cached_tokens, template_ms, encode_ms))
+    }
+
+    /// Encode one plain-text `/v1/completions` prompt through the same
+    /// `PromptEncoder` chat uses. L0 always applies; L1 prefix reuse is
+    /// skipped when `add_special_tokens` is true, so with the completion
+    /// default only L0 applies. No chat template is applied.
+    /// Returns IDs, cached token count, and encode ms.
+    pub fn text_tokenize_timed(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+        cache_salt: Option<&str>,
+    ) -> vllm_tokenizer::Result<(Arc<[u32]>, usize, f64)> {
+        let t0 = Instant::now();
+        let encoded = self.encoder.encode_detailed(
+            Prompt::Text(text.to_string()),
+            add_special_tokens,
+            cache_salt,
+        )?;
+        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok((encoded.ids, encoded.cached_tokens, encode_ms))
     }
 }
 
@@ -116,7 +160,7 @@ pub struct OpenAiChatRequest {
 }
 
 pub fn chat_request_from_openai(input: OpenAiChatRequest) -> Result<ChatRequest> {
-    // Keep this lowering aligned with vLLM 0.29
+    // Keep this lowering aligned with vLLM 0.30
     // server/routes/openai/chat_completions/convert.rs::prepare_chat_request.
     // That function is pub(super) and route-owned, so importing it would
     // require vllm-server. Replace this adapter if upstream exposes a public,
@@ -196,7 +240,7 @@ pub fn emit_detok(
     for &id in token_ids {
         decoder.push_token(id)?;
         if let Some(chunk) = decoder.next_chunk() {
-            out.push_str(&chunk);
+            out.push_str(&chunk.text);
         }
     }
     Ok(out)
