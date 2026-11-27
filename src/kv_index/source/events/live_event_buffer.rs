@@ -156,6 +156,7 @@ impl LiveEventBuffer {
     /// Return the highest sequence whose frame was discarded.
     pub(super) fn discard_buffered_frames(&mut self, topic: &[u8]) -> Option<i64> {
         let state = self.state.get_mut();
+        state.mark_queued_payload_conflicts(topic);
         let gap_trigger_seq = state.gap_trigger_seq;
         let frames_to_keep = usize::from(gap_trigger_seq.is_some());
         let mut highest = None;
@@ -242,9 +243,10 @@ impl LiveEventBuffer {
     }
 
     /// Clear replay fingerprints while keeping queued live frames and known conflicts.
-    pub(super) fn clear_fingerprints(&mut self) {
+    pub(super) fn clear_fingerprints(&mut self, topic: &[u8]) {
         let state = self.state.get_mut();
         if !state.recent_by_seq.is_empty() {
+            state.mark_queued_payload_conflicts(topic);
             state.recent_by_seq = HashMap::new();
             for queued in state.queued_by_seq.values_mut() {
                 queued.replay_fingerprint = None;
@@ -322,6 +324,21 @@ impl LiveEventBuffer {
 }
 
 impl LiveEventBufferState {
+    // Replay can be interrupted after recording a payload but before checking the handoff.
+    fn mark_queued_payload_conflicts(&mut self, topic: &[u8]) {
+        for frame in &mut self.frames {
+            let Some(seq) = valid_live_seq(&frame.frames, topic) else {
+                continue;
+            };
+            if let Some(queued) = self.queued_by_seq.get_mut(&seq) {
+                queued.had_replay_conflict = queued.had_replay_conflict
+                    || queued
+                        .replay_fingerprint
+                        .is_some_and(|replay| replay != frame.payload_fingerprint());
+            }
+        }
+    }
+
     fn discarded_conflict_error(&self, applied_seq: i64) -> Option<HandoffError> {
         if self.discarded_conflicts_unverifiable {
             return Some(HandoffError::UnverifiableDiscardedConflicts);
@@ -436,6 +453,21 @@ mod tests {
     }
 
     #[test]
+    fn disagreeing_discarded_live_copies_cannot_be_verified_by_one_match() {
+        let mut live_events = LiveEventBuffer::default();
+        live_events.push(frame(9, b"first"), b"topic");
+        live_events.push(frame(9, b"second"), b"topic");
+        live_events.record_replay_payload(9, b"first").unwrap();
+
+        live_events.discard_buffered_frames(b"topic");
+        live_events.record_replay_payload(9, b"first").unwrap();
+        assert!(matches!(
+            live_events.validate_handoff(b"topic", 11, Some(10)),
+            Err(HandoffError::UnverifiableDiscardedConflicts)
+        ));
+    }
+
+    #[test]
     fn discarded_conflicts_beyond_the_limit_keep_handoff_untrusted() {
         let mut live_events = LiveEventBuffer::default();
         let last_seq = MAX_PENDING_LIVE_FRAMES as i64;
@@ -465,7 +497,7 @@ mod tests {
         live_events.push(frame(0, b"new replay"), b"topic");
         live_events.record_replay_payload(0, b"old replay").unwrap();
 
-        live_events.clear_fingerprints();
+        live_events.clear_fingerprints(b"topic");
         assert!(!live_events.is_replayed_duplicate(&frame(0, b"old replay"), b"topic", Some(0)));
         live_events.record_replay_payload(0, b"new replay").unwrap();
         live_events.state.get_mut().recent_by_seq.remove(&0);

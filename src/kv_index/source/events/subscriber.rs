@@ -636,7 +636,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         if exhausted {
                             live_events.reset();
                         } else if !overflow {
-                            live_events.clear_fingerprints();
+                            live_events.clear_fingerprints(topic.as_bytes());
                         }
                         if had_credit {
                             subscriber.invalidated("replay lost continuity");
@@ -810,7 +810,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             bootstrap = false;
                             replay_socket = None;
                             check_live_duplicates = false;
-                            live_events.clear_fingerprints();
+                            live_events.clear_fingerprints(topic.as_bytes());
                             debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
                             // A sustained publisher starves EAGAIN; yield so this task
                             // can't monopolize the runtime worker.
@@ -855,7 +855,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 bootstrap = true;
                 next_catchup = tokio::time::Instant::now();
                 check_live_duplicates = check_replayed_duplicates;
-                live_events.clear_fingerprints();
+                live_events.clear_fingerprints(topic.as_bytes());
                 replay_socket = None;
             }
             if is_shutdown(&mut shutdown_rx) || !subscriber.active() {

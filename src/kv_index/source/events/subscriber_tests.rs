@@ -569,9 +569,12 @@ async fn live_buffer_overflow_preserves_a_known_payload_conflict() {
     let request = tcp.request(0).await;
     tcp.live(9, &store);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    tcp.history(&request, &[(9, &empty), (10, &clear), (11, &store)]);
+    for seq in 0..=9 {
+        tcp.reply(&request, seq, &empty);
+    }
+    wait_until(|| next_seq(&index) == Some(10)).await;
 
-    tcp.request(0).await;
+    // Overflow while replay is still open, before the overlap check at EOF.
     for _ in 1..MAX_PENDING_LIVE_FRAMES {
         tcp.live(11, &store);
     }
@@ -582,6 +585,59 @@ async fn live_buffer_overflow_preserves_a_known_payload_conflict() {
     assert_eq!(credit(&index), 0);
     tcp.history(&matching, &[(9, &store), (10, &clear), (11, &store)]);
     wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
+async fn replay_rejection_preserves_a_conflict_observed_before_handoff() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("rejected-conflict"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let empty = batch_payload(&[]);
+    let clear = batch_payload(&[KVEvent::AllBlocksCleared(Default::default())]);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+
+    tcp.subscribed().await;
+    let request = tcp.request(0).await;
+    tcp.live(9, &store);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tcp.reply(&request, 9, &empty);
+    tcp.reply(&request, 10, &[0xc1]);
+
+    let retry = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(10, &clear), (11, &store)]);
+
+    let matching = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&matching, &[(9, &store), (10, &clear), (11, &store)]);
+    wait_until(|| credit(&index) == 4).await;
+}
+
+#[tokio::test]
+async fn replay_eof_cannot_substitute_a_disputed_gap_trigger() {
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("disputed-trigger-end"), BLOCK_SIZE));
+    let _handle = tcp.start_with_recovery(index.clone(), None, true);
+    let empty = batch_payload(&[]);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+    tcp.live(0, &store);
+    wait_until(|| credit(&index) == 4).await;
+    tcp.live(2, &empty);
+    let request = tcp.request(1).await;
+    tcp.reply(&request, 1, &empty);
+    tcp.reply(&request, 2, &store);
+
+    let retry = tcp.request(0).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&retry, &[(0, &store), (1, &empty)]);
+
+    let matching = tcp.request(2).await;
+    assert_eq!(credit(&index), 0);
+    tcp.history(&matching, &[(2, &empty), (3, &empty)]);
+    wait_until(|| next_seq(&index) == Some(4) && credit(&index) == 4).await;
 }
 
 #[tokio::test]
