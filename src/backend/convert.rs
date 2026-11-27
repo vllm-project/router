@@ -798,9 +798,11 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
         emit_token_ids,
         ..
     } = lowered;
-    // Stage 2 (logprobs/echo) landed on the regular-pool path only: the P/D
-    // response path has no accumulator, so anything that needs one stays a
-    // 400 here instead of being silently dropped.
+    // Stage 2 (logprobs/echo) landed on the regular-pool path only, so
+    // anything that needs it stays a 400 here instead of being silently
+    // dropped. This is a scope gate, not a missing capability: the P/D
+    // decode leg shares the same `stream_openai` / `collect_openai`
+    // response path (and its per-choice accumulator) via `dispatch_decode`.
     for (field, present) in [
         ("logprobs", options.logprobs.is_some()),
         ("echo", options.echo),
@@ -1479,8 +1481,9 @@ mod tests {
 
     #[test]
     fn pd_lower_still_rejects_logprobs_and_echo() {
-        // Stage 2 landed on the regular-pool path only: the P/D response
-        // path has no accumulator, so these stay 400s there.
+        // Stage 2 landed on the regular-pool path only, so these stay 400s
+        // on the P/D path (a scope gate, not a missing accumulator: the P/D
+        // decode leg shares the same response path).
         for (body, field) in [
             (
                 serde_json::json!({"prompt": [1], "logprobs": 3}),
