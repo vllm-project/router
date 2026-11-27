@@ -21,6 +21,10 @@ class RouterArgs:
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
     pd_kv_events: List[str] = dataclasses.field(default_factory=list)
+    pd_prefill_bypass_max_tokens: int = 0
+    pd_prefill_bypass_max_ratio: float = 0.7
+    pd_prefill_bypass_policy: str = "short_suffix"
+    pd_prefill_bypass_p_busy_requests: Optional[int] = None
 
     # Routing policy
     policy: str = "cache_aware"
@@ -234,6 +238,29 @@ class RouterArgs:
             type=float,
             default=RouterArgs.kv_penalty_disk,
             help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-prefill-bypass-max-tokens",
+            type=int,
+            default=RouterArgs.pd_prefill_bypass_max_tokens,
+            help="Maximum local prefill tokens on Decode (0 disables bypass)",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-prefill-bypass-max-ratio",
+            type=float,
+            default=RouterArgs.pd_prefill_bypass_max_ratio,
+            help="Maximum fraction of the prompt left to prefill in the suffix check",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-prefill-bypass-policy",
+            choices=("short_suffix", "busy_prefill", "short_suffix_or_busy_prefill"),
+            default=RouterArgs.pd_prefill_bypass_policy,
+        )
+        parser.add_argument(
+            f"--{prefix}pd-prefill-bypass-p-busy-requests",
+            type=int,
+            default=RouterArgs.pd_prefill_bypass_p_busy_requests,
+            help="Count of other Prefill requests at which Prefill is busy",
         )
         parser.add_argument(
             f"--{prefix}kv-aware-session-affinity-ttl-secs",

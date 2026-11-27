@@ -9,6 +9,54 @@ use crate::program_scheduling::{
     ProgramResumeOrder, ProgramSchedulingEnableKey, TokenCountMode,
 };
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum PdPrefillBypassPolicy {
+    #[default]
+    ShortSuffix,
+    BusyPrefill,
+    ShortSuffixOrBusyPrefill,
+}
+
+impl PdPrefillBypassPolicy {
+    pub(crate) fn uses_prefill_load(self) -> bool {
+        self != Self::ShortSuffix
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, clap::Args)]
+#[serde(default)]
+pub struct PdPrefillBypassConfig {
+    /// Maximum local prefill tokens on Decode. Zero disables bypass.
+    #[arg(long = "pd-prefill-bypass-max-tokens", default_value_t = 0)]
+    pub max_tokens: usize,
+    /// Maximum fraction of the input left to prefill in the suffix check.
+    #[arg(long = "pd-prefill-bypass-max-ratio", default_value_t = 0.7)]
+    pub max_ratio: f64,
+    /// Policy used to decide whether to bypass Prefill.
+    #[arg(
+        long = "pd-prefill-bypass-policy",
+        value_enum,
+        default_value = "short_suffix"
+    )]
+    pub policy: PdPrefillBypassPolicy,
+    /// Minimum number of other Prefill requests for Prefill to be busy.
+    #[arg(long = "pd-prefill-bypass-p-busy-requests")]
+    pub p_busy_requests: Option<usize>,
+}
+
+impl Default for PdPrefillBypassConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 0,
+            max_ratio: 0.7,
+            policy: PdPrefillBypassPolicy::ShortSuffix,
+            p_busy_requests: None,
+        }
+    }
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -24,6 +72,8 @@ pub struct RouterConfig {
     /// Explicit routing pairs by Prefill base URL for a heterogeneous P/D pool.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_worker_pairs: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub pd_prefill_bypass: PdPrefillBypassConfig,
     /// Opt in to hiding KV placement until a complete authoritative recovery.
     #[serde(default)]
     pub kv_event_strict_recovery: bool,
@@ -1416,6 +1466,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            pd_prefill_bypass: Default::default(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -2318,6 +2369,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            pd_prefill_bypass: Default::default(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2390,6 +2442,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            pd_prefill_bypass: Default::default(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2458,6 +2511,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            pd_prefill_bypass: Default::default(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

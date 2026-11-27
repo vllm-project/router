@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
 use super::probe::{fetch_kv_event_sources, fetch_native_sources, worker_serves_base_model};
@@ -67,6 +67,17 @@ impl KvIndexSupervisor {
                 (base.clone(), allowed)
             })
             .collect()
+    }
+
+    pub(crate) fn local_prefill_revision(&self, base: &str, rank: u32) -> Option<u64> {
+        let lifecycles = self.lifecycles.lock();
+        let lifecycle = lifecycles.get(base)?;
+        let state = lifecycle.state.lock();
+        let info = state.info.as_ref()?;
+        (lifecycle.trusted_at(&state, Instant::now)
+            && info.nixl_pull_local_prefill
+            && info.ranks.contains(&rank))
+        .then_some(state.revision)
     }
 
     /// A Decode price requires an installed cache binding for each candidate rank.

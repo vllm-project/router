@@ -165,6 +165,31 @@ flag. Repeat the flag for each worker.
 The Rust binary consumes `--prefill` before clap parsing, so it does not appear
 in clap's option list in `--help`.
 
+### Prefill bypass
+
+Opt in with `--pd-prefill-bypass-max-tokens N` (default `0`, disabled).
+For a single text prompt with `n=1`, sequential NIXL P/D can send the full
+request directly to the selected KV-aware Decode rank. The rank must advertise
+support, have verified reusable KV on device, and have no other pending or
+active Decode requests in the Router. Its estimated uncached prompt tokens must
+be at most `N` for every policy.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--pd-prefill-bypass-max-ratio` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
+| `--pd-prefill-bypass-policy` | `short_suffix` | `short_suffix` checks the uncached fraction. `busy_prefill` checks Prefill load. `short_suffix_or_busy_prefill` accepts either. |
+| `--pd-prefill-bypass-p-busy-requests` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |
+
+Decode workers opt in with `"nixl_pull_local_prefill": true` in their routing
+capabilities JSON. Router sends both remote transfer flags as `false` and sets
+`kv_transfer_params.max_local_prefill_tokens`. Before generation, the worker
+must enforce that limit against the actual cache hit. A worker that declines
+must return HTTP 422 or an initial gRPC `FAILED_PRECONDITION`, with
+`x-vllm-error-code: local_prefill_limit_exceeded`. Only this refusal triggers a
+fresh P/D attempt. Workers without the capability continue on the usual P/D
+path.
+
+
 ## Program scheduling
 
 | Option | Rust value | Rust default | Python value | Python default | Description |

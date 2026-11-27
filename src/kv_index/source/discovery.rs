@@ -151,6 +151,7 @@ pub struct WorkerKvInfo {
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
+    pub(crate) nixl_pull_local_prefill: bool,
 }
 
 pub(crate) struct WorkerDiscovery {
@@ -894,6 +895,10 @@ pub(crate) fn split_worker_rank(worker_url: &str) -> (&str, Option<u32>) {
 
 fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
     let model = config.model.trim().to_owned();
+    let mut layout = config.hybrid.clone();
+    if let Some(layout) = &mut layout {
+        layout.nixl_pull_local_prefill = None;
+    }
     let (_, rank_suffix) = split_worker_rank(worker_url);
     let server_info = ServerInfo {
         // Model/block size are declarations; the registry URL is not a boot ID.
@@ -919,7 +924,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
             }),
             model_id: Ok(Some(model)),
             base_models: None,
-            hybrid: config.hybrid.clone(),
+            hybrid: layout,
             assumed_plain_full: false,
         };
     }
@@ -961,7 +966,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         sources: Ok(sources),
         model_id: Ok(Some(model)),
         base_models: None,
-        hybrid: config.hybrid.clone(),
+        hybrid: layout,
         assumed_plain_full: config
             .hybrid
             .as_ref()
@@ -1172,6 +1177,7 @@ fn synthesize_plain_full_layout(
     ranks.sort_unstable_by_key(|rank| rank.rank);
     Some(CacheCapabilities {
         schema_version: 1,
+        nixl_pull_local_prefill: None,
         adapters: Vec::new(),
         ranks,
     })

@@ -660,6 +660,48 @@ impl PdAttempt {
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
+    pub(super) fn bypass_load_allows(
+        &self,
+        loads: &Loads,
+        decode: &PdEndpoint,
+        own_decode_reservations: usize,
+        config: &crate::config::PdPrefillBypassConfig,
+        estimate: super::pd_prefill_bypass::PrefillEstimate,
+    ) -> bool {
+        let decode_load = loads
+            .get(&(Stage::Decode, decode.clone()))
+            .copied()
+            .unwrap_or_default();
+        if decode_load.active_decode_requests != 0
+            || decode_load.pending_decode_requests != own_decode_reservations
+        {
+            return false;
+        }
+        let other_prefills = config
+            .policy
+            .uses_prefill_load()
+            .then(|| {
+                loads
+                    .get(&(Stage::Prefill, self.0.prefill.clone()))
+                    .and_then(|load| load.prefill_requests.checked_sub(1))
+            })
+            .flatten();
+        estimate.allows(config, other_prefills)
+    }
+
+    pub(super) fn reserved_decode_allows_bypass(
+        &self,
+        decode: &PdEndpoint,
+        config: &crate::config::PdPrefillBypassConfig,
+        estimate: super::pd_prefill_bypass::PrefillEstimate,
+    ) -> bool {
+        let state = self.0.state.lock();
+        state.prefill
+            && state.decode == DecodeState::Pending
+            && state.decode_endpoint.as_ref() == Some(decode)
+            && self.bypass_load_allows(&self.0.loads.lock(), decode, 1, config, estimate)
+    }
+
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }
