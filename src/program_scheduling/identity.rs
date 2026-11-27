@@ -5,7 +5,7 @@
 //! headers. Request and trace identifiers never become Program identifiers.
 
 use super::ScheduleError;
-use crate::policies::{hash_key, header_map_to_request_headers};
+use crate::policies::{hash_key, RequestHeaders};
 use http::HeaderMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::time::Duration;
@@ -379,8 +379,17 @@ fn consistent_hash_request_key(headers: Option<&HeaderMap>, request: Option<&Jso
             }
         }
     }
-    // First value wins for duplicate names, matching read_nonempty_header above.
-    let request_headers = headers.map(header_map_to_request_headers);
+    let request_headers = headers.map(|headers| {
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+            })
+            .collect::<RequestHeaders>()
+    });
     if let Some(key) = request_headers
         .as_ref()
         .and_then(hash_key::extract_hash_key_from_headers)
@@ -671,32 +680,6 @@ mod tests {
         assert_eq!(first.program_id(), "session-shared:lead");
         assert_eq!(second.program_id(), first.program_id());
         assert_eq!(second.placement_hash_key(), first.placement_hash_key());
-    }
-
-    #[test]
-    fn repeated_dsh_session_header_keeps_first_value_for_placement() {
-        let mut headers = HeaderMap::new();
-        headers.append(DSH_SESSION_HEADER, "first".parse().unwrap());
-        headers.append(DSH_SESSION_HEADER, "second".parse().unwrap());
-
-        let identity = ProgramIdentity::from_request(Some(&headers), None, Some("model"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(identity.program_id(), "first:lead");
-        assert_eq!(
-            identity.placement_hash_key(),
-            "header:x-deepseek-harness-session-id:first"
-        );
-
-        // Fallback hash path (non-framework sticky keys) must use the same
-        // first-wins rule as read_nonempty_header.
-        let mut sticky = HeaderMap::new();
-        sticky.append("x-user-id", "u-first".parse().unwrap());
-        sticky.append("x-user-id", "u-second".parse().unwrap());
-        assert_eq!(
-            consistent_hash_request_key(Some(&sticky), None),
-            "header:x-user-id:u-first"
-        );
     }
 
     #[test]

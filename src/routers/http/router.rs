@@ -1625,13 +1625,20 @@ impl Router {
         }
     }
 
-    /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>).
-    /// Duplicate header names keep the first value (same rule as
-    /// [`crate::policies::header_map_to_request_headers`]).
+    /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
     fn headers_to_request_headers(
         headers: Option<&HeaderMap>,
     ) -> Option<crate::policies::RequestHeaders> {
-        headers.map(crate::policies::header_map_to_request_headers)
+        headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        })
     }
 
     fn policy_for_model(&self, model_id: Option<&str>) -> Arc<dyn LoadBalancingPolicy> {
@@ -8206,32 +8213,30 @@ mod tests {
 
     #[test]
     fn test_inline_header_conversion_matches_headers_to_request_headers() {
-        // Verify Router conversion matches the shared first-wins helper.
+        // Verify that the inline header conversion pattern used in vllm_pd_router
+        // produces the same result as Router::headers_to_request_headers.
         let mut header_map = HeaderMap::new();
         header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
         header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
         header_map.insert("x-user-id", HeaderValue::from_static("user-42"));
-        header_map.append(
-            "x-deepseek-harness-session-id",
-            HeaderValue::from_static("first"),
-        );
-        header_map.append(
-            "x-deepseek-harness-session-id",
-            HeaderValue::from_static("second"),
-        );
 
+        // Method 1: Router::headers_to_request_headers (used in router.rs)
         let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
-        let method2 = crate::policies::header_map_to_request_headers(&header_map);
+
+        // Method 2: Inline conversion (used in vllm_pd_router.rs)
+        let method2: HashMap<String, String> = header_map
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect();
 
         assert_eq!(
             method1, method2,
             "Both header conversion methods should produce identical results"
-        );
-        assert_eq!(
-            method1
-                .get("x-deepseek-harness-session-id")
-                .map(String::as_str),
-            Some("first")
         );
     }
 

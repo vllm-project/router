@@ -47,23 +47,6 @@ pub use sticky_least_loaded::StickyLeastLoadedPolicy;
 /// Key is lowercase header name, value is header value
 pub type RequestHeaders = HashMap<String, String>;
 
-/// Convert an HTTP [`http::HeaderMap`] into [`RequestHeaders`].
-///
-/// Names are lowercased; non-UTF-8 values are skipped. When the same header
-/// name appears more than once, the **first** value is kept so policy /
-/// Program identity agree with `HeaderMap::get` (and `read_nonempty_header`).
-pub fn header_map_to_request_headers(headers: &http::HeaderMap) -> RequestHeaders {
-    let mut out = RequestHeaders::new();
-    for (name, value) in headers.iter() {
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        let key = name.as_str().to_lowercase();
-        out.entry(key).or_insert_with(|| value.to_string());
-    }
-    out
-}
-
 /// Coordinates selection and reservation for one worker pool.
 ///
 /// Reuse the same context for admissions to the same pool. It belongs to the
