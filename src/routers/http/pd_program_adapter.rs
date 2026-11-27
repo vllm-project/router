@@ -695,7 +695,10 @@ fn track_response_inner(
         .map_or(PdTrackedBody::MAX_BUFFER, |context| {
             context.response_buffer_limit()
         });
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // A fixed-length HTTP/1 body can be dropped after the last data frame
+    // without an EOF poll. EOF settles the Program turn and publishes its KV.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     Response::from_parts(
         parts,
         Body::from_stream(PdTrackedBody {

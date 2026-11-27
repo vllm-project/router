@@ -350,6 +350,46 @@ async fn exact_two_turns_take_engine_metadata_once_and_reject_rewrite() {
         .is_none());
 }
 #[tokio::test]
+async fn real_http_body_completion_publishes_the_warm_source() {
+    let p = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let router = Arc::new(router(&p, &d).await);
+    let app = axum::Router::new().route(
+        "/v1/completions",
+        axum::routing::post(move |Json(body): Json<Value>| {
+            let router = router.clone();
+            async move {
+                let request = serde_json::from_value(body).unwrap();
+                router.route_completion(None, &request, Some("test")).await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/completions", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for prompt in [vec![1, 2, 3], next_prompt()] {
+        let response = client
+            .post(&url)
+            .json(&completion_body("transport", &prompt, true, false))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let _: Value = response.json().await.unwrap();
+    }
+    server.abort();
+    let calls = prefill_calls(&p, &next_prompt());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].pointer("/kv_transfer_params/remote_engine_id"),
+        Some(&json!("d-engine"))
+    );
+}
+
+#[tokio::test]
 async fn kv_prefill_prices_the_same_history_on_two_readers_and_respects_minimum_gain() {
     let policy = PolicyConfig::KvAware {
         router_temperature: 0.0,
