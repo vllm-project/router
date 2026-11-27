@@ -285,6 +285,8 @@ Exactness covers only the input IDs sent to the Engine. Future output length, th
 
 `auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; DeepSeek Harness (`dsh`) uses `x-deepseek-harness-session-id` (and may also send `x-deepseek-harness-user-id`, which is not part of Program identity); the generic schema uses `x-session-id`. Recognized schemas are not mixed.
 
+For `dsh` (tested with `@deepseek-ai/dsh@0.2.2-rc.5`), only the `deepseek-official` Messages adapter emits `x-deepseek-harness-session-id` on requests that already have a harness session. The `llm-pi-ai` adapter used for self-hosted OpenAI-compatible endpoints omits that header by default, so Program affinity under `auto` requires either that Messages path or an explicit session header on the OpenAI-compatible client. With the header present, each turn of the same session resolves to the same Program ID `{session}:lead` (no agent/thread component).
+
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 
 ## Resume ordering and capacity
