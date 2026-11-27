@@ -15,7 +15,7 @@ Follow the [reference workflow](../../../docs/program_scheduling/program-schedul
 for baseline comparability, cache protection, and regression checks. This skill
 adds calibration steps, parameter sweeps, and deployment criteria.
 
-For a sample invocation, replay commands, and a deployment decision table, see
+For a sample invocation, a live SWE-bench command, and a deployment decision table, see
 [Tuning DeepSeek V4 Flash on Ascend A3](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md).
 
 ## Scope and deployment shapes
@@ -49,7 +49,7 @@ can produce anything at all.
 |---|---|---|---|
 | Single-turn, no tool calls | no reuse across turns | no benefit; the feature is inert | confirm identity is not attached where it has no meaning |
 | Interactive assistant, sub-second to seconds gaps | many short returns | retention can pay when eviction pressure exists | section 3 as written |
-| Agent with build or test loops, seconds to minutes gaps | fewer, longer returns | TTL must cover the gap p95 and the cost model must reflect long prefill | the gap analysis in 3.2 before touching TTL |
+| Agent with build or test loops, seconds to minutes gaps | fewer, longer returns | short returns can benefit even when longer gaps exceed the cost of recomputing the prefix | the gap analysis in 3.2 before touching TTL |
 | Minutes-to-hours jobs | rare returns, large contexts | TTL cannot cover the gap; expect affinity-only gains | the `binding_only` diagnostic; treat as non-regression |
 | Batch or offline, no gaps | one request per Program | no reuse to protect; a large TTL only wastes capacity | leave Progress-TTL off |
 
@@ -61,8 +61,9 @@ record the result as a non-regression case rather than a failed experiment.
 1. Before raising the TTL cap, check the fitted TTL against the
    [calibrated cache-miss impact](../../../docs/program_scheduling/program-scheduling.md#offline-calibration-models).
    A higher cap can still yield a short or zero fitted TTL.
-2. Check [window maturity](../../../docs/program_scheduling/program-scheduling.md#configuration-reference) before
-   interpreting early pauses in a cold run.
+2. Check the armed TTL source before interpreting early pauses. The rank-level
+   fit starts at zero until its window matures. A request override takes precedence,
+   and active workflow prediction can supply a TTL before that window fills.
 3. Progress-TTL controls Router admission and logical token reservations to
    reduce competing KV demand across tool gaps. It does not pin physical KV
    blocks or execute engine eviction, offload, or prefetch. An engine can still
@@ -121,7 +122,7 @@ Match `--intra-node-data-parallel-size` to the engine layout.
 
 ### 1.3 The baseline has eviction pressure
 
-Use the [worker-counter query](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#3-use-the-replay-logs-to-evaluate-and-diagnose-the-configuration)
+Use the [worker-counter query](../../../docs/program_scheduling/ascend-a3-deepseek-v4-flash.md#3-read-the-benchmark-results)
 for the pressure sweep in section 3.5. Make the deployment comparison at normal
 concurrency and capacity, including when the baseline falls outside the sweep band.
 
@@ -133,7 +134,7 @@ deployment.
 ```
 working-set ratio  = CC * mean_context / (dp * per_rank_capacity)      target 1.0 - 1.5
 in-flight ratio rho = r * CC * mean_context / (dp * per_rank_capacity) target 0.4 - 0.8
-gap coverage        = TTL > p95(tool-call gap)
+gap coverage at T   = same-Program return gaps shorter than T / all observed same-Program return gaps
 ```
 
 The capacity ratios assume homogeneous Ranks and roughly balanced load. With
@@ -141,8 +142,9 @@ mixed capacities, the smallest measured Rank capacity can be used for a
 conservative screening calculation, but `dp * min_capacity` is only a lower
 bound on total physical capacity. Check each Rank's load, cache pressure, and
 hit ratio; an aggregate ratio or the common logical limit does not establish
-physical eviction pressure. Gap coverage refers to logical TTL, not a guarantee
-that the engine keeps the blocks resident.
+physical eviction pressure. Gap coverage estimates the fraction of observed returns
+that a candidate logical TTL could cover. Use the gap p95 as a sweep point. Select
+TTL by measured task performance and queueing, even if a shorter TTL wins.
 
 - `r` is in-flight requests divided by concurrency. It depends on the workload:
   interactive coding agents have been observed around 0.28–0.37 at low pressure,
@@ -273,7 +275,7 @@ changes dominate everything.
 |---|---|
 | `max_acting_ttl_seconds` | Only a bound. Change it after, not before, the cost model is trustworthy |
 | `stats_window_size` | Check the valid sample count before shortening the window for a brief experiment. |
-| `prefill_cost_model.*` | Calibrated values determine cache-miss impact; a non-zero TTL also requires a mature interval window and a useful fitted candidate |
+| `prefill_cost_model.*` | Calibrated values determine cache-miss impact. The rank-level fit needs a mature continuity window to select a positive TTL. In active mode, a mature workflow prediction can replace that fit. |
 | `prefill_cost_model.decode_throughput_alpha` | Lower values increase cache-miss impact and may extend the fitted TTL; check the selected TTL rather than assuming it increases |
 | request-level `kv_retention_ttl_seconds` | Overrides the computed TTL without the impact cap on this internal-DP path. Use for the controlled retention diagnostic in section 5; measure queueing and end-to-end cost before keeping an override |
 
@@ -301,7 +303,7 @@ to identify the symptom, then use the table to choose the next experiment.
 
 | Observation | Likely cause | First change |
 |---|---|---|
-| Short TTLs in the `vllm_router_agent_aware_armed_ttl_seconds` histogram | Incomplete continuity window, long return gaps, or underestimated recomputation cost | In `/scheduling/diagnostics`, check `ranks[].rolling.continuity_window_complete` and `ranks[].rolling.fitted_acting_ttl_seconds`. Compare the mature fit with observed return gaps and engine timings before changing the window or cost model. |
+| Short TTLs in the `vllm_router_agent_aware_armed_ttl_seconds` histogram | The `source` label identifies who chose the TTL | For `fitted`, check `ranks[].rolling.continuity_window_complete` and `ranks[].rolling.fitted_acting_ttl_seconds` in `/scheduling/diagnostics`. For `return_prediction`, check the Program's `predicted_ttl_seconds` and `return_prediction_support`. For `request_hint`, inspect the outgoing TTL override. Compare the selected TTL with observed same-Program return gaps. |
 | many `max_segment_yield` pauses | one Program consumes full segments | raise `max_segment_rounds`, or lower `force_resume_timeout_seconds` |
 | `unexpected_cache_discontinuity` (Router INFO log event) | explicitly reported cached tokens fall below the continuity threshold relative to the previous context within one placement; this alone does not prove physical eviction | inspect the log's `cached_prompt_tokens`, `previous_context_tokens`, and `cache_hit_vs_previous_context`; check whether the request prefix changed and correlate with backend cache pressure before changing capacity or concurrency |
 | `capacity_accounting_source` falls back (diagnostics) | missing engine labels or stale observations | verify per-engine metric labels, single API server per worker, idle run before traffic |
