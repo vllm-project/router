@@ -29,20 +29,32 @@ impl PdPrefillBypassPolicy {
 #[serde(default)]
 pub struct PdPrefillBypassConfig {
     /// Maximum local prefill tokens on Decode. Zero disables bypass.
-    #[arg(long = "pd-prefill-bypass-max-tokens", default_value_t = 0)]
+    #[arg(
+        id = "pd_prefill_bypass_max_tokens",
+        long = "pd-prefill-bypass-max-tokens",
+        default_value_t = 0
+    )]
     pub max_tokens: usize,
     /// Maximum fraction of the input left to prefill in the suffix check.
-    #[arg(long = "pd-prefill-bypass-max-ratio", default_value_t = 0.7)]
+    #[arg(
+        id = "pd_prefill_bypass_max_ratio",
+        long = "pd-prefill-bypass-max-ratio",
+        default_value_t = 0.7
+    )]
     pub max_ratio: f64,
     /// Policy used to decide whether to bypass Prefill.
     #[arg(
+        id = "pd_prefill_bypass_policy",
         long = "pd-prefill-bypass-policy",
         value_enum,
         default_value = "short_suffix"
     )]
     pub policy: PdPrefillBypassPolicy,
     /// Minimum number of other Prefill requests for Prefill to be busy.
-    #[arg(long = "pd-prefill-bypass-p-busy-requests")]
+    #[arg(
+        id = "pd_prefill_bypass_p_busy_requests",
+        long = "pd-prefill-bypass-p-busy-requests"
+    )]
     pub p_busy_requests: Option<usize>,
 }
 

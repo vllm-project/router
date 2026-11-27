@@ -1012,6 +1012,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_prefill_bypass_alongside_worker_policy() {
+        use vllm_router_rs::config::PdPrefillBypassPolicy;
+
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "kv_aware",
+            "--pd-prefill-bypass-max-tokens",
+            "256",
+            "--pd-prefill-bypass-max-ratio",
+            "0.25",
+            "--pd-prefill-bypass-policy",
+            "short_suffix_or_busy_prefill",
+            "--pd-prefill-bypass-p-busy-requests",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(args.policy, "kv_aware");
+        assert_eq!(args.pd_prefill_bypass.max_tokens, 256);
+        assert_eq!(args.pd_prefill_bypass.max_ratio, 0.25);
+        assert_eq!(
+            args.pd_prefill_bypass.policy,
+            PdPrefillBypassPolicy::ShortSuffixOrBusyPrefill
+        );
+        assert_eq!(args.pd_prefill_bypass.p_busy_requests, Some(4));
+    }
+
+    #[test]
     fn parses_wasm_middleware_options() {
         let args = CliArgs::try_parse_from([
             "vllm-router",
