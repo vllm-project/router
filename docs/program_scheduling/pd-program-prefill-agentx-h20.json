@@ -1,0 +1,348 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "dtype": "bfloat16",
+  "model_snapshot": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "model_config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+  "router_binary_sha256": "a6d9c6e5b3bb4c60032c7089fe67fca0a9e40898665f0f1946e45235c8d6318f",
+  "router_build_profile": "dev, unoptimized; identical binary in both arms",
+  "vllm": "0.29.0",
+  "agentinfer_commit": "c8dcdc2c98d3147dcd2622998a16e53e6fd3a176",
+  "slurm_job": 18222,
+  "gpu": "8 × NVIDIA H20-3e, single node",
+  "parallelism": {
+    "prefill_services": 2,
+    "decode_services": 2,
+    "dp_per_service": 2,
+    "tp": 1
+  },
+  "control": "P round_robin",
+  "treatment": "P kv_aware",
+  "execution_order": [
+    "kv_aware",
+    "round_robin"
+  ],
+  "settings": {
+    "program_decode_binding": "consistent_hash",
+    "native_decode_policy": "round_robin",
+    "kv_connector": "NIXL",
+    "warm_remote": false,
+    "max_concurrency": 4,
+    "same_agent_gap_scale": 0.05,
+    "max_model_len": 65536,
+    "sample_seed": 0,
+    "rank_warmup": "one direct request per rank before measurement; reset all four services before each arm",
+    "p_groups": [
+      "mamba",
+      "mamba",
+      "mamba",
+      "full_attention"
+    ],
+    "group_block_tokens": 784,
+    "hash_block_tokens": 784,
+    "mamba_cache_mode": "align"
+  },
+  "workload": {
+    "method": "AgentInfer replay, agentX hash-block snapshots, streaming /v1/completions with token IDs",
+    "selection": "Full AgentX sessions with unchanged request signatures in the 256k export, each request input + output <= 65536, 2–30 requests per session, original duration <= 7200 seconds. Take all eligible sessions.",
+    "source_sessions": 393,
+    "source_sha256": "29b6a19e751ff5230771519aab755f80a0f43a4ba9cf96b72d3a6a437ec99276",
+    "subset_sha256": "e308a1d34fa79db2398547a8d5c8b5849ccde601211b5d79c3cbe33d90385b4e",
+    "sessions": 4,
+    "programs": 5,
+    "requests_per_arm": 96,
+    "input_tokens_per_arm": 3845568,
+    "output_tokens_per_arm": 27240,
+    "matched_per_request_lengths": true
+  },
+  "round_robin": {
+    "tasks": {
+      "completed": 4,
+      "failed": 0,
+      "with_patch": 0,
+      "duration_seconds": {
+        "mean": 528.5981998164207,
+        "p50": 537.4528156153392,
+        "p95": 731.4974684520391,
+        "p99": 733.4693351296847
+      }
+    },
+    "requests": 96,
+    "input": 3845568,
+    "output": 27240,
+    "ttft": {
+      "mean": 6.019932720325111,
+      "p50": 2.470949242124334,
+      "p95": 21.897792813717388,
+      "p99": 50.59096118703018
+    },
+    "latency": {
+      "mean": 19.350441944775714,
+      "p50": 12.944418533938006,
+      "p95": 51.524569994886406,
+      "p99": 79.67338886861683
+    },
+    "wall": 733.963188,
+    "output_tps": 37.113577963258834,
+    "admitted": 96.0,
+    "decisions": {
+      "prefix_cost": null,
+      "unverified_identity": null,
+      "load_fallback": null
+    },
+    "rank_metrics": [
+      {
+        "role": "P",
+        "pool": 0,
+        "rank": 0,
+        "queries": 974120.0,
+        "hits": 752640.0,
+        "prompt": 974120.0,
+        "cached": 752640.0,
+        "requests": 24.0
+      },
+      {
+        "role": "P",
+        "pool": 0,
+        "rank": 1,
+        "queries": 937704.0,
+        "hits": 623280.0,
+        "prompt": 937704.0,
+        "cached": 623280.0,
+        "requests": 24.0
+      },
+      {
+        "role": "P",
+        "pool": 1,
+        "rank": 0,
+        "queries": 995304.0,
+        "hits": 773024.0,
+        "prompt": 995304.0,
+        "cached": 773024.0,
+        "requests": 24.0
+      },
+      {
+        "role": "P",
+        "pool": 1,
+        "rank": 1,
+        "queries": 938344.0,
+        "hits": 731472.0,
+        "prompt": 938344.0,
+        "cached": 731472.0,
+        "requests": 24.0
+      },
+      {
+        "role": "D",
+        "pool": 0,
+        "rank": 0,
+        "queries": 0.0,
+        "hits": 0.0,
+        "prompt": 0.0,
+        "cached": 0.0,
+        "requests": 0.0
+      },
+      {
+        "role": "D",
+        "pool": 0,
+        "rank": 1,
+        "queries": 1091840.0,
+        "hits": 991760.0,
+        "prompt": 1091840.0,
+        "cached": 1091818.0,
+        "requests": 22.0
+      },
+      {
+        "role": "D",
+        "pool": 1,
+        "rank": 0,
+        "queries": 818752.0,
+        "hits": 707168.0,
+        "prompt": 818752.0,
+        "cached": 818731.0,
+        "requests": 21.0
+      },
+      {
+        "role": "D",
+        "pool": 1,
+        "rank": 1,
+        "queries": 1934976.0,
+        "hits": 1818880.0,
+        "prompt": 1934976.0,
+        "cached": 1934923.0,
+        "requests": 53.0
+      }
+    ],
+    "workload_fingerprint": "9988b3dd4172433aa225ff042ee72c0b83ef2e08d04e371fc283ffaae5792a53",
+    "session_times": {
+      "agentx-bbdcb12440a7ab3496b9fac8b5f9824b1672": {
+        "requests": 21,
+        "first_submit_to_last_response_s": 305.517306
+      },
+      "agentx-979ae6377c88be0e93531cdb9632795b6a7a": {
+        "requests": 29,
+        "first_submit_to_last_response_s": 357.367496
+      },
+      "agentx-528995cdde1ebf15ccf0b79aec42dba31ce2": {
+        "requests": 24,
+        "first_submit_to_last_response_s": 733.953956
+      },
+      "agentx-3531533f1f293048fc9691b112feafc44e62": {
+        "requests": 22,
+        "first_submit_to_last_response_s": 717.52109
+      }
+    },
+    "p_prompt_tokens": 3845472.0,
+    "p_cached_tokens": 2880416.0,
+    "p_computed_tokens": 965056.0,
+    "p_local_hit_rate": 0.7490409499796123
+  },
+  "kv_aware": {
+    "tasks": {
+      "completed": 4,
+      "failed": 0,
+      "with_patch": 0,
+      "duration_seconds": {
+        "mean": 457.68963492580224,
+        "p50": 451.49743196810596,
+        "p95": 677.931791556254,
+        "p99": 684.6709207432717
+      }
+    },
+    "requests": 96,
+    "input": 3845568,
+    "output": 27240,
+    "ttft": {
+      "mean": 2.974405666483411,
+      "p50": 1.068320226157084,
+      "p95": 12.873741381801665,
+      "p99": 44.51914476121308
+    },
+    "latency": {
+      "mean": 16.33794327095772,
+      "p50": 8.782162701478228,
+      "p95": 51.29086938907858,
+      "p99": 79.61218995493832
+    },
+    "wall": 686.356979,
+    "output_tps": 39.68780216919743,
+    "admitted": 96.0,
+    "decisions": {
+      "prefix_cost": 96.0,
+      "unverified_identity": null,
+      "load_fallback": null
+    },
+    "rank_metrics": [
+      {
+        "role": "P",
+        "pool": 0,
+        "rank": 0,
+        "queries": 77819.0,
+        "hits": 0.0,
+        "prompt": 77819.0,
+        "cached": 0.0,
+        "requests": 5.0
+      },
+      {
+        "role": "P",
+        "pool": 0,
+        "rank": 1,
+        "queries": 1065964.0,
+        "hits": 988624.0,
+        "prompt": 1065964.0,
+        "cached": 988624.0,
+        "requests": 20.0
+      },
+      {
+        "role": "P",
+        "pool": 1,
+        "rank": 0,
+        "queries": 1500502.0,
+        "hits": 1387680.0,
+        "prompt": 1500502.0,
+        "cached": 1387680.0,
+        "requests": 42.0
+      },
+      {
+        "role": "P",
+        "pool": 1,
+        "rank": 1,
+        "queries": 1201187.0,
+        "hits": 1136800.0,
+        "prompt": 1201187.0,
+        "cached": 1136800.0,
+        "requests": 29.0
+      },
+      {
+        "role": "D",
+        "pool": 0,
+        "rank": 0,
+        "queries": 0.0,
+        "hits": 0.0,
+        "prompt": 0.0,
+        "cached": 0.0,
+        "requests": 0.0
+      },
+      {
+        "role": "D",
+        "pool": 0,
+        "rank": 1,
+        "queries": 1091840.0,
+        "hits": 991760.0,
+        "prompt": 1091840.0,
+        "cached": 1091818.0,
+        "requests": 22.0
+      },
+      {
+        "role": "D",
+        "pool": 1,
+        "rank": 0,
+        "queries": 818752.0,
+        "hits": 707168.0,
+        "prompt": 818752.0,
+        "cached": 818731.0,
+        "requests": 21.0
+      },
+      {
+        "role": "D",
+        "pool": 1,
+        "rank": 1,
+        "queries": 1934976.0,
+        "hits": 1818880.0,
+        "prompt": 1934976.0,
+        "cached": 1934923.0,
+        "requests": 53.0
+      }
+    ],
+    "workload_fingerprint": "9988b3dd4172433aa225ff042ee72c0b83ef2e08d04e371fc283ffaae5792a53",
+    "session_times": {
+      "agentx-bbdcb12440a7ab3496b9fac8b5f9824b1672": {
+        "requests": 21,
+        "first_submit_to_last_response_s": 241.39885
+      },
+      "agentx-979ae6377c88be0e93531cdb9632795b6a7a": {
+        "requests": 29,
+        "first_submit_to_last_response_s": 272.78894
+      },
+      "agentx-528995cdde1ebf15ccf0b79aec42dba31ce2": {
+        "requests": 24,
+        "first_submit_to_last_response_s": 686.34583
+      },
+      "agentx-3531533f1f293048fc9691b112feafc44e62": {
+        "requests": 22,
+        "first_submit_to_last_response_s": 630.185742
+      }
+    },
+    "p_prompt_tokens": 3845472.0,
+    "p_cached_tokens": 3513104.0,
+    "p_computed_tokens": 332368.0,
+    "p_local_hit_rate": 0.9135689975118789
+  },
+  "independent_round_robin_pilot": {
+    "slurm_job": 18219,
+    "requests": 96,
+    "successful_tasks": 4,
+    "p_local_hit_rate": 0.7337502392424129,
+    "p_computed_tokens": 1023856.0,
+    "ttft_mean_seconds": 6.291173622948311,
+    "jct_mean_seconds": 539.0732079314766
+  }
+}

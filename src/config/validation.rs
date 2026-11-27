@@ -1794,6 +1794,14 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.program_scheduling = Some(ProgramSchedulingConfig::default());
         assert!(ConfigValidator::validate(&config).is_err());
+        config.pd_worker_pairs.clear();
+        assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
+        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = Some(PolicyConfig::RoundRobin);
+        }
+        assert!(crate::kv_index::config::validate_pd_sources(&config).is_ok());
+        config.program_scheduling.as_mut().unwrap().pd.warm_remote = true;
+        assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
     }
 
     /// A rank-pinned prefill URL is keyed by its base URL at runtime.

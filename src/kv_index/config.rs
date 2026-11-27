@@ -527,9 +527,9 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .hybrid
                     .as_ref()
                     .is_some_and(|layout| !layout.is_plain_full_attention());
-                if hybrid_layout && config.program_scheduling.is_some() {
+                if hybrid_layout && !config.allows_hybrid_pd_sources() {
                     return Err(invalid(
-                        "hybrid PD sources do not support Program scheduling",
+                        "hybrid Program routing requires NIXL, local-only Prefill scoring, and a non-KV-aware Decode policy",
                     ));
                 }
                 if let Some(layout) = &sources.hybrid {

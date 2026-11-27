@@ -97,6 +97,8 @@ sequenceDiagram
 
 ### 5.1 每轮用 KV aware 选择 P
 
+Qwen3.8-27B 的每个 P rank 同时保存注意力 KV 和线性注意力状态。一次续轮只计入两类缓存共同支持的前缀。Router 用引擎事件中的组编号、块哈希和 rank 建索引，再将预计重算的 token 和已排队的工作量一起用于选 P。比如两个 P 都保留了旧代码的注意力 KV，只有 P1 在对应位置保留了可用的线性注意力状态，就只有 P1 可以获得这一段的完整复用分。实验使用 HTTP NIXL，D 的 Program 绑定策略固定为 `consistent_hash`，普通请求的 D 策略设为 `round_robin`。两组都关闭跨轮热读、LocalAppend 和自动 TTL。
+
 **配置。** 在已有 Program PD 配置上设置 `--prefill-policy kv_aware` 即选用该策略；未显式设置 P 策略时，沿用既有的 `--policy` 继承规则。D 首绑和失效重绑仍由 Program 的 `binding_strategy` 控制。例如可保留 D 的 `consistent_hash`，只在 P 侧打开 KV 感知。P 本地缓存评分也可用于首轮及关闭 `pd.warm_remote` 的部署。[PD 策略的配置优先级](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/config/types.rs#L1090-L1108)
 
 **接口改动。** 基线的 `select_program_prefill_index` 走文本、headers 通用接口，返回一个候选下标；该入口调用 `kv_aware` 时没有传入 token ID。基线的 `admit_bound` 又把实际发往 P 的请求一律记为大小未知。拟将下列改动接在领取 D 凭证之后，直接复用原生 PD 的 P 阶段实现。[Program 选 P 入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/routers/http/vllm_pd_router.rs#L1754-L1785) · [通用 KV 入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/policies/kv_aware.rs#L1795-L1803) · [固定目标记账入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/routers/http/pd_types.rs#L391-L444)
@@ -193,3 +195,24 @@ Acting TTL 表示工具调用期间可以保留 D 的**逻辑席位**。完整 D
 热读开关各测了 6 个两轮会话。清除两台 P 的本地缓存后，关闭热读的 6 次续轮返回的缓存量均为 0。开启热读后，6 次续轮均由 P 报告成功从 D 外读，Router 记录了 6 次历史源认领和 6 次 `warm_external_read`。热读路径的最终 usage 由 D 返回，外读次数取自 P 的传输反馈。作业共完成 72 次 Program 请求。这组串行小样本检验选点、缓存命中及跨卡读取，生产并发下的吞吐、JCT 和尾延迟需用业务负载另测。
 
 本地 `cpu,ready` 配置下通过 1,507 项库测试、10 项 PD Program 集成测试和 22 项热读集成测试，3 项库测试按原有标记跳过。热读回退、源实例重启和工作量回执释放另有确定性回归用例。复现实验时，向脚本提供两台 P 的事件与 replay 地址、实际 D 容量以及与后端一致的布局。`--chat` 验证服务端模板渲染，`--verify-warm` 验证支持反馈协议的 token-ID 续轮。[逐轮数据](pd-program-prefill-h20.csv) · [实验脚本](../../scripts/bench_pd_program_prefill.py)
+
+### 8.1 Qwen3.8-27B 的 AgentX 多轮回放
+
+作业 `18222` 在同一台 8 卡 NVIDIA H20-3e 上运行 Qwen3.8-27B BF16、vLLM 0.29.0 和 NIXL。2 个 P 服务和 2 个 D 服务各使用 DP=2、TP=1。四个 P rank 的实际事件均显示第 0–2 组为线性注意力状态，第 3 组为全注意力 KV，各组块大小均为 784 token。每个 rank 先直接执行一次预热请求，使引擎公布真实准入指标，然后在每组回放前重置全部服务的前缀缓存。两组使用同一个 Router 二进制，先测 P 侧 `kv_aware`，再测 P 侧 `round_robin`。D 绑定、并发上限和热读开关相同。
+
+AgentInfer 使用 `replay --trace-type agentX` 和 token-ID completions。从 393 个原始会话中，取在 256k 版本中请求签名保持一致、单请求输入加输出不超过 65,536 token、含 2–30 个请求、原始用时不超过 2 小时的全部完整会话。入选 4 个会话、5 个 Program，共 96 次请求。回放并发为 4，同一 agent 的等待间隔缩为原来的 5%。两组各完成 96/96 次，逐条核对请求 ID 及实际输入、输出长度一致，每组共 3,845,568 个输入 token 和 27,240 个输出 token。
+
+| 指标 | P 轮询 | P KV aware | 变化 |
+| --- | ---: | ---: | ---: |
+| P 本地前缀命中率 | 74.90% | 91.36% | +16.45 个百分点 |
+| P 实际重算的 token | 965,056 | 332,368 | −65.56% |
+| 平均首 token 时间 | 6.02 秒 | 2.97 秒 | −50.59% |
+| P95 首 token 时间 | 21.90 秒 | 12.87 秒 | −41.21% |
+| 平均会话完成时间 | 528.60 秒 | 457.69 秒 | −13.41% |
+| 整轮输出吞吐 | 37.11 token/秒 | 39.69 token/秒 | +6.94% |
+
+命中率按四个 P rank 的引擎命中 token 总数除以查询 token 总数计算。重算量取 P 引擎处理的输入 token 减去本地缓存 token。KV aware 组 96 次选点均记录为 `prefix_cost`。P 的请求分布从 24/24/24/24 变为 5/20/42/29，D 的分布两组均为 0/22/21/53。四个会话从首个请求发出到末轮返回的时间都缩短了。整条请求的 P95 从 51.52 秒变为 51.29 秒，改善主要体现在首 token 和会话完成时间。
+
+这次对照覆盖一个固定小样本和一个并发档位。两组均关闭从 D 远程热读，使用同一个 dev 构建。独立轮询作业 `18219` 也完成了 96 次请求，其 P 本地命中率为 73.38%。模型修订、工作负载指纹、逐 rank 计数和逐会话数据见[实测记录](pd-program-prefill-agentx-h20.json)。
+
+本次改动在 Linux 通过 1,507 项库测试，3 项按标记跳过。macOS 通过 10 项 PD Program 和 22 项热读集成测试。macOS 上的库测试有 1 项模拟断连失败，在改动前的提交 `2d908b3` 上也复现了同一失败。
