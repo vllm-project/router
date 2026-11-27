@@ -12,7 +12,27 @@ pip install pre-commit && pre-commit install
 
 ## Pipeline Files
 
-`pipeline.yml` builds the release binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
+`pipeline.yml` runs a lightweight CPU bootstrap, following
+[vllm-omni's diff-aware bootstrap](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py).
+When every changed path is under `docs/`, ends in `.md`, or is
+`mkdocs.yml`, it succeeds without uploading build or test jobs. This includes
+documentation additions and deletions. Mixed code/documentation changes run CI.
+For PRs (including `merge-test`), the bootstrap fetches the target branch and
+compares its merge base with `HEAD`. Merge queues compare against Buildkite's
+recorded queue base commit. Default-branch pushes always run full CI because
+the bootstrap has no verified pre-push SHA to compare the complete push range.
+It does not fall back to `HEAD^1`, which could miss earlier code changes in a
+multi-commit push. Skipping post-merge pushes requires a verified push range
+from the webhook before it can be enabled safely.
+Renames include both the old and new paths. Empty or unresolved diffs run CI.
+Scheduled builds and `NIGHTLY=1` always run CI.
+PR labels `ready`, `merge-test`, and `nightly-test` do not override docs-only
+skipping; they select test levels only when the full pipeline is uploaded.
+GitHub Actions quality/security checks and release publishing
+remain enabled. Unlike Omni, pytest skip-mark changes do not qualify.
+
+Otherwise the bootstrap uploads `bootstrap-upload-steps.yml`, which builds the release
+binary and wheel, pushes the NVIDIA CI image, then uploads L1, L2, and L3.
 Those uploads depend on the build step, not on each other. Jobs in each uploaded file depend on that upload step. The L1 and L3 NVIDIA P/D jobs, and the L3 gRPC perf job, also wait for `image-build`. `NIGHTLY=1` on this test pipeline selects tests. `NIGHTLY=1`
 on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 
@@ -20,10 +40,13 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X (scheduled builds only) |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
-A pull request labeled `ready` uploads `test-ready.yml`, including forks.
+A pull request labeled `ready` uploads `test-ready.yml`, including forks,
+unless the bootstrap skips it as documentation-only. The same exception applies
+to `merge-test` and merge-queue L2 uploads. Default-branch push L2 uploads
+remain enabled.
 `test-merge.yml` has no per-job `if`. In `test-ready.yml` and `test-nightly.yml`, a job whose gate is narrower than the upload keeps its own `if`.
 
 GPU machine presets are in [`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml).
@@ -41,7 +64,69 @@ shell. A build-level `HF_TOKEN` would override a pod env entry of the same name.
 | `mi300_2` | `router_rocm_mi300_2`, same-host xGMI Docker devices |
 | `mi300_rdma` | `router_rocm_mi300_2` coordinator, no Docker plugin |
 
-CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Dependency sets live in `ci_apt_packages.conf` and `scripts/install_packages.sh`. `rust` and `nvidia_pd` install apt packages. `router-bin` downloads the release binary and checks it. `lm-eval` installs the ROCm accuracy harness. A sourced `python` call downloads the binary and installs `.[dev]` into `/tmp/venv`. `python-wheel` uses that apt set and venv for `python -m build`.
+CPU steps keep `medium_cpu_queue_premerge` inline. Their command lives in the Docker plugin, so they do not use a preset. Dependency sets live in `ci_apt_packages.conf`, `requirements/`, and `scripts/install_packages.sh`. `rust` and `nvidia_pd` install apt packages. `router-bin` downloads the release binary and checks it. `lm-eval` installs the ROCm accuracy harness; `rocm-kv-aware` installs the pinned pytest/requests pair without building the router. A sourced `python` call downloads the binary and installs `.[dev]` into `/tmp/venv`. `python-wheel` uses that apt set and venv for `python -m build`.
+
+### Rust coverage artifacts
+
+The Rust unit and integration jobs in `test-nightly.yml`
+run through [`scripts/rust_coverage.sh`](scripts/rust_coverage.sh), using
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov/tree/v0.6.21)
+0.6.21 and pinned `nightly-2026-04-15` with its `llvm-tools-preview` component. Each job
+runs its existing `cpu,ready` test targets once with coverage instrumentation.
+Instrumentation is limited to the host target so nested WASM component builds
+do not inherit unsupported coverage flags.
+This adds tool installation and instrumented compilation time to those jobs.
+`test-ready.yml` runs ordinary Rust tests without coverage instrumentation.
+The nightly Rust jobs keep their existing scheduling condition, so a PR
+also labeled `ready` skips them and does not produce Rust coverage artifacts.
+
+Each job uploads one machine-readable LCOV file from the mounted checkout:
+
+| Artifact | Unit job | Integration job |
+| --- | --- | --- |
+| LCOV data | `target/coverage/rust-unit/lcov.info` | `target/coverage/rust-integration/lcov.info` |
+
+Reports exclude `tests/` and `benches/` files as well as inline test modules
+and test-only helpers marked with `#[cfg_attr(coverage_nightly, coverage(off))]`.
+The nightly toolchain enables this unstable attribute; ordinary stable builds
+do not enable it. Add the same marker to new test modules and test-only helpers.
+The existing `check-mark` pre-commit hook checks each test-only module,
+function and impl declaration under `src/` for this marker, including
+file-based `mod tests;` declarations.
+These are separate coverage
+measurements for each test group; their percentages must not be added or
+averaged to obtain total coverage. Python tests, doctests, ignored tests, and
+nightly-only branch coverage are outside this measurement. No minimum
+coverage threshold is enforced.
+Each run cleans workspace coverage artifacts so reports cannot include stale
+binaries from another toolchain or test group; dependency builds remain cached.
+
+Tests retain a failing job status when they fail. Report generation is
+attempted after test failures, but compilation failures or missing profiles
+may prevent reports from being generated. Report generation failures also
+fail the job.
+The previous report is removed before tool installation. A new report is
+written to a temporary file and renamed to `lcov.info` only after generation
+succeeds, so failed runs cannot publish stale or partially written reports.
+The completed report is set to mode `0644` before publication so the host
+Buildkite agent can read it even when the container runs as root.
+
+To reproduce with the same Rust image and dependency set as CI, run from the
+repository root (requires Docker and network access):
+
+```bash
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh unit'
+docker run --rm -v "$PWD:/workdir" -w /workdir rust:1.95.0-bookworm \
+  bash -euc 'bash .buildkite/scripts/install_packages.sh rust; bash .buildkite/scripts/rust_coverage.sh integration'
+```
+
+On a Linux development host with Rust, rustup, and the `rust` apt dependency
+set already installed, use `bash .buildkite/scripts/rust_coverage.sh unit`
+or `bash .buildkite/scripts/rust_coverage.sh integration`. The script installs
+the pinned nightly toolchain, precompiled coverage tool from GitHub releases,
+and LLVM component, so it also
+needs network access.
 
 ### `release-pipeline.yml`
 Release pipeline for tagged versions, nightly Docker images, and versioned
@@ -175,7 +260,7 @@ bash ./run_accuracy_test.sh
 ## Additional Pipeline Steps
 
 ### Build
-The `build` group in `pipeline.yml` creates release artifacts:
+The `build` group in `bootstrap-upload-steps.yml` creates release artifacts:
 - Rust binary (`target/release/vllm-router`)
 - Python wheels and source distribution
 
@@ -193,6 +278,24 @@ Comprehensive test suite:
 - Rust integration tests
 - Python tests with coverage
 
+### ROCm KV-aware e2e
+
+`rocm-kv-aware-e2e` in `test-nightly.yml` reuses the L4 functional test on
+two MI300X GPUs on one host. It supports `ROCM_ONLY=1` and does not require
+the NVIDIA image build.
+The pinned ROCm image supplies `vllm-rs`; the router binary comes from this
+build. See the [test configuration](../tests/python/e2e/function/kv_aware/config.py)
+for the prefix-reuse scenario and worker settings; this is not a P/D test.
+This lane runs only on scheduled `NIGHTLY=1` builds, not PR-triggered L3
+builds, to avoid adding long lease waits to the shared PR queue.
+
+Router installation and Python dependency installation each have a ten-minute
+bound; pytest has a separate 30-minute bound. On forced termination, container
+teardown remains the final cleanup boundary for workers. Worker logs
+are collected under `target/ci-logs/kv-aware-rocm`; pytest output is in the
+Buildkite console. See [shared host leases](#shared-host-leases-and-timeouts)
+for the overall job timeout.
+
 ### Benchmarks
 Not part of the pipeline. Run them locally with `scripts/run_benchmarks.py`
 (criterion) or the router overhead harness; see
@@ -206,8 +309,20 @@ Builds Docker image for the router.
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
 - `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
-- `router_rocm_mi300_2`: dedicated two-node MI300X MoRI tests (`spawn=1`)
+- `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue
+
+### Shared host leases and timeouts
+
+The `router_rocm_mi300_2` hosts are shared. Their `pre-command` hook invokes
+`vllm-router-rocm-hold-cluster-lease` after the agent accepts the job, so lease
+acquisition counts toward Buildkite's step timeout. The hook can wait up to
+360 minutes; jobs have previously timed out here before their test command ran.
+
+The KV-aware lane allows 450 minutes: 360 for the lease plus 90 for setup and
+execution. #508 aligns the MoRI lanes with this budget. A manual retry starts
+a fresh, independently bounded attempt rather than continuing the previous
+attempt's budget. Lane-specific command timeouts still bound actual test work.
 
 ## Adding New Tests
 

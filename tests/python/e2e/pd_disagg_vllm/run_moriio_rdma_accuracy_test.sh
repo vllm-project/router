@@ -32,6 +32,10 @@ LM_EVAL_LOG_SAMPLES=${LM_EVAL_LOG_SAMPLES:-false}
 SMOKE_ONLY=${SMOKE_ONLY:-false}
 SKIP_LM_EVAL=${SKIP_LM_EVAL:-false}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-300}
+RUN_PD_LIFECYCLE=${RUN_PD_LIFECYCLE:-false}
+PD_PROBE_CONCURRENCY=${PD_PROBE_CONCURRENCY:-"1 2 4 8"}
+PD_PROBE_ROUNDS=${PD_PROBE_ROUNDS:-2}
+PD_PROBE_TIMEOUT=${PD_PROBE_TIMEOUT:-60}
 EVAL_PIP_CACHE_VOLUME=${EVAL_PIP_CACHE_VOLUME:-"vllm-router-rocm-pip-cache"}
 
 PREFILL_PORT=${PREFILL_PORT:-8100}
@@ -44,9 +48,33 @@ PREFILL_NOTIFY_PORT=${PREFILL_NOTIFY_PORT:-61005}
 DECODE_NOTIFY_PORT=${DECODE_NOTIFY_PORT:-62005}
 LOG_DIR=${LOG_DIR:-"${REPO_ROOT}/target/ci-logs/moriio-rdma-${MORIIO_READ_MODE}"}
 
+# A failure before the probe must not publish a previous invocation's report.
+# Clear it even when this invocation disables the probe or fails validation.
+for stale_report in \
+  "${LOG_DIR}/pd-lifecycle.json" \
+  "${LOG_DIR}/pd-lifecycle.json.tmp"; do
+  if [[ -e "${stale_report}" ]]; then
+    echo "Removing stale lifecycle report: ${stale_report}"
+    rm -f -- "${stale_report}"
+  fi
+done
+
 PREFILL_CONTAINER="vllm-router-mori-rdma-prefill"
 DECODE_CONTAINER="vllm-router-mori-rdma-decode"
 EVAL_CONTAINER="vllm-router-mori-rdma-eval"
+
+evidence_mode=ro
+case "${RUN_PD_LIFECYCLE}" in
+  true|false) ;;
+  *) echo "ERROR: RUN_PD_LIFECYCLE must be true or false" >&2; exit 2 ;;
+esac
+if [[ "${RUN_PD_LIFECYCLE}" == true ]]; then
+  evidence_mode=rw
+  if [[ "${SMOKE_ONLY}" == true ]]; then
+    echo "ERROR: lifecycle probe requires SMOKE_ONLY=false" >&2
+    exit 2
+  fi
+fi
 
 case "${MORIIO_READ_MODE}" in
   true|false) ;;
@@ -94,6 +122,8 @@ else
 fi
 
 mkdir -p "${LOG_DIR}"
+# Docker bind mounts require an absolute host path, including caller overrides.
+LOG_DIR="$(cd "${LOG_DIR}" && pwd -P)"
 docker volume create "${EVAL_PIP_CACHE_VOLUME}" >/dev/null
 
 # OpenSSH joins command arguments without preserving their boundaries. Render a
@@ -239,6 +269,11 @@ COMMON_DOCKER_ARGS=(
   -e VLLM_LOGGING_LEVEL=INFO
   --entrypoint vllm
 )
+if [[ -n "${VLLM_ROCM_USE_SKINNY_GEMM:-}" ]]; then
+  COMMON_DOCKER_ARGS+=(
+    -e VLLM_ROCM_USE_SKINNY_GEMM="${VLLM_ROCM_USE_SKINNY_GEMM}"
+  )
+fi
 
 PREFIX_CACHING_ARGS=(--no-enable-prefix-caching)
 if [[ "${ENABLE_PREFIX_CACHING}" == "true" ]]; then
@@ -288,9 +323,9 @@ wait_for_health "prefill" "http://${COORDINATOR_FABRIC_IP}:${PREFILL_PORT}/healt
 wait_for_health "decode" "http://${WORKER_FABRIC_IP}:${DECODE_PORT}/health" "${ENGINE_STARTUP_TIMEOUT}"
 wait_for_health "router discovery" "http://127.0.0.1:${ROUTER_PORT}/health" "${ROUTER_STARTUP_TIMEOUT}"
 
-# This request must traverse prefill on node A and decode on node B. A correct
-# response therefore proves that MoRI registered and transferred GPU KV memory
-# across the RDMA fabric, not merely that host-memory verbs work.
+# Exercise the configured cross-node P/D path and reject invalid completions.
+# A structurally valid response alone does not establish KV-transfer integrity;
+# that requires transport evidence and accuracy validation.
 curl --fail --silent --show-error \
   --max-time "${REQUEST_TIMEOUT}" \
   -H 'Content-Type: application/json' \
@@ -299,16 +334,18 @@ curl --fail --silent --show-error \
   | tee "${LOG_DIR}/smoke-response.json"
 echo
 
-if [[ "${SMOKE_ONLY}" == "true" ]]; then
-  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
-  exit 0
-fi
-
 EVAL_COMMAND=$(cat <<EOF
 set -Eeuo pipefail
+# Validate before installing dependencies, including in smoke-only mode.
+python3 tests/python/helpers/completion_validation.py /evidence/smoke-response.json
+if [[ "${SMOKE_ONLY}" == true ]]; then exit 0; fi
 export PIP_ROOT_USER_ACTION=ignore
 export PIP_CACHE_DIR=/root/.cache/pip
-python3 -m pip install --disable-pip-version-check --quiet requests
+if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
+  bash .buildkite/scripts/install_packages.sh pd-lifecycle
+else
+  python3 -m pip install --disable-pip-version-check --quiet requests
+fi
 if [[ ${SKIP_LM_EVAL} != true ]]; then
   python3 -m pip install --disable-pip-version-check --quiet openai 'lm-eval[api]==0.4.12'
 fi
@@ -317,6 +354,18 @@ python3 tests/python/e2e/pd_disagg_vllm/test_pd_accuracy.py \\
   --model ${MODEL_NAMES} \\
   --num-requests ${NUM_SANITY_REQUESTS} \\
   --skip-streaming
+if [[ ${RUN_PD_LIFECYCLE} == true ]]; then
+  # Probe settings are arguments to this shell, never shell source.
+  # Run the probe first intentionally: LM-eval then checks useful recovery load
+  # after active disconnects, while a lifecycle failure preserves first cause.
+  python3 tests/python/e2e/pd_disagg_vllm/pd_lifecycle.py \\
+    --router-url http://127.0.0.1:${ROUTER_PORT} \\
+    --model ${MODEL_NAMES} \\
+    --concurrency "\$1" \\
+    --rounds "\$2" \\
+    --timeout "\$3" \\
+    --output /evidence/pd-lifecycle.json
+fi
 if [[ ${SKIP_LM_EVAL} == true ]]; then exit 0; fi
 args=(
   --router-url http://127.0.0.1:${ROUTER_PORT}
@@ -336,10 +385,18 @@ docker run --rm \
   --name "${EVAL_CONTAINER}" \
   --network host \
   -v "${REPO_ROOT}:/workdir" \
+  -v "${LOG_DIR}:/evidence:${evidence_mode}" \
   -v "${EVAL_PIP_CACHE_VOLUME}:/root/.cache/pip" \
   -w /workdir \
   --entrypoint bash \
   "${ROCM_VLLM_IMAGE}" \
-  -lc "${EVAL_COMMAND}"
+  -lc "${EVAL_COMMAND}" -- \
+  "${PD_PROBE_CONCURRENCY}" "${PD_PROBE_ROUNDS}" "${PD_PROBE_TIMEOUT}"
 
-echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+if [[ "${SMOKE_ONLY}" == true ]]; then
+  echo "MoRI RDMA cross-node smoke passed (read_mode=${MORIIO_READ_MODE})"
+elif [[ "${RUN_PD_LIFECYCLE}" == true && "${SKIP_LM_EVAL}" == true ]]; then
+  echo "MoRI RDMA lifecycle passed; LM-eval skipped (read_mode=${MORIIO_READ_MODE})"
+else
+  echo "MoRI RDMA cross-node accuracy passed (read_mode=${MORIIO_READ_MODE})"
+fi

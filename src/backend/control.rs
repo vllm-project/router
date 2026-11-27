@@ -8,30 +8,32 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tonic::transport::Channel;
 
-use super::detect::grpc_connect_uri;
-use super::pb::{
-    control_client::ControlClient, GetKvEventSourcesRequest, GetKvEventSourcesResponse,
-    GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
+pub use crate::kv_index::discovery::{
+    get_grpc_kv_event_sources, GrpcKvEventSourcesResponse as KvEventSourcesResponse,
 };
 
-async fn control_client(
+use super::detect::grpc_connect_uri;
+use super::pb::{
+    control_client::ControlClient, GetModelInfoRequest, GetServerInfoRequest, ModelInfo, ServerInfo,
+};
+
+pub(crate) async fn control_channel(
     worker_url: &str,
     timeout: Duration,
-) -> Result<ControlClient<Channel>, String> {
+) -> Result<Channel, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let channel = Channel::from_shared(uri.clone())
+    Channel::from_shared(uri.clone())
         .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
         .connect_timeout(timeout)
         .timeout(timeout)
         .connect()
         .await
-        .map_err(|e| format!("grpc control connect {uri}: {e}"))?;
-    Ok(ControlClient::new(channel))
+        .map_err(|e| format!("grpc control connect {uri}: {e}"))
 }
 
 pub async fn get_grpc_model_info(worker_url: &str, timeout: Duration) -> Result<ModelInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, timeout).await?);
     tokio::time::timeout(timeout, client.get_model_info(GetModelInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetModelInfo timeout {uri}"))?
@@ -44,28 +46,12 @@ pub async fn get_grpc_server_info(
     timeout: Duration,
 ) -> Result<ServerInfo, String> {
     let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
+    let mut client = ControlClient::new(control_channel(worker_url, timeout).await?);
     tokio::time::timeout(timeout, client.get_server_info(GetServerInfoRequest {}))
         .await
         .map_err(|_| format!("grpc GetServerInfo timeout {uri}"))?
         .map_err(|e| format!("grpc GetServerInfo {uri}: {e}"))
         .map(|response| response.into_inner())
-}
-
-pub async fn get_grpc_kv_event_sources(
-    worker_url: &str,
-    timeout: Duration,
-) -> Result<GetKvEventSourcesResponse, String> {
-    let uri = grpc_connect_uri(worker_url)?;
-    let mut client = control_client(worker_url, timeout).await?;
-    tokio::time::timeout(
-        timeout,
-        client.get_kv_event_sources(GetKvEventSourcesRequest {}),
-    )
-    .await
-    .map_err(|_| format!("grpc GetKvEventSources timeout {uri}"))?
-    .map_err(|e| format!("grpc GetKvEventSources {uri}: {e}"))
-    .map(|response| response.into_inner())
 }
 
 pub fn model_info_json(info: &ModelInfo) -> Value {
@@ -181,6 +167,7 @@ pub fn openai_models_json(info: &ModelInfo) -> Value {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::backend::pb::{ParallelismInfo, RlCapabilities};

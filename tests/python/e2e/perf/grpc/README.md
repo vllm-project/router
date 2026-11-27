@@ -35,8 +35,7 @@ Model path or HF id: set `"model"` in `cases/<name>.json`, or `export MODEL=...`
 export MODEL=/path/to/model   # required unless case JSON defines model
 export VLLM_RS=/path/to/vllm-rs          # rust_grpc
 export ROUTER_BIN=$PWD/target/release/vllm-router   # optional
-# results JSON (default on, dir created at run time): tests/python/e2e/perf/grpc/results/<backend>_<ts>/
-# export PERF_SAVE_RESULTS=0   # disable file output
+# results JSON (default RUNS=1): tests/python/e2e/results/perf/grpc/<backend>_<YYYYMMDD_HHMMSS>/hit<rate>_c<concurrency>_r<requests>.json
 
 pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc
 pytest tests/python/e2e/perf/grpc --perf-case=rust_http
@@ -123,7 +122,18 @@ Override bench via env: `PERF_TOKENS`, `PERF_MAX_TOKENS`, `PERF_TIMEOUT`.
 
 Each wave prints a **`perf summary`** block to stderr after the test (use `-sv`).
 Set `PERF_QUIET=1` to disable terminal summary. Wave JSON is written under
-`tests/python/e2e/perf/grpc/results/` **by default**; use `PERF_SAVE_RESULTS=0` to skip files.
+`tests/python/e2e/results/perf/grpc/` for every run.
+
+`RUNS` repeats every hit-rate/concurrency/request-count combination (default: 1).
+For example, `RUNS=3 pytest tests/python/e2e/perf/grpc --perf-case=rust_grpc -sv`
+collects three samples per combination, each with the usual cold stack start
+unless using an external router. Results are saved under
+`<backend>_<YYYYMMDD_HHMMSS>/run1/`, `run2/`, and `run3/` only when `RUNS>1`.
+When `RUNS` is unset or `RUNS=1`, files are written directly under
+`<backend>_<YYYYMMDD_HHMMSS>/`, preserving the default nightly layout.
+Filenames are unchanged, and summaries include the run index. For multiple runs,
+the dashboard must read the per-run subdirectories; nightly's `**/*.json` glob
+already includes them.
 
 One wave equals:
 
@@ -168,7 +178,7 @@ Buildkite step **`:python: grpc perf test case`** (`key: grpc-perf-e2e` in
 
 `python -m pytest -sv tests/python/e2e/perf/grpc -k c16-r32 --perf-case=python_http`
 
-Wave JSON under `results/` is collected as build artifacts.
+Wave JSON under `tests/python/e2e/results/perf/grpc/` is collected as build artifacts. The nightly dashboard copies `tests/python/e2e/results` only.
 
 ## Related
 
