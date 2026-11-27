@@ -88,7 +88,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a worker with the session ID resolved from the request headers or body.
     ///
     /// `request_text` is the request text, or a per-request key used to break
-    /// equal-load ties. Policies must not read a session ID from it.
+    /// equal-load ties. Overrides must take the ID from `session_id`, not from
+    /// `request_text`. The default ignores `session_id`.
     fn select_worker_for_session(
         &self,
         workers: &[Arc<dyn Worker>],
