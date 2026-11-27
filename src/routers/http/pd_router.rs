@@ -587,13 +587,16 @@ fn build_dp_workers(
     worker_type: WorkerType,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
+    api_key: Option<&str>,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
     let (base_url, _) = dp_utils::parse_worker_url(url);
+    let api_key = api_key.map(Arc::<str>::from);
 
     // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
     let dp_worker = |rank: usize| -> Arc<dyn Worker> {
         let worker = DPAwareWorker::new(base_url.clone(), rank, dp_size, worker_type.clone())
+            .with_worker_api_key(api_key.clone())
             .with_circuit_breaker_config(circuit_breaker_config.clone());
         let worker = match health_config {
             Some(config) => worker.with_health_config(config.clone()),
@@ -608,6 +611,7 @@ fn build_dp_workers(
             Some(rank) => dp_worker(rank),
             None => {
                 let worker = BasicWorker::new(url.to_string(), worker_type.clone())
+                    .with_worker_api_key(api_key.clone())
                     .with_dp_size(dp_size)
                     .with_circuit_breaker_config(circuit_breaker_config.clone());
                 let worker = match health_config {
@@ -840,8 +844,7 @@ impl PdRouterBase {
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
-            // PD health checks do not send the API key yet.
-            None,
+            self.api_key.as_deref(),
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -1058,6 +1061,7 @@ impl PdRouterBase {
             worker_type,
             &self.circuit_breaker_config,
             None,
+            self.api_key.as_deref(),
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
@@ -1260,10 +1264,6 @@ impl PdRouterBase {
             window_duration: Duration::from_secs(circuit_breaker_config.window_duration_secs),
         };
 
-        if ctx.router_config.api_key.is_some() {
-            warn!("--api-key is not applied to P/D worker health checks yet");
-        }
-
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -1273,8 +1273,7 @@ impl PdRouterBase {
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
-                    // PD health checks do not send the API key yet.
-                    None,
+                    ctx.router_config.api_key.as_deref(),
                 )
                 .await?;
             }
@@ -1306,6 +1305,7 @@ impl PdRouterBase {
                 worker_type,
                 &core_cb_config,
                 Some(&health_config),
+                ctx.router_config.api_key.as_deref(),
             )? {
                 ctx.worker_registry.register(worker);
             }
