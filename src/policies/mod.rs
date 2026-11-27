@@ -14,6 +14,7 @@ mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+mod least_load;
 mod power_of_two;
 mod random;
 mod registry;
@@ -36,6 +37,7 @@ pub use kv_aware::{
     SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
     WorkerTokenInputs,
 };
+pub use least_load::{least_by_load, LeastLoadPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

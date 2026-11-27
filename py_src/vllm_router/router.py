@@ -17,6 +17,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
         "sticky_least_loaded": PolicyType.StickyLeastLoaded,
+        "least_load": PolicyType.LeastLoad,
     }
     return policy_map[policy_str]
 

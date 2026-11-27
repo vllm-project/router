@@ -509,6 +509,9 @@ impl ConfigValidator {
                 // Session expiration is sourced from the environment; no
                 // structured config to validate here.
             }
+            PolicyConfig::LeastLoad => {
+                // In-flight load is read from the worker. No extra config.
+            }
             PolicyConfig::RendezvousHash => {
                 // No specific validation needed
             }
