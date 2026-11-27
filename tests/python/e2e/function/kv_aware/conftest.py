@@ -3,8 +3,9 @@ import os
 import re
 import shutil
 import sys
+import time
 from contextlib import ExitStack
-from math import lcm
+from math import ceil, lcm
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -134,7 +135,18 @@ def hybrid_kv_aware_stack(request, tmp_path):
     # NIXL leaves the last prompt token on Decode for Mamba models.
     prefill_backoff = int(pd and mamba_groups)
 
+    def wait_worker_ready(http_url, proc, log_path, deadline):
+        try:
+            launch.wait_worker_health(
+                http_url,
+                timeout=max(0.0, deadline - time.monotonic()),
+                proc=proc,
+            )
+        except TimeoutError as error:
+            pytest.fail(f"{error}. Worker log: {log_path}")
+
     with ExitStack() as cleanup:
+        worker_processes = []
         for index in range(worker_count):
             gpu_start = index * tensor_parallel_size
             worker_gpus = gpus[gpu_start : gpu_start + tensor_parallel_size]
@@ -190,7 +202,13 @@ def hybrid_kv_aware_stack(request, tmp_path):
                     grpc_port=grpc_port,
                     base_gpu_id=worker_gpus,
                     hash_seed=hash_seed,
-                    extra_argv=[*frontend_args, "--", *worker_args],
+                    extra_argv=[
+                        *frontend_args,
+                        "--engine-ready-timeout-secs",
+                        str(ceil(worker_health_timeout)),
+                        "--",
+                        *worker_args,
+                    ],
                     extra_env=worker_env,
                     log_file=log_file,
                 )
@@ -210,13 +228,17 @@ def hybrid_kv_aware_stack(request, tmp_path):
                     log_file=log_file,
                 )
             cleanup.callback(launch.terminate_process, proc)
-            try:
-                launch.wait_worker_health(
-                    http_url, timeout=worker_health_timeout, proc=proc
-                )
-            except TimeoutError as error:
-                pytest.fail(f"{error}. Worker log: {log_path}")
+            deadline = time.monotonic() + worker_health_timeout
+            worker_processes.append(
+                (http_url, url, proc, log_path, is_decode, deadline)
+            )
+            if not pd:
+                wait_worker_ready(http_url, proc, log_path, deadline)
 
+        # Start both P/D engines before waiting; their health budgets begin at launch.
+        for http_url, url, proc, log_path, is_decode, deadline in worker_processes:
+            if pd:
+                wait_worker_ready(http_url, proc, log_path, deadline)
             if is_decode:
                 continue
             ready_log = log_path.read_text(encoding="utf-8", errors="replace")

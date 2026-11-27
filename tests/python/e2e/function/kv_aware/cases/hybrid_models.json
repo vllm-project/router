@@ -187,11 +187,12 @@
     "model": "Qwen/Qwen3.8-Flash-Next-FP8",
     "local_model_env": "KV_AWARE_HYBRID_QWEN3_8_FLASH_NEXT_FP8_MODEL",
     "worker_count": 2,
-    "worker_health_timeout_sec": 1200,
+    "worker_health_timeout_sec": 1800,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,
       "prefix_caching_hash_algo": "sha256_cbor",
+      "prefix_match_unit": 16,
       "max_model_len": 8192,
       "max_num_batched_tokens": 8192,
       "language_model_only": true,
@@ -202,8 +203,9 @@
         "ranks": [
           {
             "rank": 0,
-            "hash_block_size": 1600,
+            "hash_block_size": 16,
             "hash_seed": "0",
+            "partial_hash_hits": true,
             "speculative_tokens": 0,
             "groups": [
               {"kind": "mamba", "mamba_cache_mode": "align"},
@@ -222,6 +224,9 @@
       "mtp": {
         "deployments": ["1p1d_nixl"],
         "worker_params": {
+          "enforce_eager": true,
+          "max_num_seqs": 8,
+          "kv_cache_memory_bytes": 8589934592,
           "speculative_config": {
             "method": "mtp",
             "num_speculative_tokens": 3,
@@ -233,8 +238,9 @@
             "ranks": [
               {
                 "rank": 0,
-                "hash_block_size": 1600,
+                "hash_block_size": 16,
                 "hash_seed": "0",
+                "partial_hash_hits": true,
                 "speculative_tokens": 3,
                 "groups": [
                   {"kind": "mamba", "mamba_cache_mode": "align"},
@@ -257,7 +263,7 @@
     "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_FLASH_0731_MODEL",
     "worker_count": 2,
-    "worker_health_timeout_sec": 1200,
+    "worker_health_timeout_sec": 1800,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,
@@ -295,6 +301,7 @@
     "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_1_FLASH_1017_MODEL",
     "worker_count": 2,
+    "worker_health_timeout_sec": 1800,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,
@@ -303,7 +310,7 @@
       "max_num_batched_tokens": 4096,
       "language_model_only": true,
       "trust_remote_code": true,
-      "tensor_parallel_size": 2,
+      "tensor_parallel_size": 4,
       "kv_cache_dtype": "fp8",
       "block_size": 128
     },
@@ -334,6 +341,7 @@
     "model": "nvidia/DeepSeek-V4-Pro-NVFP4",
     "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_PRO_NVFP4_MODEL",
     "worker_count": 2,
+    "worker_health_timeout_sec": 1800,
     "protocols": ["http", "grpc"],
     "worker_params": {
       "enable_prefix_caching": true,
