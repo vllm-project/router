@@ -27,6 +27,22 @@ pub fn init_metrics() {
         "vllm_router_requests_cancelled_total",
         "HTTP inference requests abandoned by the client, counted once at the outstanding stage"
     );
+    describe_histogram!(
+        "vllm_router_ttft_seconds",
+        "Router-side time to first generated output in seconds, including queueing and Router overhead"
+    );
+    describe_histogram!(
+        "vllm_router_itl_seconds",
+        "Router-side interval between separately delivered SSE output events each confirming one token"
+    );
+    describe_histogram!(
+        "vllm_router_input_tokens",
+        "Input tokens from final usage of successful HTTP inference responses"
+    );
+    describe_histogram!(
+        "vllm_router_output_tokens",
+        "Output tokens from final usage of successful HTTP inference responses"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",
@@ -544,12 +560,48 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60));
     let builder = set_program_scheduling_buckets(builder);
+    let builder = set_http_inference_buckets(builder);
     builder
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
     init_metrics();
+}
+
+fn set_http_inference_buckets(mut builder: PrometheusBuilder) -> PrometheusBuilder {
+    for (name, buckets) in [
+        (
+            "vllm_router_ttft_seconds",
+            &[
+                0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10., 30., 60., 120.,
+            ][..],
+        ),
+        (
+            "vllm_router_itl_seconds",
+            &[
+                0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5.,
+            ],
+        ),
+        (
+            "vllm_router_input_tokens",
+            &[
+                0., 16., 32., 64., 128., 256., 512., 1024., 2048., 4096., 8192., 16384., 32768.,
+                65536., 131072.,
+            ],
+        ),
+        (
+            "vllm_router_output_tokens",
+            &[
+                0., 1., 4., 16., 32., 64., 128., 256., 512., 1024., 2048., 4096., 8192., 16384.,
+            ],
+        ),
+    ] {
+        builder = builder
+            .set_buckets_for_metric(Matcher::Full(name.into()), buckets)
+            .unwrap_or_else(|error| panic!("failed to set buckets for {name}: {error}"));
+    }
+    builder
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {

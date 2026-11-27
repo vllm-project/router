@@ -1,6 +1,6 @@
 //! Conservative model-output detection for proxied Completion SSE streams.
 
-use super::sse::{sse_lines, FrameScanner};
+use super::sse::{event_fields, FrameScanner};
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
@@ -61,18 +61,7 @@ impl CompletionOutputObserver {
 }
 
 fn event_has_output(event: &[u8]) -> bool {
-    let mut data = Vec::new();
-    let mut event_type = None;
-    for (line, _) in sse_lines(event) {
-        if let Some(value) = line.strip_prefix(b"data:") {
-            if !data.is_empty() {
-                data.push(b'\n');
-            }
-            data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
-        } else if let Some(value) = line.strip_prefix(b"event:") {
-            event_type = Some(value.strip_prefix(b" ").unwrap_or(value));
-        }
-    }
+    let (event_type, data) = event_fields(event);
     if event_type == Some(b"error".as_slice()) {
         return false;
     }

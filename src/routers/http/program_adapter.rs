@@ -240,6 +240,9 @@ pub(super) fn prepare_stream_usage_body<T: serde::Serialize>(
 #[derive(Debug, Default)]
 pub(super) struct SseUsageStripper {
     pending: Vec<u8>,
+    stripped_usage: Option<super::response_metrics::Usage>,
+    usage_candidate: Option<super::response_metrics::Usage>,
+    saw_done: bool,
 }
 
 impl SseUsageStripper {
@@ -254,8 +257,36 @@ impl SseUsageStripper {
             }
             self.pending.extend_from_slice(part);
             if part.ends_with(b"\n") {
-                if !is_usage_sse_line(&self.pending) {
+                if self.pending.trim_ascii().is_empty() {
+                    if let Some(usage) = self.usage_candidate.take() {
+                        self.stripped_usage = Some(usage);
+                    }
                     out.extend_from_slice(&self.pending);
+                } else {
+                    let data = sse_data(&self.pending);
+                    let value = data.and_then(|data| serde_json::from_slice::<Value>(data).ok());
+                    let usage = value.as_ref().and_then(usage_sse_value);
+                    if !self.saw_done {
+                        if data == Some(b"[DONE]".as_slice()) {
+                            self.saw_done = true;
+                            self.usage_candidate = None;
+                        } else if let Some(choices) = value
+                            .as_ref()
+                            .and_then(|v| v.get("choices"))
+                            .and_then(Value::as_array)
+                        {
+                            if choices.is_empty() {
+                                self.usage_candidate =
+                                    usage.and_then(super::response_metrics::usage);
+                            } else {
+                                self.usage_candidate = None;
+                                self.stripped_usage = None;
+                            }
+                        }
+                    }
+                    if usage.is_none() {
+                        out.extend_from_slice(&self.pending);
+                    }
                 }
                 self.pending.clear();
             }
@@ -263,9 +294,16 @@ impl SseUsageStripper {
         Ok((!out.is_empty()).then(|| Bytes::from(out)))
     }
 
+    pub(super) fn stripped_usage(&self) -> Option<super::response_metrics::Usage> {
+        self.stripped_usage
+    }
+
     pub(super) fn finish(&mut self) -> Option<Bytes> {
         let line = std::mem::take(&mut self.pending);
-        (!line.is_empty() && !is_usage_sse_line(&line)).then(|| Bytes::from(line))
+        let is_usage = sse_data(&line)
+            .and_then(|data| serde_json::from_slice(data).ok())
+            .is_some_and(|value| usage_sse_value(&value).is_some());
+        (!line.is_empty() && !is_usage).then(|| Bytes::from(line))
     }
 }
 
@@ -289,19 +327,17 @@ fn top_level_usage(value: &Value) -> Option<&Value> {
 /// deltas, or emits usage alongside non-empty `choices`, must keep those
 /// frames: dropping them would lose content, tool calls and finish reasons.
 /// Error frames must also survive, even when they include usage.
-fn is_usage_sse_line(line: &[u8]) -> bool {
-    let Some(data) = sse_data(line) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(data) else {
-        return false;
-    };
-    !is_error_frame(&value)
-        && top_level_usage(&value).is_some()
+fn usage_sse_value(value: &Value) -> Option<&Value> {
+    if !is_error_frame(value)
         && value
             .get("choices")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
+    {
+        top_level_usage(value)
+    } else {
+        None
+    }
 }
 
 impl ProgramCompletionInner {
@@ -531,6 +567,28 @@ mod tests {
         assert!(stripper.push(part_a).unwrap().is_none());
         assert_eq!(stripper.push(part_b).unwrap().as_deref(), Some(&b"\n"[..]));
         assert!(stripper.finish().is_none());
+    }
+
+    #[test]
+    fn metrics_only_observe_complete_final_stripped_usage() {
+        let mut stripper = SseUsageStripper::default();
+        stripper
+            .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\n")
+            .unwrap();
+        assert_eq!(stripper.stripped_usage(), None);
+        stripper.push(b"\n").unwrap();
+        assert_eq!(stripper.stripped_usage(), Some((Some(3), None)));
+        stripper
+            .push(b"data: {\"choices\":[{\"text\":\"x\"}]}\n\n")
+            .unwrap();
+        assert_eq!(stripper.stripped_usage(), None);
+        stripper
+            .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4}}\n\ndata: [DONE]\n\n")
+            .unwrap();
+        stripper
+            .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":999}}\n\n")
+            .unwrap();
+        assert_eq!(stripper.stripped_usage(), Some((Some(4), None)));
     }
 
     #[test]

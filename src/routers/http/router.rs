@@ -2,7 +2,7 @@ use super::completion_route::{prepare_completion_route, reject_full_report, Comp
 use super::program_adapter::{
     prepare_stream_usage_body, settle_grpc_response, ProgramCompletion, SseUsageStripper, StreamEnd,
 };
-use super::request_metrics::{self, Phase};
+use super::request_metrics::{self, Phase, ProducerEvidence};
 use crate::backend::health::check_grpc_health_within;
 use crate::backend::preprocess::{
     http_cache_read_fallback, prepare_completion_direct_inputs, prepare_http_kv_inputs,
@@ -1790,6 +1790,11 @@ impl Router {
             request_metrics::disable();
         }
         request_metrics::stream(is_stream);
+        request_metrics::echo(match typed_req.grpc_request() {
+            Some(GrpcRequestRef::Chat(chat)) => chat.echo.unwrap_or(false),
+            Some(GrpcRequestRef::Completion(request)) => request.echo,
+            None => false,
+        });
         let raw_body = if is_http {
             raw_body
         } else {
@@ -2624,6 +2629,8 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let evidence = ProducerEvidence::current();
+            let producer_evidence = evidence.clone();
             let (mut producer_output_frame, output_frame) = if completion_echo.is_some() {
                 let (producer, consumer) = output_frame_tracking();
                 (Some(producer), Some(consumer))
@@ -2688,6 +2695,7 @@ impl Router {
                                         RouterMetrics::record_agent_aware_usage_filter_error();
                                         warn!(event = "token_fact_usage_filter_failed", error);
                                         stream_succeeded = false;
+                                        ProducerEvidence::fail(producer_evidence.as_ref());
                                         let _ = tx.send(Err(error.to_string()));
                                         break;
                                     }
@@ -2708,12 +2716,18 @@ impl Router {
                         }
                         Err(e) => {
                             stream_succeeded = false;
+                            ProducerEvidence::fail(producer_evidence.as_ref());
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
                     }
                 }
                 if let Some(stripper) = usage_stripper.as_mut().filter(|_| stream_succeeded) {
+                    if let (Some(evidence), Some(usage)) =
+                        (&producer_evidence, stripper.stripped_usage())
+                    {
+                        evidence.hidden_usage(usage);
+                    }
                     if let Some(tail) = stripper.finish() {
                         let _ = tx.send(Ok(tail));
                     }
@@ -2729,6 +2743,9 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            if let Some(evidence) = evidence {
+                response.extensions_mut().insert(evidence);
+            }
             hold_request_load_with_output_frame(response, load, Some(producer), output_frame)
         } else {
             // For requests without load tracking, just stream
@@ -2743,6 +2760,8 @@ impl Router {
 
             let stream = res.bytes_stream();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let evidence = ProducerEvidence::current();
+            let producer_evidence = evidence.clone();
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -2775,6 +2794,7 @@ impl Router {
                         }
                         Err(e) => {
                             stream_succeeded = false;
+                            ProducerEvidence::fail(producer_evidence.as_ref());
                             let _ = tx.send(Err(format!("Stream error: {}", e)));
                             break;
                         }
@@ -2791,6 +2811,9 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            if let Some(evidence) = evidence {
+                response.extensions_mut().insert(evidence);
+            }
             response
         }
     }
@@ -3654,6 +3677,11 @@ impl RouterTrait for Router {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         request_metrics::stream(is_stream);
+        request_metrics::echo(
+            body.get("echo")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        );
         let lora_name = body
             .get("lora_name")
             .and_then(serde_json::Value::as_str)
@@ -3998,6 +4026,8 @@ impl RouterTrait for Router {
                 } else {
                     let stream = response.bytes_stream();
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let evidence = ProducerEvidence::current();
+                    let producer_evidence = evidence.clone();
                     let completion = status.is_success().then_some(program_completion).flatten();
                     let stream_end = StreamEnd::for_http_route(path);
                     tokio::spawn(async move {
@@ -4016,6 +4046,7 @@ impl RouterTrait for Router {
                                 }
                                 Err(error) => {
                                     stream_ok = false;
+                                    ProducerEvidence::fail(producer_evidence.as_ref());
                                     let _ = tx.send(Err(format!("Stream error: {error}")));
                                     break;
                                 }
@@ -4025,6 +4056,9 @@ impl RouterTrait for Router {
                             completion.finish_http_stream(stream_ok, stream_end);
                         }
                     });
+                    if let Some(evidence) = evidence {
+                        response_builder = response_builder.extension(evidence);
+                    }
                     response_builder
                         .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
                         .unwrap_or_else(|error| {

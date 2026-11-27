@@ -347,3 +347,7 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "http_request_metrics"
+path = "tests/rust/http_request_metrics.rs"

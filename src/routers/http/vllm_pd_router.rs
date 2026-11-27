@@ -1556,6 +1556,12 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
     ) -> Option<Response> {
         let runtime = self.program_runtime.as_ref()?;
+        request_metrics::echo(
+            request
+                .get("echo")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
         request_metrics::stream(
             request
                 .get("stream")
@@ -3747,6 +3753,7 @@ impl RouterTrait for VllmPDRouter {
 
         // Body is already a serde_json::Value, use it directly
         request_metrics::stream(body.get("stream").and_then(Value::as_bool).unwrap_or(false));
+        request_metrics::echo(body.get("echo").and_then(Value::as_bool).unwrap_or(false));
         let request_json = body;
 
         if self.use_discovery {
