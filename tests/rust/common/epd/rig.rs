@@ -20,6 +20,10 @@ use vllm_router_rs::server::AppContext;
 mod consts;
 pub use consts::*;
 
+#[allow(dead_code)]
+#[path = "../http.rs"]
+mod http;
+
 mod mock;
 pub use mock::*;
 
@@ -182,6 +186,12 @@ pub enum Path {
     SplitPdConcurrent,
 }
 
+#[derive(Default)]
+pub struct Options {
+    /// Serve the last stage (PD, or D) with `serve_raw`, for `Mode::HangUp`.
+    pub raw_last_stage: bool,
+}
+
 /// A router with Mooncake-push EPD (a consumer EC control address, so prepare
 /// creates the cleanup guard), two encoders, the consumer and Decode.
 pub struct Rig {
@@ -199,10 +209,15 @@ pub struct Rig {
 }
 
 impl Rig {
+    /// A rig with `Options::default()`.
+    pub async fn new(path: Path) -> Self {
+        Self::with(path, Options::default()).await
+    }
+
     /// Starts the mocks and the recorder and builds the router. On
     /// `SplitPdConcurrent`, also warms the router up, so that the tests run on
     /// the concurrent path from their first request.
-    pub async fn new(path: Path) -> Self {
+    pub async fn with(path: Path, options: Options) -> Self {
         let ec = EcRecorder::start();
         let e0 = Mock::new("E0", Role::Encoder);
         let e1 = Mock::new("E1", Role::Encoder);
@@ -220,10 +235,21 @@ impl Rig {
                 Mock::new("D", Role::Decode),
             ),
         };
+        let raw_consumer = options.raw_last_stage && path == Path::CombinedPd;
+        let raw_decode = options.raw_last_stage && path != Path::CombinedPd;
         let mut urls = Vec::new();
         let mut servers = Vec::new();
-        for mock in [&e0, &e1, &consumer, &decode] {
-            let (url, server) = serve(mock).await;
+        for (mock, raw) in [
+            (&e0, false),
+            (&e1, false),
+            (&consumer, raw_consumer),
+            (&decode, raw_decode),
+        ] {
+            let (url, server) = if raw {
+                serve_raw(mock).await
+            } else {
+                serve(mock).await
+            };
             urls.push(url);
             servers.push(server);
         }

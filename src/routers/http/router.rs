@@ -1328,12 +1328,7 @@ impl Router {
             std::collections::HashMap::new();
 
         for url in worker_urls {
-            // Extract base URL by removing @rank suffix if present
-            let base_url = if let Some(at_pos) = url.rfind('@') {
-                url[..at_pos].to_string()
-            } else {
-                url.clone()
-            };
+            let base_url = crate::backend::strip_dp_suffix(url).to_owned();
 
             unique_hosts.insert(base_url.clone());
             host_to_workers
@@ -8318,6 +8313,16 @@ mod tests {
         let (url, _handle) = start_healthy_mock_server().await;
         let result = Router::wait_for_healthy_workers(&[url], 5, 1, None).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_preserves_host_after_userinfo() {
+        let (url, server) = start_healthy_mock_server().await;
+        let url = url.replacen("http://", "http://@", 1);
+        Router::wait_for_healthy_workers(&[url], 1, 1, None)
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

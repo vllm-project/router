@@ -141,7 +141,13 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
+
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
@@ -271,8 +277,7 @@ has tracing support.
 The key is the bearer token the router sends on its own requests to HTTP
 workers, including health checks; clients authenticate to the router
 separately with `--api-key-validation-urls`. It is not sent yet on
-`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
-checks.
+`/flush_cache`, `/get_load`, gRPC requests, or `--enable-igw` health checks.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.
