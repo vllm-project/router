@@ -2022,13 +2022,15 @@ async fn registration_checks_hashes_per_rank() {
 }
 
 #[tokio::test]
-async fn pinned_static_admission_uses_the_single_local_engine_report() {
-    let worker =
-        HashAdmissionWorker::start(1, &METRICS_ONLY.replace("sha256_cbor", "sha256")).await;
+async fn pinned_static_admission_and_fencing_use_the_single_local_engine_report() {
+    use crate::policies::TieredMatchProvider;
+
+    let worker = HashAdmissionWorker::start(1, METRICS_ONLY).await;
     let url = format!("{}@1", worker.url);
-    let mut layout = plain_full_layout("mock-model", "kv/admission/0", 16);
+    let topic = "kv/admission/0";
+    let mut layout = plain_full_layout("mock-model", topic, 16);
     layout.ranks[0].rank = 1;
-    let (endpoint, replay, _, _) = &worker.sockets[0];
+    let (endpoint, replay, publisher, replay_socket) = &worker.sockets[0];
     let sources = crate::config::types::StaticKvEventSources {
         model: "mock-model".into(),
         block_size: 16,
@@ -2041,10 +2043,36 @@ async fn pinned_static_admission_uses_the_single_local_engine_report() {
     let supervisor = supervisor.with_static_sources(HashMap::from([(url.clone(), sources)]));
     let source = worker.sources.lock()["0"].clone();
     *worker.sources.lock() = serde_json::json!({"1": source});
+
+    assert_eq!(supervisor.on_worker_added(&url).await.unwrap().ranks, [1]);
+    let provider = supervisor.installed.workers.lock()[&url].provider.clone();
+    let prompt = [1; 17];
+    let mut store = full_store(&prompt[..16], 16, None);
+    let root = provider.indexes[&1]
+        .keys
+        .plain_root_block(&prompt[..16])
+        .unwrap();
+    store.block_hashes[0] = crate::kv_index::wire::ExternalBlockHash::Bytes(root.to_vec());
+    boundary_subscription(publisher, topic, true).await;
+    finish_empty_startup_replay(replay_socket).await;
+    let payload = event_payload(1.0, &[KVEvent::BlockStored(store)], Some(1));
+    live_frame(publisher, topic.as_bytes(), 0, &payload);
+    let hit = || !provider.matches(&prompt, 16, None, 1).is_empty();
+    wait_for(&hit).await;
+
+    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    let (reports, _) = metrics_meta::parse_cache_config_info(&incompatible);
+    supervisor.fence_failed_registration(&url, &provider.lifecycle, &reports);
+    assert!(!hit());
+    let registration = &supervisor.worker_registrations()[&url];
+    assert!(registration.info.as_ref().unwrap().ranks.is_empty());
+    assert!(!supervisor.workers_have_cache_bindings([(url.as_str(), 1)].into_iter()));
+
+    *worker.metrics.lock() = incompatible;
     let info = supervisor.on_worker_added(&url).await.unwrap();
     assert!(info.cache_key.is_none());
     assert!(info.ranks.is_empty());
-    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

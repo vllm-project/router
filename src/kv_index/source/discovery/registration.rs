@@ -313,7 +313,12 @@ impl KvIndexSupervisor {
             base_models.insert(model_id);
             base_models.extend(server_info.served_model_aliases);
             self.publish_registration(worker_url, lifecycle, &info, Some(base_models));
-            info!(worker_url, incompatible_ranks, "KV registration is load-only because every rank reported an incompatible prefix hash");
+            info!(
+                worker_url,
+                incompatible_ranks,
+                recovery = "restart vLLM with --prefix-caching-hash-algo sha256_cbor, then re-add the worker or restart Router",
+                "KV registration is load-only because every rank reported an incompatible prefix hash"
+            );
             return Ok(info);
         }
         let indexer = self.installed.acquire_identity(&key);
