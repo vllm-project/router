@@ -10,7 +10,7 @@ use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::CONTROL_TIMEOUT;
 use crate::kv_index::KvIndexSupervisor;
 use crate::policies::{
-    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PrefillWorkEstimate, PromptHashes,
+    kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PdWorkPrices, PromptHashes,
 };
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -41,6 +41,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, TargetRegistration>>,
     worker_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
+    render_images: bool,
     nixl_decode_replay: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
@@ -67,6 +68,7 @@ impl PdKvState {
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
         allow_hybrid_layouts: bool,
+        render_images: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.worker_pairs = (!pairs.is_empty()).then(|| {
@@ -77,6 +79,7 @@ impl PdKvState {
         });
         state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
+        state.render_images = render_images;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
@@ -126,6 +129,7 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             worker_pairs: None,
             allow_hybrid_layouts: true,
+            render_images: true,
             nixl_decode_replay: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
@@ -335,7 +339,8 @@ impl PdKvState {
         defer_decode: bool,
     ) -> (
         HashMap<String, PdPrefillInput>,
-        Option<HashMap<String, u64>>,
+        Option<PdWorkPrices>,
+        Option<PdWorkPrices>,
     ) {
         let started = Instant::now();
         let bases = |workers: &[Arc<dyn Worker>]| -> Vec<String> {
@@ -355,8 +360,8 @@ impl PdKvState {
         // A deferred decision only picks a provisional worker here and re-prices at commit,
         // so rendering and pricing Decode now would be discarded - and could stall admission
         // on a slow backend for nothing.
-        // A candidate can only be priced when its base is creditable. `decode_context_from_
-        // results` needs an estimate for every candidate, so pricing with a partial set
+        // A candidate can only be priced when its base is creditable. The Decode
+        // price table needs an estimate for every candidate, so pricing a partial set
         // always falls back - after paying for the slowest render. Require the whole set.
         // Decode pricing also never renders on non-gRPC pools: only gRPC router_prompts
         // and direct token-id prompts price without a `/render` fan-out.
@@ -378,13 +383,13 @@ impl PdKvState {
                 }
             },
         );
-        let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
+        let prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
         let mut hashes = PromptHashes::new();
-        let prefill_work = kv_aware_ops(prefill_policy.as_ref())
-            .map(|kv| Self::prefill_work(kv, prefill_workers, &prepared, &mut hashes));
-        let decode_context = if decode_priced_here {
+        let prefill_prices = kv_aware_ops(prefill_policy.as_ref())
+            .and_then(|kv| Self::prefill_prices(kv, prefill_workers, &prepared, &mut hashes));
+        let decode_prices = if decode_priced_here {
             let kv = kv_aware_ops(decode_policy.as_ref()).expect("priced decode policy");
-            self.decode_context_from_results(
+            self.decode_prices_from_results(
                 kv,
                 decode_workers,
                 &allow_credit,
@@ -398,19 +403,10 @@ impl PdKvState {
             None
         };
 
-        // The cache borrows tokens from prepared. Release it before recording
-        // either stage's estimates.
         drop(hashes);
-        if let Some(work) = prefill_work {
-            for (base, rank, estimate) in work {
-                if let Some(input) = prepared.get_mut(&base) {
-                    input.work_by_rank.insert(rank, estimate);
-                }
-            }
-        }
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
-        (prepared, decode_context)
+        (prepared, prefill_prices, decode_prices)
     }
 
     /// Render the request against each base, or reuse the router's own ids.
@@ -433,6 +429,7 @@ impl PdKvState {
                     headers,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    self.render_images,
                 )
                 .await
             }
@@ -453,14 +450,14 @@ impl PdKvState {
                     allow_credit.get(&base).copied().unwrap_or(false),
                 )
             });
-            let (prompts, fallback_reason, source) = match result {
-                Ok(input) => (Some(input.prompts), fallback, input.source),
-                Err(reason) => (None, Some(reason), reason),
+            let (prompts, image, fallback_reason, source) = match result {
+                Ok(input) => (Some(input.prompts), input.image, fallback, input.source),
+                Err(reason) => (None, None, Some(reason), reason),
             };
             crate::metrics::RouterMetrics::record_kv_routing_input("pd", source);
             let input = PdPrefillInput {
                 prompts,
-                work_by_rank: HashMap::new(),
+                image,
                 allow_credit: fallback_reason.is_none(),
                 fallback_reason,
             };
@@ -471,30 +468,24 @@ impl PdKvState {
         prepared
     }
 
-    fn prefill_work<'tokens>(
+    fn prefill_prices<'tokens>(
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
         prepared: &'tokens HashMap<String, PdPrefillInput>,
         hashes: &mut PromptHashes<'tokens>,
-    ) -> Vec<(String, Option<usize>, PrefillWorkEstimate)> {
+    ) -> Option<PdWorkPrices> {
         let inputs: Vec<_> = workers
             .iter()
             .filter_map(|worker| {
                 let input = prepared.get(worker.base_url())?;
-                Some((
-                    worker.as_ref(),
-                    input.prompts.as_deref()?,
-                    input.allow_credit,
-                ))
+                let prompts = input.prompts.as_deref()?;
+                if let ([tokens], Some(image)) = (prompts, input.image.as_ref()) {
+                    hashes.register_image(tokens, image);
+                }
+                Some((worker.as_ref(), prompts, input.allow_credit))
             })
             .collect();
-        inputs
-            .iter()
-            .zip(kv.estimate_prefill_work(&inputs, hashes))
-            .map(|((worker, _, _), estimate)| {
-                (worker.base_url().to_owned(), worker.dp_rank(), estimate)
-            })
-            .collect()
+        kv.prepare_prefill_prices(&inputs, hashes)
     }
 
     /// Pure: the Decode estimate over already-rendered prompts.
@@ -502,7 +493,7 @@ impl PdKvState {
     /// Returns `None` when any candidate is unpriced, because one credited
     /// figure beside a full-price one would compare different units across the
     /// pool.
-    fn decode_context_from_results<'tokens>(
+    fn decode_prices_from_results<'tokens>(
         &self,
         kv: &dyn KvAwareOps,
         workers: &[Arc<dyn Worker>],
@@ -512,7 +503,7 @@ impl PdKvState {
             Result<crate::backend::preprocess::HttpTokenInput, &'static str>,
         >,
         hashes: &mut PromptHashes<'tokens>,
-    ) -> Option<HashMap<String, u64>> {
+    ) -> Option<PdWorkPrices> {
         let inputs: Vec<_> = workers
             .iter()
             .filter_map(|worker| {
@@ -537,19 +528,14 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unpriced");
             return None;
         }
-        let work = kv.estimate_decode_work_with_transfer(&inputs, hashes, self.nixl_decode_replay);
-        let mut context = HashMap::with_capacity(work.len());
-        for ((worker, _, _), estimate) in inputs.iter().zip(work) {
-            context.insert(worker.url().to_owned(), estimate.additional_tokens?);
-        }
-        Some(context)
+        kv.prepare_decode_prices(&inputs, hashes, self.nixl_decode_replay)
     }
 
     /// Marginal Decode context per candidate, priced against the KV index.
     /// `hashes` is the caller's cache: the admission path shares it with the
     /// Prefill estimate, while the deferred commit starts a fresh one because it
     /// prices against the index as it stands at commit time.
-    pub(super) async fn prepare_decode_context(
+    pub(super) async fn prepare_decode_prices(
         &self,
         workers: &[Arc<dyn Worker>],
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -557,7 +543,7 @@ impl PdKvState {
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<HashMap<String, u64>> {
+    ) -> Option<PdWorkPrices> {
         // The only caller is the deferred commit, which prices against the index as it
         // stands now, so this owns its cache. The admission path shares one cache across both
         // stages through `prepare_stages`.
@@ -580,7 +566,7 @@ impl PdKvState {
         let results = self
             .tokenize(bases, request, route, headers, router_prompts)
             .await;
-        self.decode_context_from_results(
+        self.decode_prices_from_results(
             kv,
             workers,
             &allow_credit,
@@ -611,8 +597,8 @@ mod kv_input_tests {
         request: &Value,
         route: &str,
         headers: Option<&HeaderMap>,
-    ) -> HashMap<String, PdPrefillInput> {
-        state
+    ) -> (HashMap<String, PdPrefillInput>, Option<PdWorkPrices>) {
+        let (inputs, prices, _) = state
             .prepare_stages(
                 workers,
                 policy,
@@ -624,9 +610,63 @@ mod kv_input_tests {
                 None,
                 true,
             )
-            .await
-            .0
+            .await;
+        (inputs, prices)
     }
+
+    #[test]
+    fn prefill_prices_the_rendered_image() {
+        use crate::kv_index::request_hash::ImagePrefix;
+        use crate::kv_index::source::test_support::{
+            full_binding, warm_test_image, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://image-worker".into(),
+            WorkerType::Regular,
+        ));
+        let base = worker.base_url().to_owned();
+        let target = RoutableTarget {
+            instance_id: Arc::from(base.as_str()),
+            dp_rank: 0,
+        };
+        let binding = Arc::new(full_binding(target.clone(), 64));
+        binding.begin_empty(0);
+        warm_test_image(&binding);
+        policy.register_target_with_cache_identity(
+            &base,
+            target,
+            CacheKey {
+                model: Arc::from("m"),
+                block_size: 64,
+            },
+            binding,
+        );
+        let workers = [worker];
+        let prepared = HashMap::from([(
+            base,
+            PdPrefillInput {
+                prompts: Some(Arc::from([(0..129).collect()])),
+                image: ImagePrefix::new(TEST_IMAGE_HASH, 60, 8, 129),
+                allow_credit: true,
+                fallback_reason: None,
+            },
+        )]);
+        let prefill =
+            PdKvState::prefill_prices(&policy, &workers, &prepared, &mut PromptHashes::default())
+                .unwrap();
+        let validated = prefill.validate(&workers);
+        assert_eq!(
+            validated
+                .prefill_work(workers[0].url())
+                .unwrap()
+                .new_prefill_tokens,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
         let state = PdKvState::new(Client::new());
@@ -651,7 +691,7 @@ mod kv_input_tests {
             body.as_object_mut()
                 .unwrap()
                 .extend(field.as_object().unwrap().clone());
-            let result = prepare_prefill(
+            let (result, prices) = prepare_prefill(
                 &state,
                 std::slice::from_ref(&worker),
                 &policy,
@@ -664,7 +704,12 @@ mod kv_input_tests {
             assert_eq!(input.fallback_reason, Some(expected));
             assert!(!input.allow_credit);
             assert_eq!(input.prompts.as_ref().unwrap()[0].len(), 65);
-            assert_eq!(input.work_by_rank[&worker.dp_rank()].new_prefill_tokens, 65);
+            let prices = prices.unwrap();
+            let work = prices.validate(std::slice::from_ref(&worker));
+            assert_eq!(
+                work.prefill_work(worker.url()).unwrap().new_prefill_tokens,
+                65
+            );
         }
     }
 
@@ -738,10 +783,15 @@ mod kv_input_tests {
                 json!({"model":"m","input":"hello","previous_response_id":"resp_1"}),
             ),
         ] {
-            let prepared = prepare_prefill(&state, &workers, &policy, &request, route, None).await;
+            let (prepared, prices) =
+                prepare_prefill(&state, &workers, &policy, &request, route, None).await;
             let input = &prepared[&base];
             assert!(input.prompts.is_none());
-            assert!(input.work_by_rank.is_empty());
+            assert!(prices
+                .unwrap()
+                .validate(&workers)
+                .prefill_work(workers[0].url())
+                .is_none());
             assert!(input.fallback_reason.is_some());
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -809,7 +859,7 @@ mod kv_input_tests {
             state
                 .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
                 .await;
-            let inputs = prepare_prefill(
+            let (inputs, _) = prepare_prefill(
                 &state,
                 &workers,
                 &policy,
@@ -1025,8 +1075,11 @@ mod kv_input_tests {
 
             let initial =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
-            assert_eq!(initial[&base].work_by_rank[&None].new_prefill_tokens, 33);
-            assert!(initial[&base].work_by_rank[&None].placement_verified);
+            let initial_prices = initial.1.unwrap();
+            let validated = initial_prices.validate(&workers);
+            let work = validated.prefill_work(workers[0].url()).unwrap();
+            assert_eq!(work.new_prefill_tokens, 33);
+            assert!(work.placement_verified);
 
             publisher
                 .replay_empty_and_publish(&[KVEvent::BlockStored(full_store(
@@ -1052,8 +1105,12 @@ mod kv_input_tests {
 
             let warm =
                 prepare_prefill(&state, &workers, &policy, &request, "/v1/completions", None).await;
-            assert_eq!(warm[&base].work_by_rank[&None].new_prefill_tokens, 1);
-            assert!(warm[&base].work_by_rank[&None].placement_verified);
+            let warm_prices = warm.1.unwrap();
+            let validated = warm_prices.validate(&workers);
+            let work = validated.prefill_work(workers[0].url()).unwrap();
+            assert_eq!(work.new_prefill_tokens, 1);
+            assert!(work.placement_verified);
+            drop(validated);
             drop(state);
             task.abort();
         }
@@ -1186,6 +1243,7 @@ mod kv_input_tests {
             Some(decode_policy.clone()),
             false,
             true,
+            true,
         )
         .await;
         tokio::join!(
@@ -1210,7 +1268,7 @@ mod kv_input_tests {
         let prompts: Arc<[Vec<u32>]> = Arc::from(vec![vec![1, 2, 3]]);
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1225,7 +1283,7 @@ mod kv_input_tests {
         // HTTP prices Decode only from free ids: a token-id prompt prices, a string falls back.
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1247,7 +1305,7 @@ mod kv_input_tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let (_, admission) = state
+            let (_, _, admission) = state
                 .prepare_stages(
                     &prefill,
                     &prefill_policy,
@@ -1261,7 +1319,7 @@ mod kv_input_tests {
                 )
                 .await;
             let commit = state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1275,7 +1333,7 @@ mod kv_input_tests {
         }
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &json!({"model":"m","prompt":"hello"}),
@@ -1337,7 +1395,7 @@ mod kv_input_tests {
         state.bind_refresh().await;
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,
@@ -1353,7 +1411,7 @@ mod kv_input_tests {
         state.bind_refresh().await;
         assert!(
             state
-                .prepare_decode_context(
+                .prepare_decode_prices(
                     &decode,
                     &decode_policy,
                     &request,

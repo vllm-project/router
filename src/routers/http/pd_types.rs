@@ -1,5 +1,8 @@
 use crate::core::Worker;
-use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
+use crate::policies::{
+    AffinityKey, AffinityRecord, PdWorkPrices, PrefillWorkEstimate, RequestHeaders,
+    ValidatedWorkPrices,
+};
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -167,11 +170,15 @@ pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
 #[derive(Debug, Clone)]
 pub struct PdPrefillInput {
     pub prompts: Option<Arc<[Vec<u32>]>>,
-    /// Per-rank placement snapshot.
-    /// Hashing and index queries are completed before the admission lock.
-    pub work_by_rank: HashMap<Option<usize>, crate::policies::PrefillWorkEstimate>,
+    pub(crate) image: Option<crate::kv_index::request_hash::ImagePrefix>,
     pub allow_credit: bool,
     pub fallback_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StagePricing<'a> {
+    Prepared(&'a PdWorkPrices),
+    Validated(&'a ValidatedWorkPrices<'a>),
 }
 
 /// Token inputs are keyed by the P base URL: each backend renders its own
@@ -193,14 +200,49 @@ pub struct PdRequestContext<'a> {
     pub lora_name: Option<&'a str>,
     /// Request cache salt scoping the binding digest.
     pub cache_salt: Option<&'a str>,
-    /// Marginal Decode context per candidate, keyed by worker URL, priced
-    /// immediately before Decode is selected. `None` keeps Decode on full
-    /// context tokens, or on request counts when those are unknown too.
-    pub decode_context: Option<&'a HashMap<String, u64>>,
+    /// Prefill work per candidate, validated before admission ranks the workers.
+    pub(super) prefill_pricing: Option<StagePricing<'a>>,
+    /// Marginal Decode context per candidate, validated at its own commit.
+    pub(super) decode_pricing: Option<StagePricing<'a>>,
     pub route: &'a str,
     /// True when this admission is a health probe: it takes a pair but starts
     /// no sequence, so it must not reserve Decode occupancy.
     pub probe: bool,
+}
+
+impl<'a> StagePricing<'a> {
+    /// The caller keeps the guard slot outside the selection callback so it
+    /// outlives both the callback and the ledger write.
+    pub(super) fn validate<'b>(
+        self,
+        workers: &[Arc<dyn Worker>],
+        validated: &'b mut Option<ValidatedWorkPrices<'a>>,
+    ) -> StagePricing<'b>
+    where
+        'a: 'b,
+    {
+        if let Self::Prepared(prices) = self {
+            StagePricing::Validated(validated.insert(prices.validate(workers)))
+        } else {
+            self
+        }
+    }
+}
+
+impl PdRequestContext<'_> {
+    pub(super) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
+        match self.prefill_pricing {
+            Some(StagePricing::Validated(prices)) => prices.prefill_work(worker_url),
+            _ => None,
+        }
+    }
+
+    pub(super) fn marginal_decode_context(&self) -> Option<&HashMap<String, u64>> {
+        match self.decode_pricing {
+            Some(StagePricing::Validated(prices)) => Some(prices.tokens()),
+            _ => None,
+        }
+    }
 }
 
 /// Prompt tokens a Prefill decision established, including credited prefix.

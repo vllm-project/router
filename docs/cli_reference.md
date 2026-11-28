@@ -136,12 +136,18 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--prefill` | `URL [PORT or none] (repeatable)` | `[]` | `string [1..] (repeatable)` | `unset` | Add one prefill URL and optional bootstrap port: `--prefill URL [PORT]`. Omit the port or pass `none` for no bootstrap port. |
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
-| `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
+| `--kv-connector` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` with vLLM-Ascend `MooncakeConnectorV2` in pull mode. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
+
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
@@ -271,8 +277,7 @@ has tracing support.
 The key is the bearer token the router sends on its own requests to HTTP
 workers, including health checks; clients authenticate to the router
 separately with `--api-key-validation-urls`. It is not sent yet on
-`/flush_cache`, `/get_load`, gRPC requests, or PD and `--enable-igw` health
-checks.
+`/flush_cache`, `/get_load`, gRPC requests, or `--enable-igw` health checks.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.

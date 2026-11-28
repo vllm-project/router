@@ -1,6 +1,6 @@
 //! Event-shape admission, separate from structural decoding and transport.
 use crate::kv_index::layout::{CacheGroup, GroupRule};
-use crate::kv_index::request_hash::SequenceHash;
+use crate::kv_index::request_hash::{is_image_hash, SequenceHash};
 use crate::kv_index::wire::{BlockStored, ExternalBlockHash, KVEvent};
 use crate::kv_index::SourceError;
 
@@ -40,7 +40,19 @@ fn complete_blocks(store: &BlockStored) -> bool {
         == Some(store.token_ids.len())
 }
 
-/// Return false for a secondary page size that proves no prefix evidence.
+fn image_block_key(value: &rmpv::Value) -> Option<(&str, i64)> {
+    let [hash, offset] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    Some((hash.as_str()?, offset.as_i64()?))
+}
+
+pub(super) fn image_block_keys(key: &rmpv::Value) -> Option<Vec<(&str, i64)>> {
+    let features = key.as_array().filter(|features| !features.is_empty())?;
+    features.iter().map(image_block_key).collect()
+}
+
+/// Return false when a store provides no usable prefix evidence.
 pub(super) fn validate_store(
     group: &CacheGroup,
     store: &BlockStored,
@@ -65,6 +77,7 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
+    let mut unsupported_extra_keys = false;
     if let Some(keys) = store
         .extra_keys
         .as_ref()
@@ -73,26 +86,31 @@ pub(super) fn validate_store(
         if keys.len() != store.block_hashes.len() {
             return Err(SourceError::InvalidBatch);
         }
-        if let Some((first, rest)) = keys.split_first() {
-            if !rest.iter().all(rmpv::Value::is_nil) {
+        for (index, key) in keys.iter().enumerate().filter(|(_, key)| !key.is_nil()) {
+            let parts = key.as_array().ok_or(SourceError::InvalidBatch)?;
+            let Some((last, preceding)) = parts.split_last() else {
                 return Err(SourceError::InvalidBatch);
-            }
-            if !first.is_nil() {
-                // vLLM folds cache_salt into the first block's native hash.
-                // Leave salted requests on load-based routing without invalidating
-                // unrelated chains or the publisher's replay.
-                return if first.as_array().is_some_and(|parts| {
-                    matches!(parts.as_slice(), [salt] if salt.as_str().is_some_and(|s| !s.is_empty()))
-                }) {
-                    Ok(false)
-                } else {
-                    Err(SourceError::InvalidBatch)
-                };
+            };
+            // vLLM appends the cache salt after any image keys on the first block.
+            let media = if index == 0 && last.as_str().is_some_and(|salt| !salt.is_empty()) {
+                unsupported_extra_keys = true;
+                preceding
+            } else {
+                parts.as_slice()
+            };
+            for feature in media {
+                let (hash, _) = image_block_key(feature).ok_or(SourceError::InvalidBatch)?;
+                unsupported_extra_keys |= !is_image_hash(hash);
             }
         }
     }
     let partial = partial_hash_hits
-        && matches!(group.kind, GroupRule::FullAttention | GroupRule::Checkpoint)
+        && matches!(
+            group.kind,
+            GroupRule::FullAttention
+                | GroupRule::CompressedFullAttention { .. }
+                | GroupRule::Checkpoint
+        )
         && store.block_size < group.block_size
         && store.block_size as usize == hash_block_size
         && store.block_hashes.len() == 1
@@ -124,7 +142,7 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
-    Ok(true)
+    Ok(!unsupported_extra_keys)
 }
 
 pub(in crate::kv_index) fn event_kind_matches(kind: GroupRule, store: &BlockStored) -> bool {

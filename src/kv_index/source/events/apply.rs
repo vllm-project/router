@@ -10,7 +10,7 @@ use crate::kv_index::{
     KVEvent, KVEventBatch, ResidencyOwner, SourceBinding, SourceError, StorageTier,
 };
 
-use super::validate::{publishes_int_hash, sequence_hash, validate_store};
+use super::validate::{image_block_keys, publishes_int_hash, sequence_hash, validate_store};
 
 fn tier_or_warn(medium: Option<&str>) -> Option<StorageTier> {
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -303,8 +303,30 @@ impl SourceBinding {
             && namespace.is_none()
             && incremental
             && store.parent_block_hash.is_none();
-        if proves_root && self.keys.plain_root_block(&store.token_ids).as_ref() != hashes.first() {
-            return Err(SourceError::RootHashMismatch);
+        if store.parent_block_hash.is_none() && namespace.is_none() {
+            let image_keys = store
+                .extra_keys
+                .as_ref()
+                .and_then(|keys| keys.first())
+                .and_then(image_block_keys);
+            if let Some(image_keys) = image_keys.filter(|_| {
+                store.block_size as usize == self.keys.block_size()
+                    && self.keys.lookahead_tokens() == 0
+            }) {
+                if self.keys.root_block(&store.token_ids, &image_keys).as_ref() != hashes.first() {
+                    tracing::debug!(
+                        source = %self.target.instance_id,
+                        rank = self.target.dp_rank,
+                        group = group.group_idx,
+                        "Skipping KV store with an incompatible image hash root"
+                    );
+                    return Ok(None);
+                }
+            } else if proves_root
+                && self.keys.plain_root_block(&store.token_ids).as_ref() != hashes.first()
+            {
+                return Err(SourceError::RootHashMismatch);
+            }
         }
         Ok(Some(PreparedEvent::Store {
             group: group.group_idx,

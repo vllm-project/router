@@ -1008,6 +1008,9 @@ impl CompletionRequest {
 
         match &self.prompt {
             PromptInput::IntArray(_) => String::new(),
+            // A singleton batch is the same single sequence as the flat
+            // form; keep its (empty) routing text identical.
+            PromptInput::IntBatch(batch) if batch.len() == 1 => String::new(),
             prompt => prompt.extract_text_for_routing(),
         }
     }
@@ -2833,9 +2836,15 @@ impl PromptInput {
                 format!("token_ids:{}", ids.len())
             }
             PromptInput::IntBatch(batches) => {
-                // For batches, use total token count
-                let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
-                format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
+                // A singleton batch dispatches the same IDs as the flat form
+                // ([1,2] vs [[1,2]]), so it must route identically.
+                if let [single] = batches.as_slice() {
+                    format!("token_ids:{}", single.len())
+                } else {
+                    // For batches, use total token count
+                    let total_tokens: usize = batches.iter().map(|b| b.len()).sum();
+                    format!("token_ids_batch:{}:{}", batches.len(), total_tokens)
+                }
             }
         }
     }

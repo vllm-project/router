@@ -169,3 +169,120 @@ mod consumer_2xx_with_stalled_or_invalid_body {
         rig.expect_cancel().await;
     }
 }
+
+/// D disconnects, before its first byte or in the middle of an SSE
+/// stream. On E+PD, PD has both roles.
+mod decode_disconnect {
+    use super::*;
+
+    fn raw_last_stage() -> Options {
+        Options {
+            raw_last_stage: true,
+        }
+    }
+
+    /// D sends its headers and one SSE event, then its stream breaks. This is
+    /// after the handoff on every path, so the router sends no cancel.
+    /// Whether the consumer frees its EC buffer (GPU completion) is not
+    /// visible here.
+    async fn decode_breaks_mid_sse(path: Path) {
+        let mut rig = Rig::new(path).await;
+        let decode = if path == Path::CombinedPd {
+            &rig.consumer
+        } else {
+            &rig.decode
+        };
+        decode.set_mode(Mode::BreakBody);
+        let response = answer(rig.send(two_images_stream())).await;
+        assert_eq!(response.status(), StatusCode::OK, "[client]");
+        let mut body = response.into_body().into_data_stream();
+        let first = first_event(&mut body).await;
+        assert_eq!(first, SSE_FIRST_EVENT, "[client] first event");
+        decode.release();
+        let (rest, broken) = rest_of_body(body).await;
+        assert!(broken, "[client] the stream ends with an error");
+        assert_eq!(rest, "", "[client] nothing after the first event");
+        rig.expect_no_cancel().await;
+    }
+
+    #[tokio::test]
+    async fn regular_e_pd() {
+        // Before the first byte: a transport error comes before the handoff,
+        // so the armed guard cancels.
+        {
+            let mut rig = Rig::with(Path::CombinedPd, raw_last_stage()).await;
+            rig.consumer.set_mode(Mode::HangUp);
+            let client = rig.send(two_images_stream());
+            rig.consumer.wait_requests(1).await;
+            rig.consumer.release();
+            rig.consumer.expect_completed().await;
+            let response = answer(client).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "[client] transport error"
+            );
+            let text = text(response).await;
+            assert!(text.contains("Backend request failed"), "[client] {text}");
+            rig.expect_cancel().await;
+        }
+        decode_breaks_mid_sse(Path::CombinedPd).await;
+    }
+
+    #[tokio::test]
+    async fn sequential_e_p_d() {
+        // Before the first byte.
+        {
+            let mut rig = Rig::with(Path::SplitPdSequential, raw_last_stage()).await;
+            rig.decode.set_mode(Mode::HangUp);
+            let client = rig.send(two_images_stream());
+            rig.decode.wait_requests(1).await;
+            rig.consumer.expect_completed().await;
+            rig.decode.release();
+            rig.decode.expect_completed().await;
+            let response = answer(client).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "[client]"
+            );
+            let text = text(response).await;
+            assert!(text.contains("Decode request failed"), "[client] {text}");
+            // P has used the embeddings, and the guard was disarmed before D
+            // was sent: no EC cancel. What happens to P's KV is a separate
+            // question.
+            rig.expect_no_cancel().await;
+        }
+        decode_breaks_mid_sse(Path::SplitPdSequential).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_nixl() {
+        // Before the first byte, while P is still working.
+        {
+            let mut rig = Rig::with(Path::SplitPdConcurrent, raw_last_stage()).await;
+            rig.consumer.set_mode(Mode::HoldThenReply);
+            rig.decode.set_mode(Mode::HangUp);
+            let mut client = rig.send(two_images_stream());
+            rig.consumer.wait_requests(1).await;
+            rig.decode.wait_requests(1).await;
+            rig.decode.release();
+            rig.decode.expect_completed().await;
+            expect_waiting(&mut client).await;
+            rig.consumer.expect_open(1);
+            rig.expect_no_cancel().await;
+            rig.consumer.release();
+            let response = answer(client).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "[client]"
+            );
+            let text = text(response).await;
+            assert!(text.contains("Decode request failed"), "[client] {text}");
+            // P answered 2xx, so the guard was disarmed after the join.
+            rig.expect_no_cancel().await;
+        }
+        decode_breaks_mid_sse(Path::SplitPdConcurrent).await;
+    }
+}
