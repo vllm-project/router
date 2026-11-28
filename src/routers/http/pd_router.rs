@@ -1462,7 +1462,7 @@ impl PdRouterBase {
                     let api_key = admin_auth.key_for(url);
                     let url = url.clone();
                     async move {
-                        let load = get_worker_load(&client, &url, api_key).await.unwrap_or(0);
+                        let load = get_worker_load(&client, &url, api_key).await;
                         (url, load)
                     }
                 })
@@ -1471,7 +1471,9 @@ impl PdRouterBase {
             let results = futures_util::future::join_all(futures).await;
 
             for (url, load) in results {
-                loads.insert(url, load);
+                if let Some(load) = load {
+                    loads.insert(url, load);
+                }
             }
 
             debug!("Worker loads updated: {:?}", loads);
@@ -2258,7 +2260,63 @@ mod tests {
         );
         assert_eq!(payload["errors"].as_array().unwrap().len(), 2, "{payload}");
 
+        // A failed poll must also clear a previously cached load so that both
+        // policies fall back to the worker's local in-flight count.
+        let (healthy_url, healthy_server, healthy_requests) =
+            start_admin_auth_mock_server(Some("other-key")).await;
+        let failed_url = format!("{url}@0");
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            router.worker_registry.get_by_url(&failed_url).unwrap(),
+            Arc::new(BasicWorker::new(healthy_url.clone(), WorkerType::Decode)),
+        ];
+        for _ in 0..8 {
+            workers[0].increment_load();
+        }
+        let prefill_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::PowerOfTwoPolicy::new());
+        let decode_policy: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::PowerOfTwoPolicy::new());
+        for policy in [&prefill_policy, &decode_policy] {
+            policy.update_loads(&HashMap::from([
+                (failed_url.clone(), 0),
+                (healthy_url.clone(), 7),
+            ]));
+            assert_eq!(policy.select_worker(&workers, None), Some(0));
+        }
+        let (tx, mut monitored) = tokio::sync::watch::channel(HashMap::new());
+        let monitor = tokio::spawn(PdRouterBase::monitor_worker_loads_with_client(
+            vec![failed_url, healthy_url.clone()],
+            tx,
+            60,
+            Client::new(),
+            PdAdminAuth::new(
+                Some("other-key"),
+                [url.as_str(), healthy_url.as_str()].into_iter(),
+            ),
+            prefill_policy.clone(),
+            decode_policy.clone(),
+        ));
+        let batch = tokio::time::timeout(Duration::from_secs(2), monitored.changed())
+            .await
+            .unwrap()
+            .map(|()| monitored.borrow().clone())
+            .unwrap();
+        monitor.abort();
+        assert_eq!(batch, HashMap::from([(healthy_url, 7)]));
+        assert_eq!(
+            requests.borrow().last(),
+            Some(&("/get_load".into(), StatusCode::UNAUTHORIZED))
+        );
+        assert_eq!(
+            *healthy_requests.borrow(),
+            [("/get_load".into(), StatusCode::OK)]
+        );
+        for policy in [prefill_policy, decode_policy] {
+            assert_eq!(policy.select_worker(&workers, None), Some(1));
+        }
+
         server.abort();
+        healthy_server.abort();
     }
 
     // ============= Worker Management Tests =============
