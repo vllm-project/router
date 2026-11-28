@@ -60,23 +60,6 @@ impl LifecycleState {
     pub(super) fn vllm_boot_id(&self) -> Option<&str> {
         self.descriptor.as_ref()?.vllm_boot_id.as_deref()
     }
-
-    pub(super) fn vllm_restarted(&self, boot: Option<&VllmBoot>) -> bool {
-        self.vllm_boot_id()
-            .zip(boot)
-            .is_some_and(|(old, new)| old != new.id)
-    }
-
-    fn all_hash_fenced(&self) -> bool {
-        // An empty published registration comes from hash rejection at admission
-        // or from revoking its last installed rank.
-        self.info.as_ref().is_some_and(|info| info.ranks.is_empty())
-            && self
-                .descriptor
-                .as_ref()
-                .and_then(WorkerDescriptor::sources)
-                .is_some_and(|sources| !sources.is_empty())
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,7 +67,6 @@ pub(super) enum SourceAction {
     Keep,
     Recover,
     Rebuild,
-    RebindFenced,
     Stop,
 }
 
@@ -179,9 +161,7 @@ impl WorkerLifecycle {
     pub(super) fn refresh_due(&self) -> bool {
         let state = self.state.lock();
         state.checked.is_none_or(|checked| {
-            let interval = if state.all_hash_fenced()
-                || (state.info.is_some() && (!self.layout || self.trusted(&state)))
-            {
+            let interval = if state.info.is_some() && (!self.layout || self.trusted(&state)) {
                 REFRESH_INTERVAL
             } else {
                 CONTROL_TIMEOUT
@@ -190,19 +170,17 @@ impl WorkerLifecycle {
         })
     }
 
-    pub(super) fn vllm_restarted(&self, boot: Option<&VllmBoot>) -> bool {
-        self.state.lock().vllm_restarted(boot)
+    pub(super) fn vllm_restart_probe_due(&self) -> bool {
+        let has_boot = self.state.lock().vllm_boot_id().is_some();
+        has_boot && self.refresh_due()
     }
 
     pub(super) fn layout_rebind_due(&self) -> bool {
-        let state = self.state.lock();
-        if state.all_hash_fenced() || (state.vllm_boot_id().is_some() && self.trusted(&state)) {
-            return state
-                .checked
-                .is_none_or(|checked| checked.elapsed() >= REFRESH_INTERVAL);
+        if !self.layout {
+            return false;
         }
-        (self.layout || state.vllm_boot_id().is_some())
-            && !state.trusted
+        let state = self.state.lock();
+        !state.trusted
             && state
                 .checked
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
@@ -216,7 +194,6 @@ impl WorkerLifecycle {
         state.info.is_some()
             && state.descriptor.as_ref() == Some(descriptor)
             && (!self.layout
-                || state.all_hash_fenced()
                 || self.trusted(state)
                 // The layout monitor owns transient recovery for this same boot.
                 || (state.vllm_boot_id().is_some() && self.active.load(Ordering::Acquire)))
@@ -230,26 +207,34 @@ impl WorkerLifecycle {
     ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
-        if state.vllm_restarted(boot) {
-            // Invalidate placement before trying admission, even if this probe
-            // found the new boot before its event source became available.
-            self.stop_layout(&mut state);
-            state.checked = Some(Instant::now());
-            return SourceAction::Rebuild;
-        }
-        if state.vllm_boot_id().is_some() && boot.is_none() {
-            // Missing startup evidence on an optional refresh is not a new boot.
-            return SourceAction::Keep;
+        if let Some(old) = state.vllm_boot_id() {
+            let Some(boot) = boot else {
+                // An optional probe failure does not identify a new instance.
+                return SourceAction::Keep;
+            };
+            if old != boot.id {
+                self.stop_layout(&mut state);
+                state.checked = Some(Instant::now());
+                return if descriptor.is_some() && boot.prefix_hash.is_some() {
+                    SourceAction::Rebuild
+                } else {
+                    SourceAction::Stop
+                };
+            }
+            // Descriptor changes within a fenced boot cannot restore KV credit.
+            if state
+                .info
+                .as_ref()
+                .is_some_and(|info| info.ranks.is_empty())
+            {
+                return SourceAction::Keep;
+            }
         }
         match descriptor {
             Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
                 SourceAction::Keep
             }
-            // Keep the load-only registration and its publisher identities
-            // until normal admission accepts a replacement.
-            Some(_) if state.all_hash_fenced() => SourceAction::RebindFenced,
-            None if state.all_hash_fenced() => SourceAction::Keep,
             Some(_) => {
                 state.info = None;
                 state.base_models.clear();
@@ -277,9 +262,6 @@ impl WorkerLifecycle {
     /// A fast layout probe cannot advance the descriptor failure counter.
     pub(super) fn observe_layout(&self, outcome: &StaticHybridMatch) -> SourceAction {
         let mut state = self.state.lock();
-        if state.all_hash_fenced() {
-            return SourceAction::Keep;
-        }
         if !self.active.load(Ordering::Acquire) || !probe_keeps_trust(outcome) {
             self.stop_layout(&mut state);
             return SourceAction::Stop;
@@ -306,9 +288,6 @@ impl WorkerLifecycle {
 
     pub(super) fn finish_layout_recovery(&self, recovered: bool) -> bool {
         let mut state = self.state.lock();
-        if state.all_hash_fenced() {
-            return true;
-        }
         if recovered && self.active.load(Ordering::Acquire) {
             state.trusted = true;
             return true;
@@ -487,9 +466,7 @@ impl KvIndexSupervisor {
                 let Some(provider) = provider.upgrade() else {
                     break;
                 };
-                if !provider.lifecycle.active.load(Ordering::Acquire)
-                    || provider.lifecycle.state.lock().all_hash_fenced()
-                {
+                if !provider.lifecycle.active.load(Ordering::Acquire) {
                     break;
                 }
                 if provider.lifecycle.expire_if_needed() {
@@ -557,7 +534,7 @@ impl KvIndexSupervisor {
                         }
                     }
                     SourceAction::Keep => continue,
-                    SourceAction::Rebuild | SourceAction::RebindFenced => {
+                    SourceAction::Rebuild => {
                         unreachable!("layout probe cannot install a descriptor")
                     }
                 }

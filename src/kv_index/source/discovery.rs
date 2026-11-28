@@ -179,6 +179,12 @@ pub(crate) struct WorkerDiscovery {
     engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
+impl WorkerDiscovery {
+    fn vllm_boot(&self) -> Option<&VllmBoot> {
+        self.server_info.as_ref().ok()?.vllm_boot.as_ref()
+    }
+}
+
 /// What the optional KV event source control probe found. A 404/405 means the
 /// engine cannot report sources, not that it is broken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,7 +481,6 @@ impl KvIndexSupervisor {
             observed,
             Some(lifecycle.clone()),
             None,
-            false,
         );
         if !installation
             .as_ref()
@@ -579,9 +584,7 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
-        if !self.supports_vllm_boot(worker_url)
-            || (discovery.hybrid.is_some() && !self.tracks_vllm_boot(worker_url, &discovery))
-        {
+        if !self.tracks_vllm_boot(worker_url, &discovery) {
             if let Ok(info) = &mut discovery.server_info {
                 info.vllm_boot = None;
             }
@@ -653,23 +656,18 @@ impl KvIndexSupervisor {
         discovery
     }
 
-    fn supports_vllm_boot(&self, worker_url: &str) -> bool {
+    fn tracks_vllm_boot(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
         self.full_attention_http
             && !self.http_pd
             && !crate::backend::is_grpc_url(worker_url)
             && split_worker_rank(worker_url).1.is_none()
-    }
-
-    fn tracks_vllm_boot(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
-        self.supports_vllm_boot(worker_url)
             && discovery
                 .hybrid
                 .as_ref()
-                .is_some_and(|layout| layout.ranks.len() == 1)
-            && discovery
-                .sources
-                .as_ref()
-                .is_ok_and(|sources| sources.len() == 1 && sources.contains_key("0"))
+                .is_none_or(|layout| layout.ranks.len() == 1)
+            && discovery.sources.as_ref().ok().is_none_or(|sources| {
+                sources.is_empty() || (sources.len() == 1 && sources.contains_key("0"))
+            })
     }
 
     async fn discover_declared_layout(

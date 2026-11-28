@@ -189,17 +189,19 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
+                    if lifecycle.vllm_restart_probe_due() {
+                        return true;
+                    }
                     lifecycle.layout_rebind_due()
-                        && (lifecycle.state.lock().vllm_boot_id().is_some()
-                            || self.resolved_static_source(base).is_none_or(|source| {
-                                super::layout_only(&source)
-                                    && source.hybrid.as_ref().is_some_and(|layout| {
-                                        layout
-                                            .ranks
-                                            .iter()
-                                            .any(|rank| rank.publisher_topic.is_none())
-                                    })
-                            }))
+                        && self.resolved_static_source(base).is_none_or(|source| {
+                            super::layout_only(&source)
+                                && source.hybrid.as_ref().is_some_and(|layout| {
+                                    layout
+                                        .ranks
+                                        .iter()
+                                        .any(|rank| rank.publisher_topic.is_none())
+                                })
+                        })
                 })
                 .map(|(base, lifecycle)| {
                     (
@@ -262,10 +264,7 @@ impl KvIndexSupervisor {
                 continue;
             }
             let descriptor = probe.as_ref().and_then(|probe| probe.descriptor.as_ref());
-            let boot = probe
-                .as_ref()
-                .and_then(|probe| probe.worker.server_info.as_ref().ok())
-                .and_then(|info| info.vllm_boot.as_ref());
+            let boot = probe.as_ref().and_then(|probe| probe.worker.vllm_boot());
             let action = lifecycle.observe_descriptor(descriptor, boot);
             match action {
                 SourceAction::Keep => {
@@ -274,13 +273,10 @@ impl KvIndexSupervisor {
                             probe.worker.base_models.unwrap_or_default();
                     }
                 }
-                SourceAction::Rebuild | SourceAction::RebindFenced => {
+                SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");
-                    let rebind_fenced = action == SourceAction::RebindFenced;
-                    if !rebind_fenced {
-                        lifecycle.state.lock().base_models =
-                            probe.worker.base_models.clone().unwrap_or_default();
-                    }
+                    lifecycle.state.lock().base_models =
+                        probe.worker.base_models.clone().unwrap_or_default();
                     // Both owner and control-record identities are compared under
                     // the publication lock; an old probe cannot resurrect a source.
                     let installation = self.install_observed_worker(
@@ -289,12 +285,8 @@ impl KvIndexSupervisor {
                         owner,
                         Some(lifecycle.clone()),
                         connector,
-                        rebind_fenced,
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
-                        if rebind_fenced {
-                            continue;
-                        }
                         self.installed.retire_if_current(&base, &lifecycle);
                     }
                     changed.insert(base);
@@ -471,7 +463,7 @@ pub(super) fn bound_source_moved(
     )
 }
 
-pub(super) fn source_matches(
+fn source_matches(
     host: &str,
     actual: &KvEventSourceEntry,
     endpoint: &str,

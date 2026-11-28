@@ -42,10 +42,6 @@ impl WorkerDescriptor {
         self.hybrid.as_ref()
     }
 
-    pub(super) fn sources(&self) -> Option<&KvEventSourcesResponse> {
-        self.sources.as_ref()
-    }
-
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()
@@ -96,22 +92,14 @@ impl KvIndexSupervisor {
         }
         let mut descriptor = match worker_descriptor(&worker) {
             Ok(descriptor) => descriptor,
-            Err(error) => {
-                if lifecycle.vllm_restarted(
-                    worker
-                        .server_info
-                        .as_ref()
-                        .ok()
-                        .and_then(|info| info.vllm_boot.as_ref()),
-                ) {
-                    // Preserve a confirmed restart even when source discovery failed.
-                    return Ok(RegistrationProbe {
-                        descriptor: None,
-                        worker,
-                    });
-                }
-                return Err(error);
+            // The restart can invalidate old credit even if sources are unavailable.
+            Err(_) if worker.vllm_boot().is_some() => {
+                return Ok(RegistrationProbe {
+                    descriptor: None,
+                    worker,
+                })
             }
+            Err(error) => return Err(error),
         };
         descriptor.connector = connector;
         if worker.base_models.is_none() {
@@ -660,30 +648,25 @@ pub(super) async fn query_server_info_json(
             }),
         _ => None,
     };
-    let vllm_boot = (config
-        .pointer("/parallel_config/data_parallel_size")
-        .and_then(serde_json::Value::as_u64)
-        == Some(1)
-        && config
-            .pointer("/parallel_config/_api_process_count")
-            .and_then(serde_json::Value::as_u64)
-            .is_none_or(|count| count == 1))
-    .then(|| {
-        let id = config.get("instance_id")?.as_str()?.trim();
-        if id.is_empty() {
-            return None;
-        }
-        let prefix_hash = config
-            .pointer("/cache_config/prefix_caching_hash_algo")
-            .and_then(serde_json::Value::as_str)
-            .filter(|algorithm| !algorithm.trim().is_empty())
-            .map(str::to_owned);
-        Some(VllmBoot {
-            id: id.to_owned(),
-            prefix_hash,
+    let parallel = &config["parallel_config"];
+    let vllm_boot = config["instance_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && parallel["data_parallel_size"].as_u64() == Some(1)
+                && parallel["_api_process_count"]
+                    .as_u64()
+                    .is_none_or(|count| count == 1)
         })
-    })
-    .flatten();
+        .map(|id| VllmBoot {
+            id: id.to_owned(),
+            prefix_hash: config
+                .pointer("/cache_config/prefix_caching_hash_algo")
+                .and_then(serde_json::Value::as_str)
+                .filter(|algorithm| !algorithm.trim().is_empty())
+                .map(str::to_owned),
+        });
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,

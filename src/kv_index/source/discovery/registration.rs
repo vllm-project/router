@@ -9,11 +9,10 @@ use tracing::{debug, info, warn};
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::metrics_meta::reported_prefix_hash;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
-use super::reconcile::source_matches;
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
-    worker_host, CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe,
-    WorkerDiscovery, WorkerKvInfo, WorkerSubs,
+    CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
+    WorkerKvInfo, WorkerSubs,
 };
 use crate::config::KvConnector;
 use crate::kv_index::{EventStream, SourceId};
@@ -32,7 +31,7 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed, None, None, false)
+        self.install_observed_worker(worker_url, discovery, observed, None, None)
     }
 
     pub(super) fn install_observed_worker(
@@ -42,7 +41,6 @@ impl KvIndexSupervisor {
         observed: Option<Arc<AtomicBool>>,
         expected_lifecycle: Option<Arc<WorkerLifecycle>>,
         connector: Option<KvConnector>,
-        rebind_fenced: bool,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok().map(|mut descriptor| {
             descriptor.connector = connector;
@@ -166,30 +164,6 @@ impl KvIndexSupervisor {
         };
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut event_sources = event_sources_for_worker(worker_url, &source_id, &sources, true)?;
-        if rebind_fenced {
-            let previous = expected_lifecycle
-                .as_ref()
-                .expect("rebind requires a prior registration");
-            let state = previous.state.lock();
-            let old_sources = state
-                .descriptor
-                .as_ref()
-                .and_then(|descriptor| descriptor.sources())
-                .ok_or("missing sources for fenced KV registration")?;
-            let host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_owned());
-            event_sources.retain(|source| {
-                !old_sources.iter().any(|(rank, entry)| {
-                    rank.parse::<u32>() == Ok(source.dp_rank)
-                        && source_matches(
-                            &host,
-                            entry,
-                            &source.pub_endpoint,
-                            source.replay_endpoint.as_deref(),
-                            &source.topic,
-                        )
-                })
-            });
-        }
 
         // Admit each rank on its own verified contract.
         let engine_model = layout_model(&server_info, &model_id, &capability);
@@ -197,14 +171,10 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
-        let boot = server_info.vllm_boot.as_ref();
-        if expected_lifecycle
+        let boot_hash = server_info
+            .vllm_boot
             .as_ref()
-            .is_some_and(|old| old.vllm_restarted(boot))
-            && boot.and_then(|boot| boot.prefix_hash.as_deref()).is_none()
-        {
-            return Err("restarted vLLM worker did not explicitly report its prefix hash".into());
-        }
+            .and_then(|boot| boot.prefix_hash.as_deref());
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -216,9 +186,9 @@ impl KvIndexSupervisor {
                 .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
             if let Some((expected, reported)) =
                 capability.rank_capability(rank).and_then(|contract| {
-                    [reported, boot.and_then(|boot| boot.prefix_hash.as_deref())]
-                        .into_iter()
-                        .find_map(|report| contract.reported_hash_mismatch(report))
+                    contract
+                        .reported_hash_mismatch(reported)
+                        .or_else(|| contract.reported_hash_mismatch(boot_hash))
                 })
             {
                 warn!(
@@ -263,7 +233,7 @@ impl KvIndexSupervisor {
             }
         });
         let load_only = reported_ranks != 0 && incompatible_ranks == reported_ranks;
-        if bindings.is_empty() && (!load_only || rebind_fenced) {
+        if bindings.is_empty() && !load_only {
             return Err("no KV event rank has a verified layout".into());
         }
 
