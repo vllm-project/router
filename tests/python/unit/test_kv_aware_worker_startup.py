@@ -1,6 +1,7 @@
 """Check hybrid worker startup and cleanup without loading GPU models."""
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -17,12 +18,13 @@ def worker_startup(monkeypatch, tmp_path):
     events = []
     workers = []
     clock = [0.0]
-    state = SimpleNamespace(fail_worker=None)
+    state = SimpleNamespace(fail_worker=None, gpus=[0, 1, 2, 3], ports_reserved=False)
     case = {
         "model": "startup-test",
         "local_model_env": "KV_AWARE_STARTUP_TEST_MODEL",
         "worker_count": 2,
         "worker_health_timeout_sec": 60,
+        "worker_env": {"VLLM_KV_CACHE_LAYOUT": "LBNHC"},
         "worker_params": {"tensor_parallel_size": 2, "max_model_len": 4096},
         "router_params": {
             "--kv-hybrid-layout": {
@@ -40,6 +42,7 @@ def worker_startup(monkeypatch, tmp_path):
     }
 
     def spawn_worker(*args, **kwargs):
+        assert state.ports_reserved
         index = len(workers)
         worker = SimpleNamespace(index=index, args=kwargs)
         workers.append(worker)
@@ -57,20 +60,27 @@ def worker_startup(monkeypatch, tmp_path):
             clock[0] += 30
 
     def spawn_router(*args, **kwargs):
-        assert {event[1] for event in events if event[0] == "health"} == {0, 1}
+        assert {event[1] for event in events if event[0] == "health"} == set(
+            range(len(workers))
+        )
         events.append(("router", kwargs))
         return SimpleNamespace(index="router")
 
-    monkeypatch.setattr(config, "kv_aware_gpu_pool", lambda: [0, 1, 2, 3])
+    monkeypatch.setattr(config, "kv_aware_gpu_pool", lambda: state.gpus)
     monkeypatch.setattr(kv_fixtures.shutil, "which", lambda _: "/test/vllm")
     monkeypatch.setattr(
         kv_fixtures, "time", SimpleNamespace(monotonic=lambda: clock[0])
     )
-    monkeypatch.setattr(
-        launch,
-        "find_distinct_available_ports",
-        lambda count: list(range(20000, 20000 + count)),
-    )
+
+    @contextmanager
+    def reserve_ports(count):
+        state.ports_reserved = True
+        try:
+            yield list(range(20000, 20000 + count))
+        finally:
+            state.ports_reserved = False
+
+    monkeypatch.setattr(launch, "reserve_available_ports", reserve_ports)
     monkeypatch.setattr(launch, "popen_launch_vllm_http_worker", spawn_worker)
     monkeypatch.setattr(launch, "popen_launch_vllm_rs_grpc_worker", spawn_worker)
     monkeypatch.setattr(launch, "wait_worker_health", wait_health)
@@ -88,6 +98,7 @@ def worker_startup(monkeypatch, tmp_path):
         events=events,
         workers=workers,
         state=state,
+        case=case,
         layout_path=tmp_path / "cache_layout.json",
     )
 
@@ -111,6 +122,11 @@ def test_hybrid_worker_startup_order_and_timeouts(worker_startup, protocol, depl
             assert budgets == pytest.approx([60, 60])
         gpu_key = "gpu_id" if protocol == "http" else "base_gpu_id"
         assert [worker.args[gpu_key] for worker in run.workers] == [[0, 1], [2, 3]]
+        assert all(
+            worker.args["extra_env"]["VLLM_KV_CACHE_LAYOUT"] == "LBNHC"
+            for worker in run.workers
+        )
+        assert run.case["worker_env"] == {"VLLM_KV_CACHE_LAYOUT": "LBNHC"}
         if protocol == "grpc":
             for worker in run.workers:
                 argv = worker.args["extra_argv"]
@@ -125,6 +141,7 @@ def test_hybrid_worker_startup_order_and_timeouts(worker_startup, protocol, depl
     finally:
         stack.close()
     assert [event[1] for event in events if event[0] == "stop"] == ["router", 1, 0]
+    assert not run.state.ports_reserved
 
 
 @pytest.mark.parametrize("protocol", ["http", "grpc"])
@@ -140,3 +157,75 @@ def test_pd_health_failure_cleans_up_both_workers(
     assert [event[1] for event in run.events if event[0] == "start"] == [0, 1]
     assert [event[1] for event in run.events if event[0] == "stop"] == [1, 0]
     assert not any(event[0] == "router" for event in run.events)
+    assert not run.state.ports_reserved
+
+
+@pytest.mark.parametrize("protocol", ["http", "grpc"])
+def test_single_merge_worker_uses_all_eight_gpus(worker_startup, protocol):
+    run = worker_startup
+    run.case["worker_count"] = 1
+    run.case["worker_health_timeout_sec"] = 3600
+    run.case["worker_params"]["tensor_parallel_size"] = 8
+    run.state.gpus = list(range(8))
+    stack = run.start(protocol, "merge")
+    try:
+        result = next(stack)
+        assert len(run.workers) == len(result.worker_http_urls) == 1
+        gpu_key = "gpu_id" if protocol == "http" else "base_gpu_id"
+        assert run.workers[0].args[gpu_key] == list(range(8))
+        health = [event for event in run.events if event[0] == "health"]
+        assert health == [("health", 0, 3600)]
+        router = next(event[1] for event in run.events if event[0] == "router")
+        assert len(router["worker_urls"]) == 1
+        assert len(json.loads(run.layout_path.read_text())) == 1
+        if protocol == "grpc":
+            argv = run.workers[0].args["extra_argv"]
+            index = argv.index("--engine-ready-timeout-secs")
+            assert argv[index + 1] == "3600"
+            assert index < argv.index("--")
+    finally:
+        stack.close()
+    assert [event[1] for event in run.events if event[0] == "stop"] == ["router", 0]
+
+
+@pytest.mark.parametrize("protocol", ["http", "grpc"])
+def test_single_merge_health_failure_cleans_up_worker(worker_startup, protocol):
+    run = worker_startup
+    run.case["worker_count"] = 1
+    run.state.fail_worker = 0
+    stack = run.start(protocol, "merge")
+    with pytest.raises(pytest.fail.Exception, match="Worker log: .*worker_0"):
+        next(stack)
+    assert [event[1] for event in run.events if event[0] == "stop"] == [0]
+    assert not any(event[0] == "router" for event in run.events)
+
+
+@pytest.mark.parametrize("protocol", ["http", "grpc"])
+def test_pd_skips_before_launch_when_sixteen_gpus_are_required(
+    worker_startup, protocol
+):
+    run = worker_startup
+    run.case["worker_params"]["tensor_parallel_size"] = 8
+    run.state.gpus = list(range(8))
+    stack = run.start(protocol, "1p1d_nixl")
+    with pytest.raises(pytest.skip.Exception, match="requires 16 GPUs"):
+        next(stack)
+    assert not run.events
+    assert not run.workers
+
+
+@pytest.mark.parametrize("protocol", ["http", "grpc"])
+def test_pd_rejects_single_worker_configuration(worker_startup, protocol):
+    run = worker_startup
+    run.case["worker_count"] = 1
+    stack = run.start(protocol, "1p1d_nixl")
+    with pytest.raises(AssertionError, match="1P1D requires exactly two workers"):
+        next(stack)
+    assert not run.workers
+
+
+def test_single_gpu_pool_preserves_dual_lane_requirement(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    assert config.kv_aware_gpu_pool() == [3]
+    with pytest.raises(RuntimeError, match="dual-lane case requires at least two GPUs"):
+        config.kv_aware_worker_gpu_ids()

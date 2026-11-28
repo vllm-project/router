@@ -1,8 +1,8 @@
 {
   "model": "nvidia/DeepSeek-V4-Pro-NVFP4",
   "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_PRO_NVFP4_MODEL",
-  "worker_count": 2,
-  "worker_health_timeout_sec": 1800,
+  "worker_count": 1,
+  "worker_health_timeout_sec": 3600,
   "protocols": [
     "http",
     "grpc"
@@ -13,7 +13,7 @@
     "max_model_len": 4096,
     "max_num_batched_tokens": 4096,
     "trust_remote_code": true,
-    "tensor_parallel_size": 4,
+    "tensor_parallel_size": 8,
     "kv_cache_dtype": "fp8",
     "block_size": 256,
     "prefix_match_unit": 4
@@ -54,7 +54,6 @@
     }
   },
   "deployments": [
-    "merge",
-    "1p1d_nixl"
+    "merge"
   ]
 }

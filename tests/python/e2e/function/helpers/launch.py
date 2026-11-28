@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import urlparse
@@ -89,26 +93,89 @@ def find_available_port() -> int:
 
 
 def find_distinct_available_ports(count: int) -> list[int]:
-    """Return ``count`` unique ephemeral ports on 127.0.0.1 (hold until allocated)."""
+    """Find free ports; delayed binders must keep ``reserve_available_ports`` open."""
+    with reserve_available_ports(count) as ports:
+        return ports
+
+
+def _port_candidates() -> list[int]:
+    # Engine listeners and outgoing connections use bind(0) during model loading.
+    # Keep delayed ZMQ listeners out of that automatically allocated range.
+    low, high = 32768, 65535
+    if sys.platform == "linux":
+        try:
+            values = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+            start, end = map(int, values)
+            if 0 < start <= end <= 65535:
+                low, high = start, end
+        except (OSError, ValueError):
+            pass
+    ports = [port for port in range(10000, 65536) if not low <= port <= high]
+    random.SystemRandom().shuffle(ports)
+    return ports
+
+
+def _try_port_lease(directory: Path, port: int):
+    """Keep an OS file lock until the test stack stops, including process crashes."""
+    lease = (directory / f"{port}.lock").open("a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if lease.tell() == 0:
+                lease.write(b"\0")
+                lease.flush()
+            lease.seek(0)
+            msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        lease.close()
+        if error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return None
+        raise
+    return lease
+
+
+@contextmanager
+def reserve_available_ports(count: int):
+    """Lease random free TCP ports across cooperating E2E processes.
+
+    Probe all IPv4 interfaces, matching ZMQ's wildcard bind. File locks let
+    workers bind later without another test choosing their unbound ports.
+    They do not occupy TCP sockets, and the OS releases them on process exit.
+    """
     if count < 1:
         raise ValueError("count must be >= 1")
+    directory = Path(tempfile.gettempdir()) / "vllm-router-e2e-ports"
+    directory.mkdir(exist_ok=True)
     ports: list[int] = []
-    sockets: list[socket.socket] = []
-    try:
-        while len(ports) < count:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-            if port not in ports:
-                ports.append(port)
-                sockets.append(s)
-            else:
-                s.close()
-        return ports
-    finally:
-        for s in sockets:
-            s.close()
+    with ExitStack() as leases:
+        for port in _port_candidates():
+            lease = _try_port_lease(directory, port)
+            if lease is None:
+                continue
+            leases.enter_context(lease)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    if sys.platform == "win32":
+                        probe.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                        )
+                    probe.bind(("0.0.0.0", port))
+            except OSError as error:
+                lease.close()
+                if error.errno in (errno.EADDRINUSE, errno.EACCES):
+                    continue
+                raise
+            ports.append(port)
+            if len(ports) == count:
+                break
+        if len(ports) != count:
+            raise RuntimeError(f"Could not reserve {count} free E2E TCP ports")
+        yield ports
 
 
 def _parse_url(base_url: str) -> tuple[str, str]:

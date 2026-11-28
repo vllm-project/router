@@ -30,11 +30,12 @@ Optional environment (see also ``function/helpers/launch.py``):
 - Worker logs: subprocess PIPE → log file + stderr echo when ``pytest -s`` unless
   ``KV_AWARE_WORKER_LOG_QUIET=1`` (file-only under ``[e2e] worker logs: ...``).
 
-Worker GPUs (two worker serve processes):
+Worker GPUs:
 
 - Use GPU IDs from ``CUDA_VISIBLE_DEVICES``, or query ``nvidia-smi`` when unset.
-- The dual-lane case uses one GPU per worker. Hybrid cases assign each worker
-  a distinct slice of the GPU list based on its tensor parallel size.
+- The dual-lane case uses two workers with one GPU each. Hybrid merge cases
+  may use one worker; 1P1D uses two. Each worker gets a distinct GPU slice
+  based on its tensor parallel size.
 
 Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
@@ -63,7 +64,7 @@ def load_kv_aware_case(name: str) -> dict[str, Any]:
 
 
 def load_hybrid_kv_aware_cases() -> dict[str, dict[str, Any]]:
-    """Load one complete hybrid scenario per JSON; filenames define case IDs."""
+    """Load complete hybrid scenarios keyed by filename."""
     directory = Path(__file__).with_name("cases") / "hybrid_model"
     paths = sorted(directory.glob("*.json"))
     if not paths:
@@ -174,25 +175,24 @@ def _machine_physical_gpu_indices() -> list[int]:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
             "CUDA_VISIBLE_DEVICES is unset and nvidia-smi failed; "
-            "set CUDA_VISIBLE_DEVICES to at least two GPU ids"
+            "set CUDA_VISIBLE_DEVICES to the available GPU ids"
         ) from exc
     indices = [int(line.strip()) for line in out.splitlines() if line.strip()]
-    if len(indices) < 2:
+    if not indices:
         raise RuntimeError(
-            f"kv_aware e2e needs at least two GPUs; nvidia-smi reported {indices!r}"
+            f"kv_aware e2e needs at least one GPU; nvidia-smi reported {indices!r}"
         )
     return indices
 
 
 def kv_aware_gpu_pool() -> list[int]:
-    """Ordered physical GPU ids available for picking worker A/B."""
+    """Ordered physical GPU ids available for assigning workers."""
     raw = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw is not None and raw.strip():
         pool = _parse_cuda_visible_device_list(raw.strip())
-        if len(pool) < 2:
+        if not pool:
             raise RuntimeError(
-                f"CUDA_VISIBLE_DEVICES={raw!r} lists fewer than two GPUs; "
-                "kv_aware e2e needs two worker GPUs"
+                f"CUDA_VISIBLE_DEVICES={raw!r} does not list any GPU ids"
             )
         return pool
     return _machine_physical_gpu_indices()
@@ -201,4 +201,6 @@ def kv_aware_gpu_pool() -> list[int]:
 def kv_aware_worker_gpu_ids() -> tuple[int, int]:
     """Physical GPU indices for worker A and worker B (first two in the pool)."""
     pool = kv_aware_gpu_pool()
+    if len(pool) < 2:
+        raise RuntimeError("The dual-lane case requires at least two GPUs")
     return pool[0], pool[1]

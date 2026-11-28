@@ -79,7 +79,9 @@ def hybrid_kv_aware_stack(request, tmp_path):
     assert deployment in ("merge", "1p1d_nixl")
     pd = deployment == "1p1d_nixl"
     worker_count = case["worker_count"]
-    assert worker_count == 2, "Hybrid routing probes require two workers"
+    assert worker_count >= 1, "Hybrid cache probes require at least one worker"
+    if pd:
+        assert worker_count == 2, "1P1D requires exactly two workers"
     worker_health_timeout = case.get("worker_health_timeout_sec", 600.0)
     engine_params = case["worker_params"].copy()
     tensor_parallel_size = engine_params.get("tensor_parallel_size", 1)
@@ -109,10 +111,6 @@ def hybrid_kv_aware_stack(request, tmp_path):
     (rank,) = case["router_params"][layout_flag]["ranks"]
     hash_seed = rank["hash_seed"]
     ports_per_worker = 3 + (protocol == "grpc") + pd
-    router_port, *worker_ports = launch.find_distinct_available_ports(
-        1 + ports_per_worker * worker_count
-    )
-    router_url = f"http://127.0.0.1:{router_port}"
     router_log = tmp_path / "router.log"
     layout_path = tmp_path / "cache_layout.json"
     worker_http_urls = {}
@@ -146,6 +144,10 @@ def hybrid_kv_aware_stack(request, tmp_path):
             pytest.fail(f"{error}. Worker log: {log_path}")
 
     with ExitStack() as cleanup:
+        router_port, *worker_ports = cleanup.enter_context(
+            launch.reserve_available_ports(1 + ports_per_worker * worker_count)
+        )
+        router_url = f"http://127.0.0.1:{router_port}"
         worker_processes = []
         for index in range(worker_count):
             gpu_start = index * tensor_parallel_size
@@ -154,7 +156,7 @@ def hybrid_kv_aware_stack(request, tmp_path):
             http_port, live_port, replay_port, *extra_ports = worker_ports[
                 start : start + ports_per_worker
             ]
-            worker_env = {}
+            worker_env = case.get("worker_env", {}).copy()
             worker_args = engine_args.copy()
             is_decode = pd and index == 1
             if pd:

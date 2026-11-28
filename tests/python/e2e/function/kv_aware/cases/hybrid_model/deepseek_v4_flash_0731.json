@@ -1,8 +1,8 @@
 {
   "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
   "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_FLASH_0731_MODEL",
-  "worker_count": 2,
-  "worker_health_timeout_sec": 1800,
+  "worker_count": 1,
+  "worker_health_timeout_sec": 3600,
   "protocols": [
     "http",
     "grpc"
@@ -54,7 +54,6 @@
     }
   },
   "deployments": [
-    "merge",
-    "1p1d_nixl"
+    "merge"
   ]
 }

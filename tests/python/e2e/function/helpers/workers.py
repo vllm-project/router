@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -67,17 +68,6 @@ def spawn_two_vllm_rs_grpc_workers(
         else None
     )
     port_count = 8 if replay_on else (6 if kv_on else 4)
-    ports = launch.find_distinct_available_ports(port_count)
-    http_a, grpc_a, http_b, grpc_b = ports[:4]
-    # Replay uses four extra ports (zmq+replay per worker). Without replay,
-    # each worker still needs its own PUB port — do not share ports[4].
-    if replay_on:
-        zmq_a, replay_a, zmq_b, replay_b = ports[4], ports[5], ports[6], ports[7]
-    elif kv_on:
-        zmq_a, zmq_b = ports[4], ports[5]
-        replay_a = replay_b = None
-    else:
-        zmq_a = zmq_b = replay_a = replay_b = None
     serve_extra = worker_serve_extra_argv()
     endpoint_bind = kv_aware_kv_events_endpoint_bind()
     replay_host = kv_aware_kv_events_replay_host()
@@ -91,7 +81,19 @@ def spawn_two_vllm_rs_grpc_workers(
             parts.append(f" replay={replay}")
         return "".join(parts)
 
+    port_reservations = ExitStack()
     try:
+        ports = port_reservations.enter_context(
+            launch.reserve_available_ports(port_count)
+        )
+        http_a, grpc_a, http_b, grpc_b = ports[:4]
+        if replay_on:
+            zmq_a, replay_a, zmq_b, replay_b = ports[4:]
+        elif kv_on:
+            zmq_a, zmq_b = ports[4:]
+            replay_a = replay_b = None
+        else:
+            zmq_a = zmq_b = replay_a = replay_b = None
         print(
             f"[e2e] worker A gpu={gpu_a} http={http_a} grpc={grpc_a}"
             f"{_kv_log(zmq_a, replay_a)}",
@@ -121,6 +123,7 @@ def spawn_two_vllm_rs_grpc_workers(
             gpu_id=gpu_a,
             log_path=str(log_a_path),
             log_pump=None,
+            port_reservations=port_reservations,
         )
         workers.append(worker_a)
         worker_a.log_pump = SubprocessLogPump(
@@ -174,8 +177,9 @@ def spawn_two_vllm_rs_grpc_workers(
             worker_b.http_url, worker_health_timeout, proc=worker_b.proc
         )
         return workers
-    except Exception:
+    except BaseException:
         terminate_workers(workers)
+        port_reservations.close()
         raise
 
 
@@ -191,3 +195,7 @@ def terminate_workers(workers) -> None:
                 log_f.close()
             except OSError:
                 pass
+    for w in workers:
+        reservations = getattr(w, "port_reservations", None)
+        if reservations is not None:
+            reservations.close()

@@ -1,8 +1,10 @@
-"""Compare Router KV credit with actual reuse on hybrid model worker pairs.
+"""Compare Router KV credit with actual reuse on hybrid model workers.
 
 Set ROUTER_BIN to a binary that includes PR #493 and run with vLLM 0.30.0.
-Each case uses two workers with the GPUs per replica set by its tensor
-parallel size. Use `-k` to select a model, protocol, or variant.
+Merge cases can use one worker for cache accounting or multiple workers to
+also check cache-holder selection. 1P1D requires two workers. GPUs per worker
+are set by tensor parallel size. Use `-k` to select a model, protocol, or variant.
+An optional `case_id` preserves IDs across deployment-specific JSON files.
 The 1P1D cases require NixlConnector on both workers.
 Set the model's `local_model_env` from cases/hybrid_model/*.json to use a local
 checkpoint.
@@ -60,13 +62,16 @@ _DRAFTS = "vllm:spec_decode_num_drafts_total"
 
 def _hybrid_parameters(deployment: str):
     parameters = []
+    case_ids = set()
     for name, case in load_hybrid_kv_aware_cases().items():
         if deployment not in case.get("deployments", ("merge",)):
             continue
+        name = case.get("case_id", name)
         for protocol in case["protocols"]:
-            parameters.append(
-                pytest.param((case, protocol, deployment), id=f"{name}-{protocol}")
-            )
+            case_id = f"{name}-{protocol}"
+            assert case_id not in case_ids, f"Duplicate {deployment} case: {case_id}"
+            case_ids.add(case_id)
+            parameters.append(pytest.param((case, protocol, deployment), id=case_id))
     return parameters
 
 
@@ -288,7 +293,7 @@ def test_kv_aware_hybrid_prefix_reuse(hybrid_kv_aware_stack):
                 f"{probe} {request_id}: Router credited {router_credit} tokens, "
                 f"{worker} reused {worker_credit}"
             )
-            if probe == "warm":
+            if probe == "warm" and len(scored_workers) > 1:
                 assert worker == warm_worker, (
                     f"{request_id}: expected warm worker {warm_worker}, got {worker}"
                 )

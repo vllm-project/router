@@ -1,0 +1,60 @@
+{
+  "model": "nvidia/DeepSeek-V4-Pro-NVFP4",
+  "local_model_env": "KV_AWARE_HYBRID_DEEPSEEK_V4_PRO_NVFP4_MODEL",
+  "worker_count": 2,
+  "worker_health_timeout_sec": 3600,
+  "protocols": [
+    "http",
+    "grpc"
+  ],
+  "worker_params": {
+    "enable_prefix_caching": true,
+    "prefix_caching_hash_algo": "sha256_cbor",
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 4096,
+    "trust_remote_code": true,
+    "tensor_parallel_size": 8,
+    "kv_cache_dtype": "fp8",
+    "block_size": 256,
+    "prefix_match_unit": 4
+  },
+  "router_params": {
+    "--kv-hybrid-layout": {
+      "ranks": [
+        {
+          "rank": 0,
+          "hash_block_size": 4,
+          "hash_seed": "0",
+          "speculative_tokens": 0,
+          "groups": [
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 128
+            },
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 128
+            },
+            {
+              "kind": "mla_attention",
+              "cache_role": "sparse",
+              "tokens_per_state": "128"
+            },
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 128
+            },
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 8
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "deployments": [
+    "1p1d_nixl"
+  ],
+  "case_id": "deepseek_v4_pro_nvfp4"
+}
