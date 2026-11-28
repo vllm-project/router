@@ -206,7 +206,7 @@ steps:
         artifact_paths:
           - "tests/python/e2e/results/perf/l1_encode/**/*.json"
 
-  - group: "AMD TestGroup"
+  - group: "AMD Test"
     key: "pd-disagg-moriio-tests"
     steps:
       # Reuse the L4 functional test against the pinned ROCm engine. Two full
