@@ -1,3 +1,5 @@
+pub mod service_endpoints;
+
 use crate::routers::RouterTrait;
 
 use futures::{StreamExt, TryStreamExt};
