@@ -286,3 +286,108 @@ mod decode_disconnect {
         decode_breaks_mid_sse(Path::SplitPdConcurrent).await;
     }
 }
+
+/// The client goes away just before or just after a handoff event.
+/// Gates put the drop on one side of the event, so the result does not depend
+/// on which one runs first.
+mod client_drop_races_the_handoff {
+    use super::*;
+
+    #[tokio::test]
+    async fn regular_e_pd() {
+        // Just before: PD has the request, but has not sent its headers.
+        {
+            let mut rig = Rig::new(Path::CombinedPd).await;
+            rig.consumer.set_mode(Mode::HoldThenReply);
+            let mut client = rig.send(two_images());
+            rig.consumer.wait_requests(1).await;
+            expect_waiting(&mut client).await;
+            disconnect(client).await;
+            rig.consumer.expect_aborted().await;
+            rig.expect_cancel().await;
+        }
+        // Just after: PD sent its 2xx headers and streams.
+        {
+            let mut rig = Rig::new(Path::CombinedPd).await;
+            rig.consumer.set_mode(Mode::StallBody);
+            let response = answer(rig.send(two_images_stream())).await;
+            assert_eq!(response.status(), StatusCode::OK, "[client]");
+            let mut body = response.into_body().into_data_stream();
+            next_chunk(&mut body).await;
+            drop(body); // [local drop]: the response body
+            rig.consumer.expect_aborted().await;
+            rig.expect_no_cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_e_p_d() {
+        // Just before: P has the request.
+        {
+            let mut rig = Rig::new(Path::SplitPdSequential).await;
+            rig.consumer.set_mode(Mode::HoldThenReply);
+            let mut client = rig.send(two_images());
+            rig.consumer.wait_requests(1).await;
+            expect_waiting(&mut client).await;
+            disconnect(client).await;
+            rig.consumer.expect_aborted().await;
+            rig.expect_cancel().await;
+            rig.decode.expect_no_request();
+        }
+        // Just after: P is done, and D has the request.
+        {
+            let mut rig = Rig::new(Path::SplitPdSequential).await;
+            rig.decode.set_mode(Mode::HoldThenReply);
+            let mut client = rig.send(two_images());
+            rig.decode.wait_requests(1).await;
+            rig.consumer.expect_completed().await;
+            expect_waiting(&mut client).await;
+            disconnect(client).await;
+            rig.decode.expect_aborted().await;
+            rig.expect_no_cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_nixl() {
+        // Just before: P and D both have the request.
+        {
+            let mut rig = Rig::new(Path::SplitPdConcurrent).await;
+            rig.consumer.set_mode(Mode::HoldThenReply);
+            rig.decode.set_mode(Mode::HoldThenReply);
+            let mut client = rig.send(two_images());
+            rig.consumer.wait_requests(1).await;
+            // [dispatch] D gets its request while P holds: the concurrent path.
+            rig.decode.wait_requests(1).await;
+            expect_waiting(&mut client).await;
+            disconnect(client).await;
+            rig.consumer.expect_aborted().await;
+            rig.decode.expect_aborted().await;
+            rig.expect_cancel().await;
+        }
+        // P has sent its whole 2xx reply; D has not sent its headers.
+        {
+            let mut rig = Rig::new(Path::SplitPdConcurrent).await;
+            rig.decode.set_mode(Mode::HoldThenReply);
+            let mut client = rig.send(two_images());
+            rig.consumer.expect_completed().await;
+            rig.decode.wait_requests(1).await;
+            expect_waiting(&mut client).await;
+            disconnect(client).await;
+            rig.decode.expect_aborted().await;
+            rig.expect_cancel().await;
+        }
+        // Just after: D sent its headers and streams.
+        {
+            let mut rig = Rig::new(Path::SplitPdConcurrent).await;
+            rig.decode.set_mode(Mode::StallBody);
+            let response = answer(rig.send(two_images_stream())).await;
+            assert_eq!(response.status(), StatusCode::OK, "[client]");
+            let mut body = response.into_body().into_data_stream();
+            next_chunk(&mut body).await;
+            drop(body); // [local drop]: the response body
+            rig.decode.expect_aborted().await;
+            rig.expect_no_cancel().await;
+        }
+    }
+}
