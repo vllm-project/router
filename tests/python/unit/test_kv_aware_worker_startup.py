@@ -24,7 +24,7 @@ def worker_startup(monkeypatch, tmp_path):
         "local_model_env": "KV_AWARE_STARTUP_TEST_MODEL",
         "worker_count": 2,
         "worker_health_timeout_sec": 60,
-        "worker_env": {"VLLM_KV_CACHE_LAYOUT": "LBNHC"},
+        "worker_env": {"OMP_NUM_THREADS": "1"},
         "worker_params": {"tensor_parallel_size": 2, "max_model_len": 4096},
         "router_params": {
             "--kv-hybrid-layout": {
@@ -123,10 +123,9 @@ def test_hybrid_worker_startup_order_and_timeouts(worker_startup, protocol, depl
         gpu_key = "gpu_id" if protocol == "http" else "base_gpu_id"
         assert [worker.args[gpu_key] for worker in run.workers] == [[0, 1], [2, 3]]
         assert all(
-            worker.args["extra_env"]["VLLM_KV_CACHE_LAYOUT"] == "LBNHC"
-            for worker in run.workers
+            worker.args["extra_env"]["OMP_NUM_THREADS"] == "1" for worker in run.workers
         )
-        assert run.case["worker_env"] == {"VLLM_KV_CACHE_LAYOUT": "LBNHC"}
+        assert run.case["worker_env"] == {"OMP_NUM_THREADS": "1"}
         if protocol == "grpc":
             for worker in run.workers:
                 argv = worker.args["extra_argv"]

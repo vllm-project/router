@@ -64,8 +64,5 @@
   "deployments": [
     "1p1d_nixl"
   ],
-  "case_id": "deepseek_v4_1_flash_1017",
-  "worker_env": {
-    "VLLM_KV_CACHE_LAYOUT": "LBNHC"
-  }
+  "case_id": "deepseek_v4_1_flash_1017"
 }

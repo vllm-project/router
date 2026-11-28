@@ -63,8 +63,5 @@
   },
   "deployments": [
     "merge"
-  ],
-  "worker_env": {
-    "VLLM_KV_CACHE_LAYOUT": "LBNHC"
-  }
+  ]
 }
