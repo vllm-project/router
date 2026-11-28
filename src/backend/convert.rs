@@ -24,6 +24,21 @@ const SUPPORTED_OTHER: [&str; 7] = [
 
 /// Completions-only response option; never part of the chat shape.
 const RETURN_TOKEN_IDS: &str = "return_token_ids";
+/// Completions-only formatting option: logprob token text as `token_id:<id>`.
+const RETURN_TOKENS_AS_TOKEN_IDS: &str = "return_tokens_as_token_ids";
+/// Completions-only prompt-logprob option (`-1` means every prompt position).
+const PROMPT_LOGPROBS: &str = "prompt_logprobs";
+/// Completions-only vLLM extension: report logprobs for these token ids.
+const LOGPROB_TOKEN_IDS: &str = "logprob_token_ids";
+
+/// Keys of `CompletionRequest.other` that the completions lower consumes
+/// itself; they never reach the chat shape or the worker as passthrough.
+const COMPLETION_ONLY_OTHER: [&str; 4] = [
+    RETURN_TOKEN_IDS,
+    RETURN_TOKENS_AS_TOKEN_IDS,
+    PROMPT_LOGPROBS,
+    LOGPROB_TOKEN_IDS,
+];
 
 // Consumed by routing, never sent as generation options.
 const ROUTING_ONLY: [&str; 4] = ["vllm_xargs", "agent_hint", "session_id", "user_id"];
@@ -57,15 +72,52 @@ pub fn requires_worker_output_text(request: &ChatCompletionRequest) -> bool {
 }
 
 /// Wire adapter: OpenAI chat fields → crates.io `vllm-proto` 0.2.
+/// Client-visible options of a `/v1/completions` request that the chat shape
+/// has no field for. `None` options mean the caller is on the chat path.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompletionOptions {
+    /// Echo the prompt text before the generated text.
+    pub echo: bool,
+    /// `logprobs`: top-N token logprobs per position.
+    pub logprobs: Option<u32>,
+    /// `prompt_logprobs` from vLLM extensions; echo implies it when `logprobs`
+    /// is set, matching the HTTP frontend.
+    pub prompt_logprobs: Option<u32>,
+    /// `prompt_logprobs: -1`: every prompt position returns all candidates.
+    pub prompt_logprobs_all: bool,
+    /// `echo` with `max_tokens == 0`: answer with the prompt only, so the
+    /// engine still has to produce one token (the HTTP frontend does the same).
+    pub echo_only: bool,
+    /// Render logprob token text as `token_id:<id>` instead of decoded text.
+    pub return_tokens_as_token_ids: bool,
+    /// vLLM `logprob_token_ids`: report logprobs only for these token ids.
+    pub logprob_token_ids: Option<Vec<u32>>,
+    /// Prompt text prepended to the reply when `echo` is set. Filled per
+    /// prompt by the frontend, which owns the tokenizer. Also decoded
+    /// when prompt logprobs will merge, so the merged `text_offset`
+    /// continues from the prompt length even without `echo`.
+    pub echo_text: Option<String>,
+}
+
 pub fn chat_to_generate_request(
     request: &ChatCompletionRequest,
     token_ids: Vec<u32>,
     request_id: String,
 ) -> Result<pb::GenerateRequest, String> {
-    if request.n.unwrap_or(1) > 1 {
+    chat_to_generate_request_with_options(request, token_ids, request_id, None)
+}
+
+/// Chat conversion with optional `/v1/completions` response semantics.
+pub fn chat_to_generate_request_with_options(
+    request: &ChatCompletionRequest,
+    token_ids: Vec<u32>,
+    request_id: String,
+    completion: Option<&CompletionOptions>,
+) -> Result<pb::GenerateRequest, String> {
+    if completion.is_none() && request.n.unwrap_or(1) > 1 {
         return Err("n > 1 is not supported by vLLM 0.29 GenerateStream; use n=1".to_string());
     }
-    if request.logprobs || request.top_logprobs.is_some() {
+    if completion.is_none() && (request.logprobs || request.top_logprobs.is_some()) {
         return Err(
             "chat logprobs are not yet supported by the router gRPC response adapter".to_string(),
         );
@@ -81,7 +133,7 @@ pub fn chat_to_generate_request(
             "lora_path cannot be mapped to the gRPC loaded LoRA name; use lora_name".to_string(),
         );
     }
-    if request.return_hidden_states || request.echo == Some(true) {
+    if request.return_hidden_states || (completion.is_none() && request.echo == Some(true)) {
         return Err(
             "return_hidden_states and echo are not supported by the gRPC response adapter"
                 .to_string(),
@@ -97,6 +149,14 @@ pub fn chat_to_generate_request(
         .max_completion_tokens
         .or(request.max_tokens)
         .unwrap_or(0);
+    // `echo` with `max_tokens: 0` still needs one engine token so the stream
+    // can finish; the reply drops it and returns the prompt text only.
+    let max_new_tokens = if completion.is_some_and(|options| options.echo_only) {
+        1
+    } else {
+        max_new_tokens
+    };
+    let prompt_logprobs = completion.and_then(completion_prompt_logprobs);
 
     let (stop_strings, stop_token_ids) = split_stops(request)?;
     let logit_bias = request
@@ -169,6 +229,26 @@ pub fn chat_to_generate_request(
             output_text: Some(requires_worker_output_text(request)),
             output_token_ids: true,
             skip_special_tokens: Some(request.skip_special_tokens),
+            output_logprobs: completion.is_some_and(|options| options.logprobs.is_some()),
+            output_candidates: completion.and_then(|options| {
+                options
+                    .logprob_token_ids
+                    .as_ref()
+                    .map(|ids| pb::CandidateTokens {
+                        select: Some(pb::candidate_tokens::Select::TokenIds(pb::TokenIds {
+                            ids: ids.clone(),
+                        })),
+                    })
+                    .or_else(|| options.logprobs.and_then(top_n_candidates))
+            }),
+            prompt_logprobs: prompt_logprobs.is_some(),
+            prompt_candidates: if completion.is_some_and(|options| options.prompt_logprobs_all) {
+                Some(pb::CandidateTokens {
+                    select: Some(pb::candidate_tokens::Select::All(true)),
+                })
+            } else {
+                prompt_logprobs.and_then(top_n_candidates)
+            },
             ..Default::default()
         }),
         kv: Some(pb::KvCacheParameters {
@@ -187,6 +267,21 @@ pub fn chat_to_generate_request(
         lora_name: lora_name.unwrap_or_default().to_string(),
         watermarking: other_bool(request, "watermarking")?,
         ..Default::default()
+    })
+}
+
+/// Prompt logprobs the completion frontend asks the engine for: an explicit
+/// `prompt_logprobs` wins, otherwise `echo` + `logprobs` implies it, matching
+/// the HTTP frontend's `prompt_logprobs = logprobs` default.
+pub(crate) fn completion_prompt_logprobs(options: &CompletionOptions) -> Option<u32> {
+    options
+        .prompt_logprobs
+        .or(options.logprobs.filter(|_| options.echo))
+}
+
+fn top_n_candidates(top_n: u32) -> Option<pb::CandidateTokens> {
+    (top_n > 0).then_some(pb::CandidateTokens {
+        select: Some(pb::candidate_tokens::Select::TopN(top_n)),
     })
 }
 
@@ -430,7 +525,11 @@ pub struct PreparedCompletion {
 pub struct PreparedCompletionPrompts {
     pub chat: ChatCompletionRequest,
     pub prompts: Vec<CompletionPrompt>,
+    /// Echo text per prompt: the client's string, or `None` for ids until the
+    /// frontend decodes them with a tokenizer.
+    pub echo_texts: Vec<Option<String>>,
     pub emit_token_ids: bool,
+    pub options: CompletionOptions,
 }
 
 fn completion_ids(ids: &[i32]) -> Result<Vec<u32>, String> {
@@ -456,25 +555,34 @@ fn completion_ids(ids: &[i32]) -> Result<Vec<u32>, String> {
 pub fn prepare_grpc_completion_prompts(
     request: &CompletionRequest,
 ) -> Result<PreparedCompletionPrompts, String> {
-    let prompts = match &request.prompt {
-        PromptInput::String(text) => vec![CompletionPrompt::Text(text.clone())],
+    let (prompts, echo_texts) = match &request.prompt {
+        PromptInput::String(text) => (
+            vec![CompletionPrompt::Text(text.clone())],
+            vec![Some(text.clone())],
+        ),
         PromptInput::StringArray(texts) => {
             if texts.is_empty() {
                 return Err("completion prompt must not be empty".to_string());
             }
-            texts.iter().cloned().map(CompletionPrompt::Text).collect()
+            (
+                texts.iter().cloned().map(CompletionPrompt::Text).collect(),
+                texts.iter().cloned().map(Some).collect(),
+            )
         }
         PromptInput::IntArray(ids) => {
             if ids.is_empty() {
                 return Err("completion prompt token_ids must not be empty".to_string());
             }
-            vec![CompletionPrompt::Ids(completion_ids(ids)?)]
+            (
+                vec![CompletionPrompt::Ids(completion_ids(ids)?)],
+                vec![None],
+            )
         }
         PromptInput::IntBatch(batch) => {
             if batch.is_empty() {
                 return Err("completion prompt must not be empty".to_string());
             }
-            batch
+            let prompts = batch
                 .iter()
                 .map(|ids| {
                     if ids.is_empty() {
@@ -482,10 +590,12 @@ pub fn prepare_grpc_completion_prompts(
                     }
                     completion_ids(ids).map(CompletionPrompt::Ids)
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let echo_texts = vec![None; prompts.len()];
+            (prompts, echo_texts)
         }
     };
-    let rejected: [(&str, bool, Option<&str>); 7] = [
+    let rejected: [(&str, bool, Option<&str>); 5] = [
         ("suffix", request.suffix.is_some(), None),
         ("best_of", request.best_of.is_some(), None),
         (
@@ -493,8 +603,6 @@ pub fn prepare_grpc_completion_prompts(
             request.json_schema.is_some(),
             Some("use regex or ebnf"),
         ),
-        ("logprobs", request.logprobs.is_some(), None),
-        ("echo", request.echo, None),
         ("return_hidden_states", request.return_hidden_states, None),
         ("n > 1", request.n.unwrap_or(1) > 1, Some("use n=1")),
     ];
@@ -509,25 +617,99 @@ pub fn prepare_grpc_completion_prompts(
     }
     // Router-side only: the adapter asks the worker for ids unconditionally, so
     // this gates what the reply writes back rather than the wire request.
+    // Explicit JSON null counts as omitted for these optional extensions:
+    // vLLM accepts null for them, and clients serialize unset optionals
+    // as null, so a null must not 400 where omitting the field would not.
     let emit_token_ids = match request.other.get(RETURN_TOKEN_IDS) {
-        None => false,
+        None | Some(serde_json::Value::Null) => false,
         Some(value) => value
             .as_bool()
             .ok_or_else(|| "return_token_ids must be a boolean".to_string())?,
     };
+    let return_tokens_as_token_ids = match request.other.get(RETURN_TOKENS_AS_TOKEN_IDS) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "return_tokens_as_token_ids must be a boolean".to_string())?,
+    };
+    let logprob_token_ids = match request.other.get(LOGPROB_TOKEN_IDS) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let ids = value
+                .as_array()
+                .ok_or_else(|| "logprob_token_ids must be an array of token ids".to_string())?
+                .iter()
+                .map(|id| {
+                    id.as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .ok_or_else(|| {
+                            "logprob_token_ids must be non-negative 32-bit integers".to_string()
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if request.logprobs.is_none() {
+                return Err("logprob_token_ids requires logprobs".to_string());
+            }
+            Some(ids)
+        }
+    };
+    // `-1` asks vLLM for every prompt position: all candidates per token.
+    let prompt_logprobs_all = request
+        .other
+        .get(PROMPT_LOGPROBS)
+        .is_some_and(|value| value.as_i64() == Some(-1));
+    let prompt_logprobs = match request.other.get(PROMPT_LOGPROBS) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|value| *value == -1 || *value >= 0)
+                .and_then(|value| u32::try_from(value.max(0)).ok())
+                .ok_or_else(|| {
+                    "prompt_logprobs must be a non-negative integer or -1".to_string()
+                })?,
+        ),
+    };
+    // Explicit `prompt_logprobs` stands alone on the non-streaming path:
+    // vLLM takes the explicit value first and only derives it from
+    // `logprobs` when the client omits it and enables `echo`, and the
+    // prompt entries merge in front of `choices[].logprobs` without
+    // echoed text. Streaming keeps the old rule — vLLM's HTTP frontend
+    // rejects an explicit stream + `prompt_logprobs`, and only 0 is
+    // allowed there, asking for the sampled token per prompt position
+    // with no extra candidates. The implied count (`echo` + `logprobs`,
+    // no explicit value) is not affected by this check.
+    if let Some(explicit) = prompt_logprobs {
+        if request.stream {
+            if request.logprobs.is_none() {
+                return Err("prompt_logprobs requires logprobs".to_string());
+            }
+            if !request.echo {
+                return Err("prompt_logprobs requires echo".to_string());
+            }
+            if explicit > 0 || prompt_logprobs_all {
+                return Err("streaming prompt_logprobs must be 0".to_string());
+            }
+        }
+    }
+    if let Some(top_n) = request.logprobs {
+        if top_n > 20 {
+            return Err("logprobs must be between 0 and 20".to_string());
+        }
+    }
     ensure_supported_other(
         request
             .other
             .keys()
             .map(String::as_str)
-            .filter(|key| *key != RETURN_TOKEN_IDS),
+            .filter(|key| !COMPLETION_ONLY_OTHER.contains(key)),
         "/v1/completions",
     )?;
     let other = request
         .other
         .iter()
         .filter(|(key, _)| {
-            key.as_str() != RETURN_TOKEN_IDS && !ROUTING_ONLY.contains(&key.as_str())
+            !COMPLETION_ONLY_OTHER.contains(&key.as_str()) && !ROUTING_ONLY.contains(&key.as_str())
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
@@ -580,7 +762,18 @@ pub fn prepare_grpc_completion_prompts(
     Ok(PreparedCompletionPrompts {
         chat,
         prompts,
+        echo_texts,
         emit_token_ids,
+        options: CompletionOptions {
+            echo: request.echo,
+            logprobs: request.logprobs,
+            prompt_logprobs,
+            prompt_logprobs_all,
+            echo_only: request.echo && request.max_tokens == Some(0),
+            return_tokens_as_token_ids,
+            logprob_token_ids,
+            echo_text: None,
+        },
     })
 }
 
@@ -604,8 +797,31 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
     let PreparedCompletionPrompts {
         chat,
         mut prompts,
+        options,
         emit_token_ids,
+        ..
     } = lowered;
+    // Stage 2 (logprobs/echo) landed on the regular-pool path only, so
+    // anything that needs it stays a 400 here instead of being silently
+    // dropped. This is a scope gate, not a missing capability: the P/D
+    // decode leg shares the same `stream_openai` / `collect_openai`
+    // response path (and its per-choice accumulator) via `dispatch_decode`.
+    for (field, present) in [
+        ("logprobs", options.logprobs.is_some()),
+        ("echo", options.echo),
+        ("prompt_logprobs", options.prompt_logprobs.is_some()),
+        ("logprob_token_ids", options.logprob_token_ids.is_some()),
+        (
+            "return_tokens_as_token_ids",
+            options.return_tokens_as_token_ids,
+        ),
+    ] {
+        if present {
+            return Err(format!(
+                "{field} is not supported by the gRPC /v1/completions path"
+            ));
+        }
+    }
     let token_ids = match prompts.pop() {
         Some(CompletionPrompt::Ids(ids)) if prompts.is_empty() => ids,
         // An `IntArray` lowers to exactly one `Ids` entry.
@@ -937,6 +1153,14 @@ mod tests {
         .unwrap();
         assert!(!explicit_false.emit_token_ids);
 
+        // Explicit null is omitted, matching vLLM: no 400, no ids.
+        let explicit_null = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": null
+        })))
+        .unwrap();
+        assert!(!explicit_null.emit_token_ids);
+
         let wrong_type = prepare_grpc_completion(&completion(serde_json::json!({
             "prompt": [1],
             "return_token_ids": "yes"
@@ -1022,5 +1246,293 @@ mod tests {
         let negative = prepare_grpc_completion(&completion(serde_json::json!({"prompt": [1, -2]})))
             .unwrap_err();
         assert!(negative.contains("non-negative"), "{negative}");
+    }
+
+    #[test]
+    fn completion_options_accept_logprobs_and_echo_on_the_regular_path() {
+        // Stage 2: the regular-pool lower carries logprobs/echo through
+        // instead of rejecting them; the P/D lower still rejects them (below).
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": "hello", "logprobs": 3, "echo": true
+        })))
+        .unwrap();
+        assert_eq!(lowered.echo_texts, vec![Some("hello".to_string())]);
+        assert!(lowered.options.echo);
+        assert_eq!(lowered.options.logprobs, Some(3));
+        assert!(!lowered.options.echo_only);
+
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 3, "echo": true
+        })))
+        .unwrap();
+        assert_eq!(lowered.echo_texts, vec![None]);
+        assert!(lowered.options.echo);
+
+        // `max_tokens: 0` marks the request echo-only; the wire asks for one
+        // token and the reply drops it.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "echo": true, "max_tokens": 0
+        })))
+        .unwrap();
+        assert!(lowered.options.echo_only);
+    }
+
+    #[test]
+    fn completion_logprobs_map_onto_proto_response_options() {
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 3
+        })))
+        .unwrap();
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        let response = proto.response.unwrap();
+        assert!(response.output_logprobs);
+        assert!(matches!(
+            response.output_candidates.and_then(|c| c.select),
+            Some(pb::candidate_tokens::Select::TopN(3))
+        ));
+        assert!(!response.prompt_logprobs);
+        assert!(response.prompt_candidates.is_none());
+
+        // `echo` + `logprobs` implies prompt logprobs with the same top-N.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 3, "echo": true
+        })))
+        .unwrap();
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        let response = proto.response.unwrap();
+        assert!(response.prompt_logprobs);
+        assert!(matches!(
+            response.prompt_candidates.and_then(|c| c.select),
+            Some(pb::candidate_tokens::Select::TopN(3))
+        ));
+
+        // Explicit `prompt_logprobs: -1` asks for every prompt position:
+        // all candidates per token. It needs `logprobs` and `echo`.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 2, "echo": true, "prompt_logprobs": -1
+        })))
+        .unwrap();
+        assert_eq!(lowered.options.prompt_logprobs, Some(0));
+        assert!(lowered.options.prompt_logprobs_all);
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        let response = proto.response.unwrap();
+        assert!(response.prompt_logprobs);
+        assert!(matches!(
+            response.prompt_candidates.and_then(|c| c.select),
+            Some(pb::candidate_tokens::Select::All(true))
+        ));
+        assert!(response.output_logprobs);
+
+        // `logprob_token_ids` selects ids instead of top-N for the output.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 2, "logprob_token_ids": [7, 8]
+        })))
+        .unwrap();
+        assert_eq!(lowered.options.logprob_token_ids, Some(vec![7, 8]));
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        let response = proto.response.unwrap();
+        assert!(matches!(
+            response.output_candidates.and_then(|c| c.select),
+            Some(pb::candidate_tokens::Select::TokenIds(ids)) if ids.ids == vec![7, 8]
+        ));
+
+        // `logprobs: 0` asks for the sampled token only: no candidates.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "logprobs": 0
+        })))
+        .unwrap();
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        let response = proto.response.unwrap();
+        assert!(response.output_logprobs);
+        assert!(response.output_candidates.is_none());
+    }
+
+    #[test]
+    fn completion_logprobs_options_are_validated() {
+        let too_many = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "logprobs": 21
+        })))
+        .unwrap_err();
+        assert!(too_many.contains("between 0 and 20"), "{too_many}");
+
+        let ids_without_logprobs =
+            prepare_grpc_completion_prompts(&completion(serde_json::json!({
+                "prompt": [1], "logprob_token_ids": [7]
+            })))
+            .unwrap_err();
+        assert!(
+            ids_without_logprobs.contains("requires logprobs"),
+            "{ids_without_logprobs}"
+        );
+
+        let bad_prompt_logprobs = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": -2
+        })))
+        .unwrap_err();
+        assert!(
+            bad_prompt_logprobs.contains("prompt_logprobs"),
+            "{bad_prompt_logprobs}"
+        );
+
+        let bad_type = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "logprobs": 2, "logprob_token_ids": "seven"
+        })))
+        .unwrap_err();
+        assert!(bad_type.contains("array"), "{bad_type}");
+
+        // Explicit null counts as omitted for these optional extensions,
+        // matching vLLM: no 400, and no implied requirement fires — a
+        // null `logprob_token_ids` without `logprobs` is fine, while a
+        // real list still requires `logprobs`.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1],
+            "prompt_logprobs": null,
+            "logprob_token_ids": null,
+            "return_tokens_as_token_ids": null
+        })))
+        .unwrap();
+        assert_eq!(lowered.options.prompt_logprobs, None);
+        assert!(!lowered.options.prompt_logprobs_all);
+        assert_eq!(lowered.options.logprob_token_ids, None);
+        assert!(!lowered.options.return_tokens_as_token_ids);
+
+        // Non-streaming explicit `prompt_logprobs` stands alone — no
+        // `logprobs` or `echo` needed, matching vLLM, which takes the
+        // explicit value first. Streaming still requires both, and the
+        // logprobs check reports first.
+        for value in [
+            serde_json::json!({"prompt": [1], "prompt_logprobs": 2}),
+            serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "echo": true}),
+            serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "logprobs": 2}),
+        ] {
+            let lowered = prepare_grpc_completion_prompts(&completion(value)).unwrap();
+            assert_eq!(lowered.options.prompt_logprobs, Some(2));
+        }
+        for (value, message) in [
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "echo": true, "stream": true}),
+                "prompt_logprobs requires logprobs",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "logprobs": 2, "stream": true}),
+                "prompt_logprobs requires echo",
+            ),
+        ] {
+            let err = prepare_grpc_completion_prompts(&completion(value)).unwrap_err();
+            assert!(err.contains(message), "{err}");
+        }
+
+        // Streaming rejects a positive explicit count (or -1) outright,
+        // following vLLM; only 0 is allowed there.
+        for value in [-1, 2] {
+            let err = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+                "prompt": [1], "prompt_logprobs": value, "logprobs": 2, "echo": true, "stream": true
+            })))
+            .unwrap_err();
+            assert!(err.contains("streaming prompt_logprobs must be 0"), "{err}");
+        }
+
+        // The same count is fine non-streaming, and streaming allows 0
+        // (sampled token per prompt position, no extra candidates).
+        prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": 2, "logprobs": 2, "echo": true
+        })))
+        .unwrap();
+        prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": 0, "logprobs": 2, "echo": true, "stream": true
+        })))
+        .unwrap();
+    }
+
+    #[test]
+    fn echo_only_asks_the_engine_for_one_token() {
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "echo": true, "max_tokens": 0
+        })))
+        .unwrap();
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        assert_eq!(proto.stopping.unwrap().max_new_tokens, 1);
+
+        // Without `echo` the same request asks for zero tokens: vLLM only
+        // turns `echo` + `max_tokens: 0` into a one-token request.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "max_tokens": 0
+        })))
+        .unwrap();
+        assert!(!lowered.options.echo_only);
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        assert_eq!(proto.stopping.unwrap().max_new_tokens, 0);
+    }
+
+    #[test]
+    fn pd_lower_still_rejects_logprobs_and_echo() {
+        // Stage 2 landed on the regular-pool path only, so these stay 400s
+        // on the P/D path (a scope gate, not a missing accumulator: the P/D
+        // decode leg shares the same response path).
+        for (body, field) in [
+            (
+                serde_json::json!({"prompt": [1], "logprobs": 3}),
+                "logprobs",
+            ),
+            (serde_json::json!({"prompt": [1], "echo": true}), "echo"),
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2}),
+                "prompt_logprobs",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "logprobs": 2, "logprob_token_ids": [7]}),
+                // The guard reports its first hit, not the later field.
+                "logprobs",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "return_tokens_as_token_ids": true}),
+                "return_tokens_as_token_ids",
+            ),
+        ] {
+            let err = prepare_grpc_completion(&completion(body)).unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
     }
 }

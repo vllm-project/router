@@ -1034,6 +1034,16 @@ pub struct CompletionChoice {
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
+    /// vLLM extension: logprobs for the prompt tokens, one entry per
+    /// prompt position — `None` for the first position (nothing predicts
+    /// it), then a map from token id to candidate logprob. Populated
+    /// whenever prompt logprobs were requested (explicit
+    /// `prompt_logprobs`, or `echo` + `logprobs`), echo or not. Kept
+    /// separate from `logprobs` so the output entries' `text_offset`
+    /// stays relative to the generated text; prompt entries merge into
+    /// `logprobs` only under `echo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<PromptLogprobs>,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter", etc.
     /// Information about which stop condition was matched
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1075,6 +1085,11 @@ pub struct CompletionStreamChoice {
     /// vLLM extension: emitted for `return_token_ids` requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<u32>>,
+    /// vLLM extension: the prompt ids, emitted for `return_token_ids`
+    /// requests on the first echo chunk only; `token_ids` holds
+    /// generated ids only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
 }
 
 // ==================================================================
@@ -2022,6 +2037,24 @@ pub struct LogProbs {
     pub top_logprobs: Vec<Option<HashMap<String, f32>>>,
     pub text_offset: Vec<u32>,
 }
+
+/// One candidate in a vLLM `prompt_logprobs` entry: the logprob of one
+/// token id at one prompt position, with its rank and decoded text.
+/// Mirrors vLLM's `Logprob` (`logprob`, `rank`, `decoded_token`).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct PromptLogprob {
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoded_token: Option<String>,
+}
+
+/// vLLM `prompt_logprobs`: one entry per prompt position — `None` for
+/// the first position (nothing predicts the first prompt token), then a
+/// map from token id to candidate logprob. Integer keys serialize as
+/// strings in JSON, matching vLLM.
+pub type PromptLogprobs = Vec<Option<HashMap<u32, PromptLogprob>>>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatLogProbs {
