@@ -285,6 +285,24 @@ impl Default for HealthConfig {
     }
 }
 
+impl From<&crate::config::HealthCheckConfig> for HealthConfig {
+    fn from(config: &crate::config::HealthCheckConfig) -> Self {
+        Self {
+            timeout_secs: config.timeout_secs,
+            check_interval_secs: config.check_interval_secs,
+            endpoint: config.endpoint.clone(),
+            failure_threshold: config.failure_threshold,
+            success_threshold: config.success_threshold,
+        }
+    }
+}
+
+/// Append the health path to the worker's HTTP base, preserving any path prefix.
+pub(crate) fn worker_health_url(worker_url: &str, endpoint: &str) -> String {
+    let base = crate::backend::strip_dp_suffix(worker_url).trim_end_matches('/');
+    format!("{base}/{}", endpoint.trim_start_matches('/'))
+}
+
 /// Metadata associated with a worker
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {
@@ -436,7 +454,7 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
+                let health_url = worker_health_url(url, &self.metadata.health_config.endpoint);
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request

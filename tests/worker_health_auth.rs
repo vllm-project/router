@@ -26,12 +26,12 @@ impl Drop for HealthServer {
 }
 
 impl HealthServer {
-    async fn new(key: Option<&str>) -> Self {
+    async fn new(key: Option<&str>, endpoint: &str) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         let expected = key.map(|key| format!("Bearer {key}"));
         let app = axum::Router::new().route(
-            "/health",
+            endpoint,
             get(move |headers: HeaderMap| {
                 let captured = captured.clone();
                 let expected = expected.clone();
@@ -67,7 +67,7 @@ impl HealthServer {
     }
 }
 
-fn context(key: Option<&str>, dp_size: usize) -> Arc<AppContext> {
+fn context(key: Option<&str>, dp_size: usize, endpoint: &str) -> Arc<AppContext> {
     Arc::new(
         AppContext::new(
             RouterConfig {
@@ -75,6 +75,10 @@ fn context(key: Option<&str>, dp_size: usize) -> Arc<AppContext> {
                 intra_node_data_parallel_size: dp_size,
                 worker_startup_timeout_secs: 1,
                 worker_startup_check_interval_secs: 1,
+                health_check: vllm_router_rs::config::HealthCheckConfig {
+                    endpoint: endpoint.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             reqwest::Client::new(),
@@ -86,12 +90,12 @@ fn context(key: Option<&str>, dp_size: usize) -> Arc<AppContext> {
     )
 }
 
-async fn check_pd_health(key: Option<&str>, dp_size: usize) {
-    let prefill = HealthServer::new(key).await;
-    let decode = HealthServer::new(key).await;
-    let added_prefill = HealthServer::new(key).await;
-    let added_decode = HealthServer::new(key).await;
-    let ctx = context(key, dp_size);
+async fn check_pd_health(key: Option<&str>, dp_size: usize, endpoint: &str) {
+    let prefill = HealthServer::new(key, endpoint).await;
+    let decode = HealthServer::new(key, endpoint).await;
+    let added_prefill = HealthServer::new(key, endpoint).await;
+    let added_decode = HealthServer::new(key, endpoint).await;
+    let ctx = context(key, dp_size, endpoint);
     let router = PdRouterBase::new(
         vec![(prefill.url.clone(), None)],
         vec![decode.url.clone()],
@@ -119,20 +123,20 @@ async fn check_pd_health(key: Option<&str>, dp_size: usize) {
 
 #[tokio::test]
 async fn pd_health_auth_sends_key_to_startup_runtime_and_dynamic_workers() {
-    check_pd_health(Some("worker-key"), 1).await;
-    check_pd_health(Some("worker-key"), 2).await;
+    check_pd_health(Some("worker-key"), 1, "/health").await;
+    check_pd_health(Some("worker-key"), 2, "/readyz").await;
 }
 
 #[tokio::test]
 async fn pd_health_auth_without_key_sends_no_header() {
-    check_pd_health(None, 1).await;
+    check_pd_health(None, 1, "/health").await;
 }
 
 /// Dynamic IGW registration accepts arbitrary destinations, so it must not forward the shared router credential.
 #[tokio::test]
 async fn igw_registered_workers_do_not_forward_router_credentials() {
     let key = Some("worker-key");
-    let ctx = context(key, 1);
+    let ctx = context(key, 1, "/health");
     let manager = RouterManager::new(
         ctx.router_config.clone(),
         ctx.client.clone(),
@@ -140,7 +144,7 @@ async fn igw_registered_workers_do_not_forward_router_credentials() {
         ctx.policy_registry.clone(),
     );
     for role in ["regular", "prefill", "decode"] {
-        let server = HealthServer::new(key).await;
+        let server = HealthServer::new(key, "/health").await;
         let config: WorkerConfigRequest = serde_json::from_value(serde_json::json!({
             "url": server.url,
             "model_id": "test-model",
