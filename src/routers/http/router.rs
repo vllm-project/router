@@ -20,15 +20,14 @@ use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
 };
+use crate::kv_decision::KvDecisionStage;
 use crate::kv_index::discovery::inferred_lora_name;
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-use crate::policies::kv_aware_policy;
 use crate::policies::KvRequestTokens;
 use crate::policies::{
-    kv_aware_ops, AffinityKey, KvRequestSlot, KvSelectionReceipt, LoadBalancingPolicy,
-    PolicyRegistry,
+    kv_aware_ops, kv_aware_policy, AffinityKey, KvRequestSlot, KvSelectionReceipt,
+    LoadBalancingPolicy, PolicyRegistry, QualifiedKvInput,
 };
 use crate::program_scheduling::{
     ArrivalTokenFacts, BackendObservationProvider, ProgramIdentity, ProgramScheduler,
@@ -65,7 +64,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument, Span};
 
 pub(super) fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -1686,6 +1685,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         token_ids: KvRequestTokens<'_>,
         eligibility: Option<&[bool]>,
+        cache_read_fallback: Option<&'static str>,
         lora_name: Option<&str>,
         cache_salt: Option<&str>,
         affinity_key: Option<&AffinityKey>,
@@ -1700,17 +1700,20 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        if let Some(kv_aware) = kv_aware_ops(policy.as_ref()) {
+        if let Some(kv_aware) = kv_aware_policy(policy.as_ref()) {
             // The policy sees the full list: a retry exclusion must not
             // rewrite a still-valid binding.
             let receipt = kv_aware.select_worker_with_qualified_inputs(
                 available,
-                token_ids,
+                QualifiedKvInput {
+                    tokens: token_ids,
+                    eligibility,
+                    cache_read_fallback,
+                },
                 lora_name,
                 cache_salt,
                 affinity_key,
                 excluded_workers,
-                eligibility,
             )?;
             return Some(SelectedWorker {
                 worker: available.get(receipt.worker_index)?.clone(),
@@ -2111,7 +2114,7 @@ impl Router {
                     }) {
                         return Self::program_target_unavailable_response(route);
                     }
-                    let kv_receipt = kv_aware_ops(policy.as_ref()).and_then(|kv_aware| {
+                    let kv_receipt = kv_aware_policy(policy.as_ref()).and_then(|kv_aware| {
                         let eligibility = self.kv_placement_eligibility(
                             std::slice::from_ref(&worker),
                             typed_req.get_model(),
@@ -2120,12 +2123,15 @@ impl Router {
                         );
                         kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
-                            request_tokens,
+                            QualifiedKvInput {
+                                tokens: request_tokens,
+                                eligibility: eligibility.as_deref(),
+                                cache_read_fallback,
+                            },
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            eligibility.as_deref(),
                         )
                     });
                     Some(SelectedWorker { worker, kv_receipt })
@@ -2147,6 +2153,7 @@ impl Router {
                         headers,
                         request_tokens,
                         eligibility.as_deref(),
+                        cache_read_fallback,
                         lora_name,
                         cache_salt,
                         affinity_key.as_ref(),
@@ -2172,6 +2179,10 @@ impl Router {
                     };
                     debug!(attempt, worker_url = worker.url(), target = %receipt.decision.target.instance_id, rank = receipt.decision.target.dp_rank, new_prefill_tokens = receipt.new_prefill_tokens, input_known = input_tokens.is_some(), input_tokens, "KV request selected");
                 }
+                let decision_trace = kv_receipt.as_ref().map(|receipt| receipt.trace.clone());
+                let dispatch_span = decision_trace.as_ref().map_or_else(Span::none, |trace| {
+                    trace.dispatch_span(KvDecisionStage::Regular)
+                });
                 let load = RequestLoadGuard::from_selection(
                     worker.clone(),
                     kv_receipt,
@@ -2193,6 +2204,7 @@ impl Router {
                         },
                         program_completion.clone(),
                     )
+                    .instrument(dispatch_span)
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
@@ -3631,6 +3643,7 @@ impl RouterTrait for Router {
 
         let policy = self.policy_for_model(routing_model);
         let kv_ops = kv_aware_ops(policy.as_ref());
+        let kv_policy = kv_aware_policy(policy.as_ref());
         // Serializing the whole body is expensive when it carries base64
         // media; only consumers that actually read the text pay for it.
         let request_text = if (policy.needs_request_text() && !policy.needs_cache_routing_key())
@@ -3721,45 +3734,52 @@ impl RouterTrait for Router {
                 .get_by_url(&completion.dispatch().target_id)
                 .filter(|worker| worker.is_available())
                 .map(|worker| {
-                    let kv_receipt = kv_ops.and_then(|ops| {
+                    let kv_receipt = kv_policy.and_then(|kv_aware| {
                         let eligibility = self.kv_placement_eligibility(
                             std::slice::from_ref(&worker),
                             model_id,
                             lora_name,
                             cache_read_fallback.is_some(),
                         );
-                        ops.select_worker_with_qualified_inputs(
+                        kv_aware.select_worker_with_qualified_inputs(
                             std::slice::from_ref(&worker),
-                            request_tokens,
+                            QualifiedKvInput {
+                                tokens: request_tokens,
+                                eligibility: eligibility.as_deref(),
+                                cache_read_fallback,
+                            },
                             lora_name,
                             cache_salt,
                             affinity_key.as_ref(),
                             &[],
-                            eligibility.as_deref(),
                         )
                     });
                     SelectedWorker { worker, kv_receipt }
                 })
-        } else if let Some(ops) = kv_ops {
+        } else if let Some(kv_aware) = kv_policy {
             let eligibility = self.kv_placement_eligibility(
                 &workers,
                 model_id,
                 lora_name,
                 cache_read_fallback.is_some(),
             );
-            ops.select_worker_with_qualified_inputs(
-                &workers,
-                request_tokens,
-                lora_name,
-                cache_salt,
-                affinity_key.as_ref(),
-                &[],
-                eligibility.as_deref(),
-            )
-            .map(|receipt| SelectedWorker {
-                worker: workers[receipt.worker_index].clone(),
-                kv_receipt: Some(receipt),
-            })
+            kv_aware
+                .select_worker_with_qualified_inputs(
+                    &workers,
+                    QualifiedKvInput {
+                        tokens: request_tokens,
+                        eligibility: eligibility.as_deref(),
+                        cache_read_fallback,
+                    },
+                    lora_name,
+                    cache_salt,
+                    affinity_key.as_ref(),
+                    &[],
+                )
+                .map(|receipt| SelectedWorker {
+                    worker: workers[receipt.worker_index].clone(),
+                    kv_receipt: Some(receipt),
+                })
         } else if let Some(cache) = policy
             .as_any()
             .downcast_ref::<crate::policies::CacheAwarePolicy>()
@@ -3806,6 +3826,7 @@ impl RouterTrait for Router {
         };
         let url = worker.endpoint_url(path);
 
+        let decision_trace = kv_receipt.as_ref().map(|receipt| receipt.trace.clone());
         let load_tracked = policy.tracks_request_load() || program_completion.is_some();
         let load = load_tracked
             .then(|| RequestLoadGuard::from_selection(worker.clone(), kv_receipt, true));
@@ -3904,6 +3925,9 @@ impl RouterTrait for Router {
                 request_phase: Some("inference"),
             },
         )
+        .instrument(decision_trace.as_ref().map_or_else(Span::none, |trace| {
+            trace.dispatch_span(KvDecisionStage::Regular)
+        }))
         .await
         {
             Ok(response) => {
@@ -8187,6 +8211,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     &[],
                 )
                 .expect("Should select a worker");
@@ -8228,6 +8253,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &[],
             )
             .expect("Should select the remaining healthy worker");
@@ -8260,6 +8286,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
         );
         assert!(
@@ -8279,6 +8306,7 @@ mod tests {
                     Some(r#"{"prompt": "test"}"#),
                     None,
                     KvRequestTokens::Shared(None),
+                    None,
                     None,
                     None,
                     None,
@@ -8311,6 +8339,7 @@ mod tests {
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
                 KvRequestTokens::Shared(None),
+                None,
                 None,
                 None,
                 None,

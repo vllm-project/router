@@ -7344,6 +7344,7 @@ dependencies = [
  "hf-hub 0.4.3",
  "http",
  "http-body-util",
+ "hyper",
  "k8s-openapi",
  "kube",
  "lazy_static",

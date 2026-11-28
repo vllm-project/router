@@ -24,6 +24,155 @@ use vllm_router_rs::{
 /// What a [`RecordingPrefill`] saw: request text and headers per call.
 type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
 
+#[derive(Debug)]
+struct ObservedKvPrefill {
+    inner: vllm_router_rs::policies::KvAwarePolicy,
+    calls: AtomicUsize,
+}
+
+impl LoadBalancingPolicy for ObservedKvPrefill {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.inner
+            .select_worker_with_headers(workers, text, headers)
+    }
+
+    fn select_worker_with_observation(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        stage: vllm_router_rs::kv_decision::KvDecisionStage,
+    ) -> Option<(usize, Option<vllm_router_rs::kv_decision::KvDecisionTrace>)> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .select_worker_with_observation(workers, text, headers, stage)
+    }
+
+    fn name(&self) -> &'static str {
+        "kv_aware"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        &self.inner
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn program_kv_prefill_observation_survives_warm_and_cold_dispatch_without_reselection() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{testing::trace::InMemorySpanExporter, trace::TracerProvider};
+    use tracing::Instrument;
+    use tracing_subscriber::layer::SubscriberExt;
+    use vllm_router_rs::otel_trace::{self, PreparedOtel};
+
+    let exporter = InMemorySpanExporter::default();
+    let provider = TracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let prepared = PreparedOtel::from_parts(provider.clone(), provider.tracer("program-kv-test"));
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(prepared.layer()));
+    otel_trace::activate_otel(prepared);
+
+    let p = engine_with_cold_metadata(true, false, false, true).await;
+    let d = engine_with_cold_metadata(false, false, false, true).await;
+    let policy = Arc::new(ObservedKvPrefill {
+        inner: Default::default(),
+        calls: AtomicUsize::new(0),
+    });
+    let router =
+        router_with_custom_prefill_policy(&[&p], &d, policy.clone(), false, json!({})).await;
+    for (program, warm_shape, prompt) in [
+        ("cold-only-trace", false, vec![11, 12, 13]),
+        ("warm-trace", true, vec![11, 12, 13]),
+        ("warm-trace", true, vec![11, 12, 13, 42, 43, 44, 45, 99]),
+    ] {
+        let request = completion_body(program, &prompt, warm_shape, false);
+        let root = tracing::info_span!(target: "otel_trace", "program_request");
+        let (status, _, _) = send_completion(&router, None, request)
+            .instrument(root)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        policy.calls.load(Ordering::SeqCst),
+        3,
+        "one pure selection per Program turn"
+    );
+    assert_eq!(
+        p.state.calls.lock().unwrap().len(),
+        3,
+        "declined warm shape reuses the selected P"
+    );
+    assert_eq!(d.state.calls.lock().unwrap().len(), 3);
+    {
+        let calls = p.state.calls.lock().unwrap();
+        assert_eq!(
+            calls[2].pointer("/kv_transfer_params/remote_engine_id"),
+            Some(&json!("d-engine"))
+        );
+        assert_eq!(
+            calls[2].pointer("/kv_transfer_params/remote_request_id"),
+            Some(&json!("engine-owned-request"))
+        );
+        assert_eq!(
+            calls[2].pointer("/kv_transfer_params/remote_num_tokens"),
+            Some(&json!(3))
+        );
+    }
+    assert!(
+        router
+            .worker_registry()
+            .get_prefill_workers()
+            .iter()
+            .all(|worker| worker.load() == 0),
+        "the observation API must not reserve extra worker load"
+    );
+    let spans = exporter.get_finished_spans().unwrap();
+    let roots: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "program_request")
+        .collect();
+    assert_eq!(
+        roots.len(),
+        3,
+        "all requests end while the router and engines remain alive"
+    );
+    let routes: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "kv_route")
+        .collect();
+    assert_eq!(routes.len(), 3);
+    for route in routes {
+        assert!(roots
+            .iter()
+            .any(|root| root.span_context.span_id() == route.parent_span_id));
+        let attr = |name: &str| {
+            route
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == name)
+                .unwrap()
+                .value
+                .to_string()
+        };
+        assert_eq!(attr("stage"), "prefill");
+        assert_eq!(attr("outcome"), "missing_tokens");
+        assert_eq!(attr("credited_tokens"), "unavailable");
+        assert!(spans.iter().any(|span| span.name == "prefill_dispatch"
+            && span.parent_span_id == route.span_context.span_id()));
+    }
+    assert!(
+        !spans.iter().any(|span| span.name == "decode_dispatch"),
+        "Program-bound D has no KV policy receipt"
+    );
+    otel_trace::shutdown_otel();
+}
+
 #[derive(Clone)]
 struct StateData {
     p: bool,
@@ -50,6 +199,15 @@ impl Drop for Engine {
     }
 }
 async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
+    engine_with_cold_metadata(p, fail_warm, partial, false).await
+}
+
+async fn engine_with_cold_metadata(
+    p: bool,
+    fail_warm: bool,
+    partial: bool,
+    cold_metadata: bool,
+) -> Engine {
     let state = StateData {
         p,
         calls: Arc::new(Mutex::new(vec![])),
@@ -82,6 +240,22 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
             Json(json!({"protocol_revision":"vllm-0.28.0-pd-feedback-v1","instance_epoch":s.epoch.load(Ordering::SeqCst).to_string(),"profile":"test-profile","dp_rank":0,"bidirectional":true,"fail_on_load_error":true,"read_margin_millis":5000,"local_miss_guard":true,"local_prefix_probe":true,"store":false})).into_response()
         }))
         .route("/v1/completions",post(generate)).with_state(state.clone());
+    let app = if cold_metadata {
+        app.layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let metadata = request.uri().path() != "/v1/completions";
+                let mut response = next.run(request).await;
+                if metadata {
+                    response
+                        .headers_mut()
+                        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                }
+                response
+            },
+        ))
+    } else {
+        app
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {

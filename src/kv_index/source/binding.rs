@@ -499,6 +499,8 @@ impl CacheCapabilities {
 }
 
 impl SourceBinding {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(in crate::kv_index) fn page_snapshot<'a, 'b>(
         &self,
         namespace: Option<&str>,
@@ -506,20 +508,34 @@ impl SourceBinding {
         stop_at_gap: bool,
         cache: &'b mut RequestHashCache<'a>,
     ) -> Option<PageSnapshot<'b>> {
+        self.observed_page_snapshot(namespace, tokens, stop_at_gap, cache)
+            .0
+    }
+
+    pub(in crate::kv_index) fn observed_page_snapshot<'a, 'b>(
+        &self,
+        namespace: Option<&str>,
+        tokens: &'a [u32],
+        stop_at_gap: bool,
+        cache: &'b mut RequestHashCache<'a>,
+    ) -> (Option<PageSnapshot<'b>>, bool) {
         if self
             .binding
             .as_ref()
             .is_some_and(|binding| !binding.is_active())
         {
-            return None;
+            return (None, false);
         }
         let generation = self.control.generation();
         if generation == 0 {
-            return None;
+            return (None, false);
         }
         let adapter = match namespace {
             None => None,
-            Some(name) => Some((name, self.adapter_path(name)?)),
+            Some(name) => match self.adapter_path(name) {
+                Some(path) => Some((name, path)),
+                None => return (None, false),
+            },
         };
         let queries = self.groups.iter().map(|group| PageQuery {
             group: group.group_idx,
@@ -539,19 +555,23 @@ impl SourceBinding {
             queries.clone().map(|query| evidence.get(&query)),
         ) {
             return match matched {
-                PageMatch::Miss => None,
-                PageMatch::Hit(claims, version) => Some((
-                    claims,
-                    PlacementSnapshot {
-                        version,
-                        generation,
-                    },
-                )),
+                PageMatch::Miss => (None, false),
+                PageMatch::Hit(claims, version) => (
+                    Some((
+                        claims,
+                        PlacementSnapshot {
+                            version,
+                            generation,
+                        },
+                    )),
+                    true,
+                ),
             };
         }
         // Borrow unchanged evidence. Refresh all required groups together
         // when the source changed since collection.
-        self.index
+        let snapshot = self
+            .index
             .with_source_snapshot(&self.target, |view| {
                 let state = view.stream(&self.owner)?;
                 if state.next_seq.is_none() || !state.visible() {
@@ -590,7 +610,9 @@ impl SourceBinding {
                     },
                 ))
             })
-            .flatten()
+            .flatten();
+        let available = snapshot.is_some();
+        (snapshot, available)
     }
 
     /// The credited prefix, its storage tier, and the snapshot that proves it.
@@ -598,6 +620,8 @@ impl SourceBinding {
     /// memory or on storage is still restorable, but the policy weighs it by the
     /// transfer credit of its tier, so the boundary is reported at the slowest
     /// tier that any group needs to satisfy it.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(in crate::kv_index) fn credit_parts<'a>(
         &self,
         namespace: Option<&str>,
@@ -605,17 +629,31 @@ impl SourceBinding {
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
     ) -> Option<(u64, StorageTier, PlacementSnapshot)> {
+        self.observed_credit_parts(namespace, tokens, max_reusable_tokens, cache)
+            .0
+    }
+
+    pub(in crate::kv_index) fn observed_credit_parts<'a>(
+        &self,
+        namespace: Option<&str>,
+        tokens: &'a [u32],
+        max_reusable_tokens: usize,
+        cache: &mut RequestHashCache<'a>,
+    ) -> (Option<(u64, StorageTier, PlacementSnapshot)>, bool) {
         let replay_tokens = if cache.count_replay_pages {
             0
         } else {
             self.replay_tokens
         };
-        let (claims, snapshot) = self.page_snapshot(namespace, tokens, true, cache)?;
+        let (view, available) = self.observed_page_snapshot(namespace, tokens, true, cache);
+        let Some((claims, snapshot)) = view else {
+            return (None, available);
+        };
         if claims
             .iter()
             .all(|pages| pages.prefix_len == 0 && pages.tail.is_empty())
         {
-            return None;
+            return (None, self.snapshot_is_current(&snapshot));
         }
         let (credited, tier) = crate::kv_index::layout::credit_from_pages(
             &self.groups,
@@ -632,13 +670,15 @@ impl SourceBinding {
                 dense_lookups: &self.dense_lookups,
             },
         );
-        let tier = tier?;
+        let Some(tier) = tier else {
+            return (None, self.snapshot_is_current(&snapshot));
+        };
         if u32::try_from(credited / self.keys.block_size() as u64).is_err()
             || !self.snapshot_is_current(&snapshot)
         {
-            return None;
+            return (None, false);
         }
-        Some((credited, tier, snapshot))
+        (Some((credited, tier, snapshot)), true)
     }
     pub(in crate::kv_index) fn snapshot_is_current(&self, snapshot: &PlacementSnapshot) -> bool {
         snapshot.is_current(&self.control, self.binding.as_ref())

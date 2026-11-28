@@ -3,6 +3,7 @@
 //! Tokenize on the router, send `token_ids`, detok the returned ids.
 //! Channel cache is per connect URI.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Channel;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 use super::convert::{
@@ -40,6 +41,38 @@ use crate::protocols::spec::Usage;
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy)]
+struct ChannelTaskExecutor {
+    otel_enabled: fn() -> bool,
+}
+
+impl Default for ChannelTaskExecutor {
+    fn default() -> Self {
+        Self {
+            otel_enabled: crate::otel_trace::is_otel_enabled,
+        }
+    }
+}
+
+impl<F> hyper::rt::Executor<F> for ChannelTaskExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        if (self.otel_enabled)() {
+            // Connections and their buffer workers outlive individual RPCs.
+            // Inheriting the current span would keep a request's dispatch and
+            // decision alive until the cached channel closes, also on reconnect.
+            tokio::spawn(future);
+        } else {
+            // Match the locked hyper-util executor's tracing-enabled behavior
+            // for ordinary logs when request OTel observation is disabled.
+            tokio::spawn(future.in_current_span());
+        }
+    }
+}
 
 pub(crate) type FirstOutputCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -252,6 +285,7 @@ impl GrpcEngineBackend {
         let channel = Channel::from_shared(uri.clone())
             .map_err(|e| format!("invalid grpc uri {uri}: {e}"))?
             .connect_timeout(self.connect_timeout)
+            .executor(ChannelTaskExecutor::default())
             .connect()
             .await
             .map_err(|e| format!("grpc connect {uri}: {e}"))?;
@@ -1003,6 +1037,104 @@ mod tests {
     use super::*;
     use crate::backend::pb::{GenerateResponse, PromptInfo, SequenceOutput};
     use std::sync::atomic::Ordering;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_executor_detaches_enabled_tasks_and_preserves_disabled_context() {
+        use tracing_subscriber::{
+            layer::{Context, SubscriberExt},
+            registry::LookupSpan,
+            Layer,
+        };
+
+        struct CloseRequest(Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>);
+
+        impl<S> Layer<S> for CloseRequest
+        where
+            S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+        {
+            fn on_close(&self, id: tracing::span::Id, context: Context<'_, S>) {
+                if context
+                    .span(&id)
+                    .is_none_or(|span| span.name() != "grpc_channel_request")
+                {
+                    return;
+                }
+                if let Some(closed) = self.0.lock().unwrap().take() {
+                    let _ = closed.send(());
+                }
+            }
+        }
+
+        for enabled in [true, false] {
+            // Local gates exercise the real Executor implementation without
+            // changing the process-global OTel flag used by other library tests.
+            let executor = ChannelTaskExecutor {
+                otel_enabled: if enabled { || true } else { || false },
+            };
+            // A cached Endpoint reuses its executor for later connection work.
+            for phase in ["initial", "later"] {
+                let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel();
+                let close = CloseRequest(Arc::new(std::sync::Mutex::new(Some(closed_tx))));
+                let subscriber = tracing_subscriber::registry().with(close.with_filter(
+                    tracing_subscriber::filter::filter_fn(|metadata| {
+                        matches!(
+                            metadata.name(),
+                            "grpc_channel_request" | "grpc_channel_nested"
+                        )
+                    }),
+                ));
+                let _subscriber = tracing::subscriber::set_default(subscriber);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+                let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+                let request = tracing::info_span!(target: "otel_trace", "grpc_channel_request");
+                let nested = tracing::debug_span!(
+                    target: "h2::client",
+                    parent: &request,
+                    "grpc_channel_nested"
+                );
+                {
+                    let _entered = nested.enter();
+                    hyper::rt::Executor::execute(&executor, async move {
+                        let inherited = tracing::Span::current().metadata().map(|meta| meta.name());
+                        let _ = started_tx.send(inherited);
+                        let _ = resume_rx.await;
+                        let _ = finished_tx.send(());
+                    });
+                }
+                drop(nested);
+                drop(request);
+                let inherited = tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("the channel task must start")
+                    .unwrap();
+                if enabled {
+                    assert_eq!(inherited, None);
+                    assert!(
+                        closed_rx.try_recv().is_ok(),
+                        "a live {phase} connection task must not retain the request"
+                    );
+                } else {
+                    assert_eq!(inherited, Some("grpc_channel_nested"));
+                    assert!(matches!(
+                        closed_rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ));
+                }
+                resume_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), finished_rx)
+                    .await
+                    .expect("the channel task must finish")
+                    .unwrap();
+                if !enabled {
+                    tokio::time::timeout(Duration::from_secs(5), closed_rx)
+                        .await
+                        .expect("the inherited request must close with the task")
+                        .unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn prompt_info_does_not_count_as_generated_output() {

@@ -26,8 +26,6 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-pub(crate) use kv_aware::kv_aware_policy;
 #[doc(hidden)]
 pub use kv_aware::PdWorkPrices;
 pub(crate) use kv_aware::ValidatedWorkPrices;
@@ -39,6 +37,7 @@ pub use kv_aware::{
     SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
     WorkerTokenInputs,
 };
+pub(crate) use kv_aware::{kv_aware_policy, QualifiedKvInput};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -87,6 +86,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize>;
+
+    /// Pure selection with an optional bounded observation. The default invokes
+    /// the original selector exactly once and never reserves worker load.
+    fn select_worker_with_observation(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+        _stage: crate::kv_decision::KvDecisionStage,
+    ) -> Option<(usize, Option<crate::kv_decision::KvDecisionTrace>)> {
+        self.select_worker_with_headers(workers, request_text, headers)
+            .map(|index| (index, None))
+    }
 
     /// Select a worker and reserve its local load before another admission
     /// through this context can make a load-based decision.

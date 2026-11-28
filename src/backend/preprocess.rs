@@ -525,8 +525,7 @@ async fn http_input_json(
     } else if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
         request = request.header("authorization", value);
     }
-    let response = request
-        .send()
+    let response = crate::otel_http::send_request(request)
         .await
         .map_err(|_| "preparation_unavailable")?;
     match response.status() {

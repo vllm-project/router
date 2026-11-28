@@ -4,6 +4,8 @@ pub(crate) mod config;
 pub use config::apply_kv_layout_file;
 pub mod request_hash;
 mod routing_provider;
+#[doc(hidden)]
+pub use routing_provider::ObservedMatches;
 pub use routing_provider::TieredMatchProvider;
 pub(crate) use routing_provider::{PlacementEvidence, PlacementPinError, PromptKey};
 #[doc(hidden)]

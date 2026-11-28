@@ -1,4 +1,5 @@
 use crate::core::Worker;
+use crate::kv_decision::{KvDecisionStage, KvDecisionTrace};
 use crate::policies::{
     AffinityKey, AffinityRecord, PdWorkPrices, PrefillWorkEstimate, RequestHeaders,
     ValidatedWorkPrices,
@@ -254,6 +255,7 @@ fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 pub struct StageDecision {
+    pub trace: Option<KvDecisionTrace>,
     pub fallback_reason: Option<&'static str>,
     pub credited_prefix_tokens: Option<u64>,
     pub worker_index: usize,
@@ -371,6 +373,7 @@ impl PdLoadManager {
             admitted_at: now,
             loads: self.loads.clone(),
             prefill: selection.prefill.endpoint.clone(),
+            prefill_trace: selection.prefill.trace.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: selection.prefill.new_prefill_tokens,
@@ -381,6 +384,7 @@ impl PdLoadManager {
                 decode_endpoint,
                 affinity,
                 pending_since,
+                decode_trace: selection.decode.trace.clone(),
             }),
         }));
         Some((selection, attempt))
@@ -418,6 +422,7 @@ impl PdLoadManager {
         }
         d.publish(Stage::Decode, &decision.endpoint);
         state.decode_endpoint = Some(decision.endpoint.clone());
+        state.decode_trace = decision.trace.clone();
         state.affinity = decision.affinity.clone();
         state.pending_since = Some(std::time::Instant::now());
         state.decode = DecodeState::Pending;
@@ -432,10 +437,11 @@ impl PdLoadManager {
     /// so it cannot go through policy selection, but its occupancy must stay
     /// visible to native admission and to `/metrics`. The prefill token count is
     /// unknown here, so the attempt is charged as an unknown-size prefill.
-    pub(super) fn admit_bound(
+    pub(super) fn admit_bound_with_trace(
         &self,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        prefill_trace: Option<KvDecisionTrace>,
     ) -> PdAttempt {
         let prefill = PdEndpoint::for_worker(prefill_worker.as_ref());
         let decode = PdEndpoint::for_worker(decode_worker.as_ref());
@@ -454,6 +460,7 @@ impl PdLoadManager {
             admitted_at: std::time::Instant::now(),
             loads: self.loads.clone(),
             prefill,
+            prefill_trace,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
             prefill_tokens: None,
@@ -468,6 +475,7 @@ impl PdLoadManager {
                 decode_endpoint: Some(decode),
                 affinity: None,
                 pending_since: Some(std::time::Instant::now()),
+                decode_trace: None,
             }),
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
@@ -486,6 +494,7 @@ enum DecodeState {
 
 #[derive(Debug)]
 struct AttemptState {
+    decode_trace: Option<KvDecisionTrace>,
     prefill: bool,
     decode: DecodeState,
     /// Committed decode endpoint; `None` while the commitment is deferred.
@@ -500,6 +509,7 @@ struct AttemptInner {
     admitted_at: std::time::Instant,
     loads: Arc<Mutex<Loads>>,
     prefill: PdEndpoint,
+    prefill_trace: Option<KvDecisionTrace>,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
     prefill_tokens: Option<u64>,
@@ -670,6 +680,20 @@ impl Drop for DecodeBodyGuard {
 }
 
 impl PdAttempt {
+    pub(super) fn dispatch_span(&self, stage: KvDecisionStage) -> tracing::Span {
+        if !crate::otel_trace::is_otel_enabled() {
+            return tracing::Span::none();
+        }
+        let trace = match stage {
+            KvDecisionStage::Regular => None,
+            KvDecisionStage::Prefill => self.0.prefill_trace.clone(),
+            KvDecisionStage::Decode => self.0.state.lock().decode_trace.clone(),
+        };
+        trace
+            .as_ref()
+            .map_or_else(tracing::Span::none, |trace| trace.dispatch_span(stage))
+    }
+
     pub(super) fn attach_workers(
         &self,
         prefill_worker: Arc<dyn Worker>,

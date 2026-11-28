@@ -145,6 +145,52 @@ impl WorkerLifecycle {
             .map_or_else(Vec::new, |hit| hit.publish(index, cache))
     }
 
+    fn observe_rank<'a>(
+        &self,
+        index: &SourceBinding,
+        cache: &mut RequestHashCache<'a>,
+        mut query: impl FnMut(&mut RequestHashCache<'a>) -> (Option<PlacementMatch>, bool),
+    ) -> crate::kv_index::ObservedMatches {
+        let mut first_trust_check = self
+            .layout
+            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
+        for _ in 0..2 {
+            let generation = index.control.generation();
+            let initial = {
+                let state = self.state.lock();
+                if generation == 0
+                    || !self.trusted_at(&state, || {
+                        first_trust_check.take().unwrap_or_else(Instant::now)
+                    })
+                {
+                    return crate::kv_index::ObservedMatches::default();
+                }
+                state.verified_at
+            };
+            let (hit, available) = query(cache);
+            let state = self.state.lock();
+            let end = Instant::now();
+            if !self.trusted_at(&state, || end) {
+                return crate::kv_index::ObservedMatches::default();
+            }
+            if index.control.generation() == generation
+                && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
+            {
+                drop(state);
+                return crate::kv_index::ObservedMatches {
+                    matches: hit.map_or_else(Vec::new, |hit| hit.publish(index, cache)),
+                    available,
+                };
+            }
+            // The original query stops on None. Certifying an empty view must
+            // not introduce a second lookup that selection did not perform.
+            if hit.is_none() {
+                return crate::kv_index::ObservedMatches::default();
+            }
+        }
+        crate::kv_index::ObservedMatches::default()
+    }
+
     pub(super) fn expire_if_needed(&self) -> bool {
         let mut state = self.state.lock();
         self.layout
@@ -352,6 +398,22 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         };
         self.lifecycle.match_rank(index, cache, |cache| {
             index.lookup_placement(tokens, block_size, lora, dp_rank, cache)
+        })
+    }
+
+    fn observed_matches_with_cache<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora: Option<&str>,
+        dp_rank: u32,
+        cache: &mut crate::kv_index::RequestHashCache<'a>,
+    ) -> crate::kv_index::ObservedMatches {
+        let Some(index) = self.indexes.get(&dp_rank) else {
+            return crate::kv_index::ObservedMatches::default();
+        };
+        self.lifecycle.observe_rank(index, cache, |cache| {
+            index.lookup_observed_placement(tokens, block_size, lora, dp_rank, cache)
         })
     }
 }

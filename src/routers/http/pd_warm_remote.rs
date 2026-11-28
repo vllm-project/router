@@ -3,6 +3,7 @@
 use super::{dp_utils, pd_program_adapter::PdProgramRuntime, program_adapter::ProgramCompletion};
 use crate::config::types::PdProgramSchedulingConfig;
 use crate::core::Worker;
+use crate::kv_decision::{KvDecisionStage, KvDecisionTrace};
 use crate::metrics::RouterMetrics;
 use crate::program_scheduling::pd_cost::{bounded_pd_duration, solve_pd_ttl, PdPath};
 use crate::program_scheduling::{ProgramDispatch, ProgramRef, ProgramScheduler, ProgramTarget};
@@ -25,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(super) struct EngineIdentity {
@@ -451,8 +453,7 @@ async fn identify_uncached(
     if let Some(auth) = engine_authorization(headers, operator_key.as_deref()) {
         b = b.header(axum::http::header::AUTHORIZATION, auth);
     }
-    let response = b
-        .send()
+    let response = crate::otel_http::send_request(b)
         .await
         .map_err(|_| "PD capability endpoint unavailable")?;
     if !response.status().is_success() {
@@ -550,11 +551,10 @@ async fn prefill(
     r["kv_transfer_params"] = params
         .cloned()
         .unwrap_or_else(|| json!({"do_remote_prefill":false,"do_remote_decode":true}));
-    let response = builder(client, p, "/v1/completions", headers)
-        .json(&r)
-        .send()
-        .await
-        .map_err(|_| PrefillError::Failed("PD prefill transport failure".into()))?;
+    let response =
+        crate::otel_http::send_request(builder(client, p, "/v1/completions", headers).json(&r))
+            .await
+            .map_err(|_| PrefillError::Failed("PD prefill transport failure".into()))?;
     if !response.status().is_success() {
         return Err(PrefillError::Upstream(response));
     }
@@ -593,12 +593,13 @@ async fn local_prefix(
     r["min_tokens"] = json!(1);
     r["kv_transfer_params"] =
         json!({"pd_probe_only":true,"do_remote_decode":false,"do_remote_prefill":false});
-    let response = builder(client, d, "/v1/completions", headers)
-        .timeout(Duration::from_secs(2))
-        .json(&r)
-        .send()
-        .await
-        .ok()?;
+    let response = crate::otel_http::send_request(
+        builder(client, d, "/v1/completions", headers)
+            .timeout(Duration::from_secs(2))
+            .json(&r),
+    )
+    .await
+    .ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -622,7 +623,7 @@ async fn local_prefix(
 ///
 /// `None` hands the turn back to the caller *unconsumed*: the caller then
 /// dispatches the prefill it already selected. Every `None` exit therefore has
-/// to stay above `claim()`, `pd_load.admit_bound()` and
+/// to stay above `claim()`, `pd_load.admit_bound_with_trace()` and
 /// `runtime.reserve_prefill()`; an early `None` after any of those points would
 /// let the caller claim, charge and reserve twice for one turn. This is checked
 /// by `cold_fallback_consumes_one_prefill_selection_per_turn` only indirectly
@@ -645,6 +646,7 @@ pub(super) async fn execute(
     policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
+    prefill_trace: Option<KvDecisionTrace>,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -821,9 +823,10 @@ pub(super) async fn execute(
     // Charge the same native P/D accounting the native two-stage path uses so
     // load-aware policies and
     // the published PD occupancy metrics see Program traffic too.
-    // admit_bound charges PdLoadManager and attaches the workers itself, so
+    // admit_bound_with_trace charges PdLoadManager and attaches the workers itself, so
     // do not attach again: finish/Drop decrement exactly once.
-    let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker);
+    let attempt =
+        pd_load.admit_bound_with_trace(prefill_worker.clone(), decode_worker, prefill_trace);
     let result = async {
         let d_params = if route == PdPath::LocalAppend {
             attempt.finish_prefill();
@@ -868,6 +871,7 @@ pub(super) async fn execute(
                 warm_remote.config.max_metadata_bytes,
                 warm_remote.config.max_response_bytes,
             )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
             .await;
             // Only a warm read failure is retried cold. Ordinary upstream
             // rejections are forwarded so the client keeps the status/body.
@@ -895,6 +899,7 @@ pub(super) async fn execute(
                     warm_remote.config.max_metadata_bytes,
                     warm_remote.config.max_response_bytes,
                 )
+                .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
                 .await;
             }
             drop(permit);
@@ -951,9 +956,7 @@ pub(super) async fn execute(
         let d_started = Instant::now();
         RouterMetrics::record_pd_decode_request(d_metric);
         attempt.begin_decode();
-        let response = builder(client, d, path, headers)
-            .json(&dr)
-            .send()
+        let response = crate::otel_http::send_request(builder(client, d, path, headers).json(&dr))
             .await
             .map_err(|_| "PD decode transport failure")?;
         let streaming = request.get("stream") == Some(&Value::Bool(true));
@@ -1044,6 +1047,7 @@ pub(super) async fn execute(
                 warm_remote.config.max_metadata_bytes,
                 warm_remote.config.max_response_bytes,
             )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
             .await;
             drop(permit);
             let fallback = async {
@@ -1083,11 +1087,10 @@ pub(super) async fn execute(
                 RouterMetrics::record_pd_decode_request(d_metric);
                 // The first local attempt may have failed before decode began.
                 attempt.begin_decode();
-                let response = builder(client, d, path, headers)
-                    .json(&dr)
-                    .send()
-                    .await
-                    .map_err(|_| "Cold fallback transport failure")?;
+                let response =
+                    crate::otel_http::send_request(builder(client, d, path, headers).json(&dr))
+                        .await
+                        .map_err(|_| "Cold fallback transport failure")?;
                 let gate = gate_response(
                     response,
                     request.get("stream") == Some(&Value::Bool(true)),
