@@ -1,13 +1,17 @@
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
-from .ports import find_free_port
+from .process import release_all_port_holders, reserve_port
 
 
 @dataclass
@@ -15,6 +19,75 @@ class ProcHandle:
     process: subprocess.Popen
     url: str
     prometheus_port: Optional[int] = None
+
+
+class _RouterExited(Exception):
+    """The router process exited before /health returned 200."""
+
+
+def _tee(stream, tail: Deque[str]) -> None:
+    # sys.__stderr__ is fd 2, where the router wrote before its output was piped.
+    mirror = sys.__stderr__
+    # Close the pipe at EOF: nothing else reads or closes proc.stdout.
+    with stream:
+        for line in stream:
+            tail.append(line)
+            if mirror is None:
+                continue
+            # Best effort: this is the only reader, so a closed stderr must not
+            # stop draining the pipe or hide a bind failure from tail.
+            try:
+                mirror.write(line)
+                mirror.flush()
+            except (OSError, ValueError):
+                mirror = None
+
+
+def _owns_listener(pid: int, port: int) -> Optional[bool]:
+    """Whether pid or a descendant holds a LISTEN socket on port.
+
+    Returns None without Linux /proc, so callers can skip the check.
+    """
+    if not os.path.exists("/proc/net/tcp"):
+        return None
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            # local_address is HEX_IP:HEX_PORT, st 0A is LISTEN, field 9 is inode.
+            fields = row.split()
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add(f"socket:[{fields[9]}]")
+    if not inodes:
+        # /health answered, so someone listens; tables that show nobody can't
+        # be trusted (e.g. a sandboxed /proc).
+        return None
+    pids = [pid]
+    while pids:
+        p = pids.pop()
+        # Any of these can vanish mid-scan if the process exits.
+        try:
+            fds = os.listdir(f"/proc/{p}/fd")
+            tasks = os.listdir(f"/proc/{p}/task")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{p}/fd/{fd}") in inodes:
+                    return True
+            except OSError:
+                pass
+        for task in tasks:
+            try:
+                with open(f"/proc/{p}/task/{task}/children") as f:
+                    pids.extend(int(child) for child in f.read().split())
+            except OSError:
+                pass
+    return False
 
 
 class RouterManager:
@@ -43,7 +116,9 @@ class RouterManager:
         timeout: float = 30.0,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
-        port = port or find_free_port()
+        pick_port = not port
+        holders: List[Optional[socket.socket]] = []
+        port = port or reserve_port(holders)
         router_bin = router_bin or os.environ.get("VLLM_ROUTER_TEST_BIN")
         if router_bin:
             cmd = [
@@ -67,10 +142,10 @@ class RouterManager:
                 "--policy",
                 policy,
             ]
-        prom_port = find_free_port()
-        # The API port isn't bound yet, so the allocator can return it again.
+        prom_port = reserve_port(holders)
+        # A caller's API port isn't reserved, so the allocator can return it.
         while prom_port == port:
-            prom_port = find_free_port()
+            prom_port = reserve_port(holders)
         cmd.extend(
             ["--prometheus-port", str(prom_port), "--prometheus-host", "127.0.0.1"]
         )
@@ -154,19 +229,72 @@ class RouterManager:
                 else:
                     cmd.extend([flag, str(v)])
 
-        proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
-        self._children.append(proc)
-        url = f"http://127.0.0.1:{port}"
-        self._wait_health(url, timeout)
-        return ProcHandle(process=proc, url=url, prometheus_port=prom_port)
+        # Reserved ports are freed just before Popen, so another process can
+        # still take one first. Retry when the router says its bind failed.
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            release_all_port_holders(holders)
+            proc = subprocess.Popen(
+                cmd,
+                env={**os.environ, **(env or {})},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+            )
+            tail: Deque[str] = deque(maxlen=50)
+            reader = threading.Thread(
+                target=_tee, args=(proc.stdout, tail), daemon=True
+            )
+            reader.start()
+            self._children.append(proc)
+            url = f"http://127.0.0.1:{port}"
+            try:
+                self._wait_health(url, timeout, proc=proc)
+                return ProcHandle(process=proc, url=url, prometheus_port=prom_port)
+            except _RouterExited:
+                proc.wait()
+                reader.join(timeout=5)
+                self._children.remove(proc)
+                output = "".join(tail)
+                # API bind: "AddrInUse"; Prometheus bind: "Address already in use".
+                clash = "AddrInUse" in output or "Address already in use" in output
+                if not clash or attempt == attempts:
+                    raise RuntimeError(
+                        f"Router exited with code {proc.returncode} before becoming "
+                        f"healthy (port={port}, prometheus_port={prom_port}, "
+                        f"port_clash={clash}, attempt {attempt}/{attempts}). "
+                        f"Last output:\n{output}"
+                    ) from None
+            if pick_port:
+                port = reserve_port(holders)
+            prom_port = reserve_port(holders)
+            while prom_port == port:
+                prom_port = reserve_port(holders)
+            cmd[cmd.index("--port") + 1] = str(port)
+            cmd[cmd.index("--prometheus-port") + 1] = str(prom_port)
 
-    def _wait_health(self, base_url: str, timeout: float = 30.0):
+    def _wait_health(
+        self,
+        base_url: str,
+        timeout: float = 30.0,
+        proc: Optional[subprocess.Popen] = None,
+    ):
         start = time.time()
         with requests.Session() as s:
             while time.time() - start < timeout:
+                if proc is not None and proc.poll() is not None:
+                    raise _RouterExited
                 try:
                     r = s.get(f"{base_url}/health", timeout=2)
-                    if r.status_code == 200:
+                    # Another process can win the port and answer for a child
+                    # that is about to exit on its failed bind.
+                    if r.status_code == 200 and (
+                        proc is None
+                        or _owns_listener(proc.pid, urlparse(base_url).port)
+                        is not False
+                    ):
                         return
                 except requests.RequestException:
                     pass
