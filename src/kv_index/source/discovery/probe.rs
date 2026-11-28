@@ -10,11 +10,11 @@ use tracing::{info, warn};
 
 use super::lifecycle::{WorkerLifecycle, OPTIONAL_METADATA_BUDGET};
 use super::metrics_meta::EngineCacheConfigs;
-use super::reconcile::{is_fenced_source, BoundSources};
+use super::reconcile::BoundSources;
 use super::{
-    discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
-    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
-    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
+    canonical_source_rank, discovered_block_size, events_enabled, metrics_meta, split_worker_rank,
+    CacheCapabilities, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo,
+    SourcesProbe, SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -22,7 +22,7 @@ use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
 
 pub(super) struct RegistrationProbe {
-    pub(super) descriptor: Result<WorkerDescriptor, String>,
+    pub(super) descriptor: Option<WorkerDescriptor>,
     pub(super) worker: WorkerDiscovery,
 }
 
@@ -57,7 +57,7 @@ impl WorkerDescriptor {
         let view = |mut descriptor: Self| {
             let fenced = |rank| fences.contains_key(&rank);
             if let Some(sources) = &mut descriptor.sources {
-                sources.retain(|rank, _| !is_fenced_source(rank, fenced));
+                sources.retain(|rank, _| !canonical_source_rank(rank).is_some_and(fenced));
             }
             if let Some(layout) = &mut descriptor.hybrid {
                 layout.ranks.retain(|rank| !fenced(rank.rank));
@@ -99,7 +99,9 @@ impl KvIndexSupervisor {
         connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
     ) -> RegistrationProbe {
-        let mut worker = self.discover_for_role(base, connector, true).await;
+        let mut worker = self
+            .discover_for_role(base, connector, Some(lifecycle))
+            .await;
         if plain_only
             && worker
                 .hybrid
@@ -112,10 +114,9 @@ impl KvIndexSupervisor {
             );
             worker.hybrid = None;
         }
-        let mut result = worker_descriptor(&worker);
-        let Ok(descriptor) = &mut result else {
+        let Ok(mut descriptor) = worker_descriptor(&worker) else {
             return RegistrationProbe {
-                descriptor: result,
+                descriptor: None,
                 worker,
             };
         };
@@ -124,7 +125,7 @@ impl KvIndexSupervisor {
             let cached = {
                 let state = lifecycle.state.lock();
                 (state.info.is_some()
-                    && state.descriptor.as_ref() == Some(descriptor)
+                    && state.descriptor.as_ref() == Some(&descriptor)
                     && (descriptor
                         .server_info
                         .instance_id
@@ -144,7 +145,7 @@ impl KvIndexSupervisor {
             });
         }
         RegistrationProbe {
-            descriptor: result,
+            descriptor: Some(descriptor),
             worker,
         }
     }

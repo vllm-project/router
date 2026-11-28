@@ -30,9 +30,7 @@ use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use metrics_meta::reported_prefix_hash;
 use metrics_meta::EngineCacheConfigs;
 use observer::WorkerObservation;
-use reconcile::{
-    bound_source_moved, is_fenced_source, static_hybrid_sources_match, StaticHybridMatch,
-};
+use reconcile::{bound_source_moved, static_hybrid_sources_match, StaticHybridMatch};
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use probe::worker_serves_base_model;
@@ -484,7 +482,7 @@ impl KvIndexSupervisor {
 
     /// Discover worker metadata and available hashes for a new registration.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        let mut discovery = self.discover_for_role(worker_url, None, false).await;
+        let mut discovery = self.discover_for_role(worker_url, None, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery)
             .await;
         discovery
@@ -494,7 +492,7 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         prefill_connector: Option<KvConnector>,
-        observe_runtime: bool,
+        lifecycle: Option<&WorkerLifecycle>,
     ) -> WorkerDiscovery {
         let static_source = if self.http_pd {
             self.static_pd_sources
@@ -506,10 +504,29 @@ impl KvIndexSupervisor {
         } else {
             self.resolved_static_source(worker_url)
         };
+        let probe_static_hashes = |enabled: bool| {
+            probe::probe_engine_cache_configs(
+                &self.client,
+                worker_url,
+                self.api_key.as_deref(),
+                (lifecycle.is_some() && enabled).then_some(lifecycle::OPTIONAL_METADATA_BUDGET),
+            )
+        };
         let mut discovery = match static_source {
             Some(discovery) if layout_only(&discovery) => {
-                self.discover_declared_layout(worker_url, discovery, observe_runtime)
-                    .await
+                // Missing hash sizes already trigger a required metrics fetch.
+                let configured_sizes = discovery.hybrid.as_ref().is_some_and(|layout| {
+                    layout
+                        .ranks
+                        .iter()
+                        .all(|rank| rank.hash_block_size.is_some())
+                });
+                let (mut discovery, configs) = tokio::join!(
+                    self.discover_declared_layout(worker_url, discovery),
+                    probe_static_hashes(configured_sizes),
+                );
+                discovery.engine_cache_configs = discovery.engine_cache_configs.or(configs);
+                discovery
             }
             Some(mut discovery) => {
                 if discovery.sources.is_err() {
@@ -517,13 +534,7 @@ impl KvIndexSupervisor {
                 }
                 let (verification, configs) = tokio::join!(
                     self.verify_static_source(worker_url, &discovery),
-                    probe::probe_engine_cache_configs(
-                        &self.client,
-                        worker_url,
-                        self.api_key.as_deref(),
-                        (observe_runtime && discovery.hybrid.is_some())
-                            .then_some(lifecycle::OPTIONAL_METADATA_BUDGET),
-                    ),
+                    probe_static_hashes(discovery.hybrid.is_some()),
                 );
                 discovery.engine_cache_configs = configs;
                 if let Err((probe, reason)) = verification {
@@ -537,17 +548,12 @@ impl KvIndexSupervisor {
                 discovery
             }
             None => {
-                let lifecycle = if observe_runtime {
-                    self.lifecycles.lock().get(worker_url).cloned()
-                } else {
-                    None
-                };
                 let mut discovery = discover_worker(
                     &self.client,
                     worker_url,
                     self.http_pd || self.full_attention_http,
                     self.api_key.as_deref(),
-                    lifecycle.as_deref(),
+                    lifecycle,
                 )
                 .await;
                 if discovery.assumed_plain_full
@@ -640,20 +646,12 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         mut discovery: WorkerDiscovery,
-        observe_runtime: bool,
     ) -> WorkerDiscovery {
         let (base, _) = split_worker_rank(worker_url);
         let api_key = self.api_key.as_deref();
         let grpc = crate::backend::is_grpc_url(base);
-        let requires_hash_size = discovery.hybrid.as_ref().is_some_and(|layout| {
-            layout
-                .ranks
-                .iter()
-                .any(|rank| rank.hash_block_size.is_none())
-        });
-        let (sources, (model, base_models), configs) = tokio::join!(
-            fetch_kv_event_sources(&self.client, base, api_key),
-            async {
+        let (sources, (model, base_models)) =
+            tokio::join!(fetch_kv_event_sources(&self.client, base, api_key), async {
                 if let Some(model) = discovery
                     .model_id
                     .as_ref()
@@ -679,17 +677,8 @@ impl KvIndexSupervisor {
                         Some(base_model_names(&models)),
                     )
                 }
-            },
-            probe::probe_engine_cache_configs(
-                &self.client,
-                base,
-                api_key,
-                (observe_runtime && !requires_hash_size)
-                    .then_some(lifecycle::OPTIONAL_METADATA_BUDGET),
-            ),
-        );
+            },);
         discovery.base_models = base_models;
-        discovery.engine_cache_configs = configs;
         let Ok(sources) = sources else {
             discovery.sources = sources;
             return discovery;
@@ -718,7 +707,11 @@ impl KvIndexSupervisor {
         }
         discovery.model_id = Ok(Some(model.clone()));
         if let Some(layout) = &mut discovery.hybrid {
-            if requires_hash_size {
+            if layout
+                .ranks
+                .iter()
+                .any(|rank| rank.hash_block_size.is_none())
+            {
                 let engines = match tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     probe::query_engine_cache_configs(&self.client, base, api_key),
@@ -1208,9 +1201,9 @@ fn validate_native_publishers(
     model: &str,
     fenced: impl Fn(u32) -> bool + Copy,
 ) -> Result<(), String> {
-    let active = sources
-        .iter()
-        .filter(|(key, source)| events_enabled(source) && !is_fenced_source(key, fenced));
+    let active = sources.iter().filter(|(key, source)| {
+        events_enabled(source) && !canonical_source_rank(key).is_some_and(fenced)
+    });
     if active.clone().count()
         != layout
             .ranks

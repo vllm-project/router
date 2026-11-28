@@ -113,7 +113,6 @@ impl WorkerLifecycle {
             let initial = {
                 let state = self.state.lock();
                 if generation == 0
-                    || state.hash_fences.contains_key(&rank.target.dp_rank)
                     || !self.trusted_at(&state, || first_trust_check.take().unwrap_or_else(&now))
                 {
                     return None;
@@ -123,7 +122,10 @@ impl WorkerLifecycle {
             let hits = query()?;
             let state = self.state.lock();
             let end = now();
-            if state.hash_fences.contains_key(&rank.target.dp_rank)
+            if rank
+                .binding
+                .as_ref()
+                .is_some_and(|lease| !lease.is_active())
                 || !self.trusted_at(&state, || end)
             {
                 return None;
@@ -315,37 +317,34 @@ pub(super) struct LayoutWorkerProvider {
 impl LayoutWorkerProvider {
     pub(super) fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
         let mut state = self.lifecycle.state.lock();
-        let Some(capability) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
+        let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
             return;
         };
-        let fenced: Vec<_> = self
-            .bound
-            .iter()
-            .filter_map(|(&rank, source)| {
-                let index = &self.indexes[&rank];
-                let lease = index.binding.as_ref()?;
-                (lease.is_active()
-                    && runtime_hash_mismatch(Some(configs), capability, worker, rank))
-                .then_some((rank, source, index, lease))
-            })
-            .collect();
-        for &(rank, source, _, lease) in &fenced {
-            lease.fence_hash();
-            state.hash_fences.insert(rank, source.clone());
-            if let Some(info) = &mut state.info {
-                info.ranks.retain(|&active| active != rank);
+        let mut fenced = Vec::new();
+        for (&rank, source) in &self.bound {
+            let index = &self.indexes[&rank];
+            let Some(lease) = index.binding.as_ref().filter(|lease| lease.is_active()) else {
+                continue;
+            };
+            if runtime_hash_mismatch(Some(configs), layout, worker, rank) {
+                lease.fence_hash();
+                fenced.push((rank, source, index, lease));
             }
         }
-        if !fenced.is_empty()
-            && state
-                .info
-                .as_ref()
-                .is_some_and(|info| info.ranks.is_empty())
-        {
-            tracing::warn!(
-                worker,
-                "No KV ranks remain after fencing incompatible hashes"
-            );
+        state.hash_fences.extend(
+            fenced
+                .iter()
+                .map(|&(rank, source, _, _)| (rank, source.clone())),
+        );
+        if let Some(info) = &mut state.info {
+            info.ranks
+                .retain(|rank| !fenced.iter().any(|(fenced, _, _, _)| fenced == rank));
+            if !fenced.is_empty() && info.ranks.is_empty() {
+                tracing::warn!(
+                    worker,
+                    "No KV ranks remain after fencing incompatible hashes"
+                );
+            }
         }
         drop(state);
         for (_, _, index, lease) in fenced {

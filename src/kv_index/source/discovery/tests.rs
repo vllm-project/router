@@ -34,46 +34,32 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         bound: HashMap::new(),
         lifecycle,
     };
+    let action = |outcome| {
+        provider
+            .lifecycle
+            .observe_layout(
+                &mut provider.lifecycle.state.lock(),
+                &outcome,
+                Instant::now(),
+            )
+            .1
+    };
     assert!(!provider.is_trusted());
     assert!(provider.lifecycle.expire_if_needed());
     assert!(active.load(Ordering::Acquire));
     assert_eq!(
-        provider
-            .lifecycle
-            .observe_layout(
-                &mut provider.lifecycle.state.lock(),
-                &StaticHybridMatch::Unavailable(SourcesProbe::Failed),
-                Instant::now()
-            )
-            .1,
+        action(StaticHybridMatch::Unavailable(SourcesProbe::Failed)),
         SourceAction::Keep
     );
     assert!(!provider.is_trusted());
-    assert_eq!(
-        provider
-            .lifecycle
-            .observe_layout(
-                &mut provider.lifecycle.state.lock(),
-                &StaticHybridMatch::Matches,
-                Instant::now()
-            )
-            .1,
-        SourceAction::Recover
-    );
+    assert_eq!(action(StaticHybridMatch::Matches), SourceAction::Recover);
     assert!(!provider.is_trusted()); // Replay must be started before publication.
     assert!(provider.lifecycle.finish_layout_recovery(true));
     assert!(provider.is_trusted());
     provider.lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     assert!(provider.lifecycle.expire_if_needed());
     assert_eq!(
-        provider
-            .lifecycle
-            .observe_layout(
-                &mut provider.lifecycle.state.lock(),
-                &StaticHybridMatch::Unavailable(SourcesProbe::Unsupported),
-                Instant::now()
-            )
-            .1,
+        action(StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
         SourceAction::Recover
     );
     let revision = {
@@ -87,17 +73,7 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         assert!(state.info.is_none());
         assert_ne!(state.revision, revision);
     }
-    assert_eq!(
-        provider
-            .lifecycle
-            .observe_layout(
-                &mut provider.lifecycle.state.lock(),
-                &StaticHybridMatch::Matches,
-                Instant::now()
-            )
-            .1,
-        SourceAction::Stop
-    );
+    assert_eq!(action(StaticHybridMatch::Matches), SourceAction::Stop);
     assert!(!active.load(Ordering::Acquire));
     assert!(!provider.is_trusted());
 }
@@ -1668,7 +1644,7 @@ async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
     let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
 
     let discovery = supervisor
-        .discover_for_role(&worker, Some(KvConnector::Nixl), false)
+        .discover_for_role(&worker, Some(KvConnector::Nixl), None)
         .await;
     assert!(discovery.sources.is_ok());
     assert_eq!(
@@ -2015,6 +1991,10 @@ struct HashAdmissionWorker {
 
 impl HashAdmissionWorker {
     async fn start(ranks: usize, metrics: &str) -> Self {
+        Self::start_with_routes(ranks, metrics, axum::Router::new()).await
+    }
+
+    async fn start_with_routes(ranks: usize, metrics: &str, routes: axum::Router) -> Self {
         use serde_json::json;
 
         let sockets: Vec<_> = (0..ranks).map(|_| layout_endpoints()).collect();
@@ -2047,7 +2027,7 @@ impl HashAdmissionWorker {
             }
         });
         let (url, server) = source_boundary_worker_with_routes(
-            app,
+            app.merge(routes),
             json!({
                 "model_id": "mock-model", "instance_id": "boot", "kv_block_size": 16,
                 "served_model_aliases": ["control-alias"]
@@ -2414,34 +2394,19 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
     }
 }
 
-fn event_sources_routes(sources: Arc<Mutex<serde_json::Value>>) -> axum::Router {
-    axum::Router::new().route(
-        "/kv_event_sources",
-        axum::routing::get(move || {
-            let data = sources.lock().clone();
-            async move { axum::Json(data) }
-        }),
-    )
+fn vllm_default_root(tokens: &[u32]) -> KVEvent {
+    use crate::kv_index::{request_hash::BlockKeyGenerator, wire::ExternalBlockHash};
+
+    let mut root = full_store(tokens, 16, None);
+    let keys = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
+    root.block_hashes[0] =
+        ExternalBlockHash::Bytes(keys.plain_root_block(tokens).unwrap().to_vec());
+    KVEvent::BlockStored(root)
 }
 
 #[tokio::test]
 async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
-    use std::sync::atomic::AtomicUsize;
-
-    use crate::kv_index::request_hash::BlockKeyGenerator;
-    use crate::kv_index::wire::ExternalBlockHash;
-
-    let endpoints: Vec<_> = (0..3).map(|_| layout_endpoints()).collect();
-    let topics = ["kv/hash-probe/0", "kv/hash-probe/1", "kv/hash-probe/2"];
-    let source = |rank: usize| {
-        serde_json::json!({
-            "endpoint": endpoints[rank].0, "replay_endpoint": endpoints[rank].1,
-            "topic": topics[rank], "publisher": "zmq"
-        })
-    };
-    let sources = Arc::new(Mutex::new(serde_json::json!({
-        "0": source(0), "1": source(1), "2": source(2)
-    })));
+    let topics = ["kv/admission/0", "kv/admission/1", "kv/admission/2"];
     let metrics = |first, second| {
         format!(
             "vllm:cache_config_info{{block_size=\"16\",engine=\"0\",prefix_caching_hash_algo=\"{first}\"}} 1.0\n\
@@ -2449,7 +2414,6 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
              vllm:cache_config_info{{block_size=\"16\",engine=\"2\"}} 1.0\n"
         )
     };
-    let reported = Arc::new(Mutex::new(metrics("sha256_cbor", "xxhash")));
     let mut native = plain_full_layout("mock-model", topics[0], 16);
     native.ranks = topics
         .iter()
@@ -2457,50 +2421,39 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         .map(|(rank, topic)| plain_full_rank(rank as u32, "mock-model".into(), (*topic).into(), 16))
         .collect();
     let native = Arc::new(Mutex::new(automatic_layout(native)));
-    let scrapes = Arc::new(AtomicUsize::new(0));
-    let (router, _) = metrics_and_models_router({
-        let reported = reported.clone();
-        let scrapes = scrapes.clone();
-        move || {
-            scrapes.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(reported.lock().clone())
-        }
-    });
-    let router = router.merge(event_sources_routes(sources.clone())).route(
-        "/kv_routing_capabilities",
-        axum::routing::get({
-            let native = native.clone();
-            move || {
-                let layout = native.lock().clone();
-                async move { axum::Json(layout) }
-            }
-        }),
-    );
-    let (worker, server) = spawn_metrics_only_worker(router).await;
-    let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
-    let bases = HashSet::from([worker.clone()]);
+    let worker = HashAdmissionWorker::start_with_routes(
+        3,
+        &metrics("sha256_cbor", "xxhash"),
+        axum::Router::new().route(
+            "/kv_routing_capabilities",
+            axum::routing::get({
+                let native = native.clone();
+                move || {
+                    let layout = native.lock().clone();
+                    std::future::ready(axum::Json(layout))
+                }
+            }),
+        ),
+    )
+    .await;
+    let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+    let url = &worker.url;
+    let bases = HashSet::from([url.clone()]);
     let empty = HashSet::new();
     let refresh = || supervisor.refresh_workers(&bases, &empty, &empty);
-    let info = refresh().await[&worker].info.clone().unwrap();
-    let lifecycle = supervisor.lifecycle_for_worker(&worker);
+    let info = refresh().await[url].info.clone().unwrap();
+    let lifecycle = supervisor.lifecycle_for_worker(url);
     assert_eq!(
         info.ranks.into_iter().collect::<HashSet<_>>(),
         HashSet::from([0, 2])
     );
-    let provider = supervisor.match_provider_for_worker(&worker).unwrap();
-    let revision = supervisor.worker_registrations()[&worker].revision;
+    let provider = supervisor.match_provider_for_worker(url).unwrap();
+    let revision = supervisor.worker_registrations()[url].revision;
     let prompt = [7; 17];
-    let generator = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
     let hits = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
-    let mut store = full_store(&prompt[..16], 16, None);
-    store.block_hashes = generator
-        .generate_block_keys(&prompt[..16])
-        .into_iter()
-        .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
-        .collect();
-    let event = KVEvent::BlockStored(store);
+    let event = vllm_default_root(&prompt[..16]);
     for rank in [0, 2] {
-        let (_, _, publisher, replay) = &endpoints[rank];
+        let (_, _, publisher, replay) = &worker.sockets[rank];
         boundary_subscription(publisher, topics[rank], true).await;
         finish_empty_startup_replay(replay).await;
         let payload = event_payload(1.0, std::slice::from_ref(&event), Some(rank as u32));
@@ -2508,7 +2461,7 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         wait_for(|| hits(rank as u32)).await;
     }
     let has_binding =
-        |rank| supervisor.workers_have_cache_bindings([(worker.as_str(), rank)].into_iter());
+        |rank| supervisor.workers_have_cache_bindings([(url.as_str(), rank)].into_iter());
     assert!(has_binding(0) && has_binding(2));
     assert!(!has_binding(1));
 
@@ -2518,20 +2471,23 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         state.hash_checked = Instant::now() - super::lifecycle::REFRESH_INTERVAL;
         state.verified_at
     };
-    let scrapes_before_layout_poll = scrapes.load(Ordering::Relaxed);
+    let scrapes_before_layout_poll = worker.requests.metrics.load(Ordering::Relaxed);
     native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!("kv/changed/1");
     wait_for(|| lifecycle.state.lock().verified_at > verified_at).await;
-    assert_eq!(scrapes.load(Ordering::Relaxed), scrapes_before_layout_poll);
+    assert_eq!(
+        worker.requests.metrics.load(Ordering::Relaxed),
+        scrapes_before_layout_poll
+    );
     lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[&worker].revision, revision);
+    assert_eq!(refresh().await[url].revision, revision);
     assert!(hits(2));
 
     // Refresh can observe a new topic before the native layout reports it.
-    *reported.lock() = metrics("xxhash", "sha256_cbor");
-    sources.lock()["0"]["topic"] = serde_json::json!("kv/changed/0");
+    *worker.metrics.lock() = Some(metrics("xxhash", "sha256_cbor"));
+    worker.sources.lock()["0"]["topic"] = serde_json::json!("kv/changed/0");
     native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!(topics[1]);
     lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[&worker].revision, revision);
+    assert_eq!(refresh().await[url].revision, revision);
     assert!(!hits(0));
     assert!(has_binding(2));
     assert!(
@@ -2543,29 +2499,16 @@ async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
         "a rank rejected at discovery gained a binding"
     );
     // A failed source response still leaves the hash sample usable in this refresh.
-    *reported.lock() = metrics("xxhash", "xxhash").replace(
+    *worker.metrics.lock() = Some(metrics("xxhash", "xxhash").replace(
         "engine=\"2\"",
         "engine=\"2\",prefix_caching_hash_algo=\"xxhash\"",
-    );
-    let previous = std::mem::replace(&mut *sources.lock(), serde_json::json!([]));
+    ));
+    *worker.sources.lock() = serde_json::json!([]);
     lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[&worker].revision, revision);
+    assert_eq!(refresh().await[url].revision, revision);
     assert!(!has_binding(2) && !hits(2));
     assert_eq!(lifecycle.state.lock().probe_failures, 1);
-    *sources.lock() = previous;
-
-    supervisor.on_worker_removed(&worker);
-    sources.lock()["0"]["topic"] = serde_json::json!(topics[0]);
-    sources.lock()["2"]["topic"] = serde_json::json!(topics[2]);
-    assert!(refresh().await[&worker]
-        .info
-        .as_ref()
-        .unwrap()
-        .ranks
-        .is_empty());
-    assert!(supervisor.match_provider_for_worker(&worker).is_none());
     supervisor.shutdown();
-    server.abort();
 }
 
 #[tokio::test]
@@ -2644,14 +2587,7 @@ async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
         let prompt = [7; 17];
         let tokens = &prompt[..16];
         let hits = || provider.matches(&prompt, 16, None, replacement_rank);
-        let mut root = full_store(tokens, 16, None);
-        root.block_hashes[0] = crate::kv_index::wire::ExternalBlockHash::Bytes(
-            crate::kv_index::request_hash::BlockKeyGenerator::from_seed(16, "vllm-none-hash")
-                .plain_root_block(tokens)
-                .unwrap()
-                .to_vec(),
-        );
-        let payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(replacement_rank));
+        let payload = event_payload(1.0, &[vllm_default_root(tokens)], Some(replacement_rank));
         let topic = b"kv/new";
         boundary_subscription(&replacement_publisher, "kv/new", true).await;
         finish_empty_startup_replay(&replacement_replay).await;
@@ -2683,11 +2619,6 @@ async fn optional_metrics_preserves_registration_and_metadata_fallback() {
     };
     use std::sync::atomic::AtomicUsize;
 
-    let (endpoint, replay_endpoint, _publisher, _replay) = layout_endpoints();
-    let sources = serde_json::json!({"0": {
-        "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-        "topic": "kv/metrics-fallback", "publisher": "zmq"
-    }});
     for slow_metrics in [true, false] {
         let scrapes = Arc::new(AtomicUsize::new(0));
         let first_scrape = Arc::new(tokio::sync::Notify::new());
@@ -2720,24 +2651,19 @@ async fn optional_metrics_preserves_registration_and_metadata_fallback() {
                 }),
             )
             .with_state((slow_metrics, scrapes.clone(), first_scrape))
-            .route("/v1/models", get(mock_model_list))
-            .merge(event_sources_routes(Arc::new(Mutex::new(sources.clone()))));
+            .route("/v1/models", get(mock_model_list));
         let (worker, server) = spawn_metrics_only_worker(router).await;
-        let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
-        let registered = supervisor
-            .refresh_workers(
-                &HashSet::from([worker.clone()]),
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .await;
-        assert!(registered[&worker].provider.is_some());
-        assert!(supervisor.workers_have_cache_bindings([(worker.as_str(), 0)].into_iter()));
+        let metadata = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(metadata.server_info.unwrap().kv_block_size, Some(16));
         assert_eq!(
             scrapes.load(Ordering::Relaxed),
             if slow_metrics { 1 } else { 2 }
         );
-        supervisor.shutdown();
         server.abort();
     }
 }

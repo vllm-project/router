@@ -8,8 +8,8 @@ use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTRO
 use super::metrics_meta::{reported_prefix_hash, EngineCacheConfigs};
 use super::probe::{probe_bound_sources, worker_serves_base_model, WorkerDescriptor};
 use super::{
-    canonical_source_rank, events_enabled, resolve_endpoint, split_worker_rank, worker_host,
-    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
+    events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
+    KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
 use crate::core::{worker::UNLABELED_WORKER_MODEL_ID, Worker};
 use crate::kv_index::subscriber::EventSource;
@@ -264,13 +264,11 @@ impl KvIndexSupervisor {
             if let Some(configs) = configs {
                 self.fence_installed_hashes(&base, &lifecycle, configs);
             }
-            let descriptor = probe
-                .as_ref()
-                .and_then(|probe| probe.descriptor.as_ref().ok());
+            let descriptor = probe.as_ref().and_then(|probe| probe.descriptor.as_ref());
             let action = lifecycle.observe_descriptor(&base, descriptor, configs);
             match action {
                 SourceAction::Keep => {
-                    if let Some(probe) = probe.filter(|probe| probe.descriptor.is_ok()) {
+                    if let Some(probe) = probe.filter(|probe| probe.descriptor.is_some()) {
                         lifecycle.state.lock().base_models =
                             probe.worker.base_models.unwrap_or_default();
                     }
@@ -339,10 +337,6 @@ impl From<&EventSource> for BoundSource {
 /// Publisher identities by rank, including publishers fenced before subscription.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
-pub(super) fn is_fenced_source(key: &str, fenced: impl FnOnce(u32) -> bool) -> bool {
-    canonical_source_rank(key).is_some_and(fenced)
-}
-
 pub(super) fn runtime_hash_mismatch(
     configs: Option<&EngineCacheConfigs>,
     capability: &CacheCapabilities,
@@ -381,10 +375,15 @@ pub(super) fn observed_sources_match(
     let Some(host) = worker_host(split_worker_rank(worker).0) else {
         return StaticHybridMatch::Differs;
     };
-    let active = bound.iter().filter(|(rank, _)| !fences.contains_key(rank));
-    if layouts_match(expected, layout.as_ref(), fences)
-        && bound_sources_match(&host, active.map(|(&rank, source)| (rank, source)), sources)
-    {
+    let publishers_match = bound
+        .iter()
+        .filter(|(rank, _)| !fences.contains_key(rank))
+        .all(|(rank, installed)| {
+            sources
+                .get(&rank.to_string())
+                .is_some_and(|actual| !bound_source_moved(&host, installed, actual))
+        });
+    if publishers_match && layouts_match(expected, layout.as_ref(), fences) {
         StaticHybridMatch::Matches
     } else {
         StaticHybridMatch::Differs
@@ -493,18 +492,6 @@ pub(super) async fn static_hybrid_sources_match(
     } else {
         StaticHybridMatch::Differs
     }
-}
-
-fn bound_sources_match<'a>(
-    host: &str,
-    mut bound: impl Iterator<Item = (u32, &'a BoundSource)>,
-    sources: &KvEventSourcesResponse,
-) -> bool {
-    bound.all(|(rank, installed)| {
-        sources
-            .get(&rank.to_string())
-            .is_some_and(|actual| !bound_source_moved(host, installed, actual))
-    })
 }
 
 /// Whether the engine's current answer for one rank no longer matches the
