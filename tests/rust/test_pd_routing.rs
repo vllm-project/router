@@ -1,5 +1,8 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
+#[path = "common/grpc_kv_fixture.rs"]
+mod kv_fixture;
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod test_pd_routing {
     use vllm_router_rs::config::{
@@ -87,6 +90,172 @@ mod test_pd_routing {
         );
         let router = RouterFactory::create_router(&context).await.unwrap();
         (router, server)
+    }
+
+    #[tokio::test]
+    async fn http_pd_bypass_only_redispatches_after_tagged_refusal() {
+        use crate::kv_fixture::{KvPublisher, TOPIC};
+        use axum::{
+            http::{Method, StatusCode},
+            response::{IntoResponse, Response},
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use vllm_router_rs::config::KvConnector;
+        use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig;
+
+        #[derive(Clone, Copy)]
+        enum Refusal {
+            Tagged,
+            Untagged,
+            NoResponse,
+        }
+
+        let publisher = KvPublisher::bind();
+        let mut layout = publisher.layout("mock-model", 16);
+        layout.nixl_pull_local_prefill = Some(true);
+        let sources = json!({"0": {
+            "publisher": "zmq", "endpoint": publisher.endpoint, "replay_endpoint": publisher.replay_endpoint,
+            "topic": TOPIC, "enable_kv_cache_events": true,
+        }});
+        let handoff = json!({"do_remote_prefill": true, "remote_engine_id": "P"});
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let refusal = Arc::new(Mutex::new(Refusal::Tagged));
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route(
+                "/d/server_info",
+                get(|| async {
+                    Json(json!({"vllm_config": {
+                        "model_config": {"model": "mock-model"},
+                        "cache_config": {"block_size": 16},
+                    }}))
+                }),
+            )
+            .route(
+                "/d/kv_event_sources",
+                get(move || {
+                    let sources = sources.clone();
+                    async move { Json(sources) }
+                }),
+            )
+            .route(
+                "/d/kv_routing_capabilities",
+                get(move || {
+                    let layout = layout.clone();
+                    async move { Json(layout) }
+                }),
+            )
+            .route(
+                "/d/v1/models",
+                get(|| async { Json(json!({"data": [{"id": "mock-model"}]})) }),
+            )
+            .route(
+                "/p/v1/completions",
+                post({
+                    let calls = calls.clone();
+                    let handoff = handoff.clone();
+                    move || {
+                        let calls = calls.clone();
+                        let handoff = handoff.clone();
+                        async move {
+                            calls.lock().unwrap().push(("P", Value::Null));
+                            Json(json!({"kv_transfer_params": handoff}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/d/v1/completions",
+                post({
+                    let calls = calls.clone();
+                    let refusal = refusal.clone();
+                    move |Json(body): Json<Value>| {
+                        let params = body["kv_transfer_params"].clone();
+                        let result = *refusal.lock().unwrap();
+                        calls.lock().unwrap().push(("D", params.clone()));
+                        async move {
+                            if params.get("max_local_prefill_tokens").is_none() {
+                                return Json(json!({"choices": [{"text": "answer"}]}))
+                                    .into_response();
+                            }
+                            match result {
+                                Refusal::Tagged => (
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    [("x-vllm-error-code", "local_prefill_limit_exceeded")],
+                                )
+                                    .into_response(),
+                                Refusal::Untagged => {
+                                    StatusCode::UNPROCESSABLE_ENTITY.into_response()
+                                }
+                                Refusal::NoResponse => std::future::pending::<Response>().await,
+                            }
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(format!("{base}/p"), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.4,
+                    static_kv_event_sources: Default::default(),
+                }),
+                discovery_address: None,
+            },
+            kv_connector: KvConnector::Nixl,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut ctx =
+            vllm_router_rs::server::AppContext::new(config, client, 64, None, vec![]).unwrap();
+        ctx.pd_prefill_bypass = PdPrefillBypassConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let router = RouterFactory::create_router(&Arc::new(ctx)).await.unwrap();
+        let prompt: Vec<u32> = (0..33).collect();
+        publisher.restore(&prompt[..32], 16).await;
+        let request = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 8});
+        let direct = json!({"do_remote_prefill": false, "do_remote_decode": false, "max_local_prefill_tokens": 2048});
+
+        for (result, status, splits) in [
+            (Refusal::Tagged, StatusCode::OK, true),
+            (Refusal::Untagged, StatusCode::UNPROCESSABLE_ENTITY, false),
+            (Refusal::NoResponse, StatusCode::GATEWAY_TIMEOUT, false),
+        ] {
+            *refusal.lock().unwrap() = result;
+            let response = router
+                .route_transparent(None, "/v1/completions", &Method::POST, request.clone())
+                .await;
+            assert_eq!(response.status(), status);
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let mut expected = vec![("D", direct.clone())];
+            if splits {
+                expected.extend([("P", Value::Null), ("D", handoff.clone())]);
+            }
+            assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+        }
+        server.abort();
     }
 
     #[tokio::test]
