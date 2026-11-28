@@ -267,7 +267,7 @@ impl PdProgramRuntime {
             Some(request),
             Some(&pool),
             self.scheduler.enable_key(),
-            scorer.is_some(),
+            true,
         )?
         else {
             return Ok(None);
@@ -291,9 +291,9 @@ impl PdProgramRuntime {
         };
         let default_output = self.scheduler.config.progress_ttl.decode_buffer_tokens;
         reserve_output_budget(&mut identity, request, path, default_output);
-        // Preserve each Program's identity (including nested agents), but let
-        // its first real turn obtain a capacity-checked placement ticket.
-        identity.session_admission = scorer.is_some();
+        // All PD Programs, including nested agents, bind from the head turn's
+        // eligible D ranks. The optional scorer only ranks that eligible set.
+        identity.session_admission = true;
         self.scheduler.sync_targets(identity.model_pool(), targets);
         let routing_text = self
             .scheduler
@@ -861,6 +861,92 @@ mod tests {
     use crate::program_scheduling::ProgramSchedulerConfig;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn non_kv_pd_binding_waits_for_capacity_at_first_placement_and_rebind() {
+        use crate::config::RouterConfig;
+        use crate::program_scheduling::BackendObservation;
+        use std::time::Instant;
+
+        for policy in ["round_robin", "consistent_hash"] {
+            let config = RouterConfig {
+                policy: serde_json::from_value(json!(policy)).unwrap(),
+                program_scheduling: Some(
+                    serde_json::from_value(json!({
+                        "token_capacity_per_dp_rank": 1000,
+                        "enable_batch_gain_admission": false,
+                        "decode_buffer_tokens": 8,
+                        "metrics_interval_seconds": 0.05,
+                        "queue_timeout_seconds": 1
+                    }))
+                    .unwrap(),
+                ),
+                ..Default::default()
+            };
+            let ctx =
+                Arc::new(AppContext::new(config, reqwest::Client::new(), 1, None, vec![]).unwrap());
+            let runtime = PdProgramRuntime::new(&ctx, Arc::new(ServiceRegistry::new()), false)
+                .unwrap()
+                .unwrap();
+            // Drive topology and fresh backend observations explicitly.
+            runtime.observer.abort();
+            let request = json!({"model":"test", "prompt":[1, 2], "max_tokens":1,
+                "vllm_xargs":{"agentic_context":{"program_id":"agent", "expected_resume":true}}});
+            let pool = model_pool(None, &request);
+            let targets = ["a", "b", "c"].map(discovered_target);
+            let observe = |targets: &[ProgramTarget], free: Option<&ProgramTarget>| {
+                let scheduler = &runtime.scheduler;
+                scheduler.sync_targets(&pool, targets);
+                scheduler.apply_observations(
+                    scheduler.begin_observation(targets),
+                    targets.iter().map(|target| BackendObservation {
+                        target_id: target.id.clone(),
+                        base_url: target.base_url.clone(),
+                        dp_rank: target.dp_rank,
+                        kv_cache_usage: Some(if free.is_some_and(|rank| rank.id == target.id) {
+                            0.0
+                        } else {
+                            1.0
+                        }),
+                        running_requests: Some(0),
+                        waiting_requests: Some(0),
+                        observed_at: Instant::now(),
+                    }),
+                );
+                scheduler.tick();
+            };
+
+            observe(&targets, None);
+            let first = runtime.acquire(None, &request, "/v1/completions", &targets, None);
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            observe(&targets, Some(&targets[2]));
+            let first = first.await.unwrap().unwrap();
+            assert_eq!(first.dispatch().target_id, targets[2].id, "{policy}");
+            first.finish(true);
+
+            // A different D is free, but an ordinary continuation waits for its bound D.
+            observe(&targets, Some(&targets[0]));
+            let next = runtime.acquire(None, &request, "/v1/completions", &targets, None);
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            observe(&targets, Some(&targets[2]));
+            let next = next.await.unwrap().unwrap();
+            assert_eq!(next.dispatch().target_id, targets[2].id, "{policy}");
+            next.finish(true);
+
+            // Remove the bound D while idle. Only the next turn knows what must fit.
+            let remaining = &targets[..2];
+            observe(remaining, None);
+            let rebound = runtime.acquire(None, &request, "/v1/completions", remaining, None);
+            tokio::pin!(rebound);
+            assert!(futures::poll!(&mut rebound).is_pending());
+            observe(remaining, Some(&targets[1]));
+            let rebound = rebound.await.unwrap().unwrap();
+            assert_eq!(rebound.dispatch().target_id, targets[1].id, "{policy}");
+            rebound.finish(true);
+        }
+    }
 
     #[test]
     fn decode_target_is_resolved_from_live_discovery_after_admission() {

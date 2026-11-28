@@ -146,9 +146,11 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 
 ### First-turn Decode selection
 
+For every Program binding policy, the head turn first filters D ranks by the turn's demand, available capacity and queue limits. If all online ranks are full, the turn keeps its queue position until capacity changes or its deadline expires. An ordinary continuation checks its bound D. When that D leaves the pool, a waiting head turn repeats capacity-first selection. An idle Program waits for its next turn before rebinding.
+
 Set `--policy '{"default":"round_robin","program":"kv_aware"}'` to score the first Decode placement of each Program. Configure KV events for the D ranks (worker discovery or `--pd-kv-events`). The native `policy.native_decode` and the per-turn `policy.prefill` can be configured independently.
 
-The scheduler first filters D ranks against the turn's capacity and queue limits. Among these ranks the Router minimizes existing Program token reservations plus the prompt tokens that would have to be added on that D. It uses the D rank's own device cache and the engine's token IDs, including worker-rendered chat inputs. If the full set cannot be priced, the Router compares load across eligible ranks. Admission rechecks the recommendation before binding. An ordinary continuation keeps its D. A new session with the same prefix can choose the same D while it has room. The counter `vllm_router_prefix_routing_decisions_total` reports `stage="program_decode"` and an outcome of `prefix_cost`, `load_fallback`, or `single_candidate`. A single eligible D skips token rendering and scoring.
+With `kv_aware`, the Router compares the eligible ranks using existing Program token reservations plus the prompt tokens that would have to be added on that D. It uses the D rank's own device cache and the engine's token IDs, including worker-rendered chat inputs. If the full set cannot be priced, the Router compares load across eligible ranks. Admission rechecks the recommendation before binding. An ordinary continuation keeps its D. A new session with the same prefix can choose the same D while it has room. The counter `vllm_router_prefix_routing_decisions_total` reports `stage="program_decode"` and an outcome of `prefix_cost`, `load_fallback`, or `single_candidate`. A single eligible D skips token rendering and scoring.
 
 ### Per-turn prefill selection
 
