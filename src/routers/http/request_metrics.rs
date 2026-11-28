@@ -340,18 +340,19 @@ pub(crate) async fn measure(request: Request, next: Next) -> Response {
             state.handoff_pending,
         )
     };
-    if !enabled || body.is_end_stream() || (!parts.status.is_success() && !is_stream) {
+    if !enabled || body.is_end_stream() {
         guard.complete();
         return Response::from_parts(parts, body);
     }
 
-    // A buffered (non-streaming) response already completed upstream. A
-    // passthrough body can still be waiting on decode even after headers.
+    // Error headers rule out client cancellation, but a passthrough error
+    // body can still be in flight. Keep the guard until the body terminates.
     if !parts.status.is_success() {
         guard.terminal();
     } else if is_stream {
         state.lock().phase = Phase::Streaming;
     } else if body.size_hint().exact().is_some() {
+        // This non-streaming body already completed upstream.
         state.lock().cancelled = false;
     }
     let content_type = parts
