@@ -15,10 +15,11 @@ use super::reconcile::{
     BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
     CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
-    SourceBinding,
+    RequestHashCache, SourceBinding, TierMatch,
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -100,8 +101,8 @@ impl WorkerLifecycle {
         rank: &SourceBinding,
         mut first_trust_check: Option<Instant>,
         now: impl Fn() -> Instant,
-        mut query: impl FnMut() -> Vec<T>,
-    ) -> Vec<T> {
+        mut query: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
         for _ in 0..2 {
             let generation = rank.control.generation();
             let initial = {
@@ -109,29 +110,41 @@ impl WorkerLifecycle {
                 if generation == 0
                     || !self.trusted_at(&state, || first_trust_check.take().unwrap_or_else(&now))
                 {
-                    return Vec::new();
+                    return None;
                 }
                 state.verified_at
             };
-            let hits = query();
-            if hits.is_empty() {
-                return hits;
-            }
+            let hits = query()?;
             let state = self.state.lock();
             let end = now();
             if !self.trusted_at(&state, || end) {
-                return Vec::new();
+                return None;
             }
             // The same source and the original grant must cover the observation.
             // Renewal alone cannot certify pages observed during an expiry gap.
             if rank.control.generation() == generation
                 && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
             {
-                return hits;
+                return Some(hits);
             }
         }
-        Vec::new()
+        None
     }
+
+    pub(super) fn match_rank<'a>(
+        &self,
+        index: &SourceBinding,
+        cache: &mut RequestHashCache<'a>,
+        mut query: impl FnMut(&mut RequestHashCache<'a>) -> Option<PlacementMatch>,
+    ) -> Vec<TierMatch> {
+        let first_trust_check = self
+            .layout
+            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
+        // Only the accepted attempt can publish evidence for the reservation.
+        self.read_rank(index, first_trust_check, Instant::now, || query(cache))
+            .map_or_else(Vec::new, |hit| hit.publish(index, cache))
+    }
+
     pub(super) fn expire_if_needed(&self) -> bool {
         let mut state = self.state.lock();
         self.layout
@@ -337,21 +350,9 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         let Some(index) = self.indexes.get(&dp_rank) else {
             return Vec::new();
         };
-        let first_trust_check = self
-            .lifecycle
-            .layout
-            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
-        self.lifecycle
-            .read_rank(index, first_trust_check, Instant::now, || {
-                crate::policies::TieredMatchProvider::matches_with_cache(
-                    index.as_ref(),
-                    tokens,
-                    block_size,
-                    lora,
-                    dp_rank,
-                    cache,
-                )
-            })
+        self.lifecycle.match_rank(index, cache, |cache| {
+            index.lookup_placement(tokens, block_size, lora, dp_rank, cache)
+        })
     }
 }
 
