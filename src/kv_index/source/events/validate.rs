@@ -40,20 +40,19 @@ fn complete_blocks(store: &BlockStored) -> bool {
         == Some(store.token_ids.len())
 }
 
-pub(super) fn image_block_keys(key: &rmpv::Value) -> Option<Vec<(&str, i64)>> {
-    let features = key.as_array().filter(|features| !features.is_empty())?;
-    features
-        .iter()
-        .map(|feature| {
-            let [hash, offset] = feature.as_array()?.as_slice() else {
-                return None;
-            };
-            Some((hash.as_str()?, offset.as_i64()?))
-        })
-        .collect()
+fn image_block_key(value: &rmpv::Value) -> Option<(&str, i64)> {
+    let [hash, offset] = value.as_array()?.as_slice() else {
+        return None;
+    };
+    Some((hash.as_str()?, offset.as_i64()?))
 }
 
-/// Return false for a secondary page size that proves no prefix evidence.
+pub(super) fn image_block_keys(key: &rmpv::Value) -> Option<Vec<(&str, i64)>> {
+    let features = key.as_array().filter(|features| !features.is_empty())?;
+    features.iter().map(image_block_key).collect()
+}
+
+/// Return false when a store provides no usable prefix evidence.
 pub(super) fn validate_store(
     group: &CacheGroup,
     store: &BlockStored,
@@ -78,7 +77,7 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
-    let mut unsupported_image = false;
+    let mut unsupported_extra_keys = false;
     if let Some(keys) = store
         .extra_keys
         .as_ref()
@@ -88,20 +87,21 @@ pub(super) fn validate_store(
             return Err(SourceError::InvalidBatch);
         }
         for (index, key) in keys.iter().enumerate().filter(|(_, key)| !key.is_nil()) {
-            if let Some(media) = image_block_keys(key) {
-                unsupported_image |= media.iter().any(|(hash, _)| !is_image_hash(hash));
-                continue;
+            let parts = key.as_array().ok_or(SourceError::InvalidBatch)?;
+            let Some((last, preceding)) = parts.split_last() else {
+                return Err(SourceError::InvalidBatch);
+            };
+            // vLLM appends the cache salt after any image keys on the first block.
+            let media = if index == 0 && last.as_str().is_some_and(|salt| !salt.is_empty()) {
+                unsupported_extra_keys = true;
+                preceding
+            } else {
+                parts.as_slice()
+            };
+            for feature in media {
+                let (hash, _) = image_block_key(feature).ok_or(SourceError::InvalidBatch)?;
+                unsupported_extra_keys |= !is_image_hash(hash);
             }
-            // vLLM folds a standalone cache salt into the first block only.
-            if index == 0
-                && key.as_array().is_some_and(|parts| {
-                    matches!(parts.as_slice(), [salt] if salt.as_str().is_some_and(|s| !s.is_empty()))
-                })
-                && keys[1..].iter().all(rmpv::Value::is_nil)
-            {
-                return Ok(false);
-            }
-            return Err(SourceError::InvalidBatch);
         }
     }
     let partial = partial_hash_hits
@@ -137,7 +137,7 @@ pub(super) fn validate_store(
     {
         return Err(SourceError::InvalidBatch);
     }
-    Ok(!unsupported_image)
+    Ok(!unsupported_extra_keys)
 }
 
 pub(in crate::kv_index) fn event_kind_matches(kind: GroupRule, store: &BlockStored) -> bool {
