@@ -50,13 +50,6 @@ pub struct CacheKey {
     pub block_size: u32,
 }
 
-/// A boot observation from stock vLLM's single-rank HTTP frontend.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct VllmBoot {
-    id: String,
-    prefix_hash: Option<String>,
-}
-
 /// Worker metadata used when constructing a KV cache identity.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ServerInfo {
@@ -83,8 +76,12 @@ pub struct ServerInfo {
     /// Engine revision used to interpret versioned cache lookup rules.
     #[serde(skip)]
     pub(crate) vllm_version: Option<(u32, u32)>,
+    /// Native vLLM process ID, independent of the KV source identity.
     #[serde(skip)]
-    pub(crate) vllm_boot: Option<VllmBoot>,
+    pub(crate) vllm_instance_id: Option<String>,
+    /// The prefix hash reported by that same process in /server_info.
+    #[serde(skip)]
+    pub(crate) prefix_caching_hash_algo: Option<String>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default)]
@@ -177,12 +174,6 @@ pub(crate) struct WorkerDiscovery {
     /// None means no usable snapshot was collected, for example when probing
     /// was inapplicable, skipped for budget, or failed.
     engine_cache_configs: Option<EngineCacheConfigs>,
-}
-
-impl WorkerDiscovery {
-    fn vllm_boot(&self) -> Option<&VllmBoot> {
-        self.server_info.as_ref().ok()?.vllm_boot.as_ref()
-    }
 }
 
 /// What the optional KV event source control probe found. A 404/405 means the
@@ -524,9 +515,9 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                let (verified, boot) =
+                let (verified, native) =
                     tokio::join!(self.verify_static_source(worker_url, &discovery), async {
-                        if !self.tracks_vllm_boot(worker_url, &discovery) {
+                        if !self.tracks_vllm_instance(worker_url, &discovery) {
                             return None;
                         }
                         tokio::time::timeout(
@@ -540,10 +531,10 @@ impl KvIndexSupervisor {
                         .await
                         .ok()
                         .and_then(Result::ok)
-                        .and_then(|info| info.vllm_boot)
                     });
-                if let Ok(info) = &mut discovery.server_info {
-                    info.vllm_boot = boot;
+                if let (Ok(info), Some(native)) = (&mut discovery.server_info, native) {
+                    info.vllm_instance_id = native.vllm_instance_id;
+                    info.prefix_caching_hash_algo = native.prefix_caching_hash_algo;
                 }
                 if let Err((probe, reason)) = verified {
                     discovery.sources = Err(SourcesUnavailable {
@@ -584,9 +575,10 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
-        if !self.tracks_vllm_boot(worker_url, &discovery) {
+        if !self.tracks_vllm_instance(worker_url, &discovery) {
             if let Ok(info) = &mut discovery.server_info {
-                info.vllm_boot = None;
+                info.vllm_instance_id = None;
+                info.prefix_caching_hash_algo = None;
             }
         }
         let Some(layout) = discovery.hybrid.as_ref() else {
@@ -656,7 +648,7 @@ impl KvIndexSupervisor {
         discovery
     }
 
-    fn tracks_vllm_boot(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
+    fn tracks_vllm_instance(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
         self.full_attention_http
             && !self.http_pd
             && !crate::backend::is_grpc_url(worker_url)

@@ -14,7 +14,7 @@ use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
-use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, VllmBoot, WorkerKvInfo, WorkerSubs};
+use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, ServerInfo, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
@@ -57,8 +57,8 @@ pub(super) struct LifecycleState {
 }
 
 impl LifecycleState {
-    pub(super) fn vllm_boot_id(&self) -> Option<&str> {
-        self.descriptor.as_ref()?.vllm_boot_id.as_deref()
+    fn vllm_instance_id(&self) -> Option<&str> {
+        self.descriptor.as_ref()?.vllm_instance_id()
     }
 }
 
@@ -171,8 +171,8 @@ impl WorkerLifecycle {
     }
 
     pub(super) fn vllm_restart_probe_due(&self) -> bool {
-        let has_boot = self.state.lock().vllm_boot_id().is_some();
-        has_boot && self.refresh_due()
+        let has_instance_id = self.state.lock().vllm_instance_id().is_some();
+        has_instance_id && self.refresh_due()
     }
 
     pub(super) fn layout_rebind_due(&self) -> bool {
@@ -196,26 +196,26 @@ impl WorkerLifecycle {
             && (!self.layout
                 || self.trusted(state)
                 // The layout monitor owns transient recovery for this same boot.
-                || (state.vllm_boot_id().is_some() && self.active.load(Ordering::Acquire)))
+                || (state.vllm_instance_id().is_some() && self.active.load(Ordering::Acquire)))
     }
 
     /// Descriptor probes run every 30s; three failures retire an installed owner.
     pub(super) fn observe_descriptor(
         &self,
         descriptor: Option<&WorkerDescriptor>,
-        boot: Option<&VllmBoot>,
+        metadata: Option<&ServerInfo>,
     ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
-        if let Some(old) = state.vllm_boot_id() {
-            let Some(boot) = boot else {
+        if let Some(old) = state.vllm_instance_id() {
+            let Some(info) = metadata.filter(|info| info.vllm_instance_id.is_some()) else {
                 // An optional probe failure does not identify a new instance.
                 return SourceAction::Keep;
             };
-            if old != boot.id {
+            if info.vllm_instance_id.as_deref() != Some(old) {
                 self.stop_layout(&mut state);
                 state.checked = Some(Instant::now());
-                return if descriptor.is_some() && boot.prefix_hash.is_some() {
+                return if descriptor.is_some() && info.prefix_caching_hash_algo.is_some() {
                     SourceAction::Rebuild
                 } else {
                     SourceAction::Stop

@@ -171,10 +171,7 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
-        let boot_hash = server_info
-            .vllm_boot
-            .as_ref()
-            .and_then(|boot| boot.prefix_hash.as_deref());
+        let native_hash = server_info.prefix_caching_hash_algo.as_deref();
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -188,7 +185,7 @@ impl KvIndexSupervisor {
                 capability.rank_capability(rank).and_then(|contract| {
                     contract
                         .reported_hash_mismatch(reported)
-                        .or_else(|| contract.reported_hash_mismatch(boot_hash))
+                        .or_else(|| contract.reported_hash_mismatch(native_hash))
                 })
             {
                 warn!(

@@ -264,8 +264,10 @@ impl KvIndexSupervisor {
                 continue;
             }
             let descriptor = probe.as_ref().and_then(|probe| probe.descriptor.as_ref());
-            let boot = probe.as_ref().and_then(|probe| probe.worker.vllm_boot());
-            let action = lifecycle.observe_descriptor(descriptor, boot);
+            let metadata = probe
+                .as_ref()
+                .and_then(|probe| probe.worker.server_info.as_ref().ok());
+            let action = lifecycle.observe_descriptor(descriptor, metadata);
             match action {
                 SourceAction::Keep => {
                     if let Some(probe) = probe.filter(|probe| probe.descriptor.is_some()) {

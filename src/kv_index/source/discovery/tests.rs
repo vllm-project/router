@@ -2377,6 +2377,7 @@ async fn fixed_publishers_rebind_after_a_verified_vllm_restart() {
 
         let initial = supervisor.on_worker_added(&url).await.unwrap();
         assert_eq!(initial.ranks.is_empty(), static_source);
+        assert_eq!(initial.instance_id, url);
         let old = supervisor.lifecycle_for_worker(&url);
         assert!(!old.vllm_restart_probe_due());
         let refresh = || async {
@@ -2416,6 +2417,7 @@ async fn fixed_publishers_rebind_after_a_verified_vllm_restart() {
 
         *boot.lock() = ("boot-b", compatible);
         let refreshed = refresh().await;
+        assert_eq!(refreshed[&url].info.as_ref().unwrap().instance_id, url);
         let provider = refreshed[&url].provider.as_ref().unwrap();
         boundary_subscription(&publisher, topic, true).await;
         let request = recv_frames(&replay).await;

@@ -14,7 +14,7 @@ use super::metrics_meta::EngineCacheConfigs;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
-    SourcesUnavailable, VllmBoot, WorkerDiscovery, CONTROL_TIMEOUT,
+    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -29,7 +29,6 @@ pub(super) struct RegistrationProbe {
 #[derive(PartialEq)]
 pub(super) struct WorkerDescriptor {
     server_info: ServerInfo,
-    pub(super) vllm_boot_id: Option<String>,
     sources: Option<KvEventSourcesResponse>,
     model_id: Result<Option<String>, String>,
     hybrid: Option<CacheCapabilities>,
@@ -42,6 +41,10 @@ impl WorkerDescriptor {
         self.hybrid.as_ref()
     }
 
+    pub(super) fn vllm_instance_id(&self) -> Option<&str> {
+        self.server_info.vllm_instance_id.as_deref()
+    }
+
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()
@@ -51,7 +54,8 @@ impl WorkerDescriptor {
 
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
     let mut server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
-    let vllm_boot_id = server_info.vllm_boot.take().map(|boot| boot.id);
+    // Hash reports affect admission, not descriptor identity.
+    server_info.prefix_caching_hash_algo = None;
     let sources = match &worker.sources {
         Ok(sources) => Some(sources.clone()),
         Err(unavailable) if !unavailable.probe.retryable() => None,
@@ -59,7 +63,6 @@ pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescri
     };
     Ok(WorkerDescriptor {
         server_info,
-        vllm_boot_id,
         sources,
         model_id: worker.model_id.clone(),
         hybrid: worker.hybrid.clone(),
@@ -93,7 +96,12 @@ impl KvIndexSupervisor {
         let mut descriptor = match worker_descriptor(&worker) {
             Ok(descriptor) => descriptor,
             // The restart can invalidate old credit even if sources are unavailable.
-            Err(_) if worker.vllm_boot().is_some() => {
+            Err(_)
+                if worker
+                    .server_info
+                    .as_ref()
+                    .is_ok_and(|info| info.vllm_instance_id.is_some()) =>
+            {
                 return Ok(RegistrationProbe {
                     descriptor: None,
                     worker,
@@ -649,7 +657,7 @@ pub(super) async fn query_server_info_json(
         _ => None,
     };
     let parallel = &config["parallel_config"];
-    let vllm_boot = config["instance_id"]
+    let vllm_instance_id = config["instance_id"]
         .as_str()
         .map(str::trim)
         .filter(|id| {
@@ -659,18 +667,17 @@ pub(super) async fn query_server_info_json(
                     .as_u64()
                     .is_none_or(|count| count == 1)
         })
-        .map(|id| VllmBoot {
-            id: id.to_owned(),
-            prefix_hash: config
-                .pointer("/cache_config/prefix_caching_hash_algo")
-                .and_then(serde_json::Value::as_str)
-                .filter(|algorithm| !algorithm.trim().is_empty())
-                .map(str::to_owned),
-        });
+        .map(str::to_owned);
+    let prefix_caching_hash_algo = config
+        .pointer("/cache_config/prefix_caching_hash_algo")
+        .and_then(serde_json::Value::as_str)
+        .filter(|algorithm| vllm_instance_id.is_some() && !algorithm.trim().is_empty())
+        .map(str::to_owned);
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
-        vllm_boot,
+        vllm_instance_id,
+        prefix_caching_hash_algo,
         kv_block_size: block_size,
         effective_attention_block_size,
         mooncake_truncates_compressed,
