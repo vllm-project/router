@@ -36,7 +36,7 @@ impl KvIndexSupervisor {
             }
             Err(error) => return Err(error.detail),
         };
-        let (server_info, _) = info?;
+        let server_info = info.server_info?;
         let mut info = WorkerKvInfo {
             instance_id: server_instance_id(&server_info, worker_url),
             block_size: discovered_block_size(&server_info),

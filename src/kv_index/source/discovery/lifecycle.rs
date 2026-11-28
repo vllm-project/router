@@ -8,19 +8,22 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::info;
 
+use super::metrics_meta::{reported_prefix_hash, EngineCacheConfigs};
 use super::probe::WorkerDescriptor;
 use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
 use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
     CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
-    SourceBinding,
+    RequestHashCache, SourceBinding, TierMatch,
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const OPTIONAL_METADATA_BUDGET: Duration = CONTROL_TIMEOUT.checked_div(4).unwrap();
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const MAX_PROBE_FAILURES: u8 = 3;
 const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
@@ -98,8 +101,8 @@ impl WorkerLifecycle {
         rank: &SourceBinding,
         mut first_trust_check: Option<Instant>,
         now: impl Fn() -> Instant,
-        mut query: impl FnMut() -> Vec<T>,
-    ) -> Vec<T> {
+        mut query: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
         for _ in 0..2 {
             let generation = rank.control.generation();
             let initial = {
@@ -107,29 +110,41 @@ impl WorkerLifecycle {
                 if generation == 0
                     || !self.trusted_at(&state, || first_trust_check.take().unwrap_or_else(&now))
                 {
-                    return Vec::new();
+                    return None;
                 }
                 state.verified_at
             };
-            let hits = query();
-            if hits.is_empty() {
-                return hits;
-            }
+            let hits = query()?;
             let state = self.state.lock();
             let end = now();
             if !self.trusted_at(&state, || end) {
-                return Vec::new();
+                return None;
             }
             // The same source and the original grant must cover the observation.
             // Renewal alone cannot certify pages observed during an expiry gap.
             if rank.control.generation() == generation
                 && (!self.layout || end.saturating_duration_since(initial) <= LAYOUT_FRESHNESS)
             {
-                return hits;
+                return Some(hits);
             }
         }
-        Vec::new()
+        None
     }
+
+    pub(super) fn match_rank<'a>(
+        &self,
+        index: &SourceBinding,
+        cache: &mut RequestHashCache<'a>,
+        mut query: impl FnMut(&mut RequestHashCache<'a>) -> Option<PlacementMatch>,
+    ) -> Vec<TierMatch> {
+        let first_trust_check = self
+            .layout
+            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
+        // Only the accepted attempt can publish evidence for the reservation.
+        self.read_rank(index, first_trust_check, Instant::now, || query(cache))
+            .map_or_else(Vec::new, |hit| hit.publish(index, cache))
+    }
+
     pub(super) fn expire_if_needed(&self) -> bool {
         let mut state = self.state.lock();
         self.layout
@@ -160,16 +175,22 @@ impl WorkerLifecycle {
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
+    pub(super) fn keeps_descriptor(
+        &self,
+        state: &LifecycleState,
+        descriptor: &WorkerDescriptor,
+    ) -> bool {
+        state.info.is_some()
+            && state.descriptor.as_ref() == Some(descriptor)
+            && (!self.layout || self.trusted(state))
+    }
+
     /// Descriptor probes run every 30s; three failures retire an installed owner.
     pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
         match descriptor {
-            Some(descriptor)
-                if state.info.is_some()
-                    && state.descriptor.as_ref() == Some(descriptor)
-                    && (!self.layout || self.trusted(&state)) =>
-            {
+            Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
                 SourceAction::Keep
             }
@@ -241,6 +262,52 @@ pub(super) struct LayoutWorkerProvider {
     pub(super) lifecycle: Arc<WorkerLifecycle>,
 }
 
+impl LayoutWorkerProvider {
+    fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
+        let mut state = self.lifecycle.state.lock();
+        let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
+            return;
+        };
+        let mut fenced = Vec::new();
+        for (&rank, index) in &self.indexes {
+            let Some(lease) = index.binding.as_ref().filter(|lease| lease.is_active()) else {
+                continue;
+            };
+            let reported = reported_prefix_hash(configs, worker, rank);
+            let Some((expected, reported)) = layout
+                .rank_capability(rank)
+                .and_then(|contract| contract.reported_hash_mismatch(reported))
+            else {
+                continue;
+            };
+            tracing::warn!(
+                worker,
+                rank,
+                expected,
+                reported,
+                "KV credit disabled after failed worker re-registration"
+            );
+            lease.fence_hash();
+            fenced.push((rank, index, lease));
+        }
+        if let Some(info) = &mut state.info {
+            info.ranks
+                .retain(|rank| !fenced.iter().any(|(fenced, _, _)| fenced == rank));
+            if !fenced.is_empty() && info.ranks.is_empty() {
+                tracing::warn!(
+                    worker,
+                    "No KV ranks remain after failed worker re-registration"
+                );
+            }
+        }
+        drop(state);
+        for (_, index, lease) in fenced {
+            let _guard = lease.gate.lock();
+            index.invalidate();
+        }
+    }
+}
+
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
     fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
         self.indexes.get(&rank)?.shared_prefix_lookup(rank)
@@ -283,25 +350,28 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
         let Some(index) = self.indexes.get(&dp_rank) else {
             return Vec::new();
         };
-        let first_trust_check = self
-            .lifecycle
-            .layout
-            .then(|| *cache.first_trust_check.get_or_insert_with(Instant::now));
-        self.lifecycle
-            .read_rank(index, first_trust_check, Instant::now, || {
-                crate::policies::TieredMatchProvider::matches_with_cache(
-                    index.as_ref(),
-                    tokens,
-                    block_size,
-                    lora,
-                    dp_rank,
-                    cache,
-                )
-            })
+        self.lifecycle.match_rank(index, cache, |cache| {
+            index.lookup_placement(tokens, block_size, lora, dp_rank, cache)
+        })
     }
 }
 
 impl KvIndexSupervisor {
+    pub(super) fn fence_failed_registration(
+        &self,
+        worker_url: &str,
+        observed: &Arc<WorkerLifecycle>,
+        configs: &EngineCacheConfigs,
+    ) {
+        let workers = self.installed.workers.lock();
+        if let Some(previous) = workers
+            .get(worker_url)
+            .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
+        {
+            previous.provider.fence_runtime_hashes(worker_url, configs);
+        }
+    }
+
     pub(super) fn monitor_hybrid_source(
         &self,
         provider: &Arc<LayoutWorkerProvider>,
@@ -396,6 +466,11 @@ impl KvIndexSupervisor {
                         handles.clear();
                         let mut recovered = true;
                         for (ev, index) in &targets {
+                            let Some(lease) =
+                                index.binding.as_ref().filter(|lease| lease.is_active())
+                            else {
+                                continue;
+                            };
                             let stream = Arc::new(
                                 EventStream::new(index.clone())
                                     .with_strict_recovery(strict_recovery),
@@ -407,7 +482,8 @@ impl KvIndexSupervisor {
                                 signals.clone(),
                             ) {
                                 Ok(handle) => handles.push(Arc::new(handle)),
-                                Err(_) => recovered = false,
+                                Err(_) if lease.is_active() => recovered = false,
+                                Err(_) => {}
                             }
                         }
                         // Retirement can race the awaited probe and the new
