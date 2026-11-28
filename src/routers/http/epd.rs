@@ -622,8 +622,8 @@ fn parse_batch_response(
             ));
         }
     };
-    // Position is the reliable correlation when the engine rehashes uuids
-    // with processing options; uuid and single-entry shapes are fallbacks.
+    // Positional reports apply only to the listed batch items, even when
+    // another item shares the UUID.
     let mut by_position: HashMap<usize, (&String, &Value)> = HashMap::new();
     for (mm_hash, reported) in params {
         let Some(item_indices) = reported.get("item_indices") else {
@@ -650,17 +650,14 @@ fn parse_batch_response(
         .iter()
         .enumerate()
         .map(|(local, &index)| {
-            let entry = by_position
-                .get(&local)
-                .copied()
-                .or_else(|| params.get_key_value(&items[index].content_id))
-                .or_else(|| {
-                    if indices.len() == 1 && params.len() == 1 {
-                        params.iter().next()
-                    } else {
-                        None
-                    }
-                });
+            let entry = by_position.get(&local).copied().or_else(|| {
+                let fallback = if indices.len() == 1 && params.len() == 1 {
+                    params.iter().next()
+                } else {
+                    params.get_key_value(&items[index].content_id)
+                };
+                fallback.filter(|(_, reported)| reported.get("item_indices").is_none())
+            });
             let Some((hash, reported)) = entry else {
                 return Ok(None);
             };
@@ -1079,8 +1076,14 @@ mod tests {
                 "duplicate_index" => json!([0, 0]),
                 _ => json!(indices),
             };
+            // In mixed batches the engine hash matches the input UUID.
+            let hash = if state.mode == "mixed" {
+                uuid
+            } else {
+                format!("engine-{uuid}")
+            };
             params.insert(
-                format!("engine-{uuid}"),
+                hash,
                 json!({
                     "metadata": metadata,
                     "item_indices": item_indices,
@@ -1718,6 +1721,50 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(|part| part["uuid"].is_string()));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn positional_report_keeps_unreported_duplicate_uuid_as_raw_media() {
+        let (stage, _, server) = mock("mixed").await;
+        let mut input = request();
+        let content = &mut input["messages"][0]["content"];
+        for index in [0, 2] {
+            content[index]["uuid"] = json!("repeated-uuid");
+        }
+        let raw_image = content[0].clone();
+
+        let (body, _) = stage
+            .prepare(&Client::new(), input, "pd", None, None)
+            .await
+            .unwrap();
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0], raw_image);
+        assert_eq!(
+            content[2],
+            json!({
+                "type": "image_embeds",
+                "image_embeds": {"image_grid_thw": [1, 2, 3]},
+                "uuid": "repeated-uuid",
+            })
+        );
+        let transfers = body["ec_transfer_params"]["ec_items"].as_array().unwrap();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0]["mm_hash"], "repeated-uuid");
+        server.abort();
+    }
+
+    #[test]
+    fn singleton_fallback_requires_report_without_item_indices() {
+        let items = collect_media_items(&request()).unwrap();
+        let hash = "engine-hash";
+        let mut reply = json!({"ec_transfer_params": {(hash): {"peer_port": 4321}}});
+
+        let result = parse_batch_response(reply.clone(), &items, &[0]).unwrap();
+        assert_eq!(result[0].as_ref().unwrap().mm_hash, hash);
+
+        reply["ec_transfer_params"][hash]["item_indices"] = json!([]);
+        let result = parse_batch_response(reply, &items, &[0]).unwrap();
+        assert!(result[0].is_none());
     }
 
     #[tokio::test]

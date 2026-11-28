@@ -211,22 +211,24 @@ bodies, and malformed transfer reports count as failed outcomes.
 
 Send ordinary OpenAI chat requests to `/v1/chat/completions`. Each raw media item
 is sent to an encoder. Published metadata replaces that item with an embeds
-reference; when an encoder reports no metadata, the original media is kept with
-its content-derived uuid pinned and its transfer is forwarded, so the consumer
-re-preprocesses into the same mm_hash and can still reuse the published
+reference. When an encoder reports a transfer without metadata, the router
+keeps the original media with its content-derived UUID pinned and forwards the
+transfer so the consumer can derive the same mm_hash and reuse the published
 embedding. Repeated images keep their original positions and independent
 transfer IDs.
 
 Encoder responses must be JSON objects. They may omit `ec_transfer_params` or
 set it to `null`. Any other report value must be a JSON object, and each matched
 transfer entry must also be a JSON object. When `item_indices` is present it
-must be a batch-local integer array with in-range, non-repeated positions. If a
-matched entry includes `metadata`, it must be a JSON object containing numeric
-arrays. Invalid responses, report types, matched entries, indices, or metadata
-fail the request with `502` before the consumer is called. The router keeps the
-raw media with its content-derived UUID when the EC report is omitted or null,
-when it has no entry for the item, or when the entry omits `metadata` or sets
-it to `{}`. It forwards the reported transfer handle when one exists.
+must be a batch-local integer array with in-range, non-repeated positions. The
+entry applies only to those positions. UUID and single-entry fallbacks use
+entries that omit `item_indices`. If a matched entry includes `metadata`, it
+must be a JSON object containing numeric arrays. Invalid responses, report
+types, matched entries, indices, or metadata fail the request with `502` before
+the consumer is called. The router keeps the raw media with its content-derived
+UUID when the EC report is omitted or null, when it has no entry for the item,
+or when the entry omits `metadata` or sets it to `{}`. It forwards the
+reported transfer handle when one exists.
 Connector-specific fields under `ec_transfer_params` remain opaque and are
 passed through unchanged.
 Other request fields, including sampling options, pass through unchanged.
