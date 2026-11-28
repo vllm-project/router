@@ -308,6 +308,12 @@ impl RouterManager {
             }
         }
 
+        // Stateful policies (cache_aware) need init_workers() to build the
+        // model's tree; without it every request takes the random fallback.
+        if policy.requires_initialization() {
+            policy.init_workers(&self.worker_registry.get_by_model_fast(&model_id));
+        }
+
         // Log which type of router would handle this worker (for debugging)
         let expected_router = match config.worker_type.as_deref() {
             Some("prefill") | Some("decode") => "http-pd",
