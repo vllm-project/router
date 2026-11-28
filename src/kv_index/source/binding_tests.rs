@@ -1537,6 +1537,47 @@ fn qwen4_compressed_group_accepts_mla_events_and_rejects_other_specs() {
 }
 
 #[test]
+fn qwen4_compressed_partial_stores_extend_prefix_reuse() {
+    let tokens = prompt();
+    let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+    let groups = qwen4_groups();
+    let batch = event_batch(
+        groups
+            .iter()
+            .flat_map(|group| {
+                let spec = if group.kind == GroupRule::Checkpoint {
+                    "mamba"
+                } else {
+                    "mla_attention"
+                };
+                [
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        320,
+                        &tokens[..320],
+                        &hashes[19..20],
+                    )),
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        16,
+                        &tokens[464..480],
+                        &hashes[29..30],
+                    )),
+                ]
+            })
+            .collect(),
+    );
+    let index = SourceBinding::new(target(), groups, 16, 0, 8)
+        .unwrap()
+        .with_partial_hash_hits(true);
+    index.begin_empty(0);
+    assert_eq!(index.apply_batch(0, &batch), Ok(()));
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 480);
+}
+
+#[test]
 fn compressed_group_must_align_with_its_block_size() {
     let mut groups = qwen4_groups();
     groups[3].kind = GroupRule::CompressedFullAttention {
