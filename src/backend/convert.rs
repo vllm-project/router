@@ -617,20 +617,23 @@ pub fn prepare_grpc_completion_prompts(
     }
     // Router-side only: the adapter asks the worker for ids unconditionally, so
     // this gates what the reply writes back rather than the wire request.
+    // Explicit JSON null counts as omitted for these optional extensions:
+    // vLLM accepts null for them, and clients serialize unset optionals
+    // as null, so a null must not 400 where omitting the field would not.
     let emit_token_ids = match request.other.get(RETURN_TOKEN_IDS) {
-        None => false,
+        None | Some(serde_json::Value::Null) => false,
         Some(value) => value
             .as_bool()
             .ok_or_else(|| "return_token_ids must be a boolean".to_string())?,
     };
     let return_tokens_as_token_ids = match request.other.get(RETURN_TOKENS_AS_TOKEN_IDS) {
-        None => false,
+        None | Some(serde_json::Value::Null) => false,
         Some(value) => value
             .as_bool()
             .ok_or_else(|| "return_tokens_as_token_ids must be a boolean".to_string())?,
     };
     let logprob_token_ids = match request.other.get(LOGPROB_TOKEN_IDS) {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(value) => {
             let ids = value
                 .as_array()
@@ -656,7 +659,7 @@ pub fn prepare_grpc_completion_prompts(
         .get(PROMPT_LOGPROBS)
         .is_some_and(|value| value.as_i64() == Some(-1));
     let prompt_logprobs = match request.other.get(PROMPT_LOGPROBS) {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
             value
                 .as_i64()
@@ -1150,6 +1153,14 @@ mod tests {
         .unwrap();
         assert!(!explicit_false.emit_token_ids);
 
+        // Explicit null is omitted, matching vLLM: no 400, no ids.
+        let explicit_null = prepare_grpc_completion(&completion(serde_json::json!({
+            "prompt": [1],
+            "return_token_ids": null
+        })))
+        .unwrap();
+        assert!(!explicit_null.emit_token_ids);
+
         let wrong_type = prepare_grpc_completion(&completion(serde_json::json!({
             "prompt": [1],
             "return_token_ids": "yes"
@@ -1398,6 +1409,22 @@ mod tests {
         })))
         .unwrap_err();
         assert!(bad_type.contains("array"), "{bad_type}");
+
+        // Explicit null counts as omitted for these optional extensions,
+        // matching vLLM: no 400, and no implied requirement fires — a
+        // null `logprob_token_ids` without `logprobs` is fine, while a
+        // real list still requires `logprobs`.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1],
+            "prompt_logprobs": null,
+            "logprob_token_ids": null,
+            "return_tokens_as_token_ids": null
+        })))
+        .unwrap();
+        assert_eq!(lowered.options.prompt_logprobs, None);
+        assert!(!lowered.options.prompt_logprobs_all);
+        assert_eq!(lowered.options.logprob_token_ids, None);
+        assert!(!lowered.options.return_tokens_as_token_ids);
 
         // Non-streaming explicit `prompt_logprobs` stands alone — no
         // `logprobs` or `echo` needed, matching vLLM, which takes the
