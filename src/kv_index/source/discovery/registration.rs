@@ -173,8 +173,7 @@ impl KvIndexSupervisor {
             .is_none_or(|version| version >= (0, 32));
         let native_hash = expected_lifecycle
             .as_ref()
-            .filter(|old| old.state.lock().reported_vllm_restart(Some(&server_info)))
-            .and(server_info.prefix_caching_hash_algo.as_deref());
+            .and_then(|old| old.state.lock().readmission_hash(Some(&server_info)));
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -310,7 +309,8 @@ impl KvIndexSupervisor {
             self.installed.retire_worker(previous);
         }
         if load_only {
-            lifecycle.state.lock().fenced_vllm_instance_id = server_info.vllm_instance_id;
+            lifecycle.state.lock().fenced_vllm_instance_id =
+                server_info.vllm_instance.map(|(id, _)| id);
             let info = WorkerKvInfo {
                 instance_id,
                 block_size: Some(block_size),

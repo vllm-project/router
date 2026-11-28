@@ -14,7 +14,10 @@ use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
-use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, ServerInfo, WorkerKvInfo, WorkerSubs};
+use super::{
+    CacheKey, InstalledWorkers, KvIndexSupervisor, ServerInfo, WorkerDiscovery, WorkerKvInfo,
+    WorkerSubs,
+};
 use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
@@ -58,17 +61,13 @@ pub(super) struct LifecycleState {
 }
 
 impl LifecycleState {
-    pub(super) fn reported_vllm_restart(&self, metadata: Option<&ServerInfo>) -> bool {
-        self.fenced_vllm_instance_id
-            .as_deref()
-            .zip(metadata)
-            .is_some_and(|(fenced, info)| {
-                info.prefix_caching_hash_algo.is_some()
-                    && info
-                        .vllm_instance_id
-                        .as_deref()
-                        .is_some_and(|id| id != fenced)
-            })
+    pub(super) fn readmission_hash<'a>(&self, report: Option<&'a ServerInfo>) -> Option<&'a str> {
+        let fenced = self.fenced_vllm_instance_id.as_ref()?;
+        let (id, hash) = report?.vllm_instance.as_ref()?;
+        if id == fenced {
+            return None;
+        }
+        hash.as_deref()
     }
 }
 
@@ -172,7 +171,9 @@ impl WorkerLifecycle {
     pub(super) fn refresh_due(&self) -> bool {
         let state = self.state.lock();
         state.checked.is_none_or(|checked| {
-            let interval = if state.info.is_some() && (!self.layout || self.trusted(&state)) {
+            let interval = if state.fenced_vllm_instance_id.is_some()
+                || (state.info.is_some() && (!self.layout || self.trusted(&state)))
+            {
                 REFRESH_INTERVAL
             } else {
                 CONTROL_TIMEOUT
@@ -182,17 +183,14 @@ impl WorkerLifecycle {
     }
 
     pub(super) fn layout_rebind_due(&self) -> bool {
-        let state = self.state.lock();
-        let interval = if state.fenced_vllm_instance_id.is_some() {
-            REFRESH_INTERVAL
-        } else if self.layout && !state.trusted {
-            CONTROL_TIMEOUT
-        } else {
+        if !self.layout {
             return false;
-        };
-        state
-            .checked
-            .is_none_or(|checked| checked.elapsed() >= interval)
+        }
+        let state = self.state.lock();
+        !state.trusted
+            && state
+                .checked
+                .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
     pub(super) fn keeps_descriptor(
@@ -209,13 +207,14 @@ impl WorkerLifecycle {
     pub(super) fn observe_descriptor(
         &self,
         descriptor: Option<&WorkerDescriptor>,
-        metadata: Option<&ServerInfo>,
+        discovery: Option<&mut WorkerDiscovery>,
     ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
         if state.fenced_vllm_instance_id.is_some() {
             // Keep the load-only registration until admission publishes a replacement.
-            return if descriptor.is_some() && state.reported_vllm_restart(metadata) {
+            let report = discovery.and_then(|worker| worker.server_info.as_ref().ok());
+            return if descriptor.is_some() && state.readmission_hash(report).is_some() {
                 SourceAction::Rebuild
             } else {
                 SourceAction::Keep
@@ -224,11 +223,16 @@ impl WorkerLifecycle {
         match descriptor {
             Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
+                if let Some(worker) = discovery {
+                    state.base_models = worker.base_models.take().unwrap_or_default();
+                }
                 SourceAction::Keep
             }
             Some(_) => {
                 state.info = None;
-                state.base_models.clear();
+                state.base_models = discovery
+                    .and_then(|worker| worker.base_models.clone())
+                    .unwrap_or_default();
                 state.trusted = false;
                 state.revision = crate::kv_index::next_owner_incarnation();
                 SourceAction::Rebuild

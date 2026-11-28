@@ -51,8 +51,7 @@ impl WorkerDescriptor {
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
     let mut server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
     // Native restart evidence is used only to re-admit a fenced registration.
-    server_info.vllm_instance_id = None;
-    server_info.prefix_caching_hash_algo = None;
+    server_info.vllm_instance = None;
     let sources = match &worker.sources {
         Ok(sources) => Some(sources.clone()),
         Err(unavailable) if !unavailable.probe.retryable() => None,
@@ -81,11 +80,12 @@ impl KvIndexSupervisor {
         let fenced = lifecycle.state.lock().fenced_vllm_instance_id.is_some();
         if fenced {
             self.probe_static_vllm_instance(base, &mut worker).await;
-            let replacement = lifecycle
+            if lifecycle
                 .state
                 .lock()
-                .reported_vllm_restart(worker.server_info.as_ref().ok());
-            if !replacement {
+                .readmission_hash(worker.server_info.as_ref().ok())
+                .is_none()
+            {
                 return Err("hash-fenced worker has no verified replacement instance".into());
             }
         }
@@ -647,7 +647,7 @@ pub(super) async fn query_server_info_json(
         _ => None,
     };
     let parallel = &config["parallel_config"];
-    let vllm_instance_id = config["instance_id"]
+    let vllm_instance = config["instance_id"]
         .as_str()
         .map(str::trim)
         .filter(|id| {
@@ -657,17 +657,17 @@ pub(super) async fn query_server_info_json(
                     .as_u64()
                     .is_none_or(|count| count == 1)
         })
-        .map(str::to_owned);
-    let prefix_caching_hash_algo = config
-        .pointer("/cache_config/prefix_caching_hash_algo")
-        .and_then(serde_json::Value::as_str)
-        .filter(|algorithm| vllm_instance_id.is_some() && !algorithm.trim().is_empty())
-        .map(str::to_owned);
+        .map(|id| {
+            let hash = config["cache_config"]["prefix_caching_hash_algo"]
+                .as_str()
+                .filter(|algorithm| !algorithm.trim().is_empty())
+                .map(str::to_owned);
+            (id.to_owned(), hash)
+        });
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
-        vllm_instance_id,
-        prefix_caching_hash_algo,
+        vllm_instance,
         kv_block_size: block_size,
         effective_attention_block_size,
         mooncake_truncates_compressed,

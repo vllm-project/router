@@ -189,11 +189,11 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
+                    if lifecycle.state.lock().fenced_vllm_instance_id.is_some() {
+                        return lifecycle.refresh_due();
+                    }
                     lifecycle.layout_rebind_due()
                         && self.resolved_static_source(base).is_none_or(|source| {
-                            if lifecycle.state.lock().fenced_vllm_instance_id.is_some() {
-                                return true;
-                            }
                             super::layout_only(&source)
                                 && source.hybrid.as_ref().is_some_and(|layout| {
                                     layout
@@ -254,7 +254,7 @@ impl KvIndexSupervisor {
         .collect()
         .await;
         let mut changed = HashSet::new();
-        for (base, lifecycle, owner, connector, probe) in probes {
+        for (base, lifecycle, owner, connector, mut probe) in probes {
             if !self
                 .lifecycles
                 .lock()
@@ -263,29 +263,16 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let descriptor = probe.as_ref().map(|probe| &probe.descriptor);
-            let metadata = probe
-                .as_ref()
-                .and_then(|probe| probe.worker.server_info.as_ref().ok());
-            let action = lifecycle.observe_descriptor(descriptor, metadata);
-            match action {
-                SourceAction::Keep => {
-                    if let Some(probe) = probe {
-                        let mut state = lifecycle.state.lock();
-                        if state.fenced_vllm_instance_id.is_none() {
-                            state.base_models = probe.worker.base_models.unwrap_or_default();
-                        }
-                    }
+            let action = match probe.as_mut() {
+                Some(probe) => {
+                    lifecycle.observe_descriptor(Some(&probe.descriptor), Some(&mut probe.worker))
                 }
+                None => lifecycle.observe_descriptor(None, None),
+            };
+            match action {
+                SourceAction::Keep => {}
                 SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");
-                    {
-                        let mut state = lifecycle.state.lock();
-                        if state.fenced_vllm_instance_id.is_none() {
-                            state.base_models =
-                                probe.worker.base_models.clone().unwrap_or_default();
-                        }
-                    }
                     // Both owner and control-record identities are compared under
                     // the publication lock; an old probe cannot resurrect a source.
                     let installation = self.install_observed_worker(
