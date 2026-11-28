@@ -926,15 +926,8 @@ impl CliArgs {
                     base_decode
                 },
                 prefill_policy: self
-                    .prefill_policy
-                    .as_ref()
-                    .map(|p| self.parse_policy(p))
-                    .or(base_p_pol),
-                decode_policy: self
-                    .decode_policy
-                    .as_ref()
-                    .map(|p| self.parse_policy(p))
-                    .or(base_d_pol),
+                    .resolve_role_policy(self.prefill_policy.as_deref(), base_p_pol),
+                decode_policy: self.resolve_role_policy(self.decode_policy.as_deref(), base_d_pol),
                 discovery_address: if has_cli("vllm_discovery_address") {
                     self.vllm_discovery_address.clone()
                 } else {
@@ -1020,12 +1013,54 @@ impl CliArgs {
         Ok(())
     }
 
+    fn resolve_role_policy(
+        &self,
+        cli_policy: Option<&str>,
+        base_policy: Option<PolicyConfig>,
+    ) -> Option<PolicyConfig> {
+        match cli_policy {
+            Some(p) => {
+                let parsed = self.parse_policy(p);
+                match base_policy {
+                    Some(existing)
+                        if std::mem::discriminant(&existing) == std::mem::discriminant(&parsed) =>
+                    {
+                        Some(existing)
+                    }
+                    _ => Some(parsed),
+                }
+            }
+            None => base_policy,
+        }
+    }
+
     fn apply_policy_param_overrides(
         &self,
         config: &mut RouterConfig,
         has_cli: &dyn Fn(&str) -> bool,
     ) {
-        match &mut config.policy {
+        self.apply_policy_param_overrides_to(&mut config.policy, has_cli);
+        if let RoutingMode::VllmPrefillDecode {
+            prefill_policy,
+            decode_policy,
+            ..
+        } = &mut config.mode
+        {
+            if let Some(policy) = prefill_policy.as_mut() {
+                self.apply_policy_param_overrides_to(policy, has_cli);
+            }
+            if let Some(policy) = decode_policy.as_mut() {
+                self.apply_policy_param_overrides_to(policy, has_cli);
+            }
+        }
+    }
+
+    fn apply_policy_param_overrides_to(
+        &self,
+        policy: &mut PolicyConfig,
+        has_cli: &dyn Fn(&str) -> bool,
+    ) {
+        match policy {
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -1942,6 +1977,196 @@ policy:
                 assert!(static_kv_event_sources.contains_key("http://127.0.0.1:8000"));
             }
             other => panic!("expected kv_aware, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_same_role_policy_override_preserves_config_file_settings() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: vllm_prefill_decode
+  prefill_urls:
+    - ["http://127.0.0.1:8100", 9000]
+  decode_urls:
+    - http://127.0.0.1:8200
+  prefill_policy:
+    type: cache_aware
+    cache_threshold: 0.72
+    balance_abs_threshold: 12
+    balance_rel_threshold: 2.0
+    eviction_interval_secs: 45
+    max_tree_size: 4096
+  decode_policy:
+    type: kv_aware
+    router_temperature: 0.25
+    kv_penalty_host: 0.7
+    kv_penalty_external: 0.5
+    kv_penalty_disk: 0.2
+policy:
+  type: round_robin
+"#
+        )
+        .unwrap();
+
+        let matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--prefill-policy",
+                "cache_aware",
+                "--decode-policy",
+                "kv_aware",
+            ])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+        cfg.validate().unwrap();
+
+        match &cfg.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy:
+                    Some(PolicyConfig::CacheAware {
+                        cache_threshold,
+                        balance_abs_threshold,
+                        balance_rel_threshold,
+                        eviction_interval_secs,
+                        max_tree_size,
+                    }),
+                decode_policy:
+                    Some(PolicyConfig::KvAware {
+                        router_temperature,
+                        kv_penalty_host,
+                        kv_penalty_external,
+                        kv_penalty_disk,
+                        ..
+                    }),
+                ..
+            } => {
+                assert!((*cache_threshold - 0.72).abs() < f32::EPSILON);
+                assert_eq!(*balance_abs_threshold, 12);
+                assert!((*balance_rel_threshold - 2.0).abs() < f32::EPSILON);
+                assert_eq!(*eviction_interval_secs, 45);
+                assert_eq!(*max_tree_size, 4096);
+                assert!((*router_temperature - 0.25).abs() < f64::EPSILON);
+                assert!((*kv_penalty_host - 0.7).abs() < f64::EPSILON);
+                assert!((*kv_penalty_external - 0.5).abs() < f64::EPSILON);
+                assert!((*kv_penalty_disk - 0.2).abs() < f64::EPSILON);
+            }
+            other => panic!("expected pd mode with preserved role policies, got {other:?}"),
+        }
+
+        let tuned_matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--prefill-policy",
+                "cache_aware",
+                "--cache-threshold",
+                "0.9",
+                "--decode-policy",
+                "kv_aware",
+                "--router-temperature",
+                "0.5",
+            ])
+            .unwrap();
+        let tuned_args = CliArgs::from_arg_matches(&tuned_matches).unwrap();
+        let tuned_cfg = tuned_args
+            .resolve_router_config(&tuned_matches, vec![])
+            .unwrap();
+        tuned_cfg.validate().unwrap();
+
+        match &tuned_cfg.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy:
+                    Some(PolicyConfig::CacheAware {
+                        cache_threshold,
+                        balance_abs_threshold,
+                        balance_rel_threshold,
+                        eviction_interval_secs,
+                        max_tree_size,
+                    }),
+                decode_policy:
+                    Some(PolicyConfig::KvAware {
+                        router_temperature,
+                        kv_penalty_host,
+                        kv_penalty_external,
+                        kv_penalty_disk,
+                        ..
+                    }),
+                ..
+            } => {
+                assert!((*cache_threshold - 0.9).abs() < f32::EPSILON);
+                assert_eq!(*balance_abs_threshold, 12);
+                assert!((*balance_rel_threshold - 2.0).abs() < f32::EPSILON);
+                assert_eq!(*eviction_interval_secs, 45);
+                assert_eq!(*max_tree_size, 4096);
+                assert!((*router_temperature - 0.5).abs() < f64::EPSILON);
+                assert!((*kv_penalty_host - 0.7).abs() < f64::EPSILON);
+                assert!((*kv_penalty_external - 0.5).abs() < f64::EPSILON);
+                assert!((*kv_penalty_disk - 0.2).abs() < f64::EPSILON);
+            }
+            other => panic!("expected pd mode with selectively tuned role policies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_different_role_policy_override_replaces_config_file_role_policy() {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+mode:
+  type: vllm_prefill_decode
+  prefill_urls:
+    - ["http://127.0.0.1:8100", 9000]
+  decode_urls:
+    - http://127.0.0.1:8200
+  prefill_policy:
+    type: cache_aware
+    cache_threshold: 0.72
+  decode_policy:
+    type: kv_aware
+    router_temperature: 0.25
+policy:
+  type: round_robin
+"#
+        )
+        .unwrap();
+
+        let matches = CliArgs::command()
+            .try_get_matches_from([
+                "vllm-router",
+                "--config",
+                file.path().to_str().unwrap(),
+                "--prefill-policy",
+                "round_robin",
+                "--decode-policy",
+                "cache_aware",
+            ])
+            .unwrap();
+        let cli_args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = cli_args.resolve_router_config(&matches, vec![]).unwrap();
+        cfg.validate().unwrap();
+
+        match &cfg.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy:
+                    Some(PolicyConfig::CacheAware {
+                        cache_threshold, ..
+                    }),
+                ..
+            } => {
+                assert!((*cache_threshold - 0.3).abs() < f32::EPSILON);
+            }
+            other => panic!("expected replaced pd role policies, got {other:?}"),
         }
     }
 
