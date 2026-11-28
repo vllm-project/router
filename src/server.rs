@@ -48,7 +48,6 @@ use tracing::{error, info, warn, Level};
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,
-    pub pd_prefill_bypass: crate::routers::http::vllm_pd_router::PdPrefillBypassConfig,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -98,7 +97,6 @@ impl AppContext {
         Ok(Self {
             client,
             router_config,
-            pd_prefill_bypass: Default::default(),
             rate_limiter,
             worker_registry,
             policy_registry,
@@ -973,10 +971,9 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::routers::http::vllm_pd_router::validate_prefill_bypass(
-        config.pd_prefill_bypass,
-        &config.router_config,
-    )?;
+    use crate::routers::http::vllm_pd_router::{install_prefill_bypass, validate_prefill_bypass};
+
+    validate_prefill_bypass(config.pd_prefill_bypass, &config.router_config)?;
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)
@@ -1053,14 +1050,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Create the application context with all dependencies
     println!("DEBUG: Creating AppContext");
-    let mut app_context = AppContext::new(
+    let app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
         config.router_config.api_key_validation_urls.clone(),
     )?;
-    app_context.pd_prefill_bypass = config.pd_prefill_bypass;
     println!("DEBUG: AppContext created");
 
     let app_context = Arc::new(app_context);
@@ -1110,6 +1106,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             {
                 Ok(http_pd) => {
+                    install_prefill_bypass(http_pd.as_ref(), config.pd_prefill_bypass)?;
                     info!("Created HTTP vLLM PD router");
                     router_manager
                         .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
@@ -1130,10 +1127,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         } else {
             info!("Single router mode (enable_igw=false)");
             // Create single router with the context
-            (
-                Arc::from(RouterFactory::create_router(&app_context).await?),
-                None,
-            )
+            let router = RouterFactory::create_router(&app_context).await?;
+            install_prefill_bypass(router.as_ref(), config.pd_prefill_bypass)?;
+            (Arc::from(router), None)
         };
 
     // Start health checker for all workers in the registry

@@ -224,13 +224,18 @@ mod test_pd_routing {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let mut ctx =
+        let ctx =
             vllm_router_rs::server::AppContext::new(config, client, 64, None, vec![]).unwrap();
-        ctx.pd_prefill_bypass = PdPrefillBypassConfig {
-            enabled: true,
-            ..Default::default()
-        };
         let router = RouterFactory::create_router(&Arc::new(ctx)).await.unwrap();
+        router
+            .as_any()
+            .downcast_ref::<vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter>()
+            .unwrap()
+            .configure_prefill_bypass(PdPrefillBypassConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
         let prompt: Vec<u32> = (0..33).collect();
         publisher.restore(&prompt[..32], 16).await;
         let request = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 8});

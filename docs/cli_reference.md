@@ -139,6 +139,11 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--kv-connector` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` with vLLM-Ascend `MooncakeConnectorV2` in pull mode. |
 | `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
 | `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
+| `--pd-prefill-bypass` | `flag` | `false` | `flag` | `false` | Enable Prefill bypass with the default thresholds. |
+| `--pd-prefill-bypass-max-tokens` | `usize` | unset | `integer` | unset | Override the 2,048-token exclusive limit. A positive value opts in and zero disables bypass. |
+| `--pd-prefill-bypass-max-ratio` | `f64` | `0.7` | `float` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
+| `--pd-prefill-bypass-policy` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | Check the uncached fraction, Prefill load, or either. |
+| `--pd-prefill-bypass-p-busy-requests` | `usize` | unset | `integer` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
 discovery. When `--api-key` is set, initial and periodic HTTP health probes

@@ -1,10 +1,8 @@
 //! Scheduler-independent policy and worker contract for local prefill.
 
 use crate::backend::preprocess::http_cache_read_fallback;
-use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::future::Future;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -24,38 +22,18 @@ impl PdPrefillBypassPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, clap::Args)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PdPrefillBypassConfig {
     /// Enable Prefill bypass with the default thresholds.
-    #[arg(id = "pd_prefill_bypass_enabled", long = "pd-prefill-bypass")]
     pub enabled: bool,
     /// Override the local prefill token limit (default 2048 when enabled). Zero disables bypass.
-    #[arg(
-        id = "pd_prefill_bypass_max_tokens",
-        long = "pd-prefill-bypass-max-tokens"
-    )]
     pub max_tokens: Option<usize>,
     /// Maximum fraction of the input left to prefill in the suffix check.
-    #[arg(
-        id = "pd_prefill_bypass_max_ratio",
-        long = "pd-prefill-bypass-max-ratio",
-        default_value_t = 0.7
-    )]
     pub max_ratio: f64,
     /// Policy used to decide whether to bypass Prefill.
-    #[arg(
-        id = "pd_prefill_bypass_policy",
-        long = "pd-prefill-bypass-policy",
-        value_enum,
-        default_value = "short_suffix"
-    )]
     pub policy: PdPrefillBypassPolicy,
     /// Minimum number of other Prefill requests for Prefill to be busy.
-    #[arg(
-        id = "pd_prefill_bypass_p_busy_requests",
-        long = "pd-prefill-bypass-p-busy-requests"
-    )]
     pub p_busy_requests: Option<usize>,
 }
 
@@ -76,11 +54,11 @@ impl PdPrefillBypassConfig {
         self.max_tokens.unwrap_or(2048)
     }
 
-    pub(super) fn is_enabled(self) -> bool {
+    pub(in crate::routers::http) fn is_enabled(self) -> bool {
         (self.enabled || self.max_tokens.is_some()) && self.token_limit() > 0
     }
 
-    pub(super) fn validate(self) -> Result<(), String> {
+    pub(in crate::routers::http) fn validate(self) -> Result<(), String> {
         if !(0.0 < self.max_ratio && self.max_ratio <= 1.0) {
             return Err("pd-prefill-bypass-max-ratio must be in (0, 1]".into());
         }
@@ -96,7 +74,7 @@ impl PdPrefillBypassConfig {
 
 /// Estimated prompt and remaining work, based on verified Decode-local KV.
 #[derive(Clone, Copy)]
-pub(super) struct PrefillEstimate {
+pub(in crate::routers::http) struct PrefillEstimate {
     pub prompt_tokens: usize,
     pub remaining_tokens: usize,
 }
@@ -104,37 +82,37 @@ pub(super) struct PrefillEstimate {
 /// Prefill bypass policy and worker contract. Admission, worker liveness and
 /// stream ownership belong to the dispatch adapter.
 #[derive(Debug)]
-pub(super) struct PrefillBypass {
+pub(in crate::routers::http) struct PrefillBypass {
     config: PdPrefillBypassConfig,
 }
 
 impl PrefillBypass {
-    pub(super) fn enabled(config: PdPrefillBypassConfig) -> Option<Self> {
+    pub(in crate::routers::http) fn enabled(config: PdPrefillBypassConfig) -> Option<Self> {
         config.is_enabled().then_some(Self { config })
     }
 
-    pub(super) fn needs_prefill_load(&self) -> bool {
+    pub(in crate::routers::http) fn needs_prefill_load(&self) -> bool {
         self.config.policy.uses_prefill_load()
     }
 
     /// A caller should supply a request with compatible local-prefill semantics
     /// before looking up KV.
-    pub(super) fn eligible_request(path: &str, request: &Value) -> bool {
+    pub(in crate::routers::http) fn eligible_request(path: &str, request: &Value) -> bool {
         http_cache_read_fallback(request).is_none() && eligible_request(path, request)
     }
 
-    pub(super) fn within_limit(&self, estimate: PrefillEstimate) -> bool {
+    pub(in crate::routers::http) fn within_limit(&self, estimate: PrefillEstimate) -> bool {
         estimate.remaining_tokens < estimate.prompt_tokens
-            && estimate.remaining_tokens <= self.config.token_limit()
+            && estimate.remaining_tokens < self.config.token_limit()
     }
 
-    pub(super) fn transfer_params(&self) -> Value {
+    pub(in crate::routers::http) fn transfer_params(&self) -> Value {
         local_params(self.config.token_limit())
     }
 
     /// Check the caller's verified local KV and load observed at dispatch.
     /// Load counts exclude this request's own reservations.
-    pub(super) fn allows(
+    pub(in crate::routers::http) fn allows(
         &self,
         estimate: PrefillEstimate,
         decode_idle: bool,
@@ -143,9 +121,8 @@ impl PrefillBypass {
         if !decode_idle || !self.within_limit(estimate) {
             return false;
         }
-        let suffix = estimate.remaining_tokens < self.config.token_limit()
-            && (estimate.remaining_tokens as f64)
-                < self.config.max_ratio * estimate.prompt_tokens as f64;
+        let suffix = (estimate.remaining_tokens as f64)
+            < self.config.max_ratio * estimate.prompt_tokens as f64;
         let busy = self
             .config
             .p_busy_requests
@@ -182,9 +159,10 @@ fn eligible_request(path: &str, request: &Value) -> bool {
                         message.get("content").is_some_and(|content| {
                             content.is_string()
                                 || content.as_array().is_some_and(|parts| {
-                                    parts.iter().all(|part| {
-                                        part.get("type").and_then(Value::as_str) == Some("text")
-                                    })
+                                    !parts.is_empty()
+                                        && parts.iter().all(|part| {
+                                            part.get("type").and_then(Value::as_str) == Some("text")
+                                        })
                                 })
                         })
                     })
@@ -201,9 +179,12 @@ fn eligible_request(path: &str, request: &Value) -> bool {
 
 const LIMIT_FIELD: &str = "max_local_prefill_tokens";
 const ERROR_CODE: &str = "local_prefill_limit_exceeded";
-pub(super) const ERROR_HEADER: &str = "x-vllm-error-code";
+pub(in crate::routers::http) const ERROR_HEADER: &str = "x-vllm-error-code";
 
-pub(super) fn http_rejected(status: http::StatusCode, headers: &http::HeaderMap) -> bool {
+pub(in crate::routers::http) fn http_rejected(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+) -> bool {
     status == http::StatusCode::UNPROCESSABLE_ENTITY
         && headers
             .get(ERROR_HEADER)
@@ -219,7 +200,7 @@ fn local_params(limit: usize) -> Value {
     })
 }
 
-pub(super) fn grpc_rejected(status: &tonic::Status) -> bool {
+pub(in crate::routers::http) fn grpc_rejected(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
         && status
             .metadata()
@@ -228,66 +209,10 @@ pub(super) fn grpc_rejected(status: &tonic::Status) -> bool {
             == Some(ERROR_CODE)
 }
 
-pub(super) enum PrefillDispatch<T> {
-    Split(T),
-    Respond(Response),
-}
-
-pub(super) enum BypassAttempt<T> {
-    Split(T),
-    Respond(Response),
-    /// Decode refused before generation and the caller released its attempt.
-    Refused,
-}
-
-/// The caller owns admission and attempt cleanup. The callback receives `true`
-/// only after a typed refusal, and that admission goes straight to the split path.
-pub(super) async fn admit_with_bypass<T, A, AFut, B, BFut>(
-    mut admit: A,
-    bypass: B,
-) -> PrefillDispatch<T>
-where
-    A: FnMut(bool) -> AFut,
-    AFut: Future<Output = Result<T, Box<Response>>>,
-    B: FnOnce(T) -> BFut,
-    BFut: Future<Output = BypassAttempt<T>>,
-{
-    let initial = match admit(false).await {
-        Ok(attempt) => attempt,
-        Err(response) => return PrefillDispatch::Respond(*response),
-    };
-    match bypass(initial).await {
-        BypassAttempt::Split(attempt) => PrefillDispatch::Split(attempt),
-        BypassAttempt::Respond(response) => PrefillDispatch::Respond(response),
-        BypassAttempt::Refused => match admit(true).await {
-            Ok(attempt) => PrefillDispatch::Split(attempt),
-            Err(response) => PrefillDispatch::Respond(*response),
-        },
-    }
-}
-
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn typed_refusal_readmits_without_trying_bypass_again() {
-        let mut admissions = Vec::new();
-        let outcome = admit_with_bypass(
-            |readmit| {
-                admissions.push(readmit);
-                std::future::ready(Ok(admissions.len()))
-            },
-            |attempt| async move {
-                assert_eq!(attempt, 1);
-                BypassAttempt::Refused
-            },
-        )
-        .await;
-        assert!(matches!(outcome, PrefillDispatch::Split(2)));
-        assert_eq!(admissions, [false, true]);
-    }
 
     #[test]
     fn opt_in_defaults_require_both_suffix_thresholds() {
@@ -337,9 +262,9 @@ mod tests {
         assert!(PrefillBypass { config }.allows(estimate, true, Some(4)));
         estimate.remaining_tokens = 99;
         assert!(PrefillBypass { config }.allows(estimate, true, None));
-        estimate.remaining_tokens = 256;
+        estimate.remaining_tokens = 255;
         assert!(PrefillBypass { config }.allows(estimate, true, Some(4)));
-        estimate.remaining_tokens = 257;
+        estimate.remaining_tokens = 256;
         assert!(!PrefillBypass { config }.allows(estimate, true, Some(4)));
         estimate.remaining_tokens = estimate.prompt_tokens;
         assert!(!PrefillBypass { config }.allows(estimate, true, Some(4)));
@@ -362,9 +287,14 @@ mod tests {
                 &request
             ));
         }
-        assert!(!PrefillBypass::eligible_request(
-            "/v1/chat/completions",
-            &serde_json::json!({"messages":[{"content":[{"type":"image_url"}]}]})
-        ));
+        for content in [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "image_url"}]),
+        ] {
+            assert!(!PrefillBypass::eligible_request(
+                "/v1/chat/completions",
+                &serde_json::json!({"messages": [{"content": content}]})
+            ));
+        }
     }
 }

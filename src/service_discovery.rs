@@ -704,7 +704,6 @@ mod tests {
 
         // Create AppContext with minimal components
         let app_context = Arc::new(AppContext {
-            pd_prefill_bypass: Default::default(),
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),

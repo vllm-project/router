@@ -183,25 +183,13 @@ For a single text prompt with `n=1`, sequential NIXL P/D can send the full
 request directly to the selected KV-aware Decode rank. The rank must advertise
 support, have verified reusable KV on device, and have no other pending or
 active Decode requests in the Router. Its estimated uncached prompt tokens must
-be within the configured token limit for every policy.
+be below the configured token limit for every policy.
 
-The Router installs this hook at startup when enabled. It runs after
-P/D admission and before Prefill dispatch. It can continue the current P/D
-attempt, return Decode's response, or release the attempt and request one fresh
-P/D admission after a typed refusal.
+The hook runs before Prefill dispatch. A typed refusal releases the attempt
+and reruns normal P/D admission once.
 
-The reusable policy takes verified Decode-local KV estimates and load facts.
-The native P/D adapter supplies these facts and owns admission, dispatch, and
-the one-time fallback. Other scheduling paths can reuse the policy and worker
-contract through their own adapters.
-
-| Option | Rust value | Rust default | Python value | Python default | Description |
-| --- | --- | --- | --- | --- | --- |
-| `--pd-prefill-bypass` | `flag` | `false` | `flag` | `false` | Enable Prefill bypass with the default thresholds. |
-| `--pd-prefill-bypass-max-tokens` | `usize` | unset | `integer` | unset | Override the 2,048-token limit. A positive value opts in and zero disables bypass. |
-| `--pd-prefill-bypass-max-ratio` | `f64` | `0.7` | `float` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
-| `--pd-prefill-bypass-policy` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | Check the uncached fraction, Prefill load, or either. |
-| `--pd-prefill-bypass-p-busy-requests` | `usize` | unset | `integer` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |
+See [Prefill/decode CLI options](../cli_reference.md#prefilldecode-disaggregation)
+for the available flags and defaults.
 
 Decode workers opt in with `"nixl_pull_local_prefill": true` in their routing
 capabilities JSON. Router sends both remote transfer flags as `false` and sets
@@ -210,7 +198,9 @@ must enforce that limit against the actual cache hit. A worker that declines
 must return HTTP 422 or an initial gRPC `FAILED_PRECONDITION`, with
 `x-vllm-error-code: local_prefill_limit_exceeded`. Only this refusal triggers a
 fresh P/D attempt. Workers without the capability continue on the usual P/D
-path.
+path. The Router counter `vllm_router_pd_prefill_bypass_total` labels attempts
+as `accepted`, `refused`, or `failed`. Prefill request metrics still count
+actual calls to Prefill workers.
 
 ## Layout files
 

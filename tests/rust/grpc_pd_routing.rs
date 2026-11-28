@@ -886,16 +886,19 @@ async fn grpc_pd_prefill_bypass_uses_verified_decode_kv_and_retries_typed_refusa
         intra_node_data_parallel_size: 1,
         ..RouterConfig::default()
     };
-    let mut ctx = create_test_context(config);
-    std::sync::Arc::get_mut(&mut ctx).unwrap().pd_prefill_bypass =
-        vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig {
-            max_tokens: Some(8),
-            ..Default::default()
-        };
+    let ctx = create_test_context(config);
     ctx.policy_registry
         .set_decode_policy(PolicyFactory::create_from_config(&decode_policy, None));
     let router = VllmPDRouter::new(prefill_urls, decode_urls, None, &ctx)
         .await
+        .unwrap();
+    router
+        .configure_prefill_bypass(
+            vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig {
+                max_tokens: Some(8),
+                ..Default::default()
+            },
+        )
         .unwrap();
     let prompt: Vec<u32> = (0..33).collect();
     publisher.restore(&prompt[..32], 16).await;

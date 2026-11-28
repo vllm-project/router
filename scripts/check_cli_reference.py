@@ -11,7 +11,6 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-PREFILL_BYPASS_SOURCE = ROOT / "src/routers/http/prefill_bypass.rs"
 
 
 def format_default(value):
@@ -63,38 +62,21 @@ def rust_enum(source, name):
     return values
 
 
-def rust_fields(source, name, flattened):
-    body = source.split(f"struct {name} {{", 1)[1].split("\n}", 1)[0]
-    declarations = re.findall(
-        r"#\[(arg\((.*?)\)|command\(flatten\))\][^\n]*\n\s*(?:pub )?(\w+): ([^\n]+),",
-        body,
-        re.DOTALL,
-    )
-    if len(declarations) != len(
-        re.findall(r"^    (?:pub )?\w+: .+,$", body, re.MULTILINE)
-    ):
-        raise ValueError(f"Could not read every {name} field; update this checker")
-    for annotation, attributes, field, field_type in declarations:
-        if annotation == "command(flatten)":
-            type_name = field_type.rsplit("::", 1)[-1]
-            if type_name not in flattened:
-                raise ValueError(f"No source configured for flattened CLI type {field_type}")
-            yield from rust_fields(flattened[type_name], type_name, {})
-        else:
-            yield attributes, field, field_type
-
-
 def rust_options():
     source = (ROOT / "src/main.rs").read_text(encoding="utf-8")
-    prefill_bypass = PREFILL_BYPASS_SOURCE.read_text(encoding="utf-8")
+    body = source.split("struct CliArgs {", 1)[1].split("\n}", 1)[0]
     enums = {
-        "PdPrefillBypassPolicy": rust_enum(prefill_bypass, "PdPrefillBypassPolicy"),
         "Backend": rust_enum(source, "Backend"),
         "KvConnector": rust_enum(
             (ROOT / "src/config/types.rs").read_text(encoding="utf-8"), "KvConnector"
         ),
     }
-    fields = rust_fields(source, "CliArgs", {"PdPrefillBypassConfig": prefill_bypass})
+    fields = re.findall(
+        r"#\[arg\((.*?)\)\][^\n]*\n\s*(\w+): ([^\n]+),", body, re.DOTALL
+    )
+    # Fail rather than silently omit a field if the declaration syntax changes.
+    if len(fields) != len(re.findall(r"^    \w+: .+,$", body, re.MULTILINE)):
+        raise ValueError("Could not read every CliArgs field; update this checker")
     result = {}
     for attributes, field, field_type in fields:
         long_name = re.search(r'\blong\s*=\s*"([^"]+)"', attributes)
@@ -164,10 +146,9 @@ def rust_options():
 def main():
     rust, python = rust_options(), python_options()
     documented = {}
-    cli_reference = (ROOT / "docs/cli_reference.md").read_text(encoding="utf-8")
-    kv_aware = (ROOT / "docs/load_balancing/kv_aware.md").read_text(encoding="utf-8")
-    bypass_options = kv_aware.split("#### Prefill bypass\n", 1)[1].split("\n## ", 1)[0]
-    for line in (cli_reference + "\n" + bypass_options).splitlines():
+    for line in (
+        (ROOT / "docs/cli_reference.md").read_text(encoding="utf-8").splitlines()
+    ):
         if not line.startswith("| `--"):
             continue
         cells = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
