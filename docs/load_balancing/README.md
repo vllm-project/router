@@ -329,3 +329,28 @@ This allows optimizing each stage independently:
 warns at startup when a worker reports an older `engine_version`, and
 `power_of_two` uses the router's local load counts for them. See
 [gRPC P/D disaggregation](../backend/grpc.md#pd-disaggregation).
+
+## Observing a Mooncake Store publisher
+
+Set `VLLM_ROUTER_MOONCAKE_SHADOW_ENDPOINT=tcp://store:5557` when starting the
+router to subscribe to one Store master's KV events. Build the master with
+`ENABLE_KV_EVENTS=ON`, enable `enable_kv_events` and `kv_events_emit_object_key`,
+and point the router at its `kv_events_bind_endpoint`. The observer runs on a background thread
+and exports aggregate Prometheus metrics.
+It tracks each backend, tenant, opaque object key and medium independently.
+A removal from CPU can leave a disk copy, and a tenant clear affects only that
+tenant on the named backend.
+
+`vllm_router_mooncake_shadow_copies{medium="cpu"}` and its `disk` counterpart
+count copies observed since the last reset. The master supplies neither a
+startup snapshot nor replay, so these counts can understate live occupancy.
+`vllm_router_mooncake_shadow_state` is 0 before the first batch, 1 while
+publishing a partial view, and 2 following invalidation until a fresh batch.
+A sequence gap or restart drops earlier observations before applying the next
+valid batch. Disconnects, ambiguous batches and capacity overflow also clear
+the publisher's state. `vllm_router_mooncake_shadow_invalidations_total{reason}`
+counts these resets, and `vllm_router_mooncake_shadow_events_total` counts
+events in accepted batches. The observer accepts up to 16,384 copies across
+both media, 1,024-byte keys, 256-byte scope fields and 1 MiB per wire frame.
+These observations do not affect worker scores. See the
+[Mooncake wire protocol](https://kvcache-ai.github.io/Mooncake/design/conductor/subscriber-guide.html).

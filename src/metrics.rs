@@ -19,6 +19,22 @@ impl Default for PrometheusConfig {
 }
 
 pub fn init_metrics() {
+    describe_gauge!(
+        "vllm_router_mooncake_shadow_copies",
+        "Observed Mooncake Store object copies by medium"
+    );
+    describe_gauge!(
+        "vllm_router_mooncake_shadow_state",
+        "Mooncake Store observer state: 0 awaiting events, 1 partial view, 2 invalidated"
+    );
+    describe_counter!(
+        "vllm_router_mooncake_shadow_events_total",
+        "Mooncake Store events in accepted batches"
+    );
+    describe_counter!(
+        "vllm_router_mooncake_shadow_invalidations_total",
+        "Publisher-wide resets of Mooncake shadow observations by reason"
+    );
     // Request metrics
     describe_counter!(
         "vllm_router_requests_total",

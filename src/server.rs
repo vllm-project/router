@@ -1016,6 +1016,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
     println!("DEBUG: Prometheus metrics initialized");
 
+    // This observer runs independently of worker discovery and routing.
+    let _mooncake_shadow = std::env::var_os("VLLM_ROUTER_MOONCAKE_SHADOW_ENDPOINT")
+        .map(|endpoint| {
+            let endpoint = endpoint
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid Mooncake shadow endpoint"))?;
+            crate::kv_index::mooncake::Observer::start(endpoint)
+        })
+        .transpose()?;
+
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | kv_connector: {:?} | max_payload: {}MB",
         config.host,

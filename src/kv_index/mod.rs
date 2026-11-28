@@ -24,6 +24,7 @@ pub(crate) fn next_owner_incarnation() -> u64 {
 }
 
 pub(crate) mod layout;
+pub(crate) mod mooncake;
 pub mod storage;
 pub(crate) use storage::SourceReadGuard;
 pub mod types;
