@@ -6,7 +6,9 @@ use super::logprobs_merge;
 use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
-use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::pd_types::{
+    error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext, StagePricing,
+};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -1224,8 +1226,7 @@ impl VllmPDRouter {
         // One hash cache for the request and one credit decision for both stages. The two
         // renders run concurrently - they are the only network work here - and only the
         // local estimation walks the prompts in sequence.
-        let (prefill_inputs, decode_inputs, decode_context) = match self.pd_router.kv_state.as_ref()
-        {
+        let (prefill_inputs, decode_inputs, prices) = match &self.pd_router.kv_state {
             Some(state) => {
                 let (stages, decode_inputs) = tokio::join!(
                     state.prepare_stages(
@@ -1247,8 +1248,12 @@ impl VllmPDRouter {
                         router_prompts,
                     ),
                 );
-                let (prefill_inputs, decode_context) = stages;
-                (Some(prefill_inputs), decode_inputs, decode_context)
+                let (prefill_inputs, prefill_prices, decode_prices) = stages;
+                (
+                    Some(prefill_inputs),
+                    decode_inputs,
+                    (prefill_prices, decode_prices),
+                )
             }
             None => {
                 let (prefill_inputs, decode_inputs) = tokio::join!(
@@ -1267,9 +1272,10 @@ impl VllmPDRouter {
                         router_prompts,
                     ),
                 );
-                (prefill_inputs, decode_inputs, None)
+                (prefill_inputs, decode_inputs, (None, None))
             }
         };
+        let (prefill_prices, decode_prices) = prices;
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
             .get("cache_salt")
@@ -1309,7 +1315,8 @@ impl VllmPDRouter {
             affinity_key: affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt,
-            decode_context: decode_context.as_ref(),
+            prefill_pricing: prefill_prices.as_ref().map(StagePricing::Prepared),
+            decode_pricing: decode_prices.as_ref().map(StagePricing::Prepared),
             route: path,
             probe: false,
         };
@@ -1468,11 +1475,12 @@ impl VllmPDRouter {
         // Price the marginal Decode context here, not at admission: #500 defers
         // Decode selection until Prefill completes, and the cheap placeholder
         // figure taken then is stale by the time a candidate is actually picked.
-        // This runs before the commit so the closure below is pure selection.
-        let decode_context = match self.pd_router.kv_state.as_ref() {
+        // Prepare the estimate before locking the ledger. The commit only
+        // pins and revalidates the captured source evidence before selection.
+        let decode_prices = match self.pd_router.kv_state.as_ref() {
             Some(state) => {
                 state
-                    .prepare_decode_context(
+                    .prepare_decode_prices(
                         &candidates,
                         &decode_policy,
                         request,
@@ -1499,23 +1507,34 @@ impl VllmPDRouter {
             affinity_key: input.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
-            decode_context: decode_context.as_ref(),
+            prefill_pricing: None,
+            decode_pricing: decode_prices.as_ref().map(StagePricing::Prepared),
             route: &input.route,
             probe: false,
         };
-        let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            if let Some(accept) = guard {
-                if !accept(loads, candidates.first()?.as_ref()) {
-                    return None;
+        let committed = {
+            // Keep the source guards until the deferred Decode commit finishes.
+            let mut validated = None;
+            self.pd_router.pd_load.commit_decode(attempt, |loads| {
+                if let Some(accept) = guard {
+                    if !accept(loads, candidates.first()?.as_ref()) {
+                        return None;
+                    }
                 }
-            }
-            super::pd_router::select_decode_stage(
-                loads,
-                &candidates,
-                decode_policy.as_ref(),
-                &context,
-            )
-        });
+                let context = PdRequestContext {
+                    decode_pricing: context
+                        .decode_pricing
+                        .map(|prices| prices.validate(&candidates, &mut validated)),
+                    ..context
+                };
+                super::pd_router::select_decode_stage(
+                    loads,
+                    &candidates,
+                    decode_policy.as_ref(),
+                    &context,
+                )
+            })
+        };
         let Some(decision) = committed else {
             if guard.is_none() {
                 RouterMetrics::record_pd_decode_commit("empty");
@@ -6510,7 +6529,7 @@ mod tests {
     }
 
     /// A Decode candidate removed while commit-time pricing waits on the bindings
-    /// lock must not be committed: the re-read after `prepare_decode_context`
+    /// lock must not be committed: the re-read after `prepare_decode_prices`
     /// drops it. The prefill gate lands the removal after admission but before
     /// the commit's re-read, which is the window that re-read protects.
     #[tokio::test]
