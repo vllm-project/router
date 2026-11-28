@@ -246,6 +246,51 @@ pub fn shutdown_otel() {
     }
 }
 
+/// Extract incoming W3C trace context, accepting the level-2 `03` flags.
+///
+/// The pinned OpenTelemetry SDK 0.27.1 rejects v00 traceparent when the
+/// entire flags byte is greater than 0x02 (also true in SDK 0.31.0).
+/// See #482. Values `00`, `01`, and `02` already work; only `03` is
+/// normalized to `01` to preserve the inbound trace identity. Other flag
+/// combinations are left for the SDK to validate rather than widened here.
+///
+/// This fixes inbound extraction only. The SDK models the sampling bit but
+/// not the level-2 random-trace-id hint, so outgoing injection with the same
+/// trace-id sends `01`, not the incoming `03`. Full level-2 propagation
+/// requires per-request hint state outside the SDK.
+pub fn extract_trace_context_http(headers: &HeaderMap) -> opentelemetry::Context {
+    if !is_otel_enabled() {
+        return opentelemetry::Context::current();
+    }
+
+    let normalized = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|traceparent| {
+            // The v00 wire layout has exactly four fields and is 55 bytes long.
+            if traceparent.len() != 55 || !traceparent.starts_with("00-") {
+                return None;
+            }
+            let (prefix, flags) = traceparent.rsplit_once('-')?;
+            // Only 03 requires a compatibility shim: SDK accepts 00/01/02.
+            // Keep 04/09/ff (reserved flags) subject to SDK validation.
+            if flags != "03" {
+                return None;
+            }
+            let mut normalized = headers.clone();
+            normalized.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("{prefix}-01")).ok()?,
+            );
+            Some(normalized)
+        });
+
+    let input = normalized.as_ref().unwrap_or(headers);
+    global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(input))
+    })
+}
+
 /// Inject W3C trace context headers into an HTTP request's HeaderMap.
 ///
 /// When OTel is enabled, this injects the current span's trace context

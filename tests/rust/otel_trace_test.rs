@@ -195,6 +195,132 @@ fn test_otel_distributed_tracing() {
     }
 
     // =====================================================================
+    // Section 2b: W3C level-2 flags must preserve the incoming trace identity
+    // =====================================================================
+    {
+        use axum::http::Request;
+        use tower_http::trace::MakeSpan;
+        use vllm_router_rs::middleware::RequestSpan;
+
+        let (exporter, provider, _guard) = setup_test_otel();
+        let upstream_trace_id = "3c9f2e6a7d184b51a6c0e83f951d274b";
+        let upstream_span_id = "8d42fa3e795c61a6";
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(
+                "traceparent",
+                format!("00-{upstream_trace_id}-{upstream_span_id}-03"),
+            )
+            .body(())
+            .unwrap();
+
+        let mut request_span = RequestSpan;
+        let span = request_span.make_span(&request);
+        let outgoing_headers = {
+            let _enter = span.enter();
+            let mut headers = HeaderMap::new();
+            otel_trace::inject_trace_context_http(&mut headers);
+            headers
+        };
+        drop(span);
+        provider.force_flush();
+
+        let outgoing_tp = outgoing_headers
+            .get("traceparent")
+            .expect("expected outgoing traceparent")
+            .to_str()
+            .unwrap();
+        let outgoing_parts: Vec<&str> = outgoing_tp.split('-').collect();
+        assert_eq!(
+            outgoing_parts.len(),
+            4,
+            "outbound traceparent: {outgoing_tp}"
+        );
+        assert_eq!(
+            outgoing_parts[1], upstream_trace_id,
+            "outbound traceparent: {outgoing_tp}"
+        );
+        // The current SDK preserves sampling, but drops the level-2 random hint.
+        assert_eq!(
+            outgoing_parts[3], "01",
+            "outbound traceparent: {outgoing_tp}"
+        );
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert!(!spans.is_empty(), "expected a traced server span");
+        assert_eq!(
+            spans[0].span_context.trace_id(),
+            TraceId::from_hex(upstream_trace_id).unwrap(),
+            "valid level-2 flags 03 must not create a new trace"
+        );
+        assert_eq!(
+            spans[0].parent_span_id,
+            SpanId::from_hex(upstream_span_id).unwrap(),
+            "router span must keep the incoming parent span"
+        );
+    }
+
+    // =====================================================================
+    // Section 2c: Normalization must not repair malformed trace-flags
+    // =====================================================================
+    {
+        use opentelemetry::trace::TraceContextExt;
+
+        let (_exporter, _provider, _guard) = setup_test_otel();
+        let trace_id = "3c9f2e6a7d184b51a6c0e83f951d274b";
+        let span_id = "8d42fa3e795c61a6";
+        for flags in ["0A", "0F", "+3", "+9", "gg"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-{flags}")).unwrap(),
+            );
+            let context = otel_trace::extract_trace_context_http(&headers);
+            assert!(
+                !context.span().span_context().is_valid(),
+                "malformed flags {flags} must not become a valid remote parent"
+            );
+        }
+        for (flags, sampled) in [
+            ("00", false),
+            ("01", true),
+            ("02", false),
+            ("03", true), // level-2 sampled with random-trace-id hint
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-{flags}")).unwrap(),
+            );
+            let context = otel_trace::extract_trace_context_http(&headers);
+            let span = context.span();
+            let parent = span.span_context();
+            assert!(
+                parent.is_remote(),
+                "flags {flags} must preserve the remote parent"
+            );
+            assert_eq!(parent.trace_id(), TraceId::from_hex(trace_id).unwrap());
+            assert_eq!(parent.span_id(), SpanId::from_hex(span_id).unwrap());
+            assert_eq!(parent.is_sampled(), sampled);
+        }
+        // Keep reserved flags invalid to avoid diverging from neighboring
+        // services that use the same SDK and would restart the trace.
+        for flags in ["04", "09", "ff"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-{flags}")).unwrap(),
+            );
+            let context = otel_trace::extract_trace_context_http(&headers);
+            assert!(
+                !context.span().span_context().is_valid(),
+                "reserved flags {flags} must remain rejected"
+            );
+        }
+    }
+
+    // =====================================================================
     // Section 3: Baggage survives the enabled path
     // =====================================================================
     {

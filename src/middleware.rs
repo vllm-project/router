@@ -184,9 +184,7 @@ impl<B> MakeSpan<B> for RequestSpan {
         // headers and set it as the parent context on this span. This links the
         // router's span as a child of the upstream caller's trace.
         if !span.is_disabled() {
-            let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-                propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
-            });
+            let parent_cx = crate::otel_trace::extract_trace_context_http(request.headers());
             span.set_parent(parent_cx);
         }
 
