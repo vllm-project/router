@@ -39,6 +39,7 @@ pyo3 = { version = "0.26", features = ["extension-module"] }
 dashmap = "6.1.0"
 scc = "3.8.8"
 http = "1.1.0"
+http-body = "1"
 mime = "0.3"
 tokio = { version = "1.42.0", features = ["full"] }
 async-trait = "0.1"
@@ -346,3 +347,7 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+[[test]]
+name = "http_request_metrics"
+path = "tests/rust/http_request_metrics.rs"

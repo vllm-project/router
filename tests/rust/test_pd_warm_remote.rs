@@ -2,6 +2,7 @@
 
 //! Exact-token multi-turn transport regressions. Mocks prove protocol rules, not GPU savings.
 use axum::{
+    body::{Body, Bytes},
     extract::{Json, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
@@ -13,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use tokio::sync::oneshot;
 use vllm_router_rs::{
     config::{ConfigValidator, PolicyConfig, RouterConfig, RoutingMode},
     core::Worker,
@@ -34,6 +36,7 @@ struct StateData {
     fail_local: Arc<AtomicBool>,
     capability_probes: Arc<AtomicU64>,
     reject_status: Arc<AtomicU64>,
+    reject_body: Arc<Mutex<Option<oneshot::Receiver<Bytes>>>>,
     large_text: Arc<AtomicUsize>,
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
@@ -59,6 +62,7 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         fail_local: Arc::new(AtomicBool::new(false)),
         capability_probes: Arc::new(AtomicU64::new(0)),
         reject_status: Arc::new(AtomicU64::new(0)),
+        reject_body: Arc::new(Mutex::new(None)),
         large_text: Arc::new(AtomicUsize::new(0)),
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
@@ -101,11 +105,17 @@ async fn generate(
     let reject = s.reject_status.load(Ordering::SeqCst);
     if reject != 0 {
         let status = StatusCode::from_u16(reject as u16).unwrap();
-        let mut response = (
-            status,
-            Json(json!({"error":{"message":"upstream rejected","code":reject}})),
-        )
-            .into_response();
+        let pending = s.reject_body.lock().unwrap().take();
+        let mut response = if let Some(pending) = pending {
+            let body = Body::from_stream(futures_util::stream::once(pending));
+            (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+        } else {
+            (
+                status,
+                Json(json!({"error":{"message":"upstream rejected","code":reject}})),
+            )
+                .into_response()
+        };
         if status == StatusCode::TOO_MANY_REQUESTS {
             response
                 .headers_mut()
@@ -319,6 +329,222 @@ async fn send_completion(
 fn next_prompt() -> Vec<u32> {
     vec![1, 2, 3, 42, 43, 44, 45, 99]
 }
+
+async fn check_delayed_decode_error(
+    decode: &Engine,
+    client: &reqwest::Client,
+    api: &str,
+    metrics_url: &str,
+) {
+    let scrape = || async {
+        client
+            .get(metrics_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let sum = |scrape: &str, metric: &str| -> f64 {
+        scrape
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key.split('{').next() == Some(metric)).then(|| value.parse::<f64>().unwrap())
+            })
+            .sum()
+    };
+    let active = |s: &str| sum(s, "vllm_router_active_requests");
+    let cancelled = |s: &str| sum(s, "vllm_router_requests_cancelled_total");
+    let before = scrape().await;
+    assert_eq!(active(&before), 0.);
+    let cancellations = cancelled(&before);
+
+    decode.state.reject_status.store(429, Ordering::SeqCst);
+    for (task, drain) in [("error-drain", true), ("error-drop", false)] {
+        let (release, body) = oneshot::channel();
+        *decode.state.reject_body.lock().unwrap() = Some(body);
+        let response = client
+            .post(api)
+            .json(&completion_body(task, &[1, 2, 3], true, false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let pending = scrape().await;
+        assert_eq!(active(&pending), 1., "{task}: error body is still pending");
+        assert_eq!(cancelled(&pending), cancellations, "{task}");
+
+        if drain {
+            let payload = Bytes::from_static(br#"{"error":{"message":"upstream rejected"}}"#);
+            release.send(payload.clone()).unwrap();
+            assert_eq!(response.bytes().await.unwrap(), payload);
+        } else {
+            drop(response);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let finished = scrape().await;
+                assert_eq!(cancelled(&finished), cancellations, "{task}");
+                if active(&finished) == 0. {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("error response must release the active request");
+    }
+}
+
+#[test]
+fn scrape_warm_remote_outcomes_through_http_router() {
+    // Scope the recorder to this current-thread runtime so the other warm
+    // protocol tests cannot increment these counters.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let port = portpicker::pick_unused_port().unwrap();
+    let (recorder, exporter) = runtime.block_on(async {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap()
+    });
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            tokio::spawn(exporter);
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                use vllm_router_rs::{
+                    metrics::init_metrics,
+                    routers::RouterFactory,
+                    server::{build_app, AppState},
+                };
+
+                init_metrics();
+                let p = engine(true, false, false).await;
+                let d = engine(false, false, false).await;
+                let (cfg, _) = warm_router_config(
+                    &[&p],
+                    &d,
+                    &PolicyConfig::RoundRobin,
+                    false,
+                    json!({"capability_cache_seconds": 0.0}),
+                );
+                let client = reqwest::Client::new();
+                let context =
+                    Arc::new(AppContext::new(cfg, client.clone(), 64, None, vec![]).unwrap());
+                let router: Arc<dyn RouterTrait> =
+                    Arc::from(RouterFactory::create_router(&context).await.unwrap());
+                let app = build_app(
+                    Arc::new(AppState {
+                        router,
+                        context,
+                        concurrency_queue_tx: None,
+                        router_manager: None,
+                    }),
+                    1024 * 1024,
+                    vec![],
+                    vec![],
+                    false,
+                );
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                let api = format!("http://{}/v1/completions", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let metrics_url = format!("http://127.0.0.1:{port}/metrics");
+                let assert_counters = |scrape: &str, expected: [u64; 3], turn: usize| {
+                    for (result, count) in ["miss", "hit", "invalidated"].into_iter().zip(expected)
+                    {
+                        let prefix =
+                            format!("vllm_router_warm_remote_total{{result=\"{result}\"}} ");
+                        let observed = scrape
+                            .lines()
+                            .find_map(|line| line.strip_prefix(&prefix))
+                            .map(|number| number.parse::<f64>().unwrap())
+                            .unwrap_or(0.);
+                        assert_eq!(
+                            observed, count as f64,
+                            "turn {turn}, warm remote result {result}",
+                        );
+                    }
+                };
+                let second = next_prompt();
+                let mut third = second.clone();
+                third.extend([42, 43, 44, 45, 100]);
+                for (turn, (prompt, counters)) in [
+                    (vec![1, 2, 3], [1, 0, 0]),
+                    (second, [1, 1, 0]),
+                    (third, [1, 1, 1]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if turn == 2 {
+                        // Restart the same endpoint before the third turn.
+                        d.state.epoch.store(2, Ordering::SeqCst);
+                    }
+                    client
+                        .post(&api)
+                        .json(&completion_body("task", &prompt, true, false))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap();
+                    let scrape = client
+                        .get(&metrics_url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .text()
+                        .await
+                        .unwrap();
+                    assert_counters(&scrape, counters, turn + 1);
+                    for prefix in [
+                        "vllm_router_pd_handoff_total{result=\"ok\"} ",
+                        "vllm_router_input_tokens_count{route=\"/v1/completions\"} ",
+                        "vllm_router_output_tokens_count{route=\"/v1/completions\"} ",
+                    ] {
+                        let actual = scrape
+                            .lines()
+                            .find_map(|line| line.strip_prefix(prefix))
+                            .map(|number| number.parse::<f64>().unwrap());
+                        assert_eq!(
+                            actual,
+                            Some((turn + 1) as f64),
+                            "{prefix} on turn {}",
+                            turn + 1
+                        );
+                    }
+                }
+                let warm_reads = p
+                    .state
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.pointer("/kv_transfer_params/remote_request_id").is_some())
+                    .collect::<Vec<_>>();
+                assert_eq!(warm_reads, [false, true, false]);
+                check_delayed_decode_error(&d, &client, &api, &metrics_url).await;
+            })
+            .await
+            .unwrap();
+        });
+    });
+}
+
 #[tokio::test]
 async fn exact_two_turns_take_engine_metadata_once_and_reject_rewrite() {
     let p = engine(true, false, false).await;

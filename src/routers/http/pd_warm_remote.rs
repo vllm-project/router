@@ -1,5 +1,6 @@
 //! Explicitly gated, exact-token NIXL multi-turn orchestration.
 //! Metadata is engine-owned and single-use. Neither leases nor cost estimates grant capacity.
+use super::request_metrics::{self, Handoff, Phase, Stage};
 use super::{dp_utils, pd_program_adapter::PdProgramRuntime, program_adapter::ProgramCompletion};
 use crate::config::types::PdProgramSchedulingConfig;
 use crate::core::Worker;
@@ -81,6 +82,12 @@ pub(super) struct PdWarmRemoteRuntime {
     loss_epoch: std::sync::atomic::AtomicU64,
     event_tracking: std::sync::atomic::AtomicBool,
 }
+enum WarmResult {
+    Hit,
+    Miss,
+    Invalidated,
+}
+
 impl PdWarmRemoteRuntime {
     pub fn new(config: PdProgramSchedulingConfig) -> Self {
         Self {
@@ -149,6 +156,17 @@ impl PdWarmRemoteRuntime {
         }
         Ok(identity)
     }
+    fn record_warm(&self, result: WarmResult) {
+        if self.config.warm_remote {
+            let result = match result {
+                WarmResult::Hit => "hit",
+                WarmResult::Miss => "miss",
+                WarmResult::Invalidated => "invalidated",
+            };
+            metrics::counter!("vllm_router_warm_remote_total", "result" => result).increment(1);
+        }
+    }
+
     pub fn invalidate_target(&self, base: &str, rank: Option<usize>) {
         let mut s = self.state.lock();
         s.identities.retain(|(cached_base, cached_rank), _| {
@@ -159,14 +177,21 @@ impl PdWarmRemoteRuntime {
             .entry((base.to_string(), rank))
             .or_default();
         *revision = revision.wrapping_add(1);
+        let before = s.candidates.len();
         s.candidates.retain(|_, c| {
             c.source.base_url != base || rank.is_some_and(|r| c.source.dp_rank.unwrap_or(0) != r)
         });
+        if s.candidates.len() < before {
+            self.record_warm(WarmResult::Invalidated);
+        }
         *s.counters.entry("source_invalidated").or_default() += 1;
     }
     pub fn invalidate_all(&self) {
         let mut s = self.state.lock();
         s.invalidation_revision = s.invalidation_revision.wrapping_add(1);
+        if !s.candidates.is_empty() {
+            self.record_warm(WarmResult::Invalidated);
+        }
         s.candidates.clear();
         s.identities.clear();
         *s.counters.entry("event_loss").or_default() += 1;
@@ -209,7 +234,10 @@ impl PdWarmRemoteRuntime {
     ) -> Option<Candidate> {
         self.refresh_loss();
         let mut s = self.state.lock();
-        let c = s.candidates.remove(dispatch.program())?;
+        let Some(c) = s.candidates.remove(dispatch.program()) else {
+            self.record_warm(WarmResult::Miss);
+            return None;
+        };
         let expiry_ok = c.expires
             > Instant::now()
                 + Duration::from_secs_f64(
@@ -235,6 +263,7 @@ impl PdWarmRemoteRuntime {
             };
             *s.counters.entry(reason).or_default() += 1;
             *s.counters.entry("candidate_rejected").or_default() += 1;
+            self.record_warm(WarmResult::Invalidated);
             return None;
         }
         *s.counters.entry("candidate_claimed").or_default() += 1;
@@ -516,10 +545,16 @@ async fn read_bounded(
     let mut body = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| "PD body transport failure")?;
+        let chunk = chunk.map_err(|error| {
+            if stage.is_some() {
+                Handoff::from_error(&error).observed();
+            }
+            "PD body transport failure"
+        })?;
         if bytes.len().saturating_add(chunk.len()) > max {
             if let Some(stage) = stage {
                 RouterMetrics::record_pd_body_over_limit(stage);
+                Handoff::Failed.observed();
             }
             return Err("PD response exceeded bounded metadata envelope".into());
         }
@@ -550,29 +585,43 @@ async fn prefill(
     r["kv_transfer_params"] = params
         .cloned()
         .unwrap_or_else(|| json!({"do_remote_prefill":false,"do_remote_decode":true}));
-    let response = builder(client, p, "/v1/completions", headers)
-        .json(&r)
-        .send()
-        .await
-        .map_err(|_| PrefillError::Failed("PD prefill transport failure".into()))?;
-    if !response.status().is_success() {
-        return Err(PrefillError::Upstream(response));
+    request_metrics::phase(Phase::Prefill);
+    let _prefill_stage = request_metrics::stage(Stage::PrefillDispatch);
+    let outcome = async {
+        let response = builder(client, p, "/v1/completions", headers)
+            .json(&r)
+            .send()
+            .await
+            .map_err(|error| {
+                Handoff::from_error(&error).observed();
+                PrefillError::Failed("PD prefill transport failure".into())
+            })?;
+        if !response.status().is_success() {
+            Handoff::http_failure(response.status());
+            return Err(PrefillError::Upstream(response));
+        }
+        let bytes = read_bounded(response, max_response, Some("prefill"))
+            .await
+            .map_err(PrefillError::Failed)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            Handoff::Failed.observed();
+            PrefillError::Failed("Invalid PD prefill JSON".into())
+        })?;
+        if value.get("error").is_some()
+            || !value
+                .get("kv_transfer_params")
+                .is_some_and(|p| bounded_metadata(p, max_metadata))
+        {
+            Handoff::Failed.observed();
+            return Err(PrefillError::Failed(
+                "Missing verified P transfer metadata".into(),
+            ));
+        }
+        Ok(value)
     }
-    let bytes = read_bounded(response, max_response, Some("prefill"))
-        .await
-        .map_err(PrefillError::Failed)?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| PrefillError::Failed("Invalid PD prefill JSON".into()))?;
-    if value.get("error").is_some()
-        || !value
-            .get("kv_transfer_params")
-            .is_some_and(|p| bounded_metadata(p, max_metadata))
-    {
-        return Err(PrefillError::Failed(
-            "Missing verified P transfer metadata".into(),
-        ));
-    }
-    Ok(value)
+    .await;
+    request_metrics::phase(Phase::Routing);
+    outcome
 }
 
 async fn local_prefix(
@@ -651,6 +700,7 @@ pub(super) async fn execute(
         warm_remote.count("unverified_discovery_fallback");
         return None;
     }
+    let routing_stage = request_metrics::stage(Stage::Route);
     let topology_revision = runtime.worker_registry.revision();
     let prompt = match exact_request(request, path, warm_remote.config.max_prefix_tokens) {
         Some(prompt) => prompt,
@@ -696,6 +746,7 @@ pub(super) async fn execute(
         {
             candidate = None;
             warm_remote.count("source_epoch_rejected");
+            warm_remote.record_warm(WarmResult::Invalidated);
         }
     }
     let coverage = candidate.as_ref().map_or(0, |c| c.prefix.len());
@@ -816,6 +867,7 @@ pub(super) async fn execute(
             }
         }
     }
+    drop(routing_stage);
     let event_revision = warm_remote.revision_for(d);
     let started = Instant::now();
     // Charge the same native P/D accounting the native two-stage path uses so
@@ -857,6 +909,7 @@ pub(super) async fn execute(
                 route = PdPath::ColdRemote;
                 predicted = None;
                 warm_remote.count("expired_before_read");
+                warm_remote.record_warm(WarmResult::Invalidated);
             }
             RouterMetrics::record_pd_prefill_request(p_metric);
             let mut value = prefill(
@@ -916,6 +969,7 @@ pub(super) async fn execute(
                 != Some(pe.instance_epoch.as_str())
             {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                Handoff::Failed.observed();
                 return Err("P response instance epoch mismatch".into());
             }
             if let Some(f) = value.pointer("/kv_transfer_params/pd_feedback") {
@@ -924,6 +978,9 @@ pub(super) async fn execute(
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 if route == PdPath::WarmRemote {
+                    if let Some(external) = f.get("external_cached_tokens").and_then(Value::as_u64) {
+                        warm_remote.record_warm(if external > 0 { WarmResult::Hit } else { WarmResult::Miss });
+                    }
                     warm_remote.count(if external > 0 {
                         "warm_external_read"
                     } else {
@@ -951,21 +1008,36 @@ pub(super) async fn execute(
         let d_started = Instant::now();
         RouterMetrics::record_pd_decode_request(d_metric);
         attempt.begin_decode();
+        request_metrics::phase(Phase::Decode);
+        let decode_stage = request_metrics::stage(Stage::DecodeDispatch);
         let response = builder(client, d, path, headers)
             .json(&dr)
             .send()
             .await
-            .map_err(|_| "PD decode transport failure")?;
+            .map_err(|error| {
+                if route != PdPath::LocalAppend {
+                    Handoff::from_error(&error).observed();
+                }
+                "PD decode transport failure"
+            })?;
         let streaming = request.get("stream") == Some(&Value::Bool(true));
-        match gate_response(
+        if route != PdPath::LocalAppend {
+            Handoff::http_failure(response.status());
+        }
+        let gate = gate_response(
             response,
             streaming,
             warm_remote.config.max_metadata_bytes,
             warm_remote.config.max_response_bytes,
+            route != PdPath::LocalAppend,
         )
-        .await?
-        {
-            GateOutcome::Ready(response) => Ok(TurnResult::Dispatch(response, d_started)),
+        .await;
+        drop(decode_stage);
+        match gate? {
+            GateOutcome::Ready(response) => {
+                Handoff::pending(route != PdPath::LocalAppend);
+                Ok(TurnResult::Dispatch(response, d_started))
+            },
             GateOutcome::Forward(response) => {
                 RouterMetrics::record_pd_decode_error(d_metric);
                 Ok(TurnResult::Forward(response))
@@ -1013,6 +1085,7 @@ pub(super) async fn execute(
         }
         Err(error) if route == PdPath::LocalAppend => {
             drop(local_permit);
+            request_metrics::phase(Phase::Routing);
             dispatch = match completion.restart_pd_attempt() {
                 Some(d) => d,
                 None => return Some(Err("Cold retry resource recheck failed".into())),
@@ -1083,20 +1156,30 @@ pub(super) async fn execute(
                 RouterMetrics::record_pd_decode_request(d_metric);
                 // The first local attempt may have failed before decode began.
                 attempt.begin_decode();
+                request_metrics::phase(Phase::Decode);
+                let _decode_stage = request_metrics::stage(Stage::DecodeDispatch);
                 let response = builder(client, d, path, headers)
                     .json(&dr)
                     .send()
                     .await
-                    .map_err(|_| "Cold fallback transport failure")?;
+                    .map_err(|error| {
+                        Handoff::from_error(&error).observed();
+                        "Cold fallback transport failure"
+                    })?;
+                Handoff::http_failure(response.status());
                 let gate = gate_response(
                     response,
                     request.get("stream") == Some(&Value::Bool(true)),
                     warm_remote.config.max_metadata_bytes,
                     warm_remote.config.max_response_bytes,
+                    true,
                 )
                 .await?;
                 match gate {
-                    GateOutcome::Ready(response) => Ok(TurnResult::Dispatch(response, d_started)),
+                    GateOutcome::Ready(response) => {
+                        Handoff::pending(true);
+                        Ok(TurnResult::Dispatch(response, d_started))
+                    }
                     GateOutcome::Forward(response) => {
                         RouterMetrics::record_pd_decode_error(d_metric);
                         Ok(TurnResult::Forward(response))
@@ -1149,6 +1232,7 @@ async fn gate_response(
     streaming: bool,
     max_metadata: usize,
     max_response: usize,
+    track_handoff: bool,
 ) -> Result<GateOutcome, String> {
     let status = response.status();
     if !status.is_success() {
@@ -1156,6 +1240,18 @@ async fn gate_response(
         // overload with Retry-After) instead of collapsing them into a 503.
         return Ok(GateOutcome::Forward(forward_backend_response(response)));
     }
+    let fail = |message: &'static str| {
+        if track_handoff {
+            Handoff::Failed.observed();
+        }
+        message.to_string()
+    };
+    let transport = |error: reqwest::Error, message: &'static str| {
+        if track_handoff {
+            Handoff::from_error(&error).observed();
+        }
+        message.to_string()
+    };
     let headers = header_utils::preserve_response_headers(response.headers());
     let mut stream: ByteStream = Box::pin(response.bytes_stream());
     let mut prefix = Vec::new();
@@ -1163,10 +1259,10 @@ async fn gate_response(
     if streaming {
         let mut saw_output = false;
         'read: while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "Pre-output D stream failed")?;
+            let chunk = chunk.map_err(|error| transport(error, "Pre-output D stream failed"))?;
             if prefix.len().saturating_add(chunk.len()) > max_metadata {
                 RouterMetrics::record_pd_body_over_limit("decode");
-                return Err("PD pre-output envelope too large".into());
+                return Err(fail("PD pre-output envelope too large"));
             }
             prefix.extend_from_slice(&chunk);
             while let Some(n) = prefix[offset..].iter().position(|b| *b == b'\n') {
@@ -1179,7 +1275,7 @@ async fn gate_response(
                         }
                         if let Ok(v) = serde_json::from_str::<Value>(data) {
                             if v.get("error").is_some() {
-                                return Err("PD initial stream error".into());
+                                return Err(fail("PD initial stream error"));
                             }
                             if v.get("choices").and_then(Value::as_array).is_some_and(|c| {
                                 c.iter().any(|c| {
@@ -1200,19 +1296,19 @@ async fn gate_response(
             }
         }
         if !saw_output {
-            return Err("PD stream ended before generated output".into());
+            return Err(fail("PD stream ended before generated output"));
         }
     } else {
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "Pre-output D response failed")?;
+            let chunk = chunk.map_err(|error| transport(error, "Pre-output D response failed"))?;
             if prefix.len().saturating_add(chunk.len()) > max_response {
                 RouterMetrics::record_pd_body_over_limit("decode");
-                return Err("PD response envelope too large".into());
+                return Err(fail("PD response envelope too large"));
             }
             prefix.extend_from_slice(&chunk);
         }
         let value: Value =
-            serde_json::from_slice(&prefix).map_err(|_| "Invalid D response JSON")?;
+            serde_json::from_slice(&prefix).map_err(|_| fail("Invalid D response JSON"))?;
         let output = value
             .get("choices")
             .and_then(Value::as_array)
@@ -1227,7 +1323,7 @@ async fn gate_response(
                 })
             });
         if value.get("error").is_some() || !output {
-            return Err("PD response completed before generated output".into());
+            return Err(fail("PD response completed before generated output"));
         }
     }
     let body = Body::from_stream(

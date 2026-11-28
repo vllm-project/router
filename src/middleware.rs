@@ -17,6 +17,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 pub use crate::core::token_bucket::TokenBucket;
 
 use crate::metrics::RouterMetrics;
+use crate::routers::http::request_metrics::{self, Phase};
 use crate::server::AppState;
 
 /// Generate OpenAI-compatible request ID based on endpoint
@@ -505,6 +506,18 @@ async fn too_many_requests(token_bucket: &TokenBucket) -> Response {
     response
 }
 
+pub(crate) async fn http_request_metrics(
+    State(app_state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request_metrics::enabled(&app_state, &request) {
+        request_metrics::measure(request, next).await
+    } else {
+        next.run(request).await
+    }
+}
+
 /// Middleware function for concurrency limiting with optional queuing
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
@@ -521,6 +534,7 @@ pub async fn concurrency_limit_middleware(
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
+        request_metrics::begin_preprocess();
         let response = next.run(request).await;
 
         // Return the token to the bucket
@@ -543,6 +557,7 @@ pub async fn concurrency_limit_middleware(
             // Try to send to queue
             match queue_tx.try_send(queued) {
                 Ok(_) => {
+                    request_metrics::phase(Phase::Queued);
                     // On successful enqueue, update embeddings queue gauge if applicable
                     if is_embeddings {
                         let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -553,6 +568,8 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
+                            request_metrics::phase(Phase::Routing);
+                            request_metrics::begin_preprocess();
                             // Dequeue for embeddings
                             if is_embeddings {
                                 let new_val =
