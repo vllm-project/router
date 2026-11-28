@@ -46,6 +46,8 @@ mod sticky_least_loaded_pd_tests {
             policy: PolicyConfig::StickyLeastLoaded,
             port: 0,
             request_timeout_secs: 10,
+            sse_forward_stall_timeout_secs:
+                vllm_router_rs::config::DEFAULT_SSE_FORWARD_STALL_TIMEOUT_SECS,
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             max_concurrent_requests: 64,

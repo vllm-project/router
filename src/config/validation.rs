@@ -542,6 +542,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.sse_forward_stall_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "sse_forward_stall_timeout_secs".to_string(),
+                value: config.sse_forward_stall_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),

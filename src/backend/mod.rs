@@ -127,6 +127,36 @@ pub(crate) mod stream_output {
             self.emitted = next;
             true
         }
+
+        /// Reserve capacity before publishing the output frame marker.
+        pub(crate) async fn send_bounded(
+            &mut self,
+            tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+            chunk: bytes::Bytes,
+            has_generated_output: bool,
+        ) -> bool {
+            let Ok(permit) = tx.reserve().await else {
+                return false;
+            };
+            let next = self.emitted.saturating_add(1);
+            if has_generated_output {
+                let _ = self.first_output.compare_exchange(
+                    0,
+                    next,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+            }
+            permit.send(chunk);
+            self.emitted = next;
+            true
+        }
+
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        pub(crate) fn first_output_frame_index(&self) -> usize {
+            self.first_output.load(Ordering::Acquire)
+        }
     }
 
     impl OutputFrameConsumer {
@@ -186,6 +216,107 @@ pub(crate) mod stream_output {
             assert!(consumer.on_frame());
             drop(rx);
             assert!(!producer.send(&tx, "cancelled", true));
+        }
+
+        /// A bounded hand-off must not publish the first-output marker while it
+        /// is still waiting for capacity: the marker is an ordered position, and
+        /// the frame it points at has not been enqueued yet.
+        #[tokio::test]
+        async fn bounded_send_keeps_the_marker_unpublished_until_a_slot_frees() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            let (mut producer, mut consumer) = output_frame_tracking();
+            assert!(
+                producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"meta"), false)
+                    .await
+            );
+            assert!(
+                producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"first token"), true)
+                    .await
+            );
+            assert_eq!(producer.first_output.load(Ordering::Acquire), 2);
+
+            // Queue is full: the third frame cannot be reserved, and the marker
+            // must stay where it is while the send waits.
+            let blocked = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                producer.send_bounded(&tx, bytes::Bytes::from_static(b"second token"), true),
+            )
+            .await;
+            assert!(
+                blocked.is_err(),
+                "the bounded send did not wait for capacity"
+            );
+            assert_eq!(producer.emitted, 2);
+            assert_eq!(producer.first_output.load(Ordering::Acquire), 2);
+
+            assert_eq!(rx.recv().await, Some(bytes::Bytes::from_static(b"meta")));
+            assert!(!consumer.on_frame());
+            assert_eq!(
+                rx.recv().await,
+                Some(bytes::Bytes::from_static(b"first token"))
+            );
+            assert!(consumer.on_frame());
+        }
+
+        #[tokio::test]
+        async fn bounded_send_publishes_the_marker_once_capacity_arrives() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let (mut producer, _consumer) = output_frame_tracking();
+            assert!(
+                producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"meta"), false)
+                    .await
+            );
+            let pending = tokio::spawn(async move {
+                let sent = producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"first token"), true)
+                    .await;
+                (
+                    sent,
+                    producer.emitted,
+                    producer.first_output.load(Ordering::Acquire),
+                )
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(rx.recv().await, Some(bytes::Bytes::from_static(b"meta")));
+            let (sent, emitted, first_output) = pending.await.unwrap();
+            assert!(sent);
+            assert_eq!(emitted, 2);
+            assert_eq!(
+                first_output, 2,
+                "capacity arrived but the marker was not published"
+            );
+        }
+
+        /// Closing the receiver while a reservation is pending must fail the
+        /// hand-off without publishing a marker for a frame nobody will see.
+        #[tokio::test]
+        async fn bounded_send_reports_closed_receiver_without_publishing() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (mut producer, _consumer) = output_frame_tracking();
+            assert!(
+                producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"meta"), false)
+                    .await
+            );
+            let pending = tokio::spawn(async move {
+                let sent = producer
+                    .send_bounded(&tx, bytes::Bytes::from_static(b"first token"), true)
+                    .await;
+                (
+                    sent,
+                    producer.emitted,
+                    producer.first_output.load(Ordering::Acquire),
+                )
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(rx);
+            let (sent, emitted, first_output) = pending.await.unwrap();
+            assert!(!sent, "a closed receiver accepted a frame");
+            assert_eq!(emitted, 1, "a dropped frame counted as emitted");
+            assert_eq!(first_output, 0, "a dropped frame published the marker");
         }
     }
 }

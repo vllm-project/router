@@ -45,6 +45,11 @@ pub fn init_metrics() {
         "Total number of requests that exhausted retries by route"
     );
 
+    describe_counter!(
+        "vllm_router_sse_forward_stops_total",
+        "Downstream SSE forwarding stops by route and reason (client_gone/stall_timeout)"
+    );
+
     // Circuit breaker metrics
     describe_gauge!(
         "vllm_router_cb_state",
@@ -668,6 +673,19 @@ pub struct RouterMetrics;
 
 pub struct TokenizerMetrics;
 
+// Transparent routing passes through raw paths. Keep this metric's label set
+// fixed even when a fallback request uses an arbitrary path.
+fn sse_forward_route_label(route: &str) -> &'static str {
+    match route {
+        "/generate" => "/generate",
+        "/inference/v1/generate" => "/inference/v1/generate",
+        "/v1/chat/completions" => "/v1/chat/completions",
+        "/v1/completions" => "/v1/completions",
+        "/v1/responses" => "/v1/responses",
+        _ => "other",
+    }
+}
+
 impl RouterMetrics {
     /// Separates real prefix decisions, explicit binding, and load fallback.
     pub fn record_prefix_routing_decision(
@@ -748,6 +766,14 @@ impl RouterMetrics {
         counter!("vllm_router_request_errors_total",
             "route" => route.to_string(),
             "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    pub(crate) fn record_sse_forward_stop(route: &str, reason: &'static str) {
+        counter!("vllm_router_sse_forward_stops_total",
+            "route" => sse_forward_route_label(route),
+            "reason" => reason
         )
         .increment(1);
     }
@@ -1597,6 +1623,17 @@ mod tests {
             rendered.contains("vllm_router_pd_new_prefill_tokens_bucket"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn sse_forward_route_labels_are_bounded() {
+        assert_eq!(
+            sse_forward_route_label("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(sse_forward_route_label("/v1/responses"), "/v1/responses");
+        assert_eq!(sse_forward_route_label("/custom/route"), "other");
+        assert_eq!(sse_forward_route_label("/another/custom/route"), "other");
     }
 
     // ============= PrometheusConfig Tests =============
