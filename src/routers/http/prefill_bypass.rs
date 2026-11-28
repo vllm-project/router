@@ -1,8 +1,10 @@
 //! Scheduler-independent policy and worker contract for local prefill.
 
 use crate::backend::preprocess::http_cache_read_fallback;
+use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -226,10 +228,66 @@ pub(super) fn grpc_rejected(status: &tonic::Status) -> bool {
             == Some(ERROR_CODE)
 }
 
+pub(super) enum PrefillDispatch<T> {
+    Split(T),
+    Respond(Response),
+}
+
+pub(super) enum BypassAttempt<T> {
+    Split(T),
+    Respond(Response),
+    /// Decode refused before generation and the caller released its attempt.
+    Refused,
+}
+
+/// The caller owns admission and attempt cleanup. The callback receives `true`
+/// only after a typed refusal, and that admission goes straight to the split path.
+pub(super) async fn admit_with_bypass<T, A, AFut, B, BFut>(
+    mut admit: A,
+    bypass: B,
+) -> PrefillDispatch<T>
+where
+    A: FnMut(bool) -> AFut,
+    AFut: Future<Output = Result<T, Box<Response>>>,
+    B: FnOnce(T) -> BFut,
+    BFut: Future<Output = BypassAttempt<T>>,
+{
+    let initial = match admit(false).await {
+        Ok(attempt) => attempt,
+        Err(response) => return PrefillDispatch::Respond(*response),
+    };
+    match bypass(initial).await {
+        BypassAttempt::Split(attempt) => PrefillDispatch::Split(attempt),
+        BypassAttempt::Respond(response) => PrefillDispatch::Respond(response),
+        BypassAttempt::Refused => match admit(true).await {
+            Ok(attempt) => PrefillDispatch::Split(attempt),
+            Err(response) => PrefillDispatch::Respond(*response),
+        },
+    }
+}
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typed_refusal_readmits_without_trying_bypass_again() {
+        let mut admissions = Vec::new();
+        let outcome = admit_with_bypass(
+            |readmit| {
+                admissions.push(readmit);
+                std::future::ready(Ok(admissions.len()))
+            },
+            |attempt| async move {
+                assert_eq!(attempt, 1);
+                BypassAttempt::Refused
+            },
+        )
+        .await;
+        assert!(matches!(outcome, PrefillDispatch::Split(2)));
+        assert_eq!(admissions, [false, true]);
+    }
 
     #[test]
     fn opt_in_defaults_require_both_suffix_thresholds() {

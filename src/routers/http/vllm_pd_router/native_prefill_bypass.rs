@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     http::{HeaderMap, StatusCode},
@@ -17,13 +18,13 @@ use super::super::{
     pd_kv_state::PdKvState,
     pd_types::{error_chain, Loads, PdAttempt, PdEndpoint, Stage},
     prefill_bypass::{
-        grpc_rejected, http_rejected, PdPrefillBypassConfig, PrefillBypass, PrefillEstimate,
-        ERROR_HEADER,
+        admit_with_bypass, grpc_rejected, http_rejected, BypassAttempt, PdPrefillBypassConfig,
+        PrefillBypass, PrefillDispatch, PrefillEstimate, ERROR_HEADER,
     },
 };
 use super::{
     grpc_decode_outcome, own_grpc_decode, record_grpc_decode_stream_failure, response_with_body,
-    Admission, AdmittedPair, DecodeCommitInput, DecodePoolSource, GrpcPdWorkers, VllmPDRouter,
+    Admission, AdmittedPair, DecodeCommitGuard, DecodeCommitInput, DecodePoolSource,
 };
 use crate::backend::{EngineFrontend, PreparedRequest};
 use crate::config::{KvConnector, PolicyConfig, RouterConfig};
@@ -51,34 +52,68 @@ pub(crate) fn validate_prefill_bypass(
     Ok(())
 }
 
+/// The native admission operations used while validating the selected pair.
+#[async_trait]
+pub(super) trait DecodeAdmission: Sync {
+    fn supports_prefill(&self, prefill: &dyn Worker) -> bool;
+
+    fn decode_policy(&self) -> Arc<dyn LoadBalancingPolicy>;
+
+    fn eligible_decode_candidates(
+        &self,
+        pool: DecodePoolSource,
+        model: Option<&str>,
+        endpoint: &PdEndpoint,
+    ) -> Vec<Arc<dyn Worker>>;
+
+    async fn commit_provisional_decode(
+        &self,
+        attempt: &PdAttempt,
+        commit: &DecodeCommitInput,
+        request: &Value,
+        headers: Option<&HeaderMap>,
+        guard: &DecodeCommitGuard<'_>,
+    ) -> Option<Arc<dyn Worker>>;
+}
+
+pub(super) struct NativeBypass<'a> {
+    pub feature: &'a PrefillBypass,
+    pub state: &'a PdKvState,
+    pub admission: &'a dyn DecodeAdmission,
+}
+
 #[derive(Clone, Copy)]
-enum Transport<'a> {
-    Http(DecodePoolSource),
+pub(super) enum Transport<'a> {
+    Http {
+        client: &'a reqwest::Client,
+        pool: DecodePoolSource,
+    },
     Grpc {
+        frontend: &'a EngineFrontend,
         prepared: &'a PreparedRequest,
         prompts: &'a Arc<[Vec<u32>]>,
     },
 }
 
 #[derive(Clone, Copy)]
-struct BeforePrefill<'a> {
-    request: &'a Value,
-    path: &'a str,
-    headers: Option<&'a HeaderMap>,
-    transport: Transport<'a>,
+pub(super) struct BeforePrefill<'a> {
+    pub request: &'a Value,
+    pub path: &'a str,
+    pub headers: Option<&'a HeaderMap>,
+    pub transport: Transport<'a>,
 }
 
 impl BeforePrefill<'_> {
     fn pool(&self) -> DecodePoolSource {
         match self.transport {
-            Transport::Http(pool) => pool,
+            Transport::Http { pool, .. } => pool,
             Transport::Grpc { .. } => DecodePoolSource::Registry,
         }
     }
 
     fn router_prompts(&self) -> Option<&Arc<[Vec<u32>]>> {
         match self.transport {
-            Transport::Http(_) => None,
+            Transport::Http { .. } => None,
             Transport::Grpc { prompts, .. } => Some(prompts),
         }
     }
@@ -91,88 +126,8 @@ pub(super) struct SplitDispatch {
     pub commit: Option<DecodeCommitInput>,
 }
 
-pub(super) enum PrefillDispatch {
-    Split(SplitDispatch),
-    Respond(Response),
-}
-
-pub(super) async fn admit_http_for_dispatch(
-    router: &VllmPDRouter,
-    request: &Value,
-    path: &str,
-    headers: Option<&HeaderMap>,
-) -> PrefillDispatch {
-    let pool = if router.use_discovery {
-        DecodePoolSource::Discovery
-    } else {
-        DecodePoolSource::Registry
-    };
-    let input = BeforePrefill {
-        request,
-        path,
-        headers,
-        transport: Transport::Http(pool),
-    };
-    admit_for_dispatch(router, input, |_| async {
-        router
-            .admit_http_pair(pool, request, path, headers)
-            .await
-            .map_err(|error| {
-                RouterMetrics::record_pd_error("server_selection");
-                Box::new((StatusCode::SERVICE_UNAVAILABLE, error).into_response())
-            })
-    })
-    .await
-}
-
-pub(super) async fn admit_grpc_for_dispatch(
-    router: &VllmPDRouter,
-    request: &Value,
-    path: &str,
-    headers: Option<&HeaderMap>,
-    prepared: &PreparedRequest,
-    workers: &GrpcPdWorkers,
-) -> PrefillDispatch {
-    let prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
-    let prompts = &prompts;
-    let input = BeforePrefill {
-        request,
-        path,
-        headers,
-        transport: Transport::Grpc { prepared, prompts },
-    };
-    admit_for_dispatch(router, input, |readmit| async move {
-        let refreshed = if readmit {
-            Some(router.available_grpc_workers()?)
-        } else {
-            None
-        };
-        router
-            .admit_grpc_pair(
-                refreshed.as_ref().unwrap_or(workers),
-                request,
-                path,
-                headers,
-                prompts,
-            )
-            .await
-    })
-    .await
-}
-
-/// Admit a native pair and optionally dispatch straight to Decode. Only a typed
-/// refusal permits fresh admission, and the second attempt always splits.
-async fn admit_for_dispatch<F, Fut>(
-    router: &VllmPDRouter,
-    input: BeforePrefill<'_>,
-    mut admit: F,
-) -> PrefillDispatch
-where
-    F: FnMut(bool) -> Fut,
-    Fut: Future<Output = Result<AdmittedPair, Box<Response>>>,
-{
-    let mut readmit = false;
-    loop {
+impl SplitDispatch {
+    fn new(pair: AdmittedPair, input: BeforePrefill<'_>) -> Self {
         let AdmittedPair {
             prefill,
             decode,
@@ -183,10 +138,7 @@ where
                     decode_tokens,
                     affinity_key,
                 },
-        } = match admit(readmit).await {
-            Ok(pair) => pair,
-            Err(response) => return PrefillDispatch::Respond(*response),
-        };
+        } = pair;
         let commit = attempt.decode_pending_commit().then(|| {
             DecodeCommitInput::for_request(
                 input.pool(),
@@ -198,47 +150,70 @@ where
                 input.router_prompts().cloned(),
             )
         });
-        let split = SplitDispatch {
+        Self {
             prefill,
             decode,
             attempt,
             commit,
-        };
-        if let Some(feature) = router.prefill_bypass.as_ref().filter(|_| !readmit) {
-            if let Some(worker) = bypass_target(router, feature, input, &split).await {
-                let params = feature.transfer_params();
-                let response = match input.transport {
-                    Transport::Http(_) => {
-                        dispatch_http(
-                            &router.pd_router.client,
-                            input,
-                            worker.as_ref(),
-                            &split.attempt,
-                            params,
-                        )
-                        .await
-                    }
-                    Transport::Grpc { prepared, .. } => {
-                        dispatch_grpc(
-                            &router.grpc_frontend,
-                            prepared.clone(),
-                            input.path,
-                            worker.as_ref(),
-                            &split.attempt,
-                            params,
-                        )
-                        .await
-                    }
-                };
-                if let Some(response) = response {
-                    return PrefillDispatch::Respond(split.attempt.track_response(response));
-                }
-                split.attempt.release();
-                readmit = true;
-                continue;
-            }
         }
-        return PrefillDispatch::Split(split);
+    }
+}
+
+pub(super) async fn admit_for_dispatch<F, Fut>(
+    bypass: Option<NativeBypass<'_>>,
+    input: BeforePrefill<'_>,
+    mut admit: F,
+) -> PrefillDispatch<SplitDispatch>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: Future<Output = Result<AdmittedPair, Box<Response>>>,
+{
+    admit_with_bypass(
+        |readmit| {
+            let admitted = admit(readmit);
+            async move { admitted.await.map(|pair| SplitDispatch::new(pair, input)) }
+        },
+        |split| try_bypass(bypass, input, split),
+    )
+    .await
+}
+
+async fn try_bypass(
+    bypass: Option<NativeBypass<'_>>,
+    input: BeforePrefill<'_>,
+    split: SplitDispatch,
+) -> BypassAttempt<SplitDispatch> {
+    let Some(bypass) = bypass else {
+        return BypassAttempt::Split(split);
+    };
+    let Some(worker) = bypass_target(&bypass, input, &split).await else {
+        return BypassAttempt::Split(split);
+    };
+    let params = bypass.feature.transfer_params();
+    let response = match input.transport {
+        Transport::Http { client, .. } => {
+            dispatch_http(client, input, worker.as_ref(), &split.attempt, params).await
+        }
+        Transport::Grpc {
+            frontend, prepared, ..
+        } => {
+            dispatch_grpc(
+                frontend,
+                prepared.clone(),
+                input.path,
+                worker.as_ref(),
+                &split.attempt,
+                params,
+            )
+            .await
+        }
+    };
+    match response {
+        Some(response) => BypassAttempt::Respond(split.attempt.track_response(response)),
+        None => {
+            split.attempt.release();
+            BypassAttempt::Refused
+        }
     }
 }
 
@@ -302,8 +277,7 @@ async fn prepare_estimate(
 }
 
 async fn bypass_target(
-    router: &VllmPDRouter,
-    feature: &PrefillBypass,
+    bypass: &NativeBypass<'_>,
     input: BeforePrefill<'_>,
     split: &SplitDispatch,
 ) -> Option<Arc<dyn Worker>> {
@@ -319,17 +293,17 @@ async fn bypass_target(
         attempt,
         commit,
     } = split;
-    if !matches!(router.kv_connector, KvConnector::Nixl)
-        || router.epd.is_some()
-        || !PrefillBypass::eligible_request(path, request)
-        || router
-            .get_nixl_push_identity(prefill.base_url(), prefill.dp_rank())
-            .is_some()
+    if !PrefillBypass::eligible_request(path, request)
+        || !bypass.admission.supports_prefill(prefill.as_ref())
     {
         return None;
     }
-    let state = router.pd_router.kv_state.as_ref()?;
-    let policy = router.policy_registry.get_decode_policy();
+    let NativeBypass {
+        feature,
+        state,
+        admission,
+    } = bypass;
+    let policy = admission.decode_policy();
     let (estimate, worker_revision) = prepare_estimate(
         state,
         decode.as_ref(),
@@ -355,18 +329,16 @@ async fn bypass_target(
                     estimate,
                 )
         };
-        return router
-            .select_and_commit_decode(attempt, commit, request, headers, true, Some(&accept))
-            .await
-            .ok();
+        return admission
+            .commit_provisional_decode(attempt, commit, request, headers, &accept)
+            .await;
     }
     let pool = input.pool();
     let endpoint = PdEndpoint::for_worker(decode.as_ref());
-    let mut live = router.live_decode_candidates(pool);
-    VllmPDRouter::retain_commit_candidates(
-        &mut live,
+    let live = admission.eligible_decode_candidates(
+        pool,
         request.get("model").and_then(Value::as_str),
-        Some(&endpoint),
+        &endpoint,
     );
     let worker = live.into_iter().find(|worker| {
         (matches!(pool, DecodePoolSource::Discovery) || Arc::ptr_eq(worker, decode))
