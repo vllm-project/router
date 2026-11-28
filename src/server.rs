@@ -1148,7 +1148,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.client.clone(),
             Duration::from_secs(config.worker_canary_interval_secs),
             Duration::from_secs(config.router_config.health_check.timeout_secs.max(1)),
-            config.router_config.api_key.clone(),
         )
     } else {
         None

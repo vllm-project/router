@@ -3,8 +3,10 @@
 `--worker-canary-interval-secs N` (default `0`) enables a generation check in
 the regular HTTP worker pool. The first check waits a full idle interval.
 The Router sends a non-streaming, one-token `/v1/completions` request directly
-to an idle worker with the configured worker credential and, when known, the
-pinned DP rank. It does not pass through user admission, routing, or request
+to an idle worker with the credential bound to that registration for HTTP
+probes, if any, and the pinned DP rank when known. Unbound workers receive no
+authorization header. The canary never falls back to the router-wide API key.
+It does not pass through user admission, routing, or request
 metrics. There are at most four concurrent probes Router-wide, each bounded
 by the existing health-check timeout. The check is local to the worker and
 never sends a KV transfer envelope.

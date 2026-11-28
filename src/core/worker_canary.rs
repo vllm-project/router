@@ -290,12 +290,7 @@ pub(crate) fn enable(worker: &dyn Worker) {
     }
 }
 
-async fn generate(
-    client: &reqwest::Client,
-    worker: &dyn Worker,
-    timeout: Duration,
-    api_key: Option<&str>,
-) -> ResultKind {
+async fn generate(client: &reqwest::Client, worker: &dyn Worker, timeout: Duration) -> ResultKind {
     let mut payload = json!({
         "prompt": "hi",
         "max_tokens": 1,
@@ -311,13 +306,10 @@ async fn generate(
         .post(worker.endpoint_url("/v1/completions"))
         .timeout(timeout)
         .json(&payload);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
     if let Some(rank) = worker.dp_rank() {
         request = request.header("X-data-parallel-rank", rank.to_string());
     }
-    let response = match request.send().await {
+    let response = match worker.authorize_http_probe(request).send().await {
         Ok(response) => response,
         Err(error) => return ResultKind::transport(&error),
     };
@@ -382,7 +374,6 @@ impl WorkerCanary {
         client: reqwest::Client,
         interval: Duration,
         timeout: Duration,
-        api_key: Option<String>,
     ) -> Option<Self> {
         if interval.is_zero() || !registry.enable_canary() {
             return None;
@@ -402,7 +393,7 @@ impl WorkerCanary {
                 tokio::select! {
                     biased;
                     _ = cancelled.cancelled() => break,
-                    _ = sweep(&registry, &client, interval, timeout, api_key.as_deref(), &metric) => {}
+                    _ = sweep(&registry, &client, interval, timeout, &metric) => {}
                 }
             }
             registry.disable_canary();
@@ -433,7 +424,6 @@ async fn sweep(
     client: &reqwest::Client,
     interval: Duration,
     timeout: Duration,
-    api_key: Option<&str>,
     metric: &metrics::Gauge,
 ) {
     let workers = registry.get_all_with_ids();
@@ -445,7 +435,7 @@ async fn sweep(
     metric.set(oldest);
     stream::iter(workers)
         .for_each_concurrent(CONCURRENCY, |(id, worker)| async move {
-            run_one(registry, client, &id, &worker, interval, timeout, api_key).await;
+            run_one(registry, client, &id, &worker, interval, timeout).await;
         })
         .await;
 }
@@ -457,7 +447,6 @@ async fn run_one(
     worker: &Arc<dyn Worker>,
     interval: Duration,
     timeout: Duration,
-    api_key: Option<&str>,
 ) {
     let Some(probe) = worker
         .canary_state()
@@ -471,7 +460,7 @@ async fn run_one(
     let result = tokio::select! {
         biased;
         _ = probe.cancel.cancelled() => return,
-        result = generate(client, worker.as_ref(), timeout, api_key) => result,
+        result = generate(client, worker.as_ref(), timeout) => result,
     };
     registry.with_registered_worker(id, worker, || {
         let was_healthy = worker.is_healthy();
@@ -590,14 +579,10 @@ mod tests {
                 worker,
                 Duration::ZERO,
                 Duration::from_secs(5),
-                Some("probe-auth")
             ),
             async {
                 let call = mock.calls.recv().await.unwrap();
-                assert_eq!(
-                    call.headers.get("authorization").unwrap(),
-                    "Bearer probe-auth"
-                );
+                assert!(!call.headers.contains_key("authorization"));
                 assert_eq!(call.body["max_tokens"], 1);
                 assert_eq!(call.body["stream"], false);
                 assert!(call.body.get("kv_transfer_params").is_none());
@@ -620,7 +605,6 @@ mod tests {
                 client.clone(),
                 Duration::ZERO,
                 Duration::from_secs(1),
-                None
             )
             .is_none());
             run_one(
@@ -630,7 +614,6 @@ mod tests {
                 &worker,
                 Duration::ZERO,
                 Duration::from_secs(1),
-                None,
             )
             .await;
             assert!(mock.calls.try_recv().is_err());
@@ -736,7 +719,6 @@ mod tests {
                 &worker,
                 Duration::ZERO,
                 Duration::from_secs(5),
-                None,
             )
             .await;
             assert!(mock.calls.try_recv().is_err());
@@ -752,7 +734,6 @@ mod tests {
                         &worker,
                         Duration::ZERO,
                         Duration::from_secs(10),
-                        None,
                     )
                     .await;
                 })
@@ -766,7 +747,6 @@ mod tests {
                 &worker,
                 Duration::ZERO,
                 Duration::from_secs(5),
-                None,
             )
             .await;
             assert!(mock.calls.try_recv().is_err());
@@ -802,6 +782,92 @@ mod tests {
             )
             .await;
             assert!(second.is_healthy());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn router_canary_respects_configured_and_unbound_registrations() {
+        use crate::{
+            config::{PolicyConfig, RouterConfig, RoutingMode},
+            routers::{router_manager::RouterManager, RouterFactory},
+            server::{build_app, AppContext, AppState},
+        };
+
+        time::timeout(Duration::from_secs(15), async {
+            let mut configured = Mock::start().await;
+            let mut unbound = Mock::start().await;
+            let client = reqwest::Client::new();
+            let config = RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec![configured.url.clone()],
+                },
+                api_key: Some("configured-worker-test-key".into()),
+                policy: PolicyConfig::RoundRobin,
+                ..Default::default()
+            };
+            let context =
+                Arc::new(AppContext::new(config, client.clone(), 32, None, vec![]).unwrap());
+            // The actual regular Router sets a trusted credential on its
+            // configured worker. IGW registrations share the registry but
+            // do not inherit that binding.
+            let router = Arc::from(RouterFactory::create_router(&context).await.unwrap());
+            let registry = context.worker_registry.clone();
+            let manager = Arc::new(RouterManager::new(
+                context.router_config.clone(),
+                client.clone(),
+                registry.clone(),
+                context.policy_registry.clone(),
+            ));
+            let app = build_app(
+                Arc::new(AppState {
+                    router,
+                    context,
+                    concurrency_queue_tx: None,
+                    router_manager: Some(manager),
+                }),
+                1024 * 1024,
+                vec![],
+                vec![],
+                false,
+            );
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let api = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let canary = WorkerCanary::start(
+                registry,
+                client.clone(),
+                Duration::from_millis(50),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            client
+                .post(format!("{api}/workers"))
+                .json(&json!({"url":unbound.url,"model_id":"unbound","worker_type":"regular"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+
+            let (configured_call, unbound_call) =
+                tokio::join!(configured.calls.recv(), unbound.calls.recv(),);
+            let configured_call = configured_call.unwrap();
+            let unbound_call = unbound_call.unwrap();
+            assert_eq!(
+                configured_call.headers["authorization"],
+                "Bearer configured-worker-test-key"
+            );
+            assert!(!unbound_call.headers.contains_key("authorization"));
+            for call in [configured_call, unbound_call] {
+                assert_eq!(call.body["max_tokens"], 1);
+                assert!(call.body.get("kv_transfer_params").is_none());
+                call.reply.send(served_one_token()).unwrap();
+            }
+            canary.shutdown().await;
+            server.abort();
         })
         .await
         .unwrap();
@@ -885,7 +951,6 @@ mod tests {
                 &worker,
                 Duration::ZERO,
                 Duration::from_secs(1),
-                None,
             )
             .await;
             assert!(
@@ -917,7 +982,6 @@ mod tests {
                 client,
                 Duration::from_millis(25),
                 Duration::from_secs(10),
-                None,
             )
             .unwrap();
             let pending = mock.calls.recv().await.unwrap();
@@ -957,7 +1021,6 @@ mod tests {
                         &client,
                         Duration::ZERO,
                         Duration::from_secs(5),
-                        None,
                         &gauge!("vllm_router_worker_idle_seconds"),
                     )
                     .await;
@@ -1001,7 +1064,7 @@ mod tests {
             sweep_task.await.unwrap();
 
             let (result, _held_response) = tokio::join!(
-                generate(&client, workers[0].as_ref(), Duration::from_secs(1), None),
+                generate(&client, workers[0].as_ref(), Duration::from_secs(1)),
                 async { mocks[0].calls.recv().await.unwrap() }
             );
             assert_eq!(result, ResultKind::Timeout);
@@ -1037,17 +1100,14 @@ mod tests {
                     &worker,
                     Duration::ZERO,
                     Duration::from_secs(1),
-                    None,
                 )
                 .await;
                 assert!(mock.calls.try_recv().is_err());
             }
-            let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
-                mock.url.clone(),
-                1,
-                2,
-                WorkerType::Regular,
-            ));
+            let worker: Arc<dyn Worker> = Arc::new(
+                DPAwareWorker::new(mock.url.clone(), 1, 2, WorkerType::Regular)
+                    .with_worker_api_key(Some(Arc::from("rank-test-key"))),
+            );
             let id = registry.register(worker.clone());
             tokio::join!(
                 run_one(
@@ -1057,11 +1117,11 @@ mod tests {
                     &worker,
                     Duration::ZERO,
                     Duration::from_secs(5),
-                    None
                 ),
                 async {
                     let call = mock.calls.recv().await.unwrap();
                     assert_eq!(call.headers.get("x-data-parallel-rank").unwrap(), "1");
+                    assert_eq!(call.headers["authorization"], "Bearer rank-test-key");
                     call.reply.send(served_one_token()).unwrap();
                 }
             );

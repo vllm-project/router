@@ -25,7 +25,13 @@ pub(crate) fn worker_get(
     url: &str,
     api_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let request = client.get(url);
+    worker_http_auth(client.get(url), api_key)
+}
+
+fn worker_http_auth(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
     match api_key {
         Some(key) => request.bearer_auth(key),
         None => request,
@@ -53,6 +59,13 @@ pub trait Worker: Send + Sync + fmt::Debug {
     #[doc(hidden)]
     fn canary_state(&self) -> Option<&CanaryState> {
         None
+    }
+
+    /// Attach credentials bound to this registration. The caller constructs
+    /// an unauthenticated request to this worker's HTTP endpoint.
+    #[doc(hidden)]
+    fn authorize_http_probe(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
     }
 
     /// Perform an async health check on the worker
@@ -381,7 +394,7 @@ impl BasicWorker {
         self
     }
 
-    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    /// Bind a bearer credential to this worker's HTTP health and generation probes.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.api_key = api_key;
         self
@@ -443,6 +456,10 @@ impl Worker for BasicWorker {
         Some(&self.canary)
     }
 
+    fn authorize_http_probe(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        worker_http_auth(request, self.api_key.as_deref())
+    }
+
     async fn check_health_async(&self) -> WorkerResult<()> {
         use std::time::Duration;
 
@@ -454,7 +471,8 @@ impl Worker for BasicWorker {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
 
                 // Use the shared client with a custom timeout for this request
-                match worker_get(&WORKER_CLIENT, &health_url, self.api_key.as_deref())
+                match self
+                    .authorize_http_probe(WORKER_CLIENT.get(&health_url))
                     .timeout(timeout)
                     .send()
                     .await
@@ -589,7 +607,7 @@ impl DPAwareWorker {
         self
     }
 
-    /// Set the API key sent as a bearer token on this worker's HTTP health checks.
+    /// Bind a bearer credential to this worker's HTTP health and generation probes.
     pub fn with_worker_api_key(mut self, api_key: Option<Arc<str>>) -> Self {
         self.base_worker = self.base_worker.with_worker_api_key(api_key);
         self
@@ -627,6 +645,10 @@ impl Worker for DPAwareWorker {
 
     fn canary_state(&self) -> Option<&CanaryState> {
         self.base_worker.canary_state()
+    }
+
+    fn authorize_http_probe(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.base_worker.authorize_http_probe(request)
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
