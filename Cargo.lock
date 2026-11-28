@@ -7372,6 +7372,7 @@ dependencies = [
  "scc",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "smallvec",
  "strum 0.26.3",

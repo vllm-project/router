@@ -11,6 +11,7 @@ use crate::program_scheduling::{
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RouterConfig {
     /// Optional encoder orchestration for E+PD or E/P/D routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1037,27 +1038,31 @@ pub enum RoutingMode {
     #[serde(rename = "regular")]
     Regular {
         /// Worker URLs: `http(s)://` or `grpc://`
+        #[serde(default)]
         worker_urls: Vec<String>,
     },
     #[serde(rename = "openai")]
     OpenAI {
         /// OpenAI-compatible API base(s), provided via worker URLs
+        #[serde(default)]
         worker_urls: Vec<String>,
     },
     #[serde(rename = "vllm_prefill_decode")]
     VllmPrefillDecode {
         /// Prefill worker URLs with optional bootstrap ports
+        #[serde(default)]
         prefill_urls: Vec<(String, Option<u16>)>,
         /// Decode worker URLs
+        #[serde(default)]
         decode_urls: Vec<String>,
         /// Optional separate policy for prefill workers
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         /// Optional separate policy for decode workers (defaults to the main policy)
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
     },
 }
@@ -1120,14 +1125,19 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_aware")]
     CacheAware {
         /// Minimum prefix match ratio to use cache-based routing
+        #[serde(default = "default_cache_threshold")]
         cache_threshold: f32,
         /// Absolute load difference threshold for load balancing
+        #[serde(default = "default_balance_abs_threshold")]
         balance_abs_threshold: usize,
         /// Relative load ratio threshold for load balancing
+        #[serde(default = "default_balance_rel_threshold")]
         balance_rel_threshold: f32,
         /// Interval between cache eviction cycles (seconds)
+        #[serde(default = "default_eviction_interval_secs")]
         eviction_interval_secs: u64,
         /// Maximum cache tree size per tenant
+        #[serde(default = "default_max_tree_size")]
         max_tree_size: usize,
     },
 
@@ -1153,12 +1163,14 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         /// Interval for load monitoring (seconds)
+        #[serde(default = "default_load_check_interval_secs")]
         load_check_interval_secs: u64,
     },
 
     #[serde(rename = "consistent_hash")]
     ConsistentHash {
         /// Number of virtual nodes per worker for better distribution
+        #[serde(default = "default_virtual_nodes")]
         virtual_nodes: u32,
     },
 
@@ -1189,6 +1201,34 @@ impl PolicyConfig {
     }
 }
 
+fn default_cache_threshold() -> f32 {
+    0.3
+}
+
+fn default_balance_abs_threshold() -> usize {
+    64
+}
+
+fn default_balance_rel_threshold() -> f32 {
+    1.5
+}
+
+fn default_eviction_interval_secs() -> u64 {
+    120
+}
+
+fn default_max_tree_size() -> usize {
+    1 << 25
+}
+
+fn default_load_check_interval_secs() -> u64 {
+    5
+}
+
+fn default_virtual_nodes() -> u32 {
+    160
+}
+
 fn default_kv_penalty_host() -> f64 {
     0.8
 }
@@ -1203,6 +1243,7 @@ fn default_kv_penalty_disk() -> f64 {
 
 /// Service discovery configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DiscoveryConfig {
     /// Enable service discovery
     pub enabled: bool,
@@ -1239,6 +1280,7 @@ impl Default for DiscoveryConfig {
 
 /// Retry configuration for request handling
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts
     pub max_retries: u32,
@@ -1272,6 +1314,7 @@ fn default_retry_jitter_factor() -> f32 {
 
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HealthCheckConfig {
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
@@ -1299,6 +1342,7 @@ impl Default for HealthCheckConfig {
 
 /// Circuit breaker configuration for worker reliability
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures before opening circuit
     pub failure_threshold: u32,
@@ -1323,6 +1367,7 @@ impl Default for CircuitBreakerConfig {
 
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetricsConfig {
     /// Prometheus metrics port
     pub port: u16,
