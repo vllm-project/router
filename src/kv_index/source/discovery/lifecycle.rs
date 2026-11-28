@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::info;
 
+use super::metrics_meta::{reported_prefix_hash, EngineCacheConfigs};
 use super::probe::WorkerDescriptor;
 use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
@@ -21,6 +22,7 @@ use crate::kv_index::{
 };
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const OPTIONAL_METADATA_BUDGET: Duration = CONTROL_TIMEOUT.checked_div(4).unwrap();
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const MAX_PROBE_FAILURES: u8 = 3;
 const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
@@ -160,16 +162,22 @@ impl WorkerLifecycle {
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
     }
 
+    pub(super) fn keeps_descriptor(
+        &self,
+        state: &LifecycleState,
+        descriptor: &WorkerDescriptor,
+    ) -> bool {
+        state.info.is_some()
+            && state.descriptor.as_ref() == Some(descriptor)
+            && (!self.layout || self.trusted(state))
+    }
+
     /// Descriptor probes run every 30s; three failures retire an installed owner.
     pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
         match descriptor {
-            Some(descriptor)
-                if state.info.is_some()
-                    && state.descriptor.as_ref() == Some(descriptor)
-                    && (!self.layout || self.trusted(&state)) =>
-            {
+            Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
                 SourceAction::Keep
             }
@@ -241,6 +249,52 @@ pub(super) struct LayoutWorkerProvider {
     pub(super) lifecycle: Arc<WorkerLifecycle>,
 }
 
+impl LayoutWorkerProvider {
+    fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
+        let mut state = self.lifecycle.state.lock();
+        let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
+            return;
+        };
+        let mut fenced = Vec::new();
+        for (&rank, index) in &self.indexes {
+            let Some(lease) = index.binding.as_ref().filter(|lease| lease.is_active()) else {
+                continue;
+            };
+            let reported = reported_prefix_hash(configs, worker, rank);
+            let Some((expected, reported)) = layout
+                .rank_capability(rank)
+                .and_then(|contract| contract.reported_hash_mismatch(reported))
+            else {
+                continue;
+            };
+            tracing::warn!(
+                worker,
+                rank,
+                expected,
+                reported,
+                "KV credit disabled after failed worker re-registration"
+            );
+            lease.fence_hash();
+            fenced.push((rank, index, lease));
+        }
+        if let Some(info) = &mut state.info {
+            info.ranks
+                .retain(|rank| !fenced.iter().any(|(fenced, _, _)| fenced == rank));
+            if !fenced.is_empty() && info.ranks.is_empty() {
+                tracing::warn!(
+                    worker,
+                    "No KV ranks remain after failed worker re-registration"
+                );
+            }
+        }
+        drop(state);
+        for (_, index, lease) in fenced {
+            let _guard = lease.gate.lock();
+            index.invalidate();
+        }
+    }
+}
+
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
     fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
         self.indexes.get(&rank)?.shared_prefix_lookup(rank)
@@ -302,6 +356,21 @@ impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
 }
 
 impl KvIndexSupervisor {
+    pub(super) fn fence_failed_registration(
+        &self,
+        worker_url: &str,
+        observed: &Arc<WorkerLifecycle>,
+        configs: &EngineCacheConfigs,
+    ) {
+        let workers = self.installed.workers.lock();
+        if let Some(previous) = workers
+            .get(worker_url)
+            .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
+        {
+            previous.provider.fence_runtime_hashes(worker_url, configs);
+        }
+    }
+
     pub(super) fn monitor_hybrid_source(
         &self,
         provider: &Arc<LayoutWorkerProvider>,
@@ -396,6 +465,11 @@ impl KvIndexSupervisor {
                         handles.clear();
                         let mut recovered = true;
                         for (ev, index) in &targets {
+                            let Some(lease) =
+                                index.binding.as_ref().filter(|lease| lease.is_active())
+                            else {
+                                continue;
+                            };
                             let stream = Arc::new(
                                 EventStream::new(index.clone())
                                     .with_strict_recovery(strict_recovery),
@@ -407,7 +481,8 @@ impl KvIndexSupervisor {
                                 signals.clone(),
                             ) {
                                 Ok(handle) => handles.push(Arc::new(handle)),
-                                Err(_) => recovered = false,
+                                Err(_) if lease.is_active() => recovered = false,
+                                Err(_) => {}
                             }
                         }
                         // Retirement can race the awaited probe and the new

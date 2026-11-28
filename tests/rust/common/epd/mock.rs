@@ -1,9 +1,9 @@
 //! Worker mocks for the E/P/D rig in `rig.rs`.
 //!
 //! A `Mock` plays one worker (an encoder, P, D or PD). Its `Mode` says how it
-//! answers; `serve` puts it on a port. The mock records each request and how
-//! it ended, so a test can check what the router sent and whether the router
-//! closed the connection.
+//! answers; `serve` or `serve_raw` puts it on a port. The mock records each
+//! request and how it ended, so a test can check what the router sent and
+//! whether the router closed the connection.
 
 use super::consts::{CHAT_ROUTE, WAIT_DURATION};
 use axum::body::{Body, Bytes};
@@ -15,9 +15,12 @@ use axum::Json;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
+
+use super::http;
 
 /// How a mock answers a request. The mode is read when the request arrives.
 /// "Hold" means: wait for `Mock::release`.
@@ -35,11 +38,17 @@ pub enum Mode {
     StallBodyWithoutKv,
     /// `StallBody`, but the body ends with an error instead of the rest.
     BreakBody,
+    /// Hold, then close the socket before any response byte. Needs `serve_raw`.
+    HangUp,
 }
 
 /// The whole body that `Mode::StallBodyInvalidJson` sends. It starts like a
 /// JSON object, but it is not JSON.
 pub const INVALID_JSON_BODY: &str = "{\"choices\": [not json";
+
+/// The first event of the SSE reply.
+pub const SSE_FIRST_EVENT: &str =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}]}\n\n";
 
 /// Which worker the mock plays. The role picks the normal reply body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +121,7 @@ impl Mock {
         *self.0.mode.lock().unwrap()
     }
 
-    /// Lets one held handler continue (`Hold*`, `Stall*`, `BreakBody`).
+    /// Lets one held handler continue (`Hold*`, `Stall*`, `HangUp`, `BreakBody`).
     /// A permit given before the request arrives is kept for it.
     pub fn release(&self) {
         self.0.release.add_permits(1);
@@ -250,6 +259,24 @@ impl Mock {
         );
     }
 
+    /// `[socket close]` / `[encoder abort]`: exactly `count` requests have
+    /// arrived and all are still open. A check of the state now, with no wait.
+    pub fn expect_open(&self, count: usize) {
+        assert_eq!(
+            self.requests().len(),
+            count,
+            "[dispatch] {}: expected the number of requests to be {count}",
+            self.0.name
+        );
+        assert!(
+            self.ends().is_empty(),
+            "[{}] {}: expected every request to be still open, got {:?}",
+            self.observation(),
+            self.0.name,
+            self.ends()
+        );
+    }
+
     /// `[dispatch]`: no request has arrived. A check of the state now, with
     /// no wait.
     pub fn expect_no_request(&self) {
@@ -261,9 +288,17 @@ impl Mock {
         );
     }
 
-    /// The reply body as (first part, rest). The stall modes send the first
-    /// part at once and hold the rest.
-    fn body(&self, request: &Value, mode: Mode) -> (String, String) {
+    /// The reply body as (content type, first part, rest).
+    fn body(&self, request: &Value, mode: Mode) -> (&'static str, String, String) {
+        let generates = matches!(self.0.role, Role::Decode | Role::PrefillDecode);
+        if generates && request["stream"] == true {
+            Self::sse_body()
+        } else {
+            self.json_body(request, mode)
+        }
+    }
+
+    fn json_body(&self, request: &Value, mode: Mode) -> (&'static str, String, String) {
         let whole = match (mode, self.0.role) {
             (Mode::StallBodyInvalidJson, _) => INVALID_JSON_BODY.to_owned(),
             (Mode::StallBodyWithoutKv, _) => json!({"choices": []}).to_string(),
@@ -275,7 +310,15 @@ impl Mock {
             .to_string(),
         };
         let rest = whole[1..].to_owned();
-        (whole[..1].to_owned(), rest)
+        ("application/json", whole[..1].to_owned(), rest)
+    }
+
+    fn sse_body() -> (&'static str, String, String) {
+        (
+            "text/event-stream",
+            SSE_FIRST_EVENT.to_owned(),
+            "data: [DONE]\n\n".to_owned(),
+        )
     }
 }
 
@@ -344,15 +387,14 @@ fn prefill_reply(push: bool) -> Value {
 async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Response {
     let life = mock.arrive(request.clone());
     let mode = mock.mode();
-    let (head, rest) = mock.body(&request, mode);
-    let headers = [(CONTENT_TYPE, "application/json")];
+    let (content_type, head, rest) = mock.body(&request, mode);
     match mode {
         Mode::Reply | Mode::HoldThenReply => {
             if mode == Mode::HoldThenReply {
                 mock.hold().await;
             }
             life.finish();
-            (headers, format!("{head}{rest}")).into_response()
+            ([(CONTENT_TYPE, content_type)], format!("{head}{rest}")).into_response()
         }
         Mode::StallBody
         | Mode::StallBodyInvalidJson
@@ -374,8 +416,9 @@ async fn handle(State(mock): State<Mock>, Json(request): Json<Value>) -> Respons
                 }
             });
             let body = futures_util::stream::once(async move { Ok(Bytes::from(head)) }).chain(rest);
-            (headers, Body::from_stream(body)).into_response()
+            ([(CONTENT_TYPE, content_type)], Body::from_stream(body)).into_response()
         }
+        Mode::HangUp => panic!("{}: Mode::HangUp needs serve_raw", mock.name()),
     }
 }
 
@@ -389,6 +432,52 @@ pub async fn serve(mock: &Mock) -> (String, JoinHandle<()>) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (url, server)
+}
+
+/// Serves the mock on a raw TCP socket.
+pub async fn serve_raw(mock: &Mock) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mock = mock.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(serve_raw_connection(socket, mock.clone()));
+        }
+    });
+    (url, server)
+}
+
+async fn serve_raw_connection(mut socket: TcpStream, mock: Mock) {
+    let mut buffer = Vec::new();
+    while let Some((head, body)) = http::read_request(&mut socket, &mut buffer).await {
+        let (content_type, reply) = if head.starts_with("GET ") {
+            ("text/plain", "ok".to_owned())
+        } else {
+            let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let life = mock.arrive(request.clone());
+            match mock.mode() {
+                Mode::Reply => {
+                    life.finish();
+                    let (content_type, head, rest) = mock.body(&request, Mode::Reply);
+                    (content_type, format!("{head}{rest}"))
+                }
+                Mode::HangUp => {
+                    mock.hold().await;
+                    life.finish();
+                    // Dropping the socket closes it before any response byte.
+                    return;
+                }
+                mode => panic!("{}: serve_raw cannot do {mode:?}", mock.name()),
+            }
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n{reply}",
+            reply.len()
+        );
+        if socket.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+    }
 }
 
 // Self-tests: the mock sees the ends that the rig's assertions depend on.
@@ -451,6 +540,26 @@ async fn released_reply_completes() {
     mock.wait_requests(1).await;
     mock.release();
     assert!(request.await.unwrap().unwrap().status().is_success());
+    mock.expect_completed().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn raw_hang_up_gives_a_transport_error() {
+    let mock = Mock::new("D", Role::Decode);
+    let (url, server) = serve_raw(&mock).await;
+    mock.set_mode(Mode::HangUp);
+    mock.release();
+    let result = plain_client()
+        .post(format!("{url}{CHAT_ROUTE}"))
+        .json(&json!({}))
+        .send()
+        .await;
+    // The client's own timeout is not a hang-up.
+    assert!(
+        result.as_ref().is_err_and(|error| !error.is_timeout()),
+        "expected a transport error: {result:?}"
+    );
     mock.expect_completed().await;
     server.abort();
 }

@@ -25,6 +25,13 @@ pub fn two_images() -> Value {
     })
 }
 
+/// `two_images()` as a streaming request: D (or PD) answers with SSE.
+pub fn two_images_stream() -> Value {
+    let mut request = two_images();
+    request["stream"] = json!(true);
+    request
+}
+
 /// `[client]`: the router's answer.
 pub async fn answer(client: JoinHandle<Response>) -> Response {
     tokio::time::timeout(WAIT_DURATION, client)
@@ -62,6 +69,18 @@ pub async fn next_chunk(body: &mut BodyDataStream) -> String {
         .expect("[client] the body ended")
         .expect("[client] body error");
     String::from_utf8(chunk.to_vec()).unwrap()
+}
+
+const SSE_EVENT_DELIMITER: &str = "\n\n";
+
+/// `[client]`: the response body up to the end of its first SSE event. One
+/// event can come in more than one chunk.
+pub async fn first_event(body: &mut BodyDataStream) -> String {
+    let mut text = String::new();
+    while !text.contains(SSE_EVENT_DELIMITER) {
+        text.push_str(&next_chunk(body).await);
+    }
+    text
 }
 
 /// `[client]`: the rest of a response body, and whether it ended with an

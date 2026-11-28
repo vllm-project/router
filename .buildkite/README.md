@@ -319,10 +319,13 @@ The `router_rocm_mi300_2` hosts are shared. Their `pre-command` hook invokes
 acquisition counts toward Buildkite's step timeout. The hook can wait up to
 360 minutes; jobs have previously timed out here before their test command ran.
 
-The KV-aware lane allows 450 minutes: 360 for the lease plus 90 for setup and
-execution. #508 aligns the MoRI lanes with this budget. A manual retry starts
-a fresh, independently bounded attempt rather than continuing the previous
-attempt's budget. Lane-specific command timeouts still bound actual test work.
+The MoRI and KV-aware lanes allow 450 minutes: 360 for the lease plus 90 for
+setup and execution. MoRI commands have a separate 89-minute limit covering
+setup and the harness, followed by up to one minute before forcibly terminating
+the local process group. Container and remote-worker cleanup remains the
+harness's responsibility. KV-aware commands retain their shorter per-phase
+limits. Automatic retries are disabled; inspect failures before retrying
+manually. Each manual retry starts a fresh, independently bounded attempt.
 
 ## Adding New Tests
 
