@@ -263,13 +263,11 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action = match probe.as_mut() {
-                Some(probe) => {
-                    lifecycle.observe_descriptor(Some(&probe.descriptor), Some(&mut probe.worker))
-                }
-                None => lifecycle.observe_descriptor(None, None),
-            };
-            match action {
+            let (descriptor, worker) = probe
+                .as_mut()
+                .map(|probe| (&probe.descriptor, &mut probe.worker))
+                .unzip();
+            match lifecycle.observe_descriptor(descriptor, worker) {
                 SourceAction::Keep => {}
                 SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");

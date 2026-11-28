@@ -2324,14 +2324,12 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let invalid = "tcp://127.0.0.1:invalid";
     for (static_source, layout_only) in [(false, false), (true, false), (true, true)] {
-        let boot = Arc::new(Mutex::new((
-            "initial",
-            if static_source {
-                Some("sha256")
-            } else {
-                compatible
-            },
-        )));
+        let initial_hash = if static_source {
+            Some("sha256")
+        } else {
+            compatible
+        };
+        let boot = Arc::new(Mutex::new(("initial", initial_hash)));
         let routes = Router::new().route(
             "/server_info",
             get({
@@ -2376,13 +2374,10 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
         let initial = supervisor.on_worker_added(url).await.unwrap();
         assert_eq!(initial.ranks.is_empty(), static_source);
         let old = supervisor.lifecycle_for_worker(url);
-        if static_source {
-            assert_eq!(
-                old.state.lock().fenced_vllm_instance_id.as_deref(),
-                Some("initial"),
-                "static worker must record the fenced instance (layout_only={layout_only})"
-            );
-        }
+        assert_eq!(
+            old.state.lock().fenced_vllm_instance_id.as_deref(),
+            static_source.then_some("initial"),
+        );
         let refresh = || async {
             old.state.lock().checked = None;
             supervisor.refresh_discovered_workers().await
@@ -2408,18 +2403,15 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
             *worker.sources.lock() = sources.clone();
         }
 
-        *boot.lock() = (if static_source { "initial" } else { "later" }, compatible);
+        let fenced_instance = if static_source { "initial" } else { "later" };
         *worker.metrics.lock() = METRICS_ONLY.to_owned();
-        assert!(
-            refresh().await.is_empty(),
-            "the fenced instance stays load-only"
-        );
-
-        *boot.lock() = ("replacement", None);
-        assert!(
-            refresh().await.is_empty(),
-            "the new instance must report its hash"
-        );
+        for (id, hash) in [(fenced_instance, compatible), ("replacement", None)] {
+            *boot.lock() = (id, hash);
+            assert!(
+                refresh().await.is_empty(),
+                "unexpected readmission for {id} with {hash:?}"
+            );
+        }
 
         *boot.lock() = ("replacement", compatible);
         *worker.sources.lock() = json!([]);

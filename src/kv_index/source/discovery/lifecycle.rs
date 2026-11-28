@@ -415,17 +415,17 @@ impl KvIndexSupervisor {
         configs: &EngineCacheConfigs,
         vllm_instance_id: Option<String>,
     ) {
-        let workers = self.installed.workers.lock();
+        let mut workers = self.installed.workers.lock();
         if let Some(previous) = workers
             .get(worker_url)
-            .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
+            .filter(|old| Arc::ptr_eq(&old.provider.lifecycle, observed))
         {
             previous
                 .provider
                 .fence_runtime_hashes(worker_url, configs, vllm_instance_id);
             if observed.state.lock().fenced_vllm_instance_id.is_some() {
-                drop(workers);
-                self.installed.retire_if_current(worker_url, observed);
+                self.installed
+                    .retire_worker(workers.remove(worker_url).expect("checked owner"));
             }
         }
     }

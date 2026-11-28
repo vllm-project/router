@@ -468,13 +468,12 @@ impl KvIndexSupervisor {
         let models = discovery.base_models.clone();
         let previous_report = observed.as_ref().and_then(|_| {
             let hashes = discovery.engine_cache_configs.clone()?;
-            let id = discovery
+            let instance = discovery
                 .server_info
                 .as_ref()
                 .ok()
-                .and_then(|info| info.vllm_instance.as_ref())
-                .map(|instance| instance.id.clone());
-            Some((hashes, id))
+                .and_then(|info| info.vllm_instance.as_ref());
+            Some((hashes, instance.map(|instance| instance.id.clone())))
         });
         let installation = self.install_observed_worker(
             worker_url,
@@ -499,21 +498,20 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
-        // A rank 0 mismatch can establish the initial fence for a single-rank worker.
-        // Later retries use the recorded fence to decide when to probe.
-        let reported = discovery
-            .engine_cache_configs
-            .as_ref()
-            .and_then(|configs| metrics_meta::reported_prefix_hash(configs, worker_url, 0));
-        if discovery
+        // Only initial single-rank fences need an extra startup metadata probe.
+        if let Some((layout, configs)) = discovery
             .hybrid
             .as_ref()
-            .and_then(|layout| layout.rank_capability(0))
-            .and_then(|rank| rank.reported_hash_mismatch(reported))
-            .is_some()
+            .zip(discovery.engine_cache_configs.as_ref())
         {
-            self.probe_static_vllm_instance(worker_url, &mut discovery)
-                .await;
+            let hash = metrics_meta::reported_prefix_hash(configs, worker_url, 0);
+            if layout
+                .rank_capability(0)
+                .is_some_and(|rank| rank.reported_hash_mismatch(hash).is_some())
+            {
+                self.probe_static_vllm_instance(worker_url, &mut discovery)
+                    .await;
+            }
         }
         discovery
     }

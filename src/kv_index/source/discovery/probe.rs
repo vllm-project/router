@@ -80,12 +80,8 @@ impl KvIndexSupervisor {
         let fenced = lifecycle.state.lock().fenced_vllm_instance_id.is_some();
         if fenced {
             self.probe_static_vllm_instance(base, &mut worker).await;
-            if lifecycle
-                .state
-                .lock()
-                .readmission_hash(worker.server_info.as_ref().ok())
-                .is_none()
-            {
+            let report = worker.server_info.as_ref().ok();
+            if lifecycle.state.lock().readmission_hash(report).is_none() {
                 return Err("hash-fenced worker has no verified replacement instance".into());
             }
         }
@@ -660,15 +656,12 @@ pub(super) async fn query_server_info_json(
                     .as_u64()
                     .is_none_or(|count| count == 1)
         })
-        .map(|id| {
-            let hash = config["cache_config"]["prefix_caching_hash_algo"]
+        .map(|id| VllmInstance {
+            id: id.to_owned(),
+            prefix_hash: config["cache_config"]["prefix_caching_hash_algo"]
                 .as_str()
                 .filter(|algorithm| !algorithm.trim().is_empty())
-                .map(str::to_owned);
-            VllmInstance {
-                id: id.to_owned(),
-                prefix_hash: hash,
-            }
+                .map(str::to_owned),
         });
     Ok(ServerInfo {
         model_id: model.clone(),
