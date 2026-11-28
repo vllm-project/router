@@ -18,6 +18,9 @@ pub mod factory;
 pub mod header_utils;
 pub mod http;
 pub mod router_manager;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod test_support;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience (keeps routers::openai_router path working)

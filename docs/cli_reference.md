@@ -274,10 +274,19 @@ has tracing support.
 | `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
 
-The key is the bearer token the router sends on its own requests to HTTP
-workers, including health checks; clients authenticate to the router
-separately with `--api-key-validation-urls`. It is not sent yet on
-`/flush_cache`, `/get_load`, gRPC requests, or `--enable-igw` health checks.
+Regular HTTP worker health checks and the regular and P/D admin requests
+(`POST /flush_cache` and `GET /get_load`) send the configured bearer token.
+HTTP health probes for static and Kubernetes-registered P/D workers also send it.
+P/D admin requests, including background load polling, send it only to worker
+base URLs configured at startup and their DP ranks. Removing and re-registering
+one of those addresses retains its authorization. Other discovered or registered
+addresses receive no shared credential.
+A cache flush sends one POST per worker base URL, even when several DP ranks
+or P/D roles share it. Load polling requires a worker that serves `/get_load`.
+
+gRPC worker calls and health checks for IGW-registered workers
+omit this token. Clients authenticate to the router separately with
+`--api-key-validation-urls`.
 
 The startup wait and `add_worker` always probe `/health`, regardless of
 `--health-check-endpoint`.

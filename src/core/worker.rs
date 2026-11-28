@@ -17,6 +17,17 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 pub(crate) const UNLABELED_WORKER_MODEL_ID: &str = "unknown";
 
+/// Attach the router's API key as a bearer token when one is configured.
+fn worker_request(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    }
+}
+
 /// GET request to a worker, with the router's API key as a bearer token when
 /// one is configured.
 pub(crate) fn worker_get(
@@ -24,10 +35,55 @@ pub(crate) fn worker_get(
     url: &str,
     api_key: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let request = client.get(url);
-    match api_key {
-        Some(key) => request.bearer_auth(key),
-        None => request,
+    worker_request(client.get(url), api_key)
+}
+
+/// Flush the cache at one HTTP worker endpoint.
+pub(crate) async fn flush_worker_cache(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let request = client.post(format!("{base_url}/flush_cache"));
+    let response = worker_request(request, api_key)
+        .send()
+        .await
+        .map_err(|error| format!("error: {error}"))?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("returned status: {status}"))
+    }
+}
+
+/// Read the load reported by an HTTP worker after the caller resolves its DP URL.
+pub(crate) async fn fetch_worker_load(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Option<isize> {
+    // Normalize like the cache flush path so a configured trailing slash
+    // does not produce `//get_load`.
+    let base_url = base_url.trim_end_matches('/');
+    let url = format!("{base_url}/get_load");
+    let response = match worker_get(client, &url, api_key).send().await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::debug!(%base_url, status = %response.status(), "Worker load request failed");
+            return None;
+        }
+        Err(error) => {
+            tracing::debug!(%base_url, %error, "Failed to request worker load");
+            return None;
+        }
+    };
+    match response.json::<serde_json::Value>().await {
+        Ok(body) => body.get("load")?.as_i64().map(|load| load as isize),
+        Err(error) => {
+            tracing::debug!(%base_url, %error, "Failed to read worker load");
+            None
+        }
     }
 }
 
