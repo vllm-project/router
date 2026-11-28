@@ -5078,6 +5078,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_only_worker_serves_alias_after_one_model_list_request() {
+        use axum::routing::{get, post};
+        use serde_json::json;
+        use std::sync::atomic::AtomicUsize;
+
+        let publisher = NativePublisher::new();
+        let sources = publisher.sources(0, "kv/load-only-alias");
+        let model_requests = Arc::new(AtomicUsize::new(0));
+        let requests = model_requests.clone();
+        let app = axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route("/get_server_info", get(|| async {
+                Json(json!({"model_id": "mock-model", "kv_block_size": 16}))
+            }))
+            .route("/kv_event_sources", get(move || {
+                let sources = sources.clone();
+                async move { Json(sources) }
+            }))
+            .route("/metrics", get(|| async {
+                "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256\"} 1.0\n"
+            }))
+            .route("/v1/models", get(move || {
+                requests.fetch_add(1, Ordering::Relaxed);
+                async { Json(json!({"data":[{"id":"mock-model"},{"id":"mock-alias"},{"id":"adapter","parent":"mock-model"}]})) }
+            }))
+            .route("/v1/completions", post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["model"], "mock-alias");
+                Json(json!({"choices":[]}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            worker_startup_timeout_secs: 5,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        let router = Router::new(vec![url.clone()], &ctx).await.unwrap();
+        let supervisor = router.kv_index_supervisor.as_ref().unwrap();
+        assert!(supervisor.match_provider_for_worker(&url).is_none());
+        let registered = ctx.worker_registry.get_by_url(&url).unwrap();
+        let serves =
+            |name| crate::kv_index::discovery::worker_serves_base_model(registered.as_ref(), name);
+        assert!(serves("mock-alias"));
+        assert!(!serves("adapter"));
+
+        let raw =
+            bytes::Bytes::from_static(br#"{"model":"mock-alias","prompt":[1,2,3],"max_tokens":1}"#);
+        let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+        let response = router.route_completion_raw(None, request, raw, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(model_requests.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn completion_registered_source_credits_prepared_alias_and_preserves_raw() {
         use crate::kv_index::source::test_support::{event_payload, full_store};
         use crate::kv_index::KVEvent;
