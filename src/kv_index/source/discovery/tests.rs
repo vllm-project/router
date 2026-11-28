@@ -1578,18 +1578,7 @@ async fn static_sources_skip_http_discovery() {
 }
 
 #[tokio::test]
-async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
-    let app = axum::Router::new().route(
-        "/server_info",
-        axum::routing::get(|| async {
-            // Exercise a cold metadata response that exceeds the prior 750 ms budget.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            axum::Json(serde_json::json!({
-                "vllm_config": {"kv_transfer_config": {"kv_connector": "MooncakeHybridConnector"}}
-            }))
-        }),
-    );
-    let (worker, server) = spawn_metrics_only_worker(app).await;
+async fn prefill_discovers_mooncake_compressed_truncation() {
     let (endpoint, replay, _publisher, _replay) = layout_endpoints();
     let layout = capability(
         "deepseek-v4",
@@ -1601,27 +1590,62 @@ async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
             "tokens_per_state": "4", "cache_role": "sparse"
         }]),
     );
-    let sources = HashMap::from([(
-        worker.clone(),
-        crate::config::types::PdKvEventSources {
-            endpoints: vec![endpoint],
-            replay_endpoints: Some(vec![replay]),
-            block_size: 8,
-            model: Some("deepseek-v4".into()),
-            hybrid: Some(layout),
-        },
-    )]);
-    let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
+    for (connector, worker_connector, hf_config, expected) in [
+        (
+            KvConnector::Nixl,
+            "MooncakeHybridConnector",
+            serde_json::json!({}),
+            true,
+        ),
+        (
+            KvConnector::MooncakeV2,
+            "MooncakeConnectorV2",
+            serde_json::json!({"compress_ratios":[1, 4]}),
+            true,
+        ),
+        (
+            KvConnector::MooncakeV2,
+            "MooncakeConnectorV2",
+            serde_json::json!({}),
+            false,
+        ),
+    ] {
+        let app = axum::Router::new().route(
+            "/server_info",
+            axum::routing::get(move || {
+                let hf_config = hf_config.clone();
+                async move {
+                    // Model diagnostics can take longer than the initial 750 ms probe.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    axum::Json(serde_json::json!({"vllm_config": {
+                        "kv_transfer_config": {"kv_connector": worker_connector},
+                        "model_config": {"hf_config": hf_config}
+                    }}))
+                }
+            }),
+        );
+        let (worker, server) = spawn_metrics_only_worker(app).await;
+        let sources = HashMap::from([(
+            worker.clone(),
+            crate::config::types::PdKvEventSources {
+                endpoints: vec![endpoint.clone()],
+                replay_endpoints: Some(vec![replay.clone()]),
+                block_size: 8,
+                model: Some("deepseek-v4".into()),
+                hybrid: Some(layout.clone()),
+            },
+        )]);
+        let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
 
-    let discovery = supervisor
-        .discover_for_role(&worker, Some(KvConnector::Nixl))
-        .await;
-    assert!(discovery.sources.is_ok());
-    assert_eq!(
-        discovery.server_info.unwrap().mooncake_truncates_compressed,
-        Some(true)
-    );
-    server.abort();
+        let discovery = supervisor.discover_for_role(&worker, Some(connector)).await;
+        assert!(discovery.sources.is_ok());
+        assert_eq!(
+            discovery.server_info.unwrap().mooncake_truncates_compressed,
+            Some(expected),
+            "{worker_connector}"
+        );
+        server.abort();
+    }
 }
 
 /// A rank-pinned static source takes its rank from the worker URL, so two

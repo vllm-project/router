@@ -654,6 +654,7 @@ impl PdRouterBase {
                         base,
                         PdPrefillInput {
                             prompts,
+                            image: None,
                             allow_credit: false,
                             fallback_reason: reason,
                         },
@@ -714,6 +715,7 @@ impl PdRouterBase {
                     headers,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    false,
                 )
                 .await
             }
@@ -1410,6 +1412,7 @@ impl PdRouterBase {
                         .then(|| decode_policy.clone()),
                     ctx.router_config.kv_event_strict_recovery,
                     ctx.router_config.program_scheduling.is_none(),
+                    ctx.router_config.epd.is_none(),
                 )
                 .await,
             )
@@ -2813,6 +2816,7 @@ mod admission_tests {
                     worker.base_url().to_owned(),
                     PdPrefillInput {
                         prompts: Some(prompts.clone()),
+                        image: None,
                         allow_credit: true,
                         fallback_reason: None,
                     },

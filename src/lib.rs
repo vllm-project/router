@@ -122,7 +122,7 @@ struct Router {
     // OpenTelemetry tracing
     enable_trace: bool,
     otlp_traces_endpoint: Option<String>,
-    // KV connector for PD disaggregation ("nixl" or "mooncake")
+    // KV connector for P/D disaggregation.
     kv_connector: String,
     // Explicit Program-level scheduling feature switch and optional overrides.
     enable_program_scheduling: bool,
@@ -288,25 +288,32 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
-            kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
-                "nixl" => config::KvConnector::Nixl,
-                "mooncake" => config::KvConnector::Mooncake,
-                "moriio" => config::KvConnector::MoriIO,
-                other => {
-                    return Err(config::ConfigError::ValidationFailed {
-                        reason: format!(
-                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', or 'moriio'",
-                            other
-                        ),
-                    });
-                }
-            },
+            kv_connector: parse_kv_connector(&self.kv_connector)?,
             program_scheduling: config::ProgramSchedulingConfig::resolve(
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
         })
     }
+}
+
+fn parse_kv_connector(value: &str) -> config::ConfigResult<config::KvConnector> {
+    use clap::ValueEnum;
+    use config::{ConfigError, KvConnector};
+
+    KvConnector::from_str(value, true).map_err(|_| {
+        let choices = KvConnector::value_variants()
+            .iter()
+            .filter_map(KvConnector::to_possible_value)
+            .map(|choice| choice.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ConfigError::InvalidValue {
+            field: "kv_connector".into(),
+            value: value.into(),
+            reason: format!("expected one of: {choices}"),
+        }
+    })
 }
 
 #[pymethods]
@@ -658,4 +665,26 @@ fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use config::KvConnector;
+
+    #[test]
+    fn python_kv_connector_parsing_reports_valid_values() {
+        assert_eq!(
+            parse_kv_connector("mooncake-v2").unwrap(),
+            KvConnector::MooncakeV2
+        );
+        assert_eq!(parse_kv_connector("NIXL").unwrap(), KvConnector::Nixl);
+        let error = parse_kv_connector("bogus").unwrap_err().to_string();
+        assert!(
+            error.contains("Invalid value for field 'kv_connector': bogus")
+                && error.contains("nixl, mooncake, mooncake-v2, moriio"),
+            "{error}"
+        );
+    }
 }
