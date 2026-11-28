@@ -32,7 +32,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Once, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -46,6 +46,10 @@ const MOONCAKE_DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 /// check, so they retry briefly instead of stalling the discovery event loop.
 const MOONCAKE_STARTUP_BOOTSTRAP_RETRIES: u32 = 30;
 const MOONCAKE_RUNTIME_BOOTSTRAP_RETRIES: u32 = 3;
+/// Per-request cap for runtime bootstrap queries. The shared client's request
+/// timeout defaults to 30 minutes, which would let one unresponsive bootstrap
+/// server stall the serial Kubernetes watcher far beyond the retry budget.
+const MOONCAKE_RUNTIME_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
@@ -497,22 +501,28 @@ impl VllmPDRouter {
             client,
             bootstrap_addr,
             MOONCAKE_STARTUP_BOOTSTRAP_RETRIES,
+            None,
         )
         .await
     }
 
-    /// `query_mooncake_bootstrap` with an explicit retry budget, for callers
-    /// that must not block for the startup budget.
+    /// `query_mooncake_bootstrap` with an explicit retry budget and per-request
+    /// timeout, for callers that must not block for the startup budget.
     async fn query_mooncake_bootstrap_with_retries(
         client: &reqwest::Client,
         bootstrap_addr: &str,
         max_retries: u32,
+        request_timeout: Option<Duration>,
     ) -> Result<HashMap<usize, String>, String> {
         let url = format!("{}/query", bootstrap_addr);
         let mut backoff_secs = 1u64;
 
         for attempt in 1..=max_retries {
-            match client.get(&url).send().await {
+            let mut request = client.get(&url);
+            if let Some(timeout) = request_timeout {
+                request = request.timeout(timeout);
+            }
+            match request.send().await {
                 Ok(response) => {
                     if !response.status().is_success() {
                         if attempt == max_retries {
@@ -943,6 +953,7 @@ impl VllmPDRouter {
             &self.http_client,
             &bootstrap_addr,
             MOONCAKE_RUNTIME_BOOTSTRAP_RETRIES,
+            Some(MOONCAKE_RUNTIME_BOOTSTRAP_TIMEOUT),
         )
         .await?;
         self.mooncake_prefill_info
@@ -966,11 +977,21 @@ impl VllmPDRouter {
         Ok(())
     }
 
-    /// Drop a removed prefill's cached Mooncake bootstrap info. Removal does
-    /// not know which bootstrap port registered the URL, so every port bucket
-    /// is cleaned.
+    /// Drop a removed prefill's cached Mooncake bootstrap info once no
+    /// registered prefill worker still serves its base URL: rank-pinned
+    /// workers (`base@0`, `base@1`) share one entry, so the entry must
+    /// outlive individual rank removals.
     fn evict_mooncake_info(&self, worker_url: &str) {
         let (base_url, _) = dp_utils::parse_worker_url(worker_url);
+        if self
+            .pd_router
+            .worker_registry
+            .get_prefill_workers()
+            .iter()
+            .any(|worker| worker.base_url() == base_url)
+        {
+            return;
+        }
         let mut table = self.mooncake_prefill_info.write().unwrap();
         for (_, per_url) in table.iter_mut() {
             per_url.remove(&base_url);
@@ -3405,14 +3426,13 @@ impl VllmPDRouter {
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
         self.evict_nixl_info(&url);
-        let result = self
-            .pd_router
-            .add_prefill_server(url.clone(), bootstrap_port)
-            .await?;
+        // Mooncake metadata is installed before the worker becomes
+        // selectable: decode needs it to build kv_transfer_params, and
+        // querying first keeps a slow bootstrap server from widening the
+        // window where requests would proceed without it. A prefill without
+        // bootstrap info cannot supply those params, but health remains the
+        // membership gate: a failed query keeps the worker with a loud error.
         if matches!(self.kv_connector, KvConnector::Mooncake) {
-            // A prefill without bootstrap info cannot supply decode with
-            // kv_transfer_params, but health remains the membership gate:
-            // keep the worker and surface the registration failure loudly.
             if let Err(e) = self.register_mooncake_prefill(&url, bootstrap_port).await {
                 error!(
                     prefill = %url,
@@ -3422,7 +3442,7 @@ impl VllmPDRouter {
                 );
             }
         }
-        Ok(result)
+        self.pd_router.add_prefill_server(url, bootstrap_port).await
     }
 
     /// Add a decode server to the router
@@ -3435,9 +3455,12 @@ impl VllmPDRouter {
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
         self.evict_nixl_info(url);
-        self.evict_mooncake_info(url);
         self.grpc_frontend.remove_worker(url);
-        self.pd_router.remove_prefill_server(url).await
+        let result = self.pd_router.remove_prefill_server(url).await?;
+        // After removal, so the registry no longer counts the removed worker
+        // when deciding whether sibling ranks still need the metadata.
+        self.evict_mooncake_info(url);
+        Ok(result)
     }
 
     /// Remove a decode server from the router
@@ -4217,6 +4240,24 @@ mod tests {
         .await
     }
 
+    async fn spawn_mock_prefill_worker_dp2() -> String {
+        spawn_test_server(
+            axum::Router::new()
+                .route(
+                    "/health",
+                    axum::routing::get(|| async { axum::http::StatusCode::OK }),
+                )
+                .route(
+                    "/metrics",
+                    axum::routing::get(|| async {
+                        "vllm:num_requests_running{engine=\"0\",model_name=\"m\"} 1\n\
+                         vllm:num_requests_running{engine=\"1\",model_name=\"m\"} 1\n"
+                    }),
+                ),
+        )
+        .await
+    }
+
     async fn spawn_mock_mooncake_bootstrap() -> (String, u16) {
         let url = spawn_test_server(axum::Router::new().route(
             "/query",
@@ -4308,6 +4349,70 @@ mod tests {
         assert!(router
             .get_mooncake_info(&worker_url, Some(dead_port), None)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn mooncake_metadata_survives_rank_removal_until_last_rank_leaves() {
+        // Rank-pinned workers (base@0, base@1) share one bootstrap entry;
+        // removing one rank must not strip the metadata the survivor needs.
+        let worker_url = spawn_mock_prefill_worker_dp2().await;
+        let (_bootstrap_url, bootstrap_port) = spawn_mock_mooncake_bootstrap().await;
+
+        let mut router = test_vllm_pd_router().await;
+        router.kv_connector = KvConnector::Mooncake;
+
+        router
+            .add_prefill_server(worker_url.clone(), Some(bootstrap_port))
+            .await
+            .unwrap();
+        // dp_size=2 expands the bare URL into base@0 and base@1 workers.
+        let rank0 = format!("{worker_url}@0");
+        let rank1 = format!("{worker_url}@1");
+
+        router.remove_prefill_server(&rank0).await.unwrap();
+        let survivor = BasicWorker::new(
+            worker_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(bootstrap_port),
+            },
+        );
+        assert!(router
+            .build_decode_kv_transfer_params(&survivor, None, Some("xfer-1"), None)
+            .is_some());
+
+        router.remove_prefill_server(&rank1).await.unwrap();
+        assert!(router
+            .build_decode_kv_transfer_params(&survivor, None, Some("xfer-2"), None)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn mooncake_runtime_bootstrap_query_is_bounded() {
+        // A bootstrap socket that accepts but never responds must not hold
+        // the query for the shared client's request timeout (30 minutes by
+        // default): the Kubernetes watcher processes add events serially.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { while let Ok((_socket, _)) = listener.accept().await {} });
+        let bootstrap_addr = format!("http://{addr}");
+
+        // A bare client has no default timeout, so only the per-request
+        // timeout can bound this call.
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let result = VllmPDRouter::query_mooncake_bootstrap_with_retries(
+            &client,
+            &bootstrap_addr,
+            1,
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "bootstrap query must be bounded by its per-request timeout, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
