@@ -414,7 +414,13 @@ impl ProgramAdmission {
             let context = state.runtime.front_request_context(program)?;
             let decode = self.config.progress_ttl.decode_buffer_tokens;
             let decision = &state.decisions[program];
-            let context = context.max(decision.context.tokens());
+            // PD serializes turns, so a shorter successor may relinquish the
+            // previous turn's reservation. Other sessions may overlap turns.
+            let context = if self.config.pd_mode {
+                context
+            } else {
+                context.max(decision.context.tokens())
+            };
             let mut output = state
                 .runtime
                 .front_request_hints(program)?

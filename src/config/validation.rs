@@ -1800,6 +1800,17 @@ mod tests {
             *decode_policy = Some(PolicyConfig::RoundRobin);
         }
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_ok());
+        let source = config
+            .pd_kv_event_sources
+            .remove("http://prefill:8000")
+            .unwrap();
+        config
+            .pd_kv_event_sources
+            .insert("http://decode:8000".into(), source);
+        assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
+        config.program_scheduling.as_mut().unwrap().binding_strategy =
+            crate::program_scheduling::ProgramBindingStrategy::KvAware;
+        assert!(crate::kv_index::config::validate_pd_sources(&config).is_ok());
         config.program_scheduling.as_mut().unwrap().pd.warm_remote = true;
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
     }

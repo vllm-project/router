@@ -1,6 +1,7 @@
 //! P/D KV source registration and request-input preparation.
 
 use super::pd_types::{PdEndpoint, PdPrefillInput};
+use super::vllm_service_discovery::ServiceRegistry;
 use crate::backend::preprocess::{
     http_cache_read_fallback, http_input_requires_render, prepare_http_token_inputs,
     router_token_inputs,
@@ -35,8 +36,10 @@ pub(super) struct PdKvState {
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<WorkerRegistry>>,
+    /// In vLLM discovery mode Decode ranks live in the registration service.
+    program_decode_discovery: Option<(Arc<ServiceRegistry>, usize)>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
-    decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    pub(super) decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     // Serializes updates to the target bindings in both policies.
     targets: Mutex<HashMap<String, TargetRegistration>>,
     worker_pairs: Option<HashMap<String, HashSet<String>>>,
@@ -63,6 +66,7 @@ impl PdKvState {
         connector: KvConnector,
         pairs: HashMap<String, Vec<String>>,
         registry: Arc<WorkerRegistry>,
+        program_decode_discovery: Option<(Arc<ServiceRegistry>, usize)>,
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
@@ -82,6 +86,7 @@ impl PdKvState {
         state.supervisor.set_strict_recovery(strict_recovery);
         state.supervisor.set_pd_connector(connector);
         state.registry = Some(registry);
+        state.program_decode_discovery = program_decode_discovery;
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
         let state = Arc::new(state);
@@ -121,6 +126,7 @@ impl PdKvState {
             api_key: None,
             supervisor,
             registry: None,
+            program_decode_discovery: None,
             prefill_policy: None,
             decode_policy: None,
             targets: Mutex::new(HashMap::new()),
@@ -177,7 +183,12 @@ impl PdKvState {
         let prefill_policy = self.prefill_policy.as_deref().and_then(kv_aware_ops);
         let decode_policy = self.decode_policy.as_deref().and_then(kv_aware_ops);
         let prefill = registry.get_prefill_workers();
-        let decode = registry.get_decode_workers();
+        let decode = match &self.program_decode_discovery {
+            Some((services, size)) => {
+                super::pd_program_adapter::discovered_decode_workers(services, *size)
+            }
+            None => registry.get_decode_workers(),
+        };
         self.bind_pools([
             (prefill.as_slice(), prefill_policy),
             (decode.as_slice(), decode_policy),
@@ -216,7 +227,21 @@ impl PdKvState {
 
         let mut targets = self.targets.lock().await;
         // A source probe may outlive the worker it started for.
+        let discovered_decodes = self
+            .program_decode_discovery
+            .as_ref()
+            .map(|(services, size)| {
+                super::pd_program_adapter::discovered_decode_instances(services, *size)
+                    .into_iter()
+                    .map(|(address, _)| super::pd_program_adapter::discovered_target(&address).id)
+                    .collect::<HashSet<_>>()
+            });
         let is_current = |worker: &Arc<dyn Worker>| {
+            if let (crate::core::WorkerType::Decode, Some(live)) =
+                (worker.worker_type(), &discovered_decodes)
+            {
+                return live.contains(worker.url());
+            }
             self.registry.as_ref().is_none_or(|registry| {
                 registry
                     .get_by_url(worker.url())
@@ -226,8 +251,9 @@ impl PdKvState {
         targets.retain(|url, target| {
             let (workers, policy) = pools[usize::from(target.decode)];
             if let Some(policy) = policy {
-                let still_registered = match &self.registry {
-                    Some(registry) => registry.get_by_url(url).is_some_and(|worker| {
+                let still_registered = match (target.decode, &discovered_decodes, &self.registry) {
+                    (true, Some(live), _) => live.contains(url),
+                    (_, _, Some(registry)) => registry.get_by_url(url).is_some_and(|worker| {
                         if target.decode {
                             worker.worker_type() == crate::core::WorkerType::Decode
                         } else {
@@ -237,7 +263,7 @@ impl PdKvState {
                             )
                         }
                     }),
-                    None => workers.iter().any(|worker| worker.url() == url),
+                    (_, _, None) => workers.iter().any(|worker| worker.url() == url),
                 };
                 if still_registered {
                     return true;
@@ -576,6 +602,21 @@ impl PdKvState {
             crate::metrics::RouterMetrics::record_kv_placement_lookup("decode_unbound");
             return None;
         }
+        self.price_decode_workers(workers, kv, request, route, headers, router_prompts)
+            .await
+    }
+
+    /// A Program first binding may render once per eligible engine. A native
+    /// deferred commit calls this only when token IDs are already available.
+    pub(super) async fn price_decode_workers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        kv: &dyn KvAwareOps,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+    ) -> Option<HashMap<String, u64>> {
         let bases: Vec<_> = workers
             .iter()
             .map(|worker| worker.base_url().to_owned())
@@ -1157,6 +1198,58 @@ mod kv_input_tests {
     }
 
     #[tokio::test]
+    async fn program_decode_index_follows_service_discovery_ranks() {
+        use super::super::vllm_service_discovery::ServiceType;
+        let (base, server) = models_server().await;
+        let base = format!("{base}/d");
+        let services = Arc::new(ServiceRegistry::new());
+        let publisher = TestPublisher::new("kv/discovery-decode");
+        let mut state = PdKvState::new_with_statics(
+            Client::new(),
+            HashMap::from([(base.clone(), publisher.static_source("m"))]),
+        );
+        state.registry = Some(Arc::new(WorkerRegistry::new()));
+        let kv = KvAwarePolicy::default();
+        state.decode_policy = Some(Arc::new(kv));
+        state.program_decode_discovery = Some((services.clone(), 2));
+        services.register_test_instance(
+            base.clone(),
+            String::new(),
+            ServiceType::Decode,
+            1,
+            Some(2),
+        );
+        state.bind_refresh().await;
+        assert!(state
+            .targets
+            .lock()
+            .await
+            .contains_key(&format!("{base}@1")));
+        services.register_test_instance(
+            base.clone(),
+            String::new(),
+            ServiceType::Decode,
+            1,
+            Some(1),
+        );
+        state.bind_refresh().await;
+        assert!(!state
+            .targets
+            .lock()
+            .await
+            .contains_key(&format!("{base}@1")));
+        let workers = super::super::pd_program_adapter::discovered_decode_workers(&services, 2);
+        let policy = state.decode_policy.as_ref().unwrap();
+        let request = json!({"model":"m","prompt":[1,2,3]});
+        let prices = state
+            .prepare_decode_context(&workers, policy, &request, "/v1/completions", None, None)
+            .await
+            .unwrap();
+        assert_eq!(prices.get(&base), Some(&3));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn start_registers_and_prices_both_pools_before_any_request() {
         // Lazy request-path binding would leave a burst unpriced for one tick.
         let (base, server) = models_server().await;
@@ -1190,6 +1283,7 @@ mod kv_input_tests {
             KvConnector::Nixl,
             HashMap::new(),
             registry.clone(),
+            None,
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,

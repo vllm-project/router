@@ -493,10 +493,11 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                         PolicyConfig::KvAware { .. }
                     );
                 let decode_kv = decode_keyed
-                    && matches!(
-                        config.mode.get_decode_policy(&config.policy),
-                        PolicyConfig::KvAware { .. }
-                    );
+                    && (config.uses_program_kv_binding()
+                        || matches!(
+                            config.mode.get_decode_policy(&config.policy),
+                            PolicyConfig::KvAware { .. }
+                        ));
                 if !prefill_kv && !decode_kv {
                     let stage = match (prefill_keyed, decode_keyed) {
                         (true, true) => "prefill and decode",
@@ -529,7 +530,7 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .is_some_and(|layout| !layout.is_plain_full_attention());
                 if hybrid_layout && !config.allows_hybrid_pd_sources() {
                     return Err(invalid(
-                        "hybrid Program routing requires NIXL, local-only Prefill scoring, and a non-KV-aware Decode policy",
+                        "hybrid Program routing requires NIXL, local-only KV scoring, and a non-KV-aware native Decode policy",
                     ));
                 }
                 if let Some(layout) = &sources.hybrid {

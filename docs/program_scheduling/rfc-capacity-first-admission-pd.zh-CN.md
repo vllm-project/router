@@ -137,7 +137,11 @@ Acting TTL 表示工具调用期间可以保留 D 的**逻辑席位**。完整 D
 
 ### 5.3 分支实现与配置
 
-本次实现对应第 5.1、5.2 节。分支 `experiment/pd-program-kv-aware` 从 `experiment/router-program-admission` 的 `65f704a` 建立。部署中可以沿用 D 的 `binding_strategy: consistent_hash`，给 P 指定 `--prefill-policy kv_aware`。第 4 节的 D 容量账本属于单独的实施项。
+分支 `experiment/pd-program-kv-aware` 从 `experiment/router-program-admission` 的 `65f704a` 建立，首先实现了第 5.1、5.2 节的逐轮选 P。现在 HTTP Program 的 D 首绑也支持 `binding_strategy: kv_aware`。第 4 节提出的跨观测容量账本仍是单独的实施项。
+
+例如，会话 A 和 B 的输入从同一段代码开头。B 首轮到来时，调度器先列出能容纳本轮的 D。Router 用各个 D rank 自己的事件估算本轮还需新增多少 token，加上该 rank 已经为 Program 记下的 token 数，选择总量较小的一台。在所有合格 D 上无法得到可比较的价格时，按负载选择。调度器提交前复核容量，普通续轮继续使用已绑定的 D。配置 `--prefill-policy kv_aware` 可同时在每轮按缓存选 P。第 8.1 节的 8 卡实验固定了 D，只衡量逐轮选 P 的收益。
+
+HTTP 集成测试使用两个模拟 D 和独立的 KV 事件发布端。一组使用全注意力缓存，另一组交换热前缀的位置并使用三组线性状态加一组全注意力 KV。两个新会话可命中同一台 D，已绑会话的下一轮可继续使用它；当它的名额用完时，另一个新会话改选有容量的 D。带缓存盐的请求按负载回退。[回归用例](../../tests/rust/test_pd_program_scheduling.rs)
 
 首轮拿到 D 的派发凭证后，Router 查每台合格 P 上与本轮输入连续匹配的设备 KV 块，算出本轮还要做的工作，加上该 P 已接下的 token 工作量。续轮重新比较 P。配置了静态、双向 NIXL 和反馈协议，且请求是精确 token ID 的 completions 时，Router 还会估算历史 D 能补上多少。默认至少多省一个 token 才计收益，部署可通过 `pd.warm_min_extra_tokens` 提高门槛。配置了时间校准表且命中表项时，还会比较传输与冷算时间。设置门槛的单位是 token。
 

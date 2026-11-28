@@ -1147,7 +1147,10 @@ impl PdRouterBase {
 
     async fn unregister_kv_worker(&self, url: &str, decode: bool) {
         let policy = if decode {
-            self.policy_registry.get_decode_policy()
+            self.kv_state
+                .as_ref()
+                .and_then(|s| s.decode_policy.clone())
+                .unwrap_or_else(|| self.policy_registry.get_decode_policy())
         } else {
             self.policy_registry.get_prefill_policy()
         };
@@ -1299,6 +1302,15 @@ impl PdRouterBase {
         decode_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        Self::new_with_discovery(prefill_urls, decode_urls, ctx, None).await
+    }
+
+    pub(super) async fn new_with_discovery(
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        ctx: &Arc<crate::server::AppContext>,
+        program_decode_discovery: Option<Arc<super::vllm_service_discovery::ServiceRegistry>>,
+    ) -> Result<Self, String> {
         // Convert config CircuitBreakerConfig to core CircuitBreakerConfig
         let circuit_breaker_config = ctx.router_config.effective_circuit_breaker_config();
         let core_cb_config = CircuitBreakerConfig {
@@ -1420,29 +1432,41 @@ impl PdRouterBase {
         // Either stage may be the KV-aware one. Bind at construction through the
         // same entry point as refresh so startup and periodic reconciliation
         // cannot disagree about membership.
-        let kv_state = if Self::needs_kv_state(prefill_policy.as_ref(), decode_policy.as_ref()) {
-            Some(
-                PdKvState::start(
-                    ctx.client.clone(),
-                    ctx.router_config.api_key.clone(),
-                    ctx.router_config.pd_kv_event_sources.clone(),
-                    ctx.router_config.kv_connector,
-                    ctx.router_config.pd_worker_pairs.clone(),
-                    Arc::clone(&ctx.worker_registry),
-                    kv_aware_ops(prefill_policy.as_ref())
-                        .is_some()
-                        .then(|| prefill_policy.clone()),
-                    kv_aware_ops(decode_policy.as_ref())
-                        .is_some()
-                        .then(|| decode_policy.clone()),
-                    ctx.router_config.kv_event_strict_recovery,
-                    ctx.router_config.allows_hybrid_pd_sources(),
+        let decode_index_policy: Arc<dyn LoadBalancingPolicy> =
+            if ctx.router_config.uses_program_kv_binding()
+                && kv_aware_ops(decode_policy.as_ref()).is_none()
+            {
+                Arc::new(crate::policies::KvAwarePolicy::default())
+            } else {
+                decode_policy
+            };
+        let kv_state =
+            if Self::needs_kv_state(prefill_policy.as_ref(), decode_index_policy.as_ref()) {
+                Some(
+                    PdKvState::start(
+                        ctx.client.clone(),
+                        ctx.router_config.api_key.clone(),
+                        ctx.router_config.pd_kv_event_sources.clone(),
+                        ctx.router_config.kv_connector,
+                        ctx.router_config.pd_worker_pairs.clone(),
+                        Arc::clone(&ctx.worker_registry),
+                        program_decode_discovery.map(|registry| {
+                            (registry, ctx.router_config.intra_node_data_parallel_size)
+                        }),
+                        kv_aware_ops(prefill_policy.as_ref())
+                            .is_some()
+                            .then(|| prefill_policy.clone()),
+                        kv_aware_ops(decode_index_policy.as_ref())
+                            .is_some()
+                            .then_some(decode_index_policy),
+                        ctx.router_config.kv_event_strict_recovery,
+                        ctx.router_config.allows_hybrid_pd_sources(),
+                    )
+                    .await,
                 )
-                .await,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         Ok(PdRouterBase {
             kv_state,
             pd_load: Arc::new(PdLoadManager::default()),

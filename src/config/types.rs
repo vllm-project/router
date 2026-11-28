@@ -1450,8 +1450,16 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// Program dispatch can use the local Prefill index independently of Decode
-    /// binding. Its remote-read executor has a separate cache contract.
+    /// In PD mode the Program's first Decode binding can consume KV events
+    /// even when native requests use a different Decode policy.
+    pub(crate) fn uses_program_kv_binding(&self) -> bool {
+        self.program_scheduling
+            .as_ref()
+            .is_some_and(|program| program.binding_strategy == ProgramBindingStrategy::KvAware)
+    }
+
+    /// Program dispatch may score local P/D indexes. The cross-turn remote-read
+    /// executor and native Decode policy have separate hybrid cache contracts.
     pub(crate) fn allows_hybrid_pd_sources(&self) -> bool {
         self.program_scheduling.as_ref().is_none_or(|program| {
             self.kv_connector == KvConnector::Nixl

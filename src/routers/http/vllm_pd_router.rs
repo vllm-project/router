@@ -52,6 +52,90 @@ struct ProgramPrefillSelection {
     input: Option<PdPrefillInput>,
 }
 
+struct ProgramDecodeKvRequest<'a> {
+    router: &'a VllmPDRouter,
+    body: &'a Value,
+    path: &'a str,
+    headers: Option<&'a HeaderMap>,
+}
+
+#[async_trait]
+impl crate::program_scheduling::SessionRankScorer for ProgramDecodeKvRequest<'_> {
+    async fn recommend(
+        &self,
+        candidates: &[crate::program_scheduling::ProgramBindingCandidate],
+    ) -> Result<Option<String>, crate::program_scheduling::ScheduleError> {
+        let model = self.body.get("model").and_then(Value::as_str);
+        let mut ranks = Vec::new();
+        let mut workers = Vec::new();
+        for rank in candidates {
+            if let Some(worker) = self
+                .router
+                .program_decode_worker(&rank.target_id)
+                .filter(|worker| super::pd_router::model_eligible(worker.as_ref(), model))
+            {
+                ranks.push(rank);
+                workers.push(worker);
+            }
+        }
+        if workers.is_empty() {
+            return Ok(None);
+        }
+        if let [only] = ranks.as_slice() {
+            RouterMetrics::record_prefix_routing_decision(
+                "kv_aware",
+                "program_decode",
+                "single_candidate",
+            );
+            return Ok(Some(only.target_id.clone()));
+        }
+        let state = self.router.pd_router.kv_state.as_ref();
+        let kv = state.and_then(|state| kv_aware_ops(state.decode_policy.as_deref()?));
+        let prices = if let (Some(state), Some(kv)) = (state, kv) {
+            state
+                .price_decode_workers(
+                    &workers,
+                    kv,
+                    &super::router::session_render_body(self.body, true),
+                    self.path,
+                    self.headers,
+                    None,
+                )
+                .await
+        } else {
+            None
+        };
+        // The admission snapshot and the marginal context are both in tokens.
+        // When any price is unavailable, compare the whole set in counts.
+        let additional: Option<Vec<_>> = prices.as_ref().and_then(|prices| {
+            workers
+                .iter()
+                .map(|worker| prices.get(worker.url()).copied())
+                .collect()
+        });
+        let (loads, additional, outcome) = if let Some(additional) = additional {
+            let projected = ranks
+                .iter()
+                .zip(&additional)
+                .map(|(rank, new)| (rank.accounted_tokens as usize).saturating_add(*new as usize))
+                .collect::<Vec<_>>();
+            (projected, additional, "prefix_cost")
+        } else {
+            let loads = workers
+                .iter()
+                .zip(&ranks)
+                .map(|(w, r)| w.load().max(r.accounted_programs))
+                .collect();
+            (loads, vec![0; workers.len()], "load_fallback")
+        };
+        let picked = kv
+            .and_then(|kv| kv.pick_decode(&loads, &additional))
+            .or_else(|| (0..loads.len()).min_by_key(|&i| loads[i]));
+        RouterMetrics::record_prefix_routing_decision("kv_aware", "program_decode", outcome);
+        Ok(picked.map(|index| ranks[index].target_id.clone()))
+    }
+}
+
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
 struct MooncakePrefillInfo {
@@ -1586,18 +1670,36 @@ impl VllmPDRouter {
                 .map(|worker| pd_program_adapter::worker_target(&worker))
                 .collect::<Vec<_>>()
         };
+        // Render and dispatch the same prompt. Transfer addresses and block
+        // IDs can only come from registered engines.
+        if let Some(object) = request.as_object_mut() {
+            object.remove("kv_transfer_params");
+        }
+        let scorer = runtime
+            .scheduler
+            .uses_kv_binding()
+            .then_some(ProgramDecodeKvRequest {
+                router: self,
+                body: &request,
+                path,
+                headers,
+            });
         let completion = match runtime
-            .acquire(headers, &request, path, &decode_targets)
+            .acquire(
+                headers,
+                &request,
+                path,
+                &decode_targets,
+                scorer
+                    .as_ref()
+                    .map(|s| s as &dyn crate::program_scheduling::SessionRankScorer),
+            )
             .await
         {
             Ok(Some(completion)) => completion,
             Ok(None) => return None,
             Err(error) => return Some(pd_program_adapter::error_response(error)),
         };
-        // Transfer addresses and block IDs can only come from registered engines.
-        if let Some(object) = request.as_object_mut() {
-            object.remove("kv_transfer_params");
-        }
         let target_id = completion.dispatch().target_id.clone();
         // Admission waits, so resolve the committed D against the live pool
         // instead of the candidate list used to propose targets before the wait.
@@ -1609,7 +1711,7 @@ impl VllmPDRouter {
         };
         let policy = self.policy_registry.get_prefill_policy();
         let kv = kv_aware_ops(policy.as_ref());
-        if kv.is_some() {
+        if kv.is_some() || runtime.scheduler.uses_kv_binding() {
             super::router::encode_session_xargs(&mut request);
         }
         let model = request.get("model").and_then(Value::as_str);
@@ -1758,11 +1860,8 @@ impl VllmPDRouter {
         }
         self.pd_router
             .worker_registry
-            .get_decode_workers()
-            .into_iter()
-            .find(|worker| {
-                worker.is_available() && pd_program_adapter::worker_target(worker).id == target_id
-            })
+            .get_by_url(target_id)
+            .filter(|worker| worker.is_available() && worker.worker_type() == WorkerType::Decode)
     }
 
     /// P candidates as `(admission id, worker)`. Discovered registrations stay
@@ -3259,9 +3358,6 @@ impl VllmPDRouter {
                 addr
             );
 
-            // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-            let pd_router = PdRouterBase::new(vec![], vec![], ctx).await?;
-
             // Initialize service discovery
             let mut service_registry = ServiceRegistry::new();
 
@@ -3278,6 +3374,15 @@ impl VllmPDRouter {
 
             // The Program runtime observes the same registry the request path reads.
             let service_registry = Arc::new(service_registry);
+            let pd_router = PdRouterBase::new_with_discovery(
+                vec![],
+                vec![],
+                ctx,
+                ctx.router_config
+                    .uses_program_kv_binding()
+                    .then(|| service_registry.clone()),
+            )
+            .await?;
             let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
 
             Ok(Self {
@@ -4519,6 +4624,7 @@ mod tests {
                 router.kv_connector,
                 HashMap::new(),
                 router.pd_router.worker_registry.clone(),
+                None,
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
                 false,

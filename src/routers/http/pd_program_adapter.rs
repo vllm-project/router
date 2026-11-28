@@ -255,13 +255,15 @@ impl PdProgramRuntime {
         request: &Value,
         path: &str,
         targets: &[ProgramTarget],
+        scorer: Option<&dyn crate::program_scheduling::SessionRankScorer>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let pool = model_pool(headers, request);
-        let Some(mut identity) = ProgramIdentity::from_request_with_enable_key(
+        let Some(mut identity) = ProgramIdentity::resolve(
             headers,
             Some(request),
             Some(&pool),
             self.scheduler.enable_key(),
+            scorer.is_some(),
         )?
         else {
             return Ok(None);
@@ -285,13 +287,18 @@ impl PdProgramRuntime {
         };
         let default_output = self.scheduler.config.progress_ttl.decode_buffer_tokens;
         reserve_output_budget(&mut identity, request, path, default_output);
+        // Preserve each Program's identity (including nested agents), but let
+        // its first real turn obtain a capacity-checked placement ticket.
+        identity.session_admission = scorer.is_some();
+        self.scheduler.sync_targets(identity.model_pool(), targets);
         let dispatch = self
             .scheduler
-            .acquire(
+            .acquire_with_scorer(
                 identity,
                 crate::program_scheduling::ContextTokens::estimated(tokens),
                 targets,
                 None,
+                scorer,
             )
             .await?;
         Ok(Some(ProgramCompletion::new(
@@ -492,23 +499,9 @@ pub(super) fn discovered_decode_instances(
     services: &ServiceRegistry,
     configured_dp: usize,
 ) -> Vec<(String, String)> {
-    services
-        .get_decode_instances()
+    decode_instance_entries(services, configured_dp)
         .into_iter()
-        .flat_map(|(address, zmq)| {
-            let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
-            if rank.is_some() || size == 1 {
-                vec![(address, zmq)]
-            } else {
-                (0..size)
-                    .map(|rank| (format!("{address}@{rank}"), zmq.clone()))
-                    .collect()
-            }
-        })
+        .map(|(address, zmq, _)| (address, zmq))
         .collect()
 }
 
@@ -533,18 +526,32 @@ pub(super) fn discovered_decode_worker(
     let (address, _, size) = decode_instance_entries(services, configured_dp)
         .into_iter()
         .find(|(url, _, _)| discovered_target(url).id == target_id)?;
-    let (base, rank) = dp_utils::parse_worker_url(&address);
-    let url = if base.starts_with("http://") || base.starts_with("https://") {
-        base.clone()
-    } else {
-        format!("http://{base}")
-    };
-    Some(match rank {
+    Some(discovery_worker(&address, size))
+}
+
+pub(super) fn discovered_decode_workers(
+    services: &ServiceRegistry,
+    configured_dp: usize,
+) -> Vec<Arc<dyn Worker>> {
+    decode_instance_entries(services, configured_dp)
+        .into_iter()
+        .map(|(address, _, size)| discovery_worker(&address, size))
+        .collect()
+}
+
+fn discovery_worker(address: &str, size: usize) -> Arc<dyn Worker> {
+    let target = discovered_target(address);
+    match target.dp_rank {
         // DPAwareWorker strips the `@rank` suffix from dispatched URLs, so the
         // bound rank survives endpoint construction.
-        Some(rank) => Arc::new(DPAwareWorker::new(url, rank, size, WorkerType::Decode)),
-        None => Arc::new(BasicWorker::new(url, WorkerType::Decode).with_dp_size(size)),
-    })
+        Some(rank) => Arc::new(DPAwareWorker::new(
+            target.base_url,
+            rank,
+            size,
+            WorkerType::Decode,
+        )),
+        None => Arc::new(BasicWorker::new(target.base_url, WorkerType::Decode).with_dp_size(size)),
+    }
 }
 
 /// Registered decode endpoints expanded to one entry per schedulable DP rank,
@@ -554,14 +561,11 @@ fn decode_instance_entries(
     configured_dp: usize,
 ) -> Vec<(String, String, usize)> {
     services
-        .get_decode_instances()
+        .get_instance_snapshots(ServiceType::Decode)
         .into_iter()
-        .flat_map(|(address, zmq)| {
+        .flat_map(|(address, zmq, reported_dp)| {
             let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
+            let size = decode_instance_size(reported_dp, configured_dp);
             if rank.is_some() || size == 1 {
                 vec![(address, zmq, size)]
             } else {

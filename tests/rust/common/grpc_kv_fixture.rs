@@ -15,6 +15,7 @@ pub struct KvPublisher {
     live: zmq::Socket,
     replay: zmq::Socket,
     seed: u64,
+    pub groups: &'static [&'static str],
     pub endpoint: String,
     pub replay_endpoint: String,
 }
@@ -32,24 +33,36 @@ impl KvPublisher {
             live,
             replay,
             seed,
+            groups: &["full_attention"],
             endpoint,
             replay_endpoint,
         }
     }
 
     pub fn layout(&self, model: &str, block_size: u32) -> CacheCapabilities {
+        let groups: Vec<_> = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, &kind)| {
+                let mut group = json!({"group_idx":index,"kind":kind,"block_size":block_size,
+                "prefix_cacheable":true,"prefix_replay_tokens":0,"spec_type":"FullAttentionSpec"});
+                if kind == "mamba" {
+                    group["spec_type"] = json!("MambaSpec");
+                    group["mamba_cache_mode"] = json!("align");
+                }
+                group
+            })
+            .collect();
         serde_json::from_value(json!({
             "schema_version": 1,
             "ranks": [{
                 "rank": 0, "model": model, "weight_version": "default",
                 "publisher_topic": TOPIC, "instance_topic": true,
                 "hash_algorithm": "sha256_cbor", "root_hash": self.root_hash_hex(), "full_hashes": true,
-                "hash_block_size": block_size, "declared_groups": 1,
+                "hash_block_size": block_size, "declared_groups": groups.len(),
                 "hash_lookahead_tokens": 0, "speculative_tokens": 0, "prefix_caching": true,
-                "groups": [{
-                    "group_idx": 0, "kind": "full_attention", "spec_type": "FullAttentionSpec",
-                    "block_size": block_size, "prefix_cacheable": true, "prefix_replay_tokens": 0
-                }]
+                "groups": groups
             }]
         }))
         .unwrap()
@@ -69,32 +82,38 @@ impl KvPublisher {
     }
 
     pub async fn restore(&self, tokens: &[u32], block_size: u32) {
-        let event = if tokens.is_empty() {
-            KVEvent::AllBlocksCleared(AllBlocksCleared {})
+        let events = if tokens.is_empty() {
+            vec![KVEvent::AllBlocksCleared(AllBlocksCleared {})]
         } else {
-            let block_hashes = BlockKeyGenerator::new(block_size as usize, self.seed)
+            let block_hashes: Vec<_> = BlockKeyGenerator::new(block_size as usize, self.seed)
                 .generate_block_keys(tokens)
                 .into_iter()
                 .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
                 .collect();
-            KVEvent::BlockStored(BlockStored {
-                extra_keys: None,
-                block_hashes,
-                parent_block_hash: None,
-                token_ids: tokens.to_vec(),
-                block_size,
-                lora_id: None,
-                medium: Some("GPU".into()),
-                lora_name: None,
-                group_idx: Some(0),
-                kv_cache_spec_kind: Some("full_attention".into()),
-                kv_cache_spec_sliding_window: None,
-                locality: None,
-                ownership: None,
-                lookahead_token_ids: None,
-            })
+            self.groups
+                .iter()
+                .enumerate()
+                .map(|(index, &kind)| {
+                    KVEvent::BlockStored(BlockStored {
+                        extra_keys: None,
+                        block_hashes: block_hashes.clone(),
+                        parent_block_hash: None,
+                        token_ids: tokens.to_vec(),
+                        block_size,
+                        lora_id: None,
+                        medium: Some("GPU".into()),
+                        lora_name: None,
+                        group_idx: Some(index as u32),
+                        kv_cache_spec_kind: Some(kind.into()),
+                        kv_cache_spec_sliding_window: None,
+                        locality: None,
+                        ownership: None,
+                        lookahead_token_ids: None,
+                    })
+                })
+                .collect()
         };
-        let payload = batch(&[event]);
+        let payload = batch(&events);
         let subscription = frames(&self.live).await;
         let [subscription] = subscription.as_slice() else {
             panic!("expected an XPUB subscription");

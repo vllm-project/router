@@ -129,7 +129,7 @@ export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
 KV_ARGS=()
 ```
 
-In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` if a scored worker needs a manual layout. Otherwise use `LAYOUT_ARGS=()`. With HTTP Program scheduling, a NIXL pool can use a hybrid layout for local Prefill scoring. Set `--prefill-policy kv_aware --decode-policy round_robin` and leave the Program remote-read, local-append and automatic-TTL switches off. Program binding still selects Decode. Supply one verified layout per Prefill rank.
+In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` if a scored worker needs a manual layout. Otherwise use `LAYOUT_ARGS=()`. With HTTP Program scheduling, a NIXL pool can use a hybrid layout for local Prefill scoring and for the first Decode binding. Set `--prefill-policy kv_aware` to score P each turn and `"binding_strategy": "kv_aware"` in the Program configuration to score D at first binding. With hybrid caches, use a native Decode policy such as `--decode-policy round_robin` and leave the Program remote-read, local-append and automatic-TTL switches off. Supply a verified layout and KV event source for each rank you want to score.
 
 #### HTTP P/D
 

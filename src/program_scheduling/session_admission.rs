@@ -228,18 +228,19 @@ impl ProgramRouter {
         };
         metrics::counter!("router_program_admission_selections_total", "result" => reason)
             .increment(1);
+        // PD rechecks observation freshness when claiming. Its deadline can
+        // expire even while the lock is held. Keep the committed binding and
+        // wait for a fresh observation through the ordinary dispatch loop.
         let dispatch = if result == Commit::Installed {
-            let dispatch = self
-                .admission
-                .claim_dispatch(&mut state, &task.handle)
-                .expect("validated FIFO head is dispatchable in the same transaction");
-            if let Some(text) = dispatch.routing_text() {
-                policy.commit_placement(pool, text, &dispatch.target_id);
-            }
-            Some(dispatch)
+            self.admission.claim_dispatch(&mut state, &task.handle)
         } else {
             None
         };
+        if let Some(dispatch) = &dispatch {
+            if let Some(text) = dispatch.routing_text() {
+                policy.commit_placement(pool, text, &dispatch.target_id);
+            }
+        }
         Ok((dispatch, rank.is_some()))
     }
 }

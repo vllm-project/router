@@ -284,7 +284,7 @@ pub(super) fn encode_session_xargs(body: &mut serde_json::Value) {
     }
 }
 
-fn session_render_body(
+pub(super) fn session_render_body(
     body: &serde_json::Value,
     session: bool,
 ) -> std::borrow::Cow<'_, serde_json::Value> {
