@@ -9,12 +9,16 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
 @pytest.mark.integration
-def test_power_of_two_prefers_less_loaded(mock_workers, router_manager):
+def test_power_of_two_prefers_less_loaded(mock_worker_manager, router_manager):
     # Start two workers: one slow (higher inflight), one fast
     # Router monitors /get_load and Power-of-Two uses cached loads to choose
     # Start one slow and one fast worker using the fixture factory
-    procs_slow, urls_slow, ids_slow = mock_workers(n=1, args=["--latency-ms", "200"])
-    procs_fast, urls_fast, ids_fast = mock_workers(n=1, args=["--latency-ms", "0"])
+    procs_slow, urls_slow, ids_slow = mock_worker_manager.start_workers(
+        n=1, args=["--latency-ms", "200"]
+    )
+    procs_fast, urls_fast, ids_fast = mock_worker_manager.start_workers(
+        n=1, args=["--latency-ms", "0"]
+    )
     _procs = procs_slow + procs_fast  # Keep processes alive
     urls = urls_slow + urls_fast
     ids = ids_slow + ids_fast

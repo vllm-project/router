@@ -529,19 +529,42 @@ In P/D, use `--pd-kv-events` for the live address. List publishers, replay addre
 
 The Router estimates placement from the KV events it has applied. The worker reports actual reuse. Requests with an unrecognized adapter, cache salt or extension still route, with no cache credit.
 
-In an idle worker pool, send the same token-ID prompt twice. Use the model ID returned by `/v1/models` and a prompt longer than the worker's cache-hit alignment. The example uses 129 tokens for a full-attention worker with 16-token blocks. Leave room for one output token.
+Use an idle pool with one scored worker and a fresh token-ID prompt. Set `SERVED_MODEL` to the ID returned by `/v1/models`. Set `WORKER_HTTP_URL` to the worker's HTTP metrics address, using Prefill for P/D. The default prompt has 129 tokens and fits a full-attention worker with 16-token blocks. Choose `PROMPT_TOKENS` above the cache-hit alignment for your layout and leave room for one output token.
+
+Start Router with `RUST_LOG=info,vllm_router_rs::kv_index=debug`. The Bash example pauses after the warm-up. Wait for the worker's `kv_index live sequence advanced` or `kv_index replay sequence advanced` log entry from the warm-up, then press Enter. The two snapshots show the counters immediately before and after the identical second request.
 
 ```bash
-SERVED_MODEL="SERVED_MODEL_ID"
-PROMPT_TOKENS=129
-payload=$(jq -nc --arg model "$SERVED_MODEL" --argjson n "$PROMPT_TOKENS" \
-  '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
-for delay in 0 1; do
-  sleep "$delay"
-  curl -fsS http://127.0.0.1:30000/v1/completions \
-    -H 'Content-Type: application/json' --data-binary "$payload"
-  printf '\n'
-done
+(
+  set -euo pipefail
+  ROUTER_URL=${ROUTER_URL:-http://127.0.0.1:30000}
+  ROUTER_METRICS_URL=${ROUTER_METRICS_URL:-http://127.0.0.1:29000}
+  WORKER_HTTP_URL=${WORKER_HTTP_URL:-http://127.0.0.1:8000}
+  payload=$(jq -nc --arg model "${SERVED_MODEL:?Set SERVED_MODEL first}" \
+    --argjson n "${PROMPT_TOKENS:-129}" \
+    '{model:$model,prompt:[range(1000;1000+$n)],max_tokens:1,temperature:0}')
+
+  send_prompt() {
+    curl -fsS "$ROUTER_URL/v1/completions" \
+      -H 'Content-Type: application/json' --data-binary "$payload" >/dev/null
+  }
+
+  show_hits() {
+    curl -fsS "$ROUTER_METRICS_URL/metrics" | awk '
+      $1 == "vllm_router_kv_placement_lookups_total{result=\"hit\"}" { hits += $2 }
+      END { print "Router placement hits", hits + 0 }'
+    curl -fsS "$WORKER_HTTP_URL/metrics" | awk '
+      /^vllm:prefix_cache_hits_total[ {]/ { hits += $2 }
+      END { print "Worker cached tokens", hits + 0 }'
+  }
+
+  send_prompt
+  read -r -p 'Press Enter after Router applies the warm-up events. ' _
+  printf 'Before repeat\n'
+  show_hits
+  send_prompt
+  printf 'After repeat\n'
+  show_hits
+)
 ```
 
 | Check | Where to look | Success signal |
@@ -557,7 +580,8 @@ same attempts. For full attention, the prediction counts the device prefix plus
 the longest indexed continuation that touches its end, counting overlapping
 tokens once. Hybrid layouts use the prefix reported by their restore rules.
 The prediction estimates vLLM's total local and external cached tokens.
-Transfer discounts apply only to routing costs. Use the outcomes counter to check how much
+Transfer discounts apply only to routing costs. Positive predictions enter
+observation only when the placement evidence remains valid at admission. Use the outcomes counter to check how much
 traffic contributed to the comparison.
 
 Streaming clients should set `stream_options.include_usage=true` and the engine

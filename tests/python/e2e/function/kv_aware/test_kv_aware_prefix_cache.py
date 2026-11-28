@@ -22,6 +22,10 @@ from tests.python.e2e.function.kv_aware.dataset import (
     lane_prime_user,
     lane_reuse_user,
 )
+from tests.python.helpers.mark import hardware_marks
+
+
+pytestmark = hardware_marks(res={"cuda": "L4", "rocm": "MI300"}, num_cards=2)
 
 
 def _assert_lane_reuse_shares_prefix(lane: str, *, round_index: int = 1) -> None:

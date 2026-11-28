@@ -268,12 +268,62 @@ steps:
     artifact_paths:
       - "tests/python/e2e/results/perf/l1_encode/**/*.json"
 
+  # Reuse the L4 functional test against the pinned ROCm engine. Two full
+  # workers on one host; this does not require a P/D connector or RDMA.
+  - label: ":large_purple_circle: ROCm kv_aware e2e (2 GPUs)"
+    key: "rocm-kv-aware-e2e"
+    # Avoid adding a whole-host lease waiter to PR-triggered L3 builds.
+    if: build.source == "schedule" && build.env("NIGHTLY") == "1"
+    depends_on: "upload-nightly-pipeline"
+    # Host pre-command waits for the lease inside the job: 360m + 90m execution.
+    # See .buildkite/README.md for the hook and observed pre-command timeouts.
+    # Bound pytest itself separately below so a test hang cannot consume this.
+    timeout_in_minutes: 450
+    retry:
+      automatic: false
+      manual:
+        allowed: true
+    mirror_hardwares: mi300_2
+    command: |
+      bash -euo pipefail <<'BASH'
+      EVIDENCE_DIR=/workdir/target/ci-logs/kv-aware-rocm
+      rm -rf "$$EVIDENCE_DIR"
+      mkdir -p "$$EVIDENCE_DIR"
+      timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh router-bin
+      timeout --signal=TERM --kill-after=30s 600 bash .buildkite/scripts/install_packages.sh rocm-kv-aware
+      export ROUTER_BIN=/workdir/target/release/vllm-router
+      export CUDA_VISIBLE_DEVICES=0,1
+      # The dedicated host preset exposes physical GPUs; each worker narrows
+      # CUDA_VISIBLE_DEVICES independently. Clear host masks at this boundary;
+      # inherited HIP/ROCR handling in the helper is covered by its CPU regression.
+      unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+      # Explicitly retain the validated reclaim-on setting even if inherited
+      # image defaults change; 0 is also the ROCr default.
+      export HSA_NO_SCRATCH_RECLAIM=0
+      export KV_AWARE_WORKER_LOG_QUIET=1
+      # Keep model and event transport identical to the validated image run,
+      # independently of inherited environment or future helper defaults.
+      export KV_AWARE_E2E_MODEL=Qwen/Qwen3-0.6B
+      export KV_AWARE_KV_EVENTS=1 KV_AWARE_KV_EVENTS_REPLAY=1
+      export KV_AWARE_WORKER_SERVE_EXTRA="--enable-prefix-caching --enable-log-requests --enforce-eager --gpu-memory-utilization 0.4 --max-model-len 4096"
+      export TMPDIR="$$EVIDENCE_DIR"
+      timeout --signal=TERM --kill-after=120s 1800 \
+        python3 -m pytest tests/python/e2e/function/kv_aware/test_kv_aware_prefix_cache.py \
+        --confcutdir=tests/python/e2e/function/kv_aware \
+        --require-gpu-platform=rocm -m "e2e and MI300 and cards_2" -v -s
+      BASH
+    artifact_paths:
+      - "target/ci-logs/kv-aware-rocm/kv_aware_worker_logs_*/*.log"
+
   # This queue is intentionally separate from the shared amd_mi300_* queues.
   # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host.
   # Hosts restore the digest-pinned image before the job (#363). This is the
   # L3 matrix, not the old "every trusted PR" condition. The one-mode smoke
   # lives in test-merge.yml. nightly-test includes forks.
+  # Shared MI300X jobs acquire a host lease in the agent pre-command hook. The
+  # lease wait counts against timeout_in_minutes, so keep 450 minutes: 360 for
+  # the lease plus 90 for readiness and test execution.
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     depends_on: "upload-nightly-pipeline"
@@ -288,22 +338,23 @@ steps:
     steps:
       - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
         key: "pd-disagg-moriio-test"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 450
         matrix:
           setup:
             read_mode:
               - "true"
               - "false"
         retry:
-          automatic:
-            - exit_status: "*"
-              limit: 1
+          automatic: false
           manual:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
         command: |
-          bash -euo pipefail <<'BASH'
+          timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+          # Bash defers this trap until its foreground command finishes,
+          # keeping timeout's kill-after active during harness cleanup.
+          trap 'exit 143' TERM
           export MORIIO_READ_MODE="{{matrix.read_mode}}"
           export MORIIO_BACKEND=xgmi
           export MODEL_NAMES=Qwen/Qwen3-0.6B
@@ -332,25 +383,31 @@ steps:
       ) ||
       ((build.source == "ui" || build.source == "api") &&
        build.env("RUN_ROCM_RDMA") == "1")
-    timeout_in_minutes: 75
+    timeout_in_minutes: 450
     matrix:
       setup:
         read_mode:
           - "true"
           - "false"
     retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
+      automatic: false
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
     command: |
-      set -euo pipefail
+      timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+      # Bash defers this trap until its foreground command finishes,
+      # keeping timeout's kill-after active during harness cleanup.
+      trap 'exit 143' TERM
 
+      # Match the artifact glob: no old probe report if download fails early.
+      rm -f -- target/ci-logs/moriio-rdma-*/pd-lifecycle.json{,.tmp}
       bash .buildkite/scripts/install_packages.sh router-bin
 
       export MORIIO_READ_MODE="{{matrix.read_mode}}"
+      if [[ "$${RUN_PD_LIFECYCLE:-false}" == "true" && "{{matrix.read_mode}}" == "true" ]]; then
+        export VLLM_ROCM_USE_SKINNY_GEMM="$${VLLM_ROCM_USE_SKINNY_GEMM:-0}"
+      fi
       export MODEL_NAMES="Qwen/Qwen3-0.6B"
       export ROUTER_BIN="$$PWD/target/release/vllm-router"
       export LOG_DIR="$$PWD/target/ci-logs/moriio-rdma-{{matrix.read_mode}}"
@@ -363,6 +420,7 @@ steps:
       export WORKER_FABRIC_IP=192.168.200.2
 
       bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+      BASH
     mirror_hardwares: mi300_rdma
     depends_on: "upload-nightly-pipeline"
     artifact_paths:
