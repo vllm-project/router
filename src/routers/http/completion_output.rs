@@ -1,8 +1,19 @@
-//! Conservative model-output detection for proxied Completion SSE streams.
+//! Bounded HTTP output observation and Completion load detection.
+
+use std::ops::ControlFlow;
+
+use serde_json::Value;
 
 use super::sse::{sse_lines, FrameScanner};
 
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_OBSERVABLE_BYTES: usize = 1024 * 1024;
+
+pub(super) fn observe_body_with(
+    body: &[u8],
+    predicate: impl FnOnce(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+) -> bool {
+    body.len() <= MAX_OBSERVABLE_BYTES && matches!(predicate(None, body), ControlFlow::Break(true))
+}
 
 pub(super) struct CompletionOutputObserver {
     event: Vec<u8>,
@@ -21,19 +32,27 @@ impl CompletionOutputObserver {
         }
     }
 
+    pub(super) fn observe(&mut self, chunk: &[u8]) -> bool {
+        self.observe_with(chunk, inspect_completion_load)
+    }
+
     /// Return true only once, after a complete SSE event proves model output.
     /// No EOF flush: an unterminated event is not evidence. Oversized events
     /// permanently disable detection for this attempt without affecting bytes.
     /// The bound counts wire bytes, including CRLF delimiters.
-    pub(super) fn observe(&mut self, mut chunk: &[u8]) -> bool {
+    pub(super) fn observe_with(
+        &mut self,
+        mut chunk: &[u8],
+        mut predicate: impl FnMut(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+    ) -> bool {
         if self.stopped {
             return false;
         }
         while !chunk.is_empty() {
-            let scan_len = chunk.len().min(MAX_EVENT_BYTES - self.event.len() + 1);
+            let scan_len = chunk.len().min(MAX_OBSERVABLE_BYTES - self.event.len() + 1);
             let end = self.scanner.frame_end(&chunk[..scan_len]);
             let consumed = end.unwrap_or(scan_len);
-            if consumed > MAX_EVENT_BYTES - self.event.len() {
+            if consumed > MAX_OBSERVABLE_BYTES - self.event.len() {
                 self.event.clear();
                 self.stopped = true;
                 return false;
@@ -48,11 +67,11 @@ impl CompletionOutputObserver {
                 } else {
                     &self.event
                 };
-                let output = event_has_output(event);
+                let observation = inspect_event(event, &mut predicate);
                 self.event.clear();
-                if output {
+                if let ControlFlow::Break(output) = observation {
                     self.stopped = true;
-                    return true;
+                    return output;
                 }
             }
         }
@@ -60,7 +79,10 @@ impl CompletionOutputObserver {
     }
 }
 
-fn event_has_output(event: &[u8]) -> bool {
+fn inspect_event(
+    event: &[u8],
+    predicate: impl FnOnce(Option<&[u8]>, &[u8]) -> ControlFlow<bool>,
+) -> ControlFlow<bool> {
     let mut data = Vec::new();
     let mut event_type = None;
     for (line, _) in sse_lines(event) {
@@ -73,24 +95,33 @@ fn event_has_output(event: &[u8]) -> bool {
             event_type = Some(value.strip_prefix(b" ").unwrap_or(value));
         }
     }
+    predicate(event_type, &data)
+}
+
+fn inspect_completion_load(event_type: Option<&[u8]>, data: &[u8]) -> ControlFlow<bool> {
     if event_type == Some(b"error".as_slice()) {
-        return false;
+        return ControlFlow::Continue(());
     }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) else {
-        return false;
+    let Ok(value) = serde_json::from_slice::<Value>(data) else {
+        return ControlFlow::Continue(());
     };
-    value.get("error").is_none()
+    if value.get("error").is_none()
         && value
             .get("choices")
-            .and_then(serde_json::Value::as_array)
+            .and_then(Value::as_array)
             .is_some_and(|choices| {
                 choices.iter().any(|choice| {
                     choice
                         .get("text")
-                        .and_then(serde_json::Value::as_str)
+                        .and_then(Value::as_str)
                         .is_some_and(|text| !text.is_empty())
                 })
             })
+    {
+        ControlFlow::Break(true)
+    } else {
+        ControlFlow::Continue(())
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -98,28 +129,49 @@ fn event_has_output(event: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn observe_callback(observer: &mut CompletionOutputObserver, chunk: &[u8]) -> bool {
+        observer.observe_with(chunk, |event, data| {
+            assert!(event.is_none());
+            let expected = br#""text":"output""#;
+            if data.windows(expected.len()).any(|win| win == expected) {
+                ControlFlow::Break(true)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+    }
+
     fn assert_output_at(event: &[u8], complete_at: usize) {
-        for split in 0..=event.len() {
+        for (mode, observe) in [
+            (
+                "load",
+                CompletionOutputObserver::observe
+                    as fn(&mut CompletionOutputObserver, &[u8]) -> bool,
+            ),
+            ("callback", observe_callback),
+        ] {
+            for split in 0..=event.len() {
+                let mut observer = CompletionOutputObserver::new(false);
+                assert_eq!(
+                    observe(&mut observer, &event[..split]),
+                    split >= complete_at,
+                    "{mode}, split {split}"
+                );
+                assert_eq!(
+                    observe(&mut observer, &event[split..]),
+                    split < complete_at,
+                    "{mode}, split {split}"
+                );
+                assert!(!observe(&mut observer, event), "{mode}: repeated output");
+            }
             let mut observer = CompletionOutputObserver::new(false);
-            assert_eq!(
-                observer.observe(&event[..split]),
-                split >= complete_at,
-                "split {split}"
-            );
-            assert_eq!(
-                observer.observe(&event[split..]),
-                split < complete_at,
-                "split {split}"
-            );
-            assert!(!observer.observe(event), "output transition is idempotent");
-        }
-        let mut observer = CompletionOutputObserver::new(false);
-        for (index, byte) in event.iter().enumerate() {
-            assert_eq!(
-                observer.observe(&[*byte]),
-                index + 1 == complete_at,
-                "byte {index}"
-            );
+            for (index, byte) in event.iter().enumerate() {
+                assert_eq!(
+                    observe(&mut observer, &[*byte]),
+                    index + 1 == complete_at,
+                    "{mode}, byte {index}"
+                );
+            }
         }
     }
 
@@ -199,12 +251,46 @@ mod tests {
 
     #[test]
     fn oversized_event_disables_detection_before_buffer_growth() {
+        let pending = vec![b'x'; MAX_OBSERVABLE_BYTES];
         let mut observer = CompletionOutputObserver::new(false);
-        assert!(!observer.observe(&vec![b'x'; MAX_EVENT_BYTES]));
-        assert_eq!(observer.event.len(), MAX_EVENT_BYTES);
-        assert!(!observer.observe(b"x\n\ndata: {\"choices\":[{\"text\":\"false positive\"}]}\n\n"));
+        let unexpected = |_: Option<&[u8]>, _: &[u8]| panic!("oversized event reached callback");
+        assert!(!observer.observe_with(&pending, unexpected));
+        assert_eq!(observer.event.len(), MAX_OBSERVABLE_BYTES);
+        assert!(!observer.observe_with(b"x\n\ndata: too late\n\n", unexpected));
         assert!(observer.event.is_empty());
         assert!(observer.stopped);
-        assert!(!observer.observe(b"data: {\"choices\":[{\"text\":\"still disabled\"}]}\n\n"));
+        assert!(!observer.observe_with(b"data: still disabled\n\n", unexpected));
+    }
+
+    #[test]
+    fn callback_can_stop_without_evidence_and_skip_later_events() {
+        let mut observer = CompletionOutputObserver::new(false);
+        let inspect = |event: Option<&[u8]>, data: &[u8]| match (event, data) {
+            (None, b"wait") => ControlFlow::Continue(()),
+            (Some(b"stop"), b"first\nsecond") => ControlFlow::Break(false),
+            _ => panic!("stopped observer inspected another event"),
+        };
+        assert!(!observer.observe_with(b"data: wait\n\n", inspect));
+        assert!(!observer.stopped);
+        assert!(!observer.observe_with(
+            b"event: stop\r\ndata: first\r\ndata: second\r\n\r\ndata: too late\n\n",
+            inspect,
+        ));
+        assert!(observer.stopped);
+        assert!(!observer.observe_with(b"data: still stopped\n\n", inspect));
+    }
+
+    #[test]
+    fn complete_body_observation_is_bounded_before_callback() {
+        let mut body = vec![b' '; MAX_OBSERVABLE_BYTES];
+        assert!(observe_body_with(&body, |event, bytes| {
+            assert!(event.is_none());
+            assert_eq!(bytes, body.as_slice());
+            ControlFlow::Break(true)
+        }));
+        body.push(b' ');
+        assert!(!observe_body_with(&body, |_, _| panic!(
+            "oversized body reached callback"
+        )));
     }
 }

@@ -50,6 +50,7 @@ struct Router {
     kv_penalty_external: f64,
     kv_penalty_disk: f64,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    kv_aware_completion_history: bool,
     pd_kv_events: Vec<String>,
     kv_event_source: Vec<String>,
     kv_event_replay_source: Vec<String>,
@@ -277,6 +278,7 @@ impl Router {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            kv_aware_completion_history: self.kv_aware_completion_history,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -396,7 +398,8 @@ impl Router {
         kv_event_strict_recovery = false,
         kv_hybrid_layout = None,
         kv_event_topic = vec![],
-        pd_pair = vec![]
+        pd_pair = vec![],
+        kv_aware_completion_history = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -478,6 +481,7 @@ impl Router {
         kv_hybrid_layout: Option<std::path::PathBuf>,
         kv_event_topic: Vec<String>,
         pd_pair: Vec<String>,
+        kv_aware_completion_history: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -504,6 +508,7 @@ impl Router {
             kv_penalty_external,
             kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
+            kv_aware_completion_history,
             pd_kv_events,
             kv_event_source,
             kv_event_replay_source,

@@ -209,6 +209,9 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Use bounded prefix history to break eligible Regular kv_aware ties.
+    #[arg(long, default_value_t = false)]
+    kv_aware_completion_history: bool,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -694,6 +697,7 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            kv_aware_completion_history: self.kv_aware_completion_history,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -875,6 +879,24 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_history_is_opt_in() {
+        for enabled in [false, true] {
+            let mut argv = vec![
+                "vllm-router",
+                "--policy",
+                "kv_aware",
+                "--worker-urls",
+                "http://127.0.0.1:8000",
+            ];
+            if enabled {
+                argv.push("--kv-aware-completion-history");
+            }
+            let args = CliArgs::try_parse_from(argv).unwrap();
+            assert_eq!(args.kv_aware_completion_history, enabled);
+        }
+    }
 
     #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {

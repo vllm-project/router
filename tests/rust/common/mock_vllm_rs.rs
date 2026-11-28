@@ -70,6 +70,8 @@ pub struct MockVllmRs {
     pub aborts: Arc<Mutex<Vec<String>>>,
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
+    /// Hold only generated output; prompt info and stream headers are sent first.
+    pub output_gate: Option<HoldGate>,
     pub kv_block_size: u32,
 }
 
@@ -101,7 +103,7 @@ impl HoldGate {
     }
 
     pub fn release(&self) {
-        let _ = self.released.send(true);
+        self.released.send_replace(true);
     }
 
     pub async fn wait(&self) {
@@ -133,6 +135,7 @@ impl Default for MockVllmRs {
             aborted_finishes_remaining: Arc::new(AtomicUsize::new(0)),
             aborts: Arc::new(Mutex::new(Vec::new())),
             hold: None,
+            output_gate: None,
             kv_block_size: 0,
         }
     }
@@ -343,6 +346,7 @@ impl Inference for MockVllmRs {
             .as_ref()
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
+        let output_gate = self.output_gate.clone();
         let cancelled = self.cancelled.clone();
         let fail_stream = self
             .stream_failures_remaining
@@ -377,6 +381,15 @@ impl Inference for MockVllmRs {
             if fail_stream {
                 let _ = tx.send(Err(Status::internal("decode failed"))).await;
                 return;
+            }
+            if let Some(gate) = output_gate {
+                tokio::select! {
+                    _ = gate.wait() => {}
+                    _ = tx.closed() => {
+                        cancelled.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
             }
             let last = frames.len().saturating_sub(1);
             let total: u32 = frames.iter().map(|(_, ids)| ids.len() as u32).sum();

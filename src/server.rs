@@ -75,6 +75,11 @@ impl AppContext {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
+        if router_config.kv_aware_completion_history {
+            if let Err(reason) = router_config.regular_history_support() {
+                warn!(reason, "Completion history disabled");
+            }
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 

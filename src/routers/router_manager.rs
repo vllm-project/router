@@ -290,10 +290,7 @@ impl RouterManager {
                     .get_by_url(worker_arc.url())
                     .is_some_and(|current| Arc::ptr_eq(&current, &worker_arc))
                 {
-                    router.register_kv_target(
-                        worker_arc.as_ref(),
-                        info.as_ref().map(|(info, _)| info),
-                    );
+                    router.register_kv_target(&worker_arc, info.as_ref().map(|(info, _)| info));
                 }
             } else {
                 if let Some(kv) = kv_aware_ops(policy.as_ref()) {

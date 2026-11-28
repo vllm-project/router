@@ -1,7 +1,10 @@
 //! Multi-tier KV cache placement index, fed by engine events.
+//! Also contains the router-observed advisory prefix history, which does not
+//! provide evidence of engine cache residency.
 
 pub(crate) mod config;
 pub use config::apply_kv_layout_file;
+pub(crate) mod prefix_history;
 pub mod request_hash;
 mod routing_provider;
 pub(crate) use routing_provider::PromptKey;

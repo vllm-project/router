@@ -76,6 +76,10 @@ pub fn init_metrics() {
 
     // Policy metrics
     describe_counter!(
+        "vllm_router_history_decisions_total",
+        "Advisory history eligibility and refinement reasons, separate from routing decisions"
+    );
+    describe_counter!(
         "vllm_router_kv_routing_inputs_total",
         "KV-aware token preparation by transport and result"
     );
@@ -669,6 +673,12 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    /// Fixed history phases and reasons; neither a routing-stage denominator nor APC hits.
+    pub(crate) fn record_history_decision(phase: &'static str, reason: &'static str) {
+        counter!("vllm_router_history_decisions_total", "phase" => phase, "reason" => reason)
+            .increment(1);
+    }
+
     /// Separates real prefix decisions, explicit binding, and load fallback.
     pub fn record_prefix_routing_decision(
         policy: &'static str,

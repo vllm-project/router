@@ -4,6 +4,7 @@ mod completion_output;
 pub(super) mod completion_route;
 pub mod dp_utils;
 mod epd;
+mod history_hook;
 pub mod logprobs_merge;
 pub mod openai_router;
 mod pd_cached_tokens;

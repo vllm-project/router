@@ -1,4 +1,4 @@
-//! Request-level Completion preparation and forwarding, separate from attempts.
+//! Request-level generation eligibility and Completion forwarding.
 
 use axum::{
     body::Bytes,

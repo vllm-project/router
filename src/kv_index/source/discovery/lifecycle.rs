@@ -19,6 +19,7 @@ use crate::kv_index::{
     CacheCapabilities, EventStream, EventSubscriberHandle, IngestionSignal, KvBlockIndexer,
     SourceBinding,
 };
+use crate::policies::{RegistrationCurrent, TieredMatchProvider};
 
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -30,7 +31,24 @@ const LAYOUT_FRESHNESS: Duration = Duration::from_secs(5);
 pub(crate) struct WorkerRegistration {
     pub(crate) revision: u64,
     pub(crate) info: Option<WorkerKvInfo>,
-    pub(crate) provider: Option<Arc<dyn crate::policies::TieredMatchProvider>>,
+    pub(crate) provider: Option<Arc<dyn TieredMatchProvider>>,
+    pub(crate) current: Option<Arc<dyn RegistrationCurrent>>,
+}
+
+impl WorkerRegistration {
+    pub(super) fn snapshot(lifecycle: &WorkerLifecycle, worker: Option<&WorkerSubs>) -> Self {
+        let state = lifecycle.state.lock();
+        // Both ports come from the same installed owner as this metadata.
+        let provider = worker
+            .filter(|worker| state.info.is_some() && Arc::ptr_eq(&worker.active, &lifecycle.active))
+            .map(|worker| &worker.provider);
+        Self {
+            revision: state.revision,
+            info: state.info.clone(),
+            provider: provider.map(|provider| provider.clone() as Arc<dyn TieredMatchProvider>),
+            current: provider.map(|provider| provider.clone() as Arc<dyn RegistrationCurrent>),
+        }
+    }
 }
 
 /// Control observations for the same owner used by its event subscribers.
@@ -241,7 +259,17 @@ pub(super) struct LayoutWorkerProvider {
     pub(super) lifecycle: Arc<WorkerLifecycle>,
 }
 
-impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
+impl RegistrationCurrent for LayoutWorkerProvider {
+    fn current(&self, rank: u32) -> bool {
+        if !self.indexes.contains_key(&rank) {
+            return false;
+        }
+        let state = self.lifecycle.state.lock();
+        self.lifecycle.active.load(Ordering::Acquire) && state.info.is_some()
+    }
+}
+
+impl TieredMatchProvider for LayoutWorkerProvider {
     fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
         self.indexes.get(&rank)?.shared_prefix_lookup(rank)
     }

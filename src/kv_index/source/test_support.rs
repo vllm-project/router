@@ -1,7 +1,23 @@
 //! Shared event fixtures; callers set model and residency-specific fields.
 
+use std::sync::Arc;
+
 use super::events::wire::{BlockRemoved, BlockStored, ExternalBlockHash, KVEvent, KVEventBatch};
 use crate::kv_index::{CacheGroup, GroupRule, RoutableTarget, SourceBinding};
+use crate::policies::RegistrationCurrent;
+
+/// A live single-rank owner for fixtures with no supervisor lifecycle.
+pub(crate) fn current_registration() -> Arc<dyn RegistrationCurrent> {
+    struct Current;
+
+    impl RegistrationCurrent for Current {
+        fn current(&self, rank: u32) -> bool {
+            rank == 0
+        }
+    }
+
+    Arc::new(Current)
+}
 
 pub(crate) fn full_binding(target: RoutableTarget, block_size: u32) -> SourceBinding {
     SourceBinding::new(

@@ -629,6 +629,12 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | `--prometheus-port` | TCP port | `29000` | Set the port for [Router cache metrics](#check-cache-reuse). |
 | `--log-level` | Log level | `info` | Use `debug` to diagnose rejected layouts or event sources. |
 
+## Optional prefix history
+
+Add `--kv-aware-completion-history` to a Regular `--policy kv_aware --router-temperature 0` invocation (off by default). With no usable session binding or positive event credit, a recently observed whole-block token prefix can break a load tie. A hint expires about 60 seconds after the last successful observation. This is a preference, not evidence that KV is still resident.
+
+It requires a registered single-rank worker with a verified model, block size and KV source, and one eligible prompt with backend-effective IDs. HTTP workers support single-prompt Completion and Chat through the existing input preparation; gRPC workers support token-ID Completion. History is recorded only after verified generated output; HTTP echo or compressed responses are forwarded without training history. Responses, native generation and gRPC Chat keep ordinary routing without history.
+
 ## Troubleshooting
 
 | Symptom | Check |

@@ -25,8 +25,8 @@ mod probe;
 mod reconcile;
 mod registration;
 
-pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+pub(crate) use lifecycle::{WorkerRegistration, CONTROL_TIMEOUT};
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
