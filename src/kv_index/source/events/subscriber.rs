@@ -6,18 +6,43 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-use super::event_stream::{EventStream, StreamLease};
+use super::event_stream::{batch_contains_clear, EventStream, StreamLease};
+use super::live_event_buffer::LiveEventBuffer;
 use super::transport::{
-    live_sequence, retry_backoff, ConnectionMonitor, PendingLive, ReplayOverlap, ReplayPoll,
-    IDLE_REPLAY_INTERVAL,
+    live_sequence, retry_backoff, ConnectionMonitor, ReplayPoll, IDLE_REPLAY_INTERVAL,
 };
 use crate::kv_index::types::SourceRecoveryReason as Reason;
-use crate::kv_index::IngestionSignal;
+use crate::kv_index::{decode_batch, IngestionSignal, KVEventBatch};
 use crate::metrics::RouterMetrics;
 
 /// The signed sentinel ending a replay stream: `seq = -1`.
 const END_SEQ: i64 = -1;
 const MAX_REPLAY_FAILURES: u32 = 3;
+const REPLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ReplayProgress {
+    applied_seq: i64,
+}
+
+enum ReplayError {
+    Incomplete(ReplayProgress),
+    Rejected,
+}
+
+#[derive(Default)]
+struct ReplayWatermarks {
+    required_live_seq: Option<i64>,
+    highest_seen_replay_seq: Option<i64>,
+    clear_seq: Option<i64>,
+}
+
+impl ReplayWatermarks {
+    fn covers_required_sequences(&self, next_expected_seq: i64) -> bool {
+        self.required_live_seq
+            .max(self.highest_seen_replay_seq)
+            .is_none_or(|required_seq| next_expected_seq > required_seq)
+    }
+}
 
 pub use crate::kv_index::source::endpoints::EventSource;
 
@@ -39,9 +64,21 @@ pub(super) fn spawn(
     ctx: Arc<zmq::Context>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
 ) -> SubscriberHandle {
+    spawn_with_idle_timeout(source, stream, lease, ctx, signals, REPLAY_IDLE_TIMEOUT)
+}
+
+fn spawn_with_idle_timeout(
+    source: EventSource,
+    stream: Arc<EventStream>,
+    lease: StreamLease,
+    ctx: Arc<zmq::Context>,
+    signals: Option<mpsc::Sender<IngestionSignal>>,
+    replay_idle_timeout: Duration,
+) -> SubscriberHandle {
     spawn_subscriber(
         Subscriber {
             source,
+            replay_idle_timeout,
             binding: Some((stream, lease)),
             signals: signals.filter(|tx| !tx.is_closed()),
         },
@@ -58,6 +95,7 @@ pub(in crate::kv_index::source) fn spawn_observer(
     spawn_subscriber(
         Subscriber {
             source,
+            replay_idle_timeout: REPLAY_IDLE_TIMEOUT,
             binding: None,
             signals: Some(signals),
         },
@@ -67,6 +105,8 @@ pub(in crate::kv_index::source) fn spawn_observer(
 
 struct Subscriber {
     source: EventSource,
+    // Production uses REPLAY_IDLE_TIMEOUT. Tests can inject a shorter timeout.
+    replay_idle_timeout: Duration,
     binding: Option<(Arc<EventStream>, StreamLease)>,
     signals: Option<mpsc::Sender<IngestionSignal>>,
 }
@@ -95,35 +135,69 @@ impl Subscriber {
         })
     }
 
-    fn resume(&self, last: i64, reason: Reason) -> Result<(), ()> {
+    fn resume(&self, applied_seq: i64, reason: Reason) -> Result<(), ()> {
         self.binding.as_ref().map_or(Ok(()), |(stream, lease)| {
-            let next = last.checked_add(1).ok_or(())?;
+            let next = applied_seq.checked_add(1).ok_or(())?;
             stream.resume(*lease, next as u64, reason).map_err(|_| ())
         })
     }
 
-    fn apply(&self, seq: u64, payload: &[u8], fresh: bool) -> Result<(), ()> {
+    fn apply_next_batch(&self, seq: i64, payload: &[u8]) -> Result<(), ()> {
+        let batch = decode_batch(payload).ok();
         let cleared = if let Some((stream, lease)) = &self.binding {
-            if fresh {
-                stream.observe_live(*lease, seq, payload)
-            } else {
-                stream.apply_publisher_payload(*lease, seq, payload)
-            }
-            .map_err(|_| ())?
+            stream
+                .apply_next_batch(*lease, seq as u64, batch.as_ref())
+                .map_err(|_| ())?
         } else {
-            let batch = crate::kv_index::decode_batch(payload).map_err(|_| ())?;
-            batch
-                .data_parallel_rank
-                .is_none_or(|rank| rank == self.source.dp_rank)
-                && batch
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, crate::kv_index::KVEvent::AllBlocksCleared(_)))
+            self.observer_detected_clear(batch.as_ref().ok_or(())?)
         };
+        self.notify_if_cleared(cleared);
+        Ok(())
+    }
+
+    fn apply_fresh_live_batch(&self, seq: i64, payload: &[u8]) -> Result<(), ()> {
+        let batch = decode_batch(payload).map_err(|_| ())?;
+        let cleared = if let Some((stream, lease)) = &self.binding {
+            stream
+                .reset_and_try_publish_from_live_batch(*lease, seq as u64, &batch)
+                .map_err(|_| ())?
+        } else {
+            self.observer_detected_clear(&batch)
+        };
+        self.notify_if_cleared(cleared);
+        Ok(())
+    }
+
+    fn observer_detected_clear(&self, batch: &KVEventBatch) -> bool {
+        batch
+            .data_parallel_rank
+            .is_none_or(|rank| rank == self.source.dp_rank)
+            && batch_contains_clear(batch)
+    }
+
+    fn notify_if_cleared(&self, cleared: bool) {
         if cleared {
             self.invalidated("engine cleared KV cache");
         }
-        Ok(())
+    }
+
+    /// A retained suffix can start after the requested cursor. Discard earlier
+    /// claims only if the suffix supplies a valid clear for this worker rank.
+    fn apply_replay_clear_if_present(&self, seq: i64, payload: &[u8]) -> Result<bool, ReplayError> {
+        let batch = decode_batch(payload).map_err(|_| ReplayError::Rejected)?;
+        // Check even skipped batches while looking for a clear.
+        if batch.data_parallel_rank != Some(self.source.dp_rank) {
+            return Err(ReplayError::Rejected);
+        }
+        if !batch_contains_clear(&batch) {
+            return Ok(false);
+        }
+        let (stream, lease) = self.binding.as_ref().ok_or(ReplayError::Rejected)?;
+        stream
+            .reset_hidden_index_from_replay_clear(*lease, seq as u64, &batch)
+            .map_err(|_| ReplayError::Rejected)?;
+        self.invalidated("engine cleared KV cache");
+        Ok(true)
     }
 
     fn invalidated(&self, reason: &'static str) {
@@ -148,38 +222,50 @@ impl Subscriber {
     async fn replay(
         &self,
         ctx: &zmq::Context,
-        mut last: i64,
-        through: Option<i64>,
-        gap_batch: Option<&(u64, Vec<u8>)>,
-        replayed: &mut ReplayOverlap,
+        mut applied_seq: i64,
+        watermarks: &mut ReplayWatermarks,
+        live_events: &LiveEventBuffer,
         socket: &mut Option<zmq::Socket>,
-        reconcile: bool,
+        idle_reconcile: bool,
         shutdown: &broadcast::Receiver<()>,
-    ) -> Option<i64> {
+    ) -> Result<ReplayProgress, ReplayError> {
         let dealer = match socket.take() {
             Some(socket) => socket,
             None => {
-                let socket = ctx.socket(zmq::DEALER).ok()?;
+                let socket = ctx
+                    .socket(zmq::DEALER)
+                    .map_err(|_| ReplayError::Incomplete(ReplayProgress { applied_seq }))?;
                 socket
                     .set_maxmsgsize(super::MAX_KV_EVENT_BYTES as i64)
-                    .ok()?;
-                socket.set_linger(0).ok()?;
+                    .map_err(|_| ReplayError::Incomplete(ReplayProgress { applied_seq }))?;
                 socket
-                    .connect(self.source.replay_endpoint.as_deref()?)
-                    .ok()?;
+                    .set_linger(0)
+                    .map_err(|_| ReplayError::Incomplete(ReplayProgress { applied_seq }))?;
+                socket
+                    .connect(
+                        self.source
+                            .replay_endpoint
+                            .as_deref()
+                            .ok_or(ReplayError::Rejected)?,
+                    )
+                    .map_err(|_| ReplayError::Incomplete(ReplayProgress { applied_seq }))?;
                 socket
             }
         };
-        let start = u64::try_from(last.checked_add(1)?).ok()?;
-        let through = through.map(u64::try_from).transpose().ok()?;
+        let requested_start_seq = applied_seq
+            .checked_add(1)
+            .filter(|&seq| seq >= 0)
+            .ok_or(ReplayError::Rejected)?;
         let topic = self.source.topic.clone();
-        if let Err(error) = dealer.send_multipart([&[][..], &start.to_be_bytes()], zmq::DONTWAIT) {
+        if let Err(error) =
+            dealer.send_multipart([&[][..], &requested_start_seq.to_be_bytes()], zmq::DONTWAIT)
+        {
             warn!(%topic, %error, "KV replay request failed");
-            return None;
+            return Err(ReplayError::Incomplete(ReplayProgress { applied_seq }));
         }
-        let idle_timeout = Duration::from_secs(5);
-        let mut deadline = tokio::time::Instant::now() + idle_timeout;
-        let mut next = start;
+        let mut deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
+        let mut next_expected_seq = requested_start_seq;
+        let mut waiting_for_replay_clear = false;
         while tokio::time::Instant::now() < deadline
             && shutdown.is_empty()
             && !shutdown.is_closed()
@@ -187,64 +273,94 @@ impl Subscriber {
         {
             match dealer.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
-                    let (wire_seq, frame_topic, payload) = super::transport::replay_frame(&frames)?;
-                    if wire_seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
+                    let (seq, frame_topic, payload) = super::transport::replay_frame(&frames)
+                        .ok_or_else(|| {
+                            warn!(%topic, "Malformed KV replay frame");
+                            ReplayError::Rejected
+                        })?;
+                    if seq == END_SEQ && frame_topic.is_empty() && payload.is_empty() {
+                        if waiting_for_replay_clear {
+                            warn!(%topic, "Truncated KV replay ended without a clear");
+                            return Err(ReplayError::Rejected);
+                        }
                         // The first live batch after a gap can finish a contiguous
                         // replay when the publisher has not buffered that batch yet.
-                        if let Some((seq, payload)) = gap_batch.filter(|(seq, _)| {
-                            *seq == next && through.is_some_and(|required| *seq == required)
-                        }) {
-                            self.apply(*seq, payload, false).ok()?;
-                            super::transport::remember_replay(replayed, *seq, payload);
-                            last = *seq as i64;
-                            next += 1;
+                        if watermarks.required_live_seq == Some(next_expected_seq)
+                            && live_events
+                                .apply_gap_trigger(next_expected_seq, |payload| {
+                                    self.apply_next_batch(next_expected_seq, payload)
+                                })
+                                .map_err(|_| ReplayError::Rejected)?
+                        {
+                            applied_seq = next_expected_seq;
+                            next_expected_seq += 1;
                         }
-                        if through.is_some_and(|required| next <= required) {
-                            return None;
+                        if !watermarks.covers_required_sequences(next_expected_seq) {
+                            return Err(ReplayError::Incomplete(ReplayProgress { applied_seq }));
                         }
                         *socket = Some(dealer);
-                        return Some(last);
+                        return Ok(ReplayProgress { applied_seq });
                     }
-                    if !(0..i64::MAX).contains(&wire_seq) {
-                        return None;
+                    if !(0..i64::MAX).contains(&seq) || frame_topic != topic.as_bytes() {
+                        warn!(%topic, seq, "KV replay frame has an invalid sequence or topic");
+                        return Err(ReplayError::Rejected);
                     }
-                    let seq = wire_seq as u64;
-                    if frame_topic != topic.as_bytes() {
-                        return None;
+                    // A rejected reply can still reveal a sequence the next replay must cover.
+                    watermarks.highest_seen_replay_seq =
+                        watermarks.highest_seen_replay_seq.max(Some(seq));
+                    if seq != next_expected_seq {
+                        if next_expected_seq != requested_start_seq || seq < requested_start_seq {
+                            warn!(%topic, seq, expected = next_expected_seq, "KV replay sequence gap");
+                            return Err(ReplayError::Rejected);
+                        }
+                        waiting_for_replay_clear = true;
                     }
-                    if seq != next {
-                        warn!(%topic, seq, expected = next, "KV replay sequence gap");
-                        return None;
-                    }
-                    if gap_batch.is_some_and(|(live_seq, live_payload)| {
-                        *live_seq == seq && live_payload.as_slice() != payload
-                    }) {
-                        warn!(%topic, seq, "KV replay conflicts with the buffered live batch");
-                        return None;
-                    }
-                    if reconcile && seq == start {
-                        self.suspend(Reason::IdleCatchup).ok()?;
+                    if idle_reconcile && next_expected_seq == requested_start_seq {
+                        self.suspend(Reason::IdleCatchup)
+                            .map_err(|_| ReplayError::Rejected)?;
                         self.invalidated("idle replay found unapplied events");
                     }
-                    self.apply(seq, payload, false).ok()?;
-                    super::transport::remember_replay(replayed, seq, payload);
-                    last = wire_seq;
-                    next = seq + 1;
-                    deadline = tokio::time::Instant::now() + idle_timeout;
+                    record_replay_payload(live_events, &topic, seq, payload)?;
+                    if waiting_for_replay_clear {
+                        if self.apply_replay_clear_if_present(seq, payload)? {
+                            watermarks.clear_seq = Some(seq);
+                            waiting_for_replay_clear = false;
+                        }
+                    } else {
+                        self.apply_next_batch(seq, payload)
+                            .map_err(|_| ReplayError::Rejected)?;
+                    }
+                    if !waiting_for_replay_clear {
+                        applied_seq = seq;
+                    }
+                    next_expected_seq = seq + 1;
+                    deadline = tokio::time::Instant::now() + self.replay_idle_timeout;
                     tokio::task::yield_now().await;
                 }
                 Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(1)).await,
                 Err(error) => {
                     warn!(%topic, %error, "KV replay receive failed");
-                    return None;
+                    return Err(ReplayError::Incomplete(ReplayProgress { applied_seq }));
                 }
             }
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(%topic, "KV replay made no progress before the idle timeout");
         }
-        None
+        Err(ReplayError::Incomplete(ReplayProgress { applied_seq }))
     }
+}
+
+fn record_replay_payload(
+    live_events: &LiveEventBuffer,
+    topic: &str,
+    seq: i64,
+    payload: &[u8],
+) -> Result<(), ReplayError> {
+    live_events.record_replay_payload(seq, payload).map_err(|_| {
+        warn!(%topic, seq, "KV replay payload differs from an earlier payload for this sequence");
+        ReplayError::Rejected
+    })
 }
 
 impl Drop for Subscriber {
@@ -291,7 +407,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 source_id, dp_rank, pub_endpoint
             );
 
-            let mut last_seq: i64 = -1;
+            let mut applied_seq: i64 = -1;
             if subscriber.invalidate(false, Reason::Registered).is_err() {
                 return;
             }
@@ -299,17 +415,15 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
             // A native publisher may already have cached blocks when Router starts.
             // Catch up by replay until a live frame confirms the SUB handoff.
             let mut bootstrap = can_replay;
-            let mut allow_overlap = bootstrap;
-            let mut replayed = ReplayOverlap::new();
+            let mut check_live_duplicates = bootstrap;
+            let mut live_events = LiveEventBuffer::default();
             let mut replay_socket = None;
-            let mut pending_live = PendingLive::default();
             let mut next_catchup = tokio::time::Instant::now();
             let mut next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
             let mut idle_reconcile = false;
             let mut disconnected = false;
             let mut reconnect = false;
-            let mut recovery_through = None;
-            let mut gap_batch = None;
+            let mut watermarks = ReplayWatermarks::default();
             let mut replay_failures = 0;
             let mut monitor_error = None;
 
@@ -346,21 +460,19 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         }
                     }
                     disconnected = true;
-                    recovery_through = None;
-                    gap_batch = None;
+                    watermarks = ReplayWatermarks::default();
                     replay_failures = 0;
-                    last_seq = -1;
+                    applied_seq = -1;
                     bootstrap = false;
                     idle_reconcile = false;
-                    allow_overlap = false;
-                    replayed.clear();
+                    check_live_duplicates = false;
+                    live_events.reset();
                     replay_socket = None;
-                    pending_live = PendingLive::default();
                 }
                 if !lost && disconnected && latest == Some(true) {
                     disconnected = false;
                     bootstrap = can_replay;
-                    allow_overlap = can_replay;
+                    check_live_duplicates = can_replay;
                     next_catchup = tokio::time::Instant::now();
                 }
                 if disconnected {
@@ -378,18 +490,18 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 }
                 if can_replay
                     && !bootstrap
-                    && last_seq >= 0
+                    && applied_seq >= 0
                     && tokio::time::Instant::now() >= next_idle_replay
                 {
                     // A timer is not evidence of loss. Keep the verified view
                     // until replay actually returns an unapplied event.
                     idle_reconcile = true;
                     bootstrap = true;
-                    allow_overlap = true;
+                    check_live_duplicates = true;
                     next_catchup = tokio::time::Instant::now();
                 }
                 if bootstrap && tokio::time::Instant::now() >= next_catchup {
-                    if last_seq == -1 && !suspended {
+                    if applied_seq == -1 && !suspended {
                         if subscriber.suspend(Reason::Registered).is_err() {
                             break;
                         }
@@ -398,10 +510,9 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     let result = {
                         let replay = subscriber.replay(
                             &ctx,
-                            last_seq,
-                            recovery_through,
-                            gap_batch.as_ref(),
-                            &mut replayed,
+                            applied_seq,
+                            &mut watermarks,
+                            &live_events,
                             &mut replay_socket,
                             idle_reconcile,
                             &shutdown_rx,
@@ -411,8 +522,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             replay,
                             !suspended,
                             &mut sub,
-                            &mut pending_live,
                             topic.as_bytes(),
+                            |frames, topic| live_events.push(frames, topic),
                         )
                         .await
                         {
@@ -438,21 +549,40 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         reconnect = true;
                         continue;
                     }
-                    if let ReplayPoll::Finished(Some(high)) = result {
+                    let result = match result {
+                        ReplayPoll::Finished(Ok(progress)) => {
+                            if let Err(error) = live_events.validate_handoff(
+                                topic.as_bytes(),
+                                progress.applied_seq,
+                                watermarks.clear_seq,
+                            ) {
+                                warn!(%topic, applied_seq = progress.applied_seq, %error, "KV replay handoff rejected");
+                                replay_socket = None;
+                                ReplayPoll::Finished(Err(ReplayError::Rejected))
+                            } else {
+                                ReplayPoll::Finished(Ok(progress))
+                            }
+                        }
+                        result => result,
+                    };
+                    if let ReplayPoll::Finished(Ok(progress)) = result {
                         RouterMetrics::record_kv_replay_outcome("applied");
                         replay_failures = 0;
-                        let advanced = high != last_seq;
-                        last_seq = high;
-                        recovery_through = None;
-                        gap_batch = None;
+                        let advanced = progress.applied_seq != applied_seq;
+                        applied_seq = progress.applied_seq;
+                        let reason = if std::mem::take(&mut watermarks).clear_seq.is_some() {
+                            Reason::ClearBarrier
+                        } else {
+                            Reason::ReplayApplied
+                        };
                         if suspended || (idle_reconcile && advanced) {
-                            if subscriber.resume(last_seq, Reason::ReplayApplied).is_err() {
+                            if subscriber.resume(applied_seq, reason).is_err() {
                                 break;
                             }
                             suspended = false;
                         }
                         if advanced {
-                            debug!(source = %source_id, rank = dp_rank, seq = last_seq, "kv_index replay sequence advanced");
+                            debug!(source = %source_id, rank = dp_rank, seq = applied_seq, "kv_index replay sequence advanced");
                         }
                         if idle_reconcile {
                             idle_reconcile = false;
@@ -467,11 +597,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                         let overflow = matches!(result, ReplayPoll::BufferFull);
                         if overflow {
                             // The replay must cover any discarded live data.
-                            recovery_through =
-                                recovery_through.max(pending_live.discard(topic.as_bytes()));
+                            watermarks.required_live_seq = watermarks
+                                .required_live_seq
+                                .max(live_events.discard_buffered_frames(topic.as_bytes()));
                         } else {
                             replay_failures += 1;
-                            gap_batch = None;
                         }
                         let exhausted = replay_failures == MAX_REPLAY_FAILURES;
                         let (reason, outcome) = if overflow {
@@ -482,12 +612,32 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             (Reason::ReplayFailed, "failed")
                         };
                         RouterMetrics::record_kv_replay_outcome(outcome);
+                        if let ReplayPoll::Finished(Err(ReplayError::Incomplete(progress))) = result
+                        {
+                            if !exhausted {
+                                // Leave the verified prefix hidden and retry only unapplied
+                                // batches. Keep the live sequence requirement and its queued frame.
+                                if subscriber.suspend(reason).is_err() {
+                                    break;
+                                }
+                                applied_seq = progress.applied_seq;
+                                suspended = true;
+                                next_catchup =
+                                    tokio::time::Instant::now() + Duration::from_millis(500);
+                                continue;
+                            }
+                        }
                         if subscriber.invalidate(had_credit, reason).is_err() {
                             break;
                         }
-                        last_seq = -1;
+                        applied_seq = -1;
+                        watermarks.clear_seq = None;
                         suspended = true;
-                        replayed.clear();
+                        if exhausted {
+                            live_events.reset();
+                        } else if !overflow {
+                            live_events.clear_fingerprints(topic.as_bytes());
+                        }
                         if had_credit {
                             subscriber.invalidated("replay lost continuity");
                         }
@@ -506,9 +656,8 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 }
                             }
                             bootstrap = false;
-                            allow_overlap = false;
-                            recovery_through = None;
-                            pending_live = PendingLive::default();
+                            check_live_duplicates = false;
+                            watermarks = ReplayWatermarks::default();
                             continue;
                         }
                         next_catchup = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -522,12 +671,25 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                     }
                     continue;
                 }
-                let (through, overlap, restart_from) = 'live_batch: {
-                    let received = pending_live
-                        .pop()
-                        .map_or_else(|| sub.socket().recv_multipart(zmq::DONTWAIT), Ok);
+                let (required_live_seq, check_replayed_duplicates, resume_after_seq) = 'live_batch: {
+                    let applied_seq_for_duplicates = check_live_duplicates.then_some(applied_seq);
+                    let received = live_events
+                        .pop(topic.as_bytes(), applied_seq_for_duplicates)
+                        .map_or_else(
+                            || {
+                                sub.socket().recv_multipart(zmq::DONTWAIT).map(|frames| {
+                                    let is_duplicate = live_events.is_replayed_duplicate(
+                                        &frames,
+                                        topic.as_bytes(),
+                                        applied_seq_for_duplicates,
+                                    );
+                                    (frames, is_duplicate)
+                                })
+                            },
+                            Ok,
+                        );
                     match received {
-                        Ok(mut frames) => {
+                        Ok((frames, is_replayed_duplicate)) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
                                 Ok(Some(seq)) if (0..i64::MAX).contains(&seq) => seq,
                                 Ok(None) => {
@@ -553,31 +715,26 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             };
                             next_idle_replay = tokio::time::Instant::now() + IDLE_REPLAY_INTERVAL;
                             if replay_failures == MAX_REPLAY_FAILURES {
-                                if subscriber.apply(seq as u64, &frames[2], true).is_ok() {
-                                    last_seq = seq;
+                                if subscriber.apply_fresh_live_batch(seq, &frames[2]).is_ok() {
+                                    applied_seq = seq;
                                     suspended = false;
                                     replay_failures = 0;
                                 }
                                 tokio::task::yield_now().await;
                                 continue 'live;
                             }
-                            if allow_overlap
-                                && seq <= last_seq
-                                && super::transport::replay_overlap(
-                                    &replayed, seq as u64, &frames[2],
-                                )
-                            {
+                            if is_replayed_duplicate {
                                 bootstrap = false;
                                 replay_socket = None;
                                 continue 'live;
                             }
                             // Sequence zero outside the verified replay overlap
                             // can belong to a new publisher lifetime.
-                            if last_seq != -1 && (seq < last_seq || seq == 0) {
+                            if applied_seq != -1 && (seq < applied_seq || seq == 0) {
                                 let incarnation = crate::kv_index::next_owner_incarnation();
                                 warn!(
                                     "kv_index {}: restart seq {} after {} → incarnation {}",
-                                    source_id, seq, last_seq, incarnation
+                                    source_id, seq, applied_seq, incarnation
                                 );
                                 if subscriber
                                     .invalidate(true, Reason::IncarnationReset)
@@ -595,7 +752,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 suspended = true;
                                 break 'live_batch (Some(seq), true, -1);
                             }
-                            if seq <= last_seq {
+                            if seq <= applied_seq {
                                 if subscriber
                                     .invalidate(true, Reason::ValidationFailed)
                                     .is_err()
@@ -604,11 +761,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 }
                                 subscriber.invalidated("duplicate live sequence");
                                 suspended = true;
-                                break 'live_batch (Some(seq), allow_overlap, -1);
+                                break 'live_batch (Some(seq), check_live_duplicates, -1);
                             }
-                            let expected = last_seq + 1; // Every accepted sequence leaves room.
-                            if (can_replay || last_seq >= 0) && seq > expected {
-                                if can_replay && last_seq >= 0 {
+                            let expected = applied_seq + 1; // Every accepted sequence leaves room.
+                            if (can_replay || applied_seq >= 0) && seq > expected {
+                                if can_replay && applied_seq >= 0 {
                                     if subscriber.suspend(Reason::SequenceGap).is_err() {
                                         break 'live;
                                     }
@@ -627,14 +784,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 );
                                 suspended = true;
                                 if can_replay {
-                                    gap_batch = Some((
-                                        seq as u64,
-                                        frames.pop().expect("validated live payload"),
-                                    ));
+                                    live_events.push_gap_trigger(seq, frames);
                                 }
-                                break 'live_batch (Some(seq), true, last_seq);
+                                break 'live_batch (Some(seq), true, applied_seq);
                             }
-                            if subscriber.apply(seq as u64, &frames[2], false).is_err() {
+                            if subscriber.apply_next_batch(seq, &frames[2]).is_err() {
                                 if subscriber
                                     .invalidate(true, Reason::ValidationFailed)
                                     .is_err()
@@ -652,11 +806,11 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 }
                                 suspended = false;
                             }
-                            last_seq = seq;
+                            applied_seq = seq;
                             bootstrap = false;
                             replay_socket = None;
-                            allow_overlap = false;
-                            replayed.clear();
+                            check_live_duplicates = false;
+                            live_events.clear_fingerprints(topic.as_bytes());
                             debug!(source = %source_id, rank = dp_rank, seq, "kv_index live sequence advanced");
                             // A sustained publisher starves EAGAIN; yield so this task
                             // can't monopolize the runtime worker.
@@ -691,16 +845,17 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 if !can_replay {
                     // Loss fenced the advisory state. Start a new observation at
                     // this watermark without reconstructing past cache residency.
-                    last_seq = through.unwrap_or(-1);
+                    applied_seq = required_live_seq.unwrap_or(-1);
                     suspended = false;
                     continue;
                 }
-                last_seq = restart_from;
-                recovery_through = through;
+                applied_seq = resume_after_seq;
+                watermarks.required_live_seq = required_live_seq;
+                watermarks.highest_seen_replay_seq = None;
                 bootstrap = true;
                 next_catchup = tokio::time::Instant::now();
-                allow_overlap = overlap;
-                replayed.clear();
+                check_live_duplicates = check_replayed_duplicates;
+                live_events.clear_fingerprints(topic.as_bytes());
                 replay_socket = None;
             }
             if is_shutdown(&mut shutdown_rx) || !subscriber.active() {
