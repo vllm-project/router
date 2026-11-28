@@ -8,6 +8,69 @@ impl LayoutWorkerProvider {
 }
 
 #[test]
+fn observed_empty_rank_requires_the_same_current_lifecycle_grant() {
+    use crate::kv_index::source::test_support::full_binding;
+    use crate::kv_index::{RequestHashCache, RoutableTarget, TieredMatchProvider};
+    let active = Arc::new(AtomicBool::new(true));
+    let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, None));
+    let source = Arc::new(full_binding(
+        RoutableTarget {
+            instance_id: "<TEST_ENGINE_EMPTY_RANK>".into(),
+            dp_rank: 0,
+        },
+        1,
+    ));
+    source.begin_empty(0);
+    let provider = LayoutWorkerProvider {
+        indexes: HashMap::from_iter([(0, source.clone())]),
+        lifecycle: lifecycle.clone(),
+    };
+    let tokens = [1, 2, 3];
+    let observe = || {
+        provider.observed_matches_with_cache(
+            &tokens,
+            1,
+            None,
+            0,
+            &mut RequestHashCache::for_single_target(),
+        )
+    };
+    let known_empty = observe();
+    assert!(known_empty.available);
+    assert!(known_empty.matches.is_empty());
+    lifecycle.state.lock().trusted = false;
+    assert!(!observe().available);
+    lifecycle.state.lock().trusted = true;
+    lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
+    assert!(
+        !observe().available,
+        "expired metadata cannot turn empty into a verified zero"
+    );
+    lifecycle.state.lock().verified_at = Instant::now();
+    active.store(false, Ordering::Release);
+    assert!(!observe().available);
+
+    active.store(true, Ordering::Release);
+    let clock = std::cell::Cell::new(lifecycle.state.lock().verified_at);
+    let mut calls = 0;
+    let observation = lifecycle.read_rank(
+        &source,
+        Some(clock.get()),
+        || clock.get(),
+        || {
+            calls += 1;
+            clock.set(clock.get() + Duration::from_secs(6));
+            Some(Vec::<crate::kv_index::TierMatch>::new())
+        },
+    );
+    assert_eq!(calls, 1);
+    assert!(
+        observation.is_none(),
+        "a grant that expires during an empty lookup is unavailable"
+    );
+}
+
+#[test]
 fn only_confirming_probes_renew_trust() {
     assert!(probe_renews_trust(&StaticHybridMatch::Matches));
     assert!(probe_renews_trust(&StaticHybridMatch::Unavailable(

@@ -43,6 +43,52 @@ fn target() -> RoutableTarget {
 }
 
 #[test]
+fn lookup_availability_distinguishes_a_visible_empty_source_from_loss_and_retirement() {
+    use crate::kv_index::source::test_support::full_binding;
+    use crate::kv_index::TieredMatchProvider;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut source = full_binding(target(), 1);
+    let active = Arc::new(AtomicBool::new(true));
+    source.binding = Some(super::SourceLease::new(active.clone()));
+    let tokens = [1, 2, 3];
+    let observe = |source: &SourceBinding| {
+        source.observed_matches_with_cache(
+            &tokens,
+            1,
+            None,
+            0,
+            &mut RequestHashCache::for_single_target(),
+        )
+    };
+    assert!(
+        !observe(&source).available,
+        "an unpublished source is not a zero miss"
+    );
+    source.begin_empty(0);
+    let empty = observe(&source);
+    assert!(empty.available);
+    assert!(empty.matches.is_empty());
+    assert_eq!(
+        source.apply_batch(9, &event_batch(Vec::new())),
+        Err(SourceError::Sequence)
+    );
+    assert!(
+        !observe(&source).available,
+        "a sequence gap revokes the view"
+    );
+    source.begin_empty(0);
+    assert!(observe(&source).available);
+    source.binding.as_ref().unwrap().fence_hash();
+    assert!(!observe(&source).available, "a hash fence revokes the view");
+    source.binding = Some(super::SourceLease::new(active.clone()));
+    active.store(false, Ordering::Release);
+    assert!(
+        !observe(&source).available,
+        "retired leases cannot confirm an empty cache"
+    );
+}
+
+#[test]
 fn inferred_full_waits_for_root_evidence_after_a_replay_restart() {
     use crate::kv_index::source::test_support::{full_binding, full_store};
 

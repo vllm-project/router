@@ -1,9 +1,41 @@
 use axum::http::HeaderMap;
-use tracing::{field::Empty, info_span, Instrument, Span};
+use tracing::{field::Empty, info_span, instrument::WithSubscriber, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use url::Url;
 
 pub const TRACE_HEADER_NAMES: &[&str] = &["traceparent", "tracestate", "baggage"];
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keep pooled connection tasks from inheriting a request's span. The owned
+/// send is cancelled when its caller is dropped; ordinary reqwest errors and
+/// task panic payloads retain their original meaning.
+pub(crate) async fn send_request(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    if !crate::otel_trace::is_otel_enabled() {
+        return request.send().await;
+    }
+    // RequestBuilder::send also performs synchronous setup, so construct its
+    // future inside the task. Carry the dispatcher, without entering a span.
+    let mut task = AbortOnDrop(tokio::spawn(
+        async move { request.send().await }.with_current_subscriber(),
+    ));
+    match (&mut task.0).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // The handle is private. Normal caller cancellation drops this entire
+        // awaiter and aborts the task; cancellation while it is still alive is
+        // an unexpected runtime failure, not a fabricated reqwest error.
+        Err(error) => panic!("HTTP send task cancelled unexpectedly: {error}"),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClientRequestOptions<'a> {
@@ -23,9 +55,9 @@ impl PreparedClientRequest {
         let Self { request, span } = self;
 
         let response = if span.is_none() {
-            request.send().await
+            send_request(request).await
         } else {
-            request.send().instrument(span.clone()).await
+            send_request(request).instrument(span.clone()).await
         };
 
         match response {

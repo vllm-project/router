@@ -12,6 +12,7 @@ use crate::core::{
     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
     Worker, WorkerRegistry, WorkerResult, WorkerType,
 };
+use crate::kv_decision::{KvDecisionOutcome, KvDecisionReceipt, KvDecisionStage, KvDecisionTrace};
 use crate::policies::WorkerTokenInputs;
 use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
 use crate::routers::header_utils;
@@ -181,6 +182,7 @@ fn provisional_decode(
                 .occupancy(Stage::Decode)
         })?;
     Some(StageDecision {
+        trace: None,
         fallback_reason: None,
         credited_prefix_tokens: None,
         worker_index,
@@ -234,6 +236,7 @@ fn select_stage(
     policy: &dyn LoadBalancingPolicy,
     context: &PdRequestContext<'_>,
 ) -> Option<StageDecision> {
+    let decision_started = std::time::Instant::now();
     let policy_input = context.legacy_policy_input;
     let kv_aware = kv_aware_ops(policy).is_some();
     // Keep the caller slice order. Static pools pass registry registration
@@ -270,6 +273,7 @@ fn select_stage(
                 .get(&(stage, endpoints[index].clone()))
                 .is_some_and(|load| load.unknown_prefill_requests > 0)
         });
+    let mut prefill_fallback = "pool_estimate_unavailable";
     if let (Stage::Prefill, Some(kv), false) = (stage, kv_aware_ops(policy), unknown_backlog) {
         let inputs: Option<Vec<_>> = projected
             .iter()
@@ -317,6 +321,26 @@ fn select_stage(
                     "kv_aware", "prefill", outcome,
                 );
                 return Some(StageDecision {
+                    trace: Some(KvDecisionTrace::new(KvDecisionReceipt::new(
+                        KvDecisionStage::Prefill,
+                        KvDecisionOutcome::from_reason(input.fallback_reason.unwrap_or(
+                            if estimate.placement_verified && !estimate.lookup_available {
+                                "placement_unavailable"
+                            } else {
+                                outcome
+                            },
+                        )),
+                        selected_indices[picked],
+                        (estimate.placement_verified && estimate.lookup_available).then(|| {
+                            tokens
+                                .iter()
+                                .map(|ids| ids.len() as u64)
+                                .sum::<u64>()
+                                .saturating_sub(new_tokens)
+                        }),
+                        Some(new_tokens),
+                        decision_started,
+                    ))),
                     worker_index: selected_indices[picked],
                     endpoint: endpoints[selected_indices[picked]].clone(),
                     score: Some(costs[picked]),
@@ -341,6 +365,7 @@ fn select_stage(
                 stage = "prefill",
                 "pick_prefill refused candidates; using policy selection"
             );
+            prefill_fallback = "invalid_prefill_costs";
         }
     }
     let mut decode_prices_used = false;
@@ -414,6 +439,17 @@ fn select_stage(
             policy.select_worker_with_headers(&projected, policy_input, context.headers)?;
         (picked, None, None)
     };
+    let decision_outcome = if affinity_outcome == Some("sticky_hit") {
+        "sticky_hit"
+    } else if stage == Stage::Prefill {
+        "load_fallback"
+    } else {
+        match (decode_tokens_known, decode_prices_used) {
+            (true, true) => "context_tokens_marginal",
+            (true, false) => "context_tokens",
+            (false, _) => "occupancy_unknown_tokens",
+        }
+    };
     if kv_aware {
         let phase = if stage == Stage::Prefill {
             "prefill"
@@ -422,21 +458,11 @@ fn select_stage(
         };
         // Recorded once, here, for every KV-aware decision: what a Decode
         // decision ranked by is part of the answer, not a debugging detail.
-        let outcome = if affinity_outcome == Some("sticky_hit") {
-            "sticky_hit"
-        } else if stage == Stage::Prefill {
-            "load_fallback"
-        } else {
-            // Report what the selector actually used, not whether a table merely
-            // existed: a table that failed the completeness filter above fell back
-            // to occupancy even though prepared prices existed.
-            match (decode_tokens_known, decode_prices_used) {
-                (true, true) => "context_tokens_marginal",
-                (true, false) => "context_tokens",
-                (false, _) => "occupancy_unknown_tokens",
-            }
-        };
-        crate::metrics::RouterMetrics::record_prefix_routing_decision("kv_aware", phase, outcome);
+        crate::metrics::RouterMetrics::record_prefix_routing_decision(
+            "kv_aware",
+            phase,
+            decision_outcome,
+        );
     }
     // A held binding reference must never leak on a late selection failure:
     // release it before any bail-out below.
@@ -456,24 +482,31 @@ fn select_stage(
                 .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum())
         })
         .flatten();
-    Some(StageDecision {
-        fallback_reason: if stage == Stage::Prefill && kv_aware {
-            Some(if unknown_backlog {
-                "unknown_prefill_backlog"
-            } else {
-                projected
-                    .iter()
-                    .find_map(|worker| {
-                        context
-                            .prefill_inputs
-                            .and_then(|inputs| inputs.get(worker.base_url()))
-                            .and_then(|input| input.fallback_reason)
-                    })
-                    .unwrap_or("unverified_effective_tokens")
-            })
+    let fallback_reason = if stage == Stage::Prefill && kv_aware {
+        Some(if unknown_backlog {
+            "unknown_prefill_backlog"
         } else {
-            None
-        },
+            prefill_fallback
+        })
+    } else {
+        None
+    };
+    Some(StageDecision {
+        trace: kv_aware.then(|| {
+            KvDecisionTrace::new(KvDecisionReceipt::new(
+                if stage == Stage::Prefill {
+                    KvDecisionStage::Prefill
+                } else {
+                    KvDecisionStage::Decode
+                },
+                KvDecisionOutcome::from_reason(fallback_reason.unwrap_or(decision_outcome)),
+                worker_index,
+                None,
+                selected_tokens,
+                decision_started,
+            ))
+        }),
+        fallback_reason,
         credited_prefix_tokens: selected_tokens.map(|_| 0),
         worker_index,
         endpoint: endpoints[worker_index].clone(),
@@ -935,7 +968,7 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/start_profile", base_url);
-        match self.client.post(&url).send().await {
+        match crate::otel_http::send_request(self.client.post(&url)).await {
             Ok(res) if res.status().is_success() => {
                 info!("Started profiling on {}", base_url);
             }
@@ -958,7 +991,7 @@ impl PdRouterBase {
         let (base_url, _) = super::dp_utils::parse_worker_url(worker_url);
 
         let url = format!("{}/stop_profile", base_url);
-        match self.client.post(&url).send().await {
+        match crate::otel_http::send_request(self.client.post(&url)).await {
             Ok(res) if res.status().is_success() => {
                 info!("Stopped profiling on {}", base_url);
             }
@@ -2828,6 +2861,101 @@ mod admission_tests {
 
     #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
+    fn incomplete_pool_estimates_do_not_inherit_another_candidates_identity_reason() {
+        let p = pool("pool-observation", 2);
+        let d = pool("decode-observation", 1);
+        let tokens: Vec<_> = (0..33).collect();
+        let policy = resident_prefix_policy(&p, &tokens);
+        let (mut inputs, _) = token_inputs(&p, &tokens, &policy);
+        let first = inputs.get_mut(p[0].base_url()).unwrap();
+        first.allow_credit = false;
+        first.fallback_reason = Some("unverified_model");
+        let missing = inputs.get_mut(p[1].base_url()).unwrap();
+        missing.prompts = None;
+        missing.fallback_reason = Some("preparation_unavailable");
+        let prompts = inputs[p[0].base_url()].prompts.as_ref().unwrap();
+        let prices = kv_aware_ops(&policy)
+            .unwrap()
+            .prepare_prefill_prices(
+                &[(p[0].as_ref(), prompts.as_ref(), false)],
+                &mut crate::policies::PromptHashes::new(),
+            )
+            .unwrap();
+        let validated = prices.validate(&p);
+        let mut request_context = context();
+        request_context.prefill_inputs = Some(&inputs);
+        request_context.prefill_pricing = Some(StagePricing::Validated(&validated));
+        let selected = select_pd_pair(
+            &Loads::new(),
+            &p,
+            &d,
+            &policy,
+            &policy,
+            &request_context,
+            true,
+        )
+        .unwrap();
+        assert_eq!(selected.prefill.worker_index, 0, "occupancy is unchanged");
+        assert_eq!(
+            selected.prefill.fallback_reason,
+            Some("pool_estimate_unavailable")
+        );
+        let receipt = selected.prefill.trace.unwrap().receipt;
+        assert_eq!(receipt.outcome, KvDecisionOutcome::PoolEstimateUnavailable);
+        assert_eq!(receipt.credited_tokens, None);
+        assert_eq!(receipt.new_prefill_tokens, Some(33));
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[test]
+    fn pd_receipt_distinguishes_lookup_availability_from_verified_identity() {
+        let p = pool("single-observation", 1);
+        let d = pool("decode-observation", 1);
+        let tokens: Vec<_> = (0..33).collect();
+        let policy = prefix_policy_with_blocks(&p, &tokens, 0);
+        let observe = || {
+            let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+            let validated = prices.validate(&p);
+            let mut request_context = context();
+            request_context.prefill_inputs = Some(&inputs);
+            request_context.prefill_pricing = Some(StagePricing::Validated(&validated));
+            select_pd_pair(
+                &Loads::new(),
+                &p,
+                &d,
+                &policy,
+                &policy,
+                &request_context,
+                true,
+            )
+            .unwrap()
+            .prefill
+            .trace
+            .unwrap()
+            .receipt
+        };
+        let known = observe();
+        assert_eq!(known.credited_tokens, Some(0));
+        assert_eq!(known.outcome, KvDecisionOutcome::NoReusablePrefix);
+        struct UnknownProvider;
+        impl crate::policies::TieredMatchProvider for UnknownProvider {}
+        policy.register_target_with_cache_identity(
+            p[0].url(),
+            policy.target_for_worker(p[0].as_ref()),
+            crate::kv_index::CacheKey {
+                model: "model".into(),
+                block_size: 16,
+            },
+            Arc::new(UnknownProvider),
+        );
+        let unknown = observe();
+        assert_eq!(unknown.credited_tokens, None);
+        assert_eq!(unknown.new_prefill_tokens, Some(33));
+        assert_eq!(unknown.outcome, KvDecisionOutcome::PlacementUnavailable);
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[test]
     fn pd_prefix_credit_changes_placement_and_charges_exact_attempt_work() {
         let manager = Arc::new(PdLoadManager::default());
         let p = pool("p", 2);
@@ -2979,6 +3107,7 @@ mod admission_tests {
                         let work = context.prefill_work(workers[0].url()).unwrap();
                         assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
                         assert!(work.placement_verified);
+                        assert_eq!(work.lookup_available, expected_tokens[0] == 1);
                         select_pd_pair(
                             loads,
                             &workers,
@@ -2994,6 +3123,10 @@ mod admission_tests {
             let expected = expected_tokens[expected_worker];
             assert_eq!(selection.prefill.worker_index, expected_worker);
             assert_eq!(selection.prefill.new_prefill_tokens, Some(expected));
+            let receipt = selection.prefill.trace.as_ref().unwrap().receipt;
+            assert_eq!(receipt.new_prefill_tokens, Some(expected));
+            assert_eq!(receipt.target_index, expected_worker);
+            assert_eq!(receipt.credited_tokens, Some(33 - expected));
             assert_eq!(
                 sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
                 expected
@@ -3229,7 +3362,7 @@ mod admission_tests {
         let p = pool("p", 1);
         let d = pool("d", 2);
         let policy = KvAwarePolicy::default();
-        let (_, attempt) = manager
+        let (selection, attempt) = manager
             .admit_deferred(|loads| {
                 select_pd_pair(loads, &p, &d, &policy, &policy, &context(), false)
             })
@@ -3238,18 +3371,31 @@ mod admission_tests {
         // Nothing is charged for the provisional decode pick.
         assert!(attempt.decode_pending_commit());
         assert!(attempt.decode_endpoint().is_none());
+        assert_eq!(selection.decode.worker_index, 0);
+        assert!(
+            selection.decode.trace.is_none(),
+            "the provisional pick has no receipt"
+        );
         assert!(manager
             .snapshot()
             .keys()
             .all(|(stage, _)| *stage == Stage::Prefill));
 
         // The commitment sees the live snapshot and charges exactly once.
+        d[0].set_healthy(false);
         let decision = manager
             .commit_decode(&attempt, |loads| {
                 select_decode_stage(loads, &d, &policy, &context())
             })
             .unwrap();
         assert!(!attempt.decode_pending_commit());
+        assert_eq!(
+            decision.worker_index, 1,
+            "the provisional worker left before commit"
+        );
+        let receipt = decision.trace.as_ref().unwrap().receipt;
+        assert_eq!(receipt.stage, KvDecisionStage::Decode);
+        assert_eq!(receipt.target_index, decision.worker_index);
         assert_eq!(attempt.decode_endpoint(), Some(decision.endpoint.clone()));
         let pending = sample(&manager, Stage::Decode, &decision.endpoint);
         // The placeholder had no known prompt length.

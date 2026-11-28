@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
+hyper = { version = "=1.11.1", default-features = false }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = [
     "trace",
@@ -215,6 +216,10 @@ path = "tests/rust/grpc_vs_http_e2e.rs"
 [[test]]
 name = "otel_config_test"
 path = "tests/rust/otel_config_test.rs"
+
+[[test]]
+name = "kv_decision_trace_test"
+path = "tests/rust/kv_decision_trace_test.rs"
 
 [[test]]
 name = "otel_disabled_path_test"

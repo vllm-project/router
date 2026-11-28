@@ -15,10 +15,11 @@ use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
+use crate::kv_decision::{KvDecisionOutcome, KvDecisionReceipt, KvDecisionStage, KvDecisionTrace};
 use crate::kv_index::request_hash::ImagePrefix;
 use crate::kv_index::{
-    CacheKey, PlacementEvidence, PlacementPinError, PromptKey, RequestHashCache, RoutableTarget,
-    SharedPrefixLookup, SourceReadGuard, StorageTier, TierMatch, WorkerKvInfo,
+    CacheKey, ObservedMatches, PlacementEvidence, PlacementPinError, PromptKey, RequestHashCache,
+    RoutableTarget, SharedPrefixLookup, SourceReadGuard, StorageTier, TierMatch, WorkerKvInfo,
 };
 use crate::request_identity::StableIdentity;
 
@@ -94,6 +95,8 @@ pub enum KvRequestTokens<'a> {
 pub(crate) struct QualifiedKvInput<'a> {
     pub(crate) tokens: KvRequestTokens<'a>,
     pub(crate) eligibility: Option<&'a [bool]>,
+    /// Preparation fact for observation only; eligibility still governs credit.
+    pub(crate) cache_read_fallback: Option<&'static str>,
 }
 
 impl QualifiedKvInput<'_> {
@@ -167,6 +170,9 @@ pub struct PrefillWorkEstimate {
     /// The candidate was eligible for KV credit at lookup. The commit check can
     /// fall back to full input while this remains true.
     pub placement_verified: bool,
+    /// Whether every contributing query had a usable view and its credit
+    /// survived the commit check. This does not describe recovery state.
+    pub lookup_available: bool,
 }
 
 /// Marginal Decode context from one placement snapshot: what the request adds
@@ -187,6 +193,7 @@ struct PdWorkPrice {
     input_tokens: u64,
     target: RoutableTarget,
     identity_verified: bool,
+    lookup_available: bool,
 }
 
 impl PdWorkPrice {
@@ -194,6 +201,7 @@ impl PdWorkPrice {
         PrefillWorkEstimate {
             new_prefill_tokens,
             placement_verified: self.identity_verified,
+            lookup_available: self.lookup_available,
         }
     }
 }
@@ -223,7 +231,11 @@ impl ValidatedWorkPrices<'_> {
 
     pub(crate) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
         let price = self.prices.workers.get(worker_url)?;
-        Some(price.prefill_estimate(*self.tokens.get(worker_url)?))
+        let tokens = *self.tokens.get(worker_url)?;
+        let mut estimate = price.prefill_estimate(tokens);
+        // A rejected pin charges full input, but does not prove a cache miss.
+        estimate.lookup_available &= tokens == price.additional_tokens;
+        Some(estimate)
     }
 }
 
@@ -733,6 +745,7 @@ pub struct KvSelectionReceipt {
     pub new_prefill_tokens: u64,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
+    pub trace: KvDecisionTrace,
 }
 
 /// Fixed bound of the affinity table shared by every policy instance.
@@ -1188,7 +1201,7 @@ impl std::hash::Hash for ProviderIdentity {
 #[derive(Default)]
 pub struct PromptHashes<'a> {
     // Each stage scores a single adapter identity for the entire request.
-    matches: HashMap<(MatchScope, PromptKey<'a>), Vec<TierMatch>, foldhash::fast::RandomState>,
+    matches: HashMap<(MatchScope, PromptKey<'a>), ObservedMatches, foldhash::fast::RandomState>,
     hashes: RequestHashCache<'a>,
 }
 
@@ -1235,6 +1248,7 @@ struct SelectionPlan {
     healthy: Vec<usize>,
     bindings: Vec<WorkerBinding>,
     grouped: Vec<Vec<TierMatch>>,
+    lookup_available: Vec<bool>,
     input_tokens: Vec<usize>,
     prefill_tokens: Vec<Option<u64>>,
     placement: Vec<PlacementEvidence>,
@@ -1252,6 +1266,7 @@ impl SelectionPlan {
                     crate::metrics::RouterMetrics::record_kv_placement_lookup("credit_revoked");
                     self.grouped[position].clear();
                     self.prefill_tokens[position] = None;
+                    self.lookup_available[position] = false;
                 }
             }
         }
@@ -1319,13 +1334,14 @@ impl KvAwarePolicy {
             }
             let mut input_tokens = 0u64;
             let mut additional_tokens = 0u64;
+            let mut lookup_available = identity_verified && !prompts.is_empty();
             for tokens in prompts {
                 let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
                 input_tokens = input_tokens.saturating_add(context);
                 if !identity_verified {
                     continue;
                 }
-                let matches = Self::cached_matches(
+                let (matches, available) = Self::cached_matches(
                     hashes,
                     &mut lookups,
                     &binding,
@@ -1339,6 +1355,7 @@ impl KvAwarePolicy {
                             })
                     },
                 );
+                lookup_available &= available;
                 let candidate = CandidateView {
                     target: &binding.target,
                     matches: &matches,
@@ -1379,6 +1396,7 @@ impl KvAwarePolicy {
                 input_tokens,
                 target: binding.target.clone(),
                 identity_verified,
+                lookup_available,
             }
         })
     }
@@ -1563,25 +1581,26 @@ impl KvAwarePolicy {
         lora_name: Option<&str>,
         fallback: Option<&'static str>,
         single_use: impl FnOnce() -> bool,
-    ) -> Cow<'a, [TierMatch]> {
+    ) -> (Cow<'a, [TierMatch]>, bool) {
         let tokens = cache.hashes.canonical_prompt(tokens);
         let scoped = binding.matches.target_scoped();
         let mut lookup = |hashes: &mut RequestHashCache<'tokens>| {
             if let Some(reason) = fallback {
                 lookups.record(reason);
-                return Vec::new();
+                return ObservedMatches::default();
             }
             if tokens.is_empty() {
-                return Vec::new();
+                return ObservedMatches::default();
             }
             let evidence_start = hashes.placement.as_ref().map(Vec::len);
-            let mut hits = binding.matches.matches_with_cache(
+            let mut observed = binding.matches.observed_matches_with_cache(
                 tokens,
                 binding.block_size,
                 lora_name,
                 binding.target.dp_rank,
                 hashes,
             );
+            let hits = &mut observed.matches;
             let hit_count = hits.len();
             if let Some(start) = evidence_start {
                 let evidence = hashes
@@ -1591,6 +1610,9 @@ impl KvAwarePolicy {
                     .unwrap_or_default();
                 // Each lookup must prove its own hits before they enter the memo.
                 hits.retain(|hit| evidence.iter().any(|proof| proof.target() == &hit.target));
+                if hit_count != hits.len() {
+                    observed.available = false;
+                }
             }
             lookups.record(if hit_count != hits.len() {
                 "unevidenced"
@@ -1604,10 +1626,11 @@ impl KvAwarePolicy {
             if scoped {
                 hits.retain(|hit| hit.target == binding.target);
             }
-            hits
+            observed
         };
         if scoped && binding.generation != 0 && single_use() {
-            return Cow::Owned(lookup(&mut cache.hashes));
+            let observed = lookup(&mut cache.hashes);
+            return (Cow::Owned(observed.matches), observed.available);
         }
         let scope = if !scoped {
             MatchScope::Shared(
@@ -1619,18 +1642,23 @@ impl KvAwarePolicy {
         } else {
             MatchScope::Unregistered(binding.target.clone())
         };
-        let hits = cache
+        let observed = cache
             .matches
             .entry((scope, PromptKey(tokens)))
             .or_insert_with(|| lookup(&mut cache.hashes));
-        if scoped || hits.is_empty() {
-            Cow::Borrowed(hits)
+        if scoped || observed.matches.is_empty() {
+            (Cow::Borrowed(&observed.matches), observed.available)
         } else {
-            Cow::Owned(
-                hits.iter()
-                    .filter(|hit| hit.target == binding.target)
-                    .cloned()
-                    .collect(),
+            (
+                Cow::Owned(
+                    observed
+                        .matches
+                        .iter()
+                        .filter(|hit| hit.target == binding.target)
+                        .cloned()
+                        .collect(),
+                ),
+                observed.available,
             )
         }
     }
@@ -1658,6 +1686,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens: KvRequestTokens::Shared(token_ids),
                 eligibility: None,
+                cache_read_fallback: None,
             },
             lora_name,
             cache_salt,
@@ -1709,6 +1738,7 @@ impl KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility: None,
+                cache_read_fallback: None,
             },
             lora_name,
             cache_salt,
@@ -1726,6 +1756,7 @@ impl KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<KvSelectionReceipt> {
+        let decision_started = Instant::now();
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         let reserve_prefill = self.slot_manager.is_some();
         let mut pin_failed = false;
@@ -1750,6 +1781,7 @@ impl KvAwarePolicy {
                     healthy,
                     bindings,
                     grouped: vec![Vec::new(); count],
+                    lookup_available: vec![false; count],
                     input_tokens: input_tokens
                         .into_iter()
                         .map(|tokens| tokens.unwrap_or(max_known_input))
@@ -1887,11 +1919,55 @@ impl KvAwarePolicy {
             if let Some(worker) = workers.get(worker_index) {
                 worker.increment_load();
             }
+            drop(guard);
+            let known_input = input
+                .tokens
+                .prompts_for(workers[worker_index].as_ref())
+                .input_tokens();
+            let observation_outcome = if let Some(reason) = input.cache_read_fallback {
+                reason
+            } else if attempt == 3 {
+                if pin_failed {
+                    "placement_pin_failed"
+                } else {
+                    "registration_churn"
+                }
+            } else if known_input.is_none_or(|tokens| tokens == 0) {
+                "missing_tokens"
+            } else if let Some(reason) = Self::credit_fallback(cache_salt, true) {
+                reason
+            } else if !input.allows_credit(worker_index, workers.len())
+                || plan.bindings[position].cache_key.is_none()
+            {
+                "unverified_identity"
+            } else if !plan.lookup_available[position] {
+                "placement_unavailable"
+            } else {
+                outcome
+            };
+            let credit_known = input.cache_read_fallback.is_none()
+                && attempt != 3
+                && known_input.is_some()
+                && Self::credit_fallback(cache_salt, true).is_none()
+                && input.allows_credit(worker_index, workers.len())
+                && plan.bindings[position].cache_key.is_some()
+                && plan.lookup_available[position];
+            let trace = KvDecisionTrace::new(KvDecisionReceipt::new(
+                KvDecisionStage::Regular,
+                KvDecisionOutcome::from_reason(observation_outcome),
+                worker_index,
+                known_input
+                    .filter(|_| credit_known)
+                    .map(|tokens| (tokens as u64).saturating_sub(new_prefill_tokens)),
+                known_input.map(|_| new_prefill_tokens),
+                decision_started,
+            ));
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
                 decision,
                 slot,
+                trace,
             });
         }
         None
@@ -2059,6 +2135,7 @@ impl KvAwarePolicy {
                 healthy,
                 bindings,
                 grouped: vec![Vec::new(); size],
+                lookup_available: vec![false; size],
                 input_tokens: vec![tokens.len(); size],
                 prefill_tokens: vec![None; size],
                 placement: Vec::new(),
@@ -2067,20 +2144,23 @@ impl KvAwarePolicy {
         }
         let mut unique = query_cache.hashes.single_target.then_some(true);
         let mut grouped = Vec::with_capacity(bindings.len());
+        let mut lookup_available = Vec::with_capacity(bindings.len());
         let mut input_tokens = Vec::with_capacity(bindings.len());
         let mut prefill_tokens = Vec::with_capacity(bindings.len());
         for ((binding, prompts), &worker_index) in bindings.iter().zip(prompts).zip(&healthy) {
             let mut total_input = 0usize;
             let mut total_prefill = 0u64;
             let mut single_matches = Vec::new();
+            let mut available = has_tokens && !prompts.is_empty();
             if has_tokens {
                 for ids in prompts.iter() {
                     if !input.allows_credit(worker_index, workers.len()) {
+                        available = false;
                         total_input = total_input.saturating_add(ids.len());
                         total_prefill = total_prefill.saturating_add(ids.len() as u64);
                         continue;
                     }
-                    let matches = Self::cached_matches(
+                    let (matches, lookup_known) = Self::cached_matches(
                         &mut query_cache,
                         &mut lookups,
                         binding,
@@ -2094,6 +2174,7 @@ impl KvAwarePolicy {
                                 })
                         },
                     );
+                    available &= lookup_known;
                     total_input = total_input.saturating_add(ids.len());
                     if prompts.len() == 1 {
                         single_matches = matches.into_owned();
@@ -2119,6 +2200,7 @@ impl KvAwarePolicy {
                 total_input = known_input_tokens;
             }
             grouped.push(single_matches);
+            lookup_available.push(available);
             input_tokens.push(total_input);
             prefill_tokens.push((has_tokens && prompts.len() > 1).then_some(total_prefill));
         }
@@ -2126,6 +2208,7 @@ impl KvAwarePolicy {
             healthy,
             bindings,
             grouped,
+            lookup_available,
             input_tokens,
             prefill_tokens,
             placement: query_cache.hashes.placement.unwrap_or_default(),
@@ -2301,6 +2384,31 @@ impl Default for KvAwarePolicy {
 }
 
 impl LoadBalancingPolicy for KvAwarePolicy {
+    fn select_worker_with_observation(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        _request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+        stage: KvDecisionStage,
+    ) -> Option<(usize, Option<KvDecisionTrace>)> {
+        let started = Instant::now();
+        let (index, _) = self.select_worker_pure(workers, None, None, None)?;
+        crate::metrics::RouterMetrics::record_prefix_routing_decision(
+            "kv_aware",
+            stage.as_str(),
+            "missing_tokens",
+        );
+        let trace = KvDecisionTrace::new(KvDecisionReceipt::new(
+            stage,
+            KvDecisionOutcome::MissingTokens,
+            index,
+            None,
+            None,
+            started,
+        ));
+        Some((index, Some(trace)))
+    }
+
     fn select_worker_with_headers(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2611,6 +2719,7 @@ impl KvAwareOps for KvAwarePolicy {
             QualifiedKvInput {
                 tokens,
                 eligibility,
+                cache_read_fallback: None,
             },
             lora_name,
             cache_salt,
@@ -2676,6 +2785,226 @@ mod tests {
             }
             hits
         }
+    }
+
+    #[test]
+    fn observed_pure_selection_runs_once_without_reserving_load() {
+        struct Backlog;
+        impl LoadProvider for Backlog {
+            fn sample(&self, _: &RoutableTarget) -> LoadSample {
+                LoadSample {
+                    active_prefill_tokens: 1,
+                    active_requests: 0,
+                }
+            }
+        }
+        #[derive(Debug)]
+        struct CountPicker(Arc<AtomicUsize>);
+        impl Picker for CountPicker {
+            fn pick(&self, costs: &[f64]) -> Option<usize> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                (!costs.is_empty()).then_some(costs.len() - 1)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let policy = KvAwarePolicy::with_components(
+            Arc::new(EmptyMatchProvider),
+            Arc::new(Backlog),
+            vec![Arc::new(MultiplicativeScorer)],
+            Arc::new(CountPicker(calls.clone())),
+            CostParams::default(),
+        );
+        let workers = registered_worker_pair(&policy);
+        let (index, trace) = policy
+            .select_worker_with_observation(&workers, None, None, KvDecisionStage::Prefill)
+            .unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(workers.iter().all(|worker| worker.load() == 0));
+        let receipt = trace.unwrap().receipt;
+        assert_eq!(receipt.target_index, index);
+        assert_eq!(receipt.stage, KvDecisionStage::Prefill);
+        assert_eq!(receipt.outcome, KvDecisionOutcome::MissingTokens);
+        assert_eq!(receipt.credited_tokens, None);
+    }
+
+    #[test]
+    fn admitted_observations_keep_unknown_credit_distinct_from_a_zero_match() {
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let receipt = policy
+            .select_worker_with_receipt(&workers, None, None, None, None, &[])
+            .unwrap();
+        assert_eq!(
+            receipt.trace.receipt.outcome,
+            KvDecisionOutcome::MissingTokens
+        );
+        assert_eq!(receipt.trace.receipt.credited_tokens, None);
+        release_receipt(&workers, &receipt);
+        let receipt = policy
+            .select_worker_with_receipt(
+                &workers,
+                Some(&[1, 2, 3, 4]),
+                None,
+                Some("salt"),
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(receipt.trace.receipt.outcome, KvDecisionOutcome::CacheSalt);
+        assert_eq!(receipt.trace.receipt.credited_tokens, None);
+        release_receipt(&workers, &receipt);
+        for (i, worker) in workers.iter().enumerate() {
+            register_full(
+                &policy,
+                worker.url(),
+                target(&format!("empty-{i}"), 0),
+                "model",
+                1,
+            );
+        }
+        let receipt = policy
+            .select_worker_with_receipt(&workers[..1], Some(&[1, 2, 3, 4]), None, None, None, &[])
+            .unwrap();
+        assert_eq!(
+            receipt.trace.receipt.outcome,
+            KvDecisionOutcome::NoReusablePrefix
+        );
+        assert_eq!(receipt.trace.receipt.credited_tokens, Some(0));
+        assert_eq!(receipt.trace.receipt.new_prefill_tokens, Some(4));
+        assert_eq!(receipt.trace.receipt.target_index, receipt.worker_index);
+        release_receipt(&workers, &receipt);
+    }
+
+    #[test]
+    fn lookup_observation_memo_keeps_availability_without_requerying() {
+        struct ChangingProvider(AtomicUsize);
+        impl TieredMatchProvider for ChangingProvider {
+            fn observed_matches_with_cache<'a>(
+                &self,
+                _: &'a [u32],
+                _: u32,
+                _: Option<&str>,
+                _: u32,
+                _: &mut RequestHashCache<'a>,
+            ) -> ObservedMatches {
+                ObservedMatches {
+                    matches: Vec::new(),
+                    available: self.0.fetch_add(1, Ordering::Relaxed) == 0,
+                }
+            }
+        }
+        let provider = Arc::new(ChangingProvider(AtomicUsize::new(0)));
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        policy.register_target_with_cache_identity(
+            workers[0].url(),
+            target("observed", 0),
+            CacheKey {
+                model: "m".into(),
+                block_size: 1,
+            },
+            provider.clone(),
+        );
+        let binding = policy.binding_for_worker(workers[0].as_ref());
+        let tokens = [1, 2, 3];
+        let mut cache = PromptHashes::new();
+        let mut lookups = crate::metrics::PlacementLookups::default();
+        for _ in 0..2 {
+            let (hits, available) = KvAwarePolicy::cached_matches(
+                &mut cache,
+                &mut lookups,
+                &binding,
+                &tokens,
+                None,
+                None,
+                || false,
+            );
+            assert!(hits.is_empty());
+            assert!(available);
+        }
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+        cache.set_stage_targets(&[(workers[0].as_ref(), &[tokens.to_vec()], true)], false);
+        let (_, available) = KvAwarePolicy::cached_matches(
+            &mut cache,
+            &mut lookups,
+            &binding,
+            &tokens,
+            None,
+            None,
+            || false,
+        );
+        assert!(!available);
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_legacy_provider_cannot_certify_an_empty_lookup() {
+        struct LegacyProvider(AtomicUsize);
+        impl TieredMatchProvider for LegacyProvider {
+            fn matches(&self, _: &[u32], _: u32, _: Option<&str>, _: u32) -> Vec<TierMatch> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+        }
+        let provider = Arc::new(LegacyProvider(AtomicUsize::new(0)));
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        policy.register_target_with_cache_identity(
+            workers[0].url(),
+            target("legacy", 0),
+            CacheKey {
+                model: "m".into(),
+                block_size: 1,
+            },
+            provider.clone(),
+        );
+        let receipt = policy
+            .select_worker_with_receipt(&workers[..1], Some(&[1, 2, 3]), None, None, None, &[])
+            .unwrap();
+        assert_eq!(receipt.new_prefill_tokens, 3);
+        assert_eq!(receipt.trace.receipt.credited_tokens, None);
+        assert_eq!(
+            receipt.trace.receipt.outcome,
+            KvDecisionOutcome::PlacementUnavailable
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+        release_receipt(&workers, &receipt);
+        let estimates = policy.estimate_prefill_work(
+            &[(workers[0].as_ref(), &[vec![1, 2, 3]], true)],
+            &mut PromptHashes::new(),
+        );
+        assert!(estimates[0].placement_verified);
+        assert!(!estimates[0].lookup_available);
+        assert_eq!(estimates[0].new_prefill_tokens, 3);
+    }
+
+    #[test]
+    fn replaying_source_keeps_identity_and_work_but_withholds_observed_credit() {
+        let policy = KvAwarePolicy::default();
+        let workers = registered_worker_pair(&policy);
+        let source = register_full(&policy, workers[0].url(), target("replaying", 0), "m", 1);
+        let tokens = [1, 2, 3];
+        let prompts = [tokens.to_vec()];
+        let inputs = [(workers[0].as_ref(), &prompts[..], true)];
+        let known = policy.estimate_prefill_work(&inputs, &mut PromptHashes::new())[0];
+        assert!(known.placement_verified && known.lookup_available);
+        let stream = crate::kv_index::EventStream::new(source);
+        let _lease = stream.begin_replay().unwrap();
+        let unknown = policy.estimate_prefill_work(&inputs, &mut PromptHashes::new())[0];
+        assert!(unknown.placement_verified);
+        assert!(!unknown.lookup_available);
+        assert_eq!(known.new_prefill_tokens, unknown.new_prefill_tokens);
+        let selected = policy
+            .select_worker_with_receipt(&workers[..1], Some(&tokens), None, None, None, &[])
+            .unwrap();
+        assert_eq!(selected.new_prefill_tokens, 3);
+        assert_eq!(selected.trace.receipt.credited_tokens, None);
+        assert_eq!(
+            selected.trace.receipt.outcome,
+            KvDecisionOutcome::PlacementUnavailable
+        );
+        release_receipt(&workers, &selected);
     }
 
     #[test]
@@ -2827,6 +3156,7 @@ mod tests {
                     QualifiedKvInput {
                         tokens: KvRequestTokens::PerWorker(inputs),
                         eligibility: None,
+                        cache_read_fallback: None,
                     },
                     None,
                     None,
@@ -3057,6 +3387,7 @@ mod tests {
                         QualifiedKvInput {
                             tokens: KvRequestTokens::Shared(Some(&ids)),
                             eligibility: Some(&[allowed]),
+                            cache_read_fallback: None,
                         },
                         None,
                         None,
@@ -3136,6 +3467,7 @@ mod tests {
                     QualifiedKvInput {
                         tokens: KvRequestTokens::Shared(Some(&ids)),
                         eligibility: None,
+                        cache_read_fallback: None,
                     },
                     None,
                     None,
@@ -3273,6 +3605,7 @@ mod tests {
                             QualifiedKvInput {
                                 tokens: KvRequestTokens::Shared(Some(&ids)),
                                 eligibility: Some(&mask),
+                                cache_read_fallback: None,
                             },
                             None,
                             None,
@@ -4949,6 +5282,21 @@ mod tests {
                 self.index
                     .matches_with_cache(tokens, block_size, lora, rank, cache)
             }
+
+            fn observed_matches_with_cache<'a>(
+                &self,
+                tokens: &'a [u32],
+                block_size: u32,
+                lora: Option<&str>,
+                rank: u32,
+                cache: &mut RequestHashCache<'a>,
+            ) -> ObservedMatches {
+                if let Some(action) = self.before_lookup.lock().as_mut() {
+                    action();
+                }
+                self.index
+                    .observed_matches_with_cache(tokens, block_size, lora, rank, cache)
+            }
         }
 
         struct RevokingLoad {
@@ -5015,6 +5363,19 @@ mod tests {
                 .unwrap();
             assert_eq!(receipt.worker_index, expected_worker);
             assert_eq!(receipt.new_prefill_tokens, expected_prefill);
+            assert_eq!(receipt.trace.receipt.target_index, expected_worker);
+            assert_eq!(
+                receipt.trace.receipt.new_prefill_tokens,
+                Some(expected_prefill)
+            );
+            let input_tokens = tokens
+                .prompts_for(workers[expected_worker].as_ref())
+                .input_tokens()
+                .unwrap() as u64;
+            assert_eq!(
+                receipt.trace.receipt.credited_tokens,
+                (expected_prefill < input_tokens).then_some(input_tokens - expected_prefill)
+            );
             assert_eq!(
                 manager
                     .sample(&targets[expected_worker])
@@ -5027,6 +5388,7 @@ mod tests {
                 LoadSample::default()
             );
             assert_eq!(workers[expected_worker].load(), 0);
+            receipt.trace.receipt
         };
 
         let mut second_prompt = prompt;
@@ -5076,7 +5438,8 @@ mod tests {
         // The existing final attempt reserves full input without a KV query.
         *load.after_lookup.lock() = peer.before_lookup.lock().take();
         let pin_failure = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        metrics::with_local_recorder(&pin_failure, || select(single_tokens, 0, 33));
+        let receipt = metrics::with_local_recorder(&pin_failure, || select(single_tokens, 0, 33));
+        assert_eq!(receipt.outcome, KvDecisionOutcome::PlacementPinFailed);
         let rendered = pin_failure.handle().render();
         assert!(rendered
             .contains("vllm_router_kv_placement_lookups_total{result=\"credit_pin_revoked\"} 3"));

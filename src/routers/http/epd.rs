@@ -489,7 +489,7 @@ async fn encode_group(
     }
     let request = request.json(&payload);
     drop(payload);
-    let response = request.send().await.map_err(|e| {
+    let response = crate::otel_http::send_request(request).await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             format!("Encoder request failed: {e}"),

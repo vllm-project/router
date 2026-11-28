@@ -14,6 +14,13 @@ use std::sync::Arc;
 use foldhash::fast::RandomState;
 use smallvec::SmallVec;
 
+/// Lookup availability is independent of source identity and recovery state.
+#[derive(Clone, Debug, Default)]
+pub struct ObservedMatches {
+    pub matches: Vec<TierMatch>,
+    pub available: bool,
+}
+
 /// Read-only placement provider for the routing policy.
 ///
 /// Hashes prompts using the verified source contract and reports the prefix
@@ -25,6 +32,22 @@ use smallvec::SmallVec;
 /// To retain credit, forward `matches_with_cache` and its cache to the
 /// source provider that produced the hit.
 pub trait TieredMatchProvider: Send + Sync {
+    /// Observe the same query. Existing providers conservatively leave
+    /// availability unknown, including when their result is empty.
+    #[doc(hidden)]
+    fn observed_matches_with_cache<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+        cache: &mut RequestHashCache<'a>,
+    ) -> ObservedMatches {
+        ObservedMatches {
+            matches: self.matches_with_cache(tokens, block_size, lora_name, dp_rank, cache),
+            available: false,
+        }
+    }
     /// Match the prompt using the provider's complete restore rules.
     fn matches(
         &self,
@@ -219,6 +242,22 @@ impl crate::policies::TieredMatchProvider for SourceBinding {
         self.lookup_placement(tokens, block_size, lora_name, dp_rank, cache)
             .map_or_else(Vec::new, |hit| hit.publish(self, cache))
     }
+
+    fn observed_matches_with_cache<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+        cache: &mut RequestHashCache<'a>,
+    ) -> ObservedMatches {
+        let (hit, available) =
+            self.lookup_observed_placement(tokens, block_size, lora_name, dp_rank, cache);
+        ObservedMatches {
+            matches: hit.map_or_else(Vec::new, |hit| hit.publish(self, cache)),
+            available,
+        }
+    }
 }
 
 impl SourceBinding {
@@ -230,16 +269,33 @@ impl SourceBinding {
         dp_rank: u32,
         cache: &mut RequestHashCache<'a>,
     ) -> Option<PlacementMatch> {
+        self.lookup_observed_placement(tokens, block_size, lora_name, dp_rank, cache)
+            .0
+    }
+
+    pub(in crate::kv_index) fn lookup_observed_placement<'a>(
+        &self,
+        tokens: &'a [u32],
+        block_size: u32,
+        lora_name: Option<&str>,
+        dp_rank: u32,
+        cache: &mut RequestHashCache<'a>,
+    ) -> (Option<PlacementMatch>, bool) {
         // Events, ownership and history are bound to one rank. A hit computed
         // from another rank's stream is never evidence for this one.
         let prompt_cap = self.reusable_prompt_cap(tokens.len());
         if block_size == 0 || dp_rank != self.target.dp_rank || prompt_cap < block_size as usize {
-            return None;
+            return (None, false);
         }
         if self.plain_attention_match() {
-            let (mut claims, snapshot) =
-                self.page_snapshot(lora_name, tokens, cache.stop_at_gap, cache)?;
-            let group_claims = claims.pop()?;
+            let (view, available) =
+                self.observed_page_snapshot(lora_name, tokens, cache.stop_at_gap, cache);
+            let Some((mut claims, snapshot)) = view else {
+                return (None, available);
+            };
+            let Some(group_claims) = claims.pop() else {
+                return (None, false);
+            };
             let hits = crate::kv_index::layout::full_attention_matches(
                 &self.target,
                 &self.groups[0],
@@ -248,30 +304,41 @@ impl SourceBinding {
                 block_size,
                 prompt_cap as u64,
             );
-            if hits.is_empty() || !self.snapshot_is_current(&snapshot) {
-                return None;
+            if !self.snapshot_is_current(&snapshot) {
+                return (None, false);
             }
-            return Some(PlacementMatch { hits, snapshot });
+            return (
+                (!hits.is_empty()).then_some(PlacementMatch { hits, snapshot }),
+                true,
+            );
         }
         // The policy's page size can be coarser than the hash granularity: the
         // engine restores the aligned prefix, so round down instead of dropping
         // a recoverable hit.
-        let (tokens, tier, snapshot) = self.credit_parts(lora_name, tokens, usize::MAX, cache)?;
+        let (credit, available) = self.observed_credit_parts(lora_name, tokens, usize::MAX, cache);
+        let Some((tokens, tier, snapshot)) = credit else {
+            return (None, available);
+        };
         let tokens = align_down(tokens, block_size);
         if tokens == 0 {
-            return None;
+            return (None, true);
         }
-        let blocks = u32::try_from(tokens / u64::from(block_size)).ok()?;
+        let Ok(blocks) = u32::try_from(tokens / u64::from(block_size)) else {
+            return (None, false);
+        };
         // The engine restores at the tier that completes the boundary; the policy
         // weighs that tier by its transfer credit.
-        Some(PlacementMatch {
-            hits: vec![TierMatch {
-                target: self.target.clone(),
-                tier,
-                segments: vec![(0, blocks)],
-            }],
-            snapshot,
-        })
+        (
+            Some(PlacementMatch {
+                hits: vec![TierMatch {
+                    target: self.target.clone(),
+                    tier,
+                    segments: vec![(0, blocks)],
+                }],
+                snapshot,
+            }),
+            true,
+        )
     }
 }
 

@@ -16,6 +16,7 @@ use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, Service
 use crate::backend::preprocess::{ADAPTER_FIELDS, NAMED_LORA_FIELD};
 use crate::config::KvConnector;
 use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
+use crate::kv_decision::{KvDecisionStage, KvDecisionTrace};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
@@ -37,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Once, RwLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
@@ -1705,7 +1706,7 @@ impl VllmPDRouter {
                     .iter()
                     .map(|(_, worker)| worker.clone())
                     .collect::<Vec<_>>();
-                if let Some(index) =
+                if let Some((index, prefill_trace)) =
                     self.select_program_prefill_index(&prefill_workers, &request, path, headers)
                 {
                     // The target and the worker it charges travel together, so
@@ -1730,6 +1731,7 @@ impl VllmPDRouter {
                         index,
                         &self.pd_router.pd_load,
                         decode_worker.clone(),
+                        prefill_trace.clone(),
                     )
                     .await
                     {
@@ -1754,11 +1756,12 @@ impl VllmPDRouter {
                     // execute() declined the warm/local protocol for this turn
                     // (request shape, engine capability): the cold path reuses
                     // the P selected above rather than consuming a second one.
-                    selected = Some(prefill_candidates[index].clone());
+                    let (id, worker) = prefill_candidates[index].clone();
+                    selected = Some((id, worker, prefill_trace));
                 }
             }
         }
-        let Some((prefill_id, prefill_worker)) = selected
+        let Some((prefill_id, prefill_worker, prefill_trace)) = selected
             .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
         else {
             RouterMetrics::record_pd_error("server_selection");
@@ -1783,10 +1786,11 @@ impl VllmPDRouter {
         // Program turns bypass native selection, so charge their P and D
         // occupancy explicitly; otherwise they would be invisible to native
         // admission and to `/metrics`.
-        let attempt = self
-            .pd_router
-            .pd_load
-            .admit_bound(prefill_worker.clone(), decode_worker.clone());
+        let attempt = self.pd_router.pd_load.admit_bound_with_trace(
+            prefill_worker.clone(),
+            decode_worker.clone(),
+            prefill_trace,
+        );
         let result = self
             .process_vllm_two_stage_request(
                 request,
@@ -1867,7 +1871,7 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<(String, Arc<dyn Worker>)> {
+    ) -> Option<(String, Arc<dyn Worker>, Option<KvDecisionTrace>)> {
         if candidates.is_empty() {
             return None;
         }
@@ -1875,8 +1879,11 @@ impl VllmPDRouter {
             .iter()
             .map(|(_, worker)| worker.clone())
             .collect::<Vec<_>>();
-        let index = self.select_program_prefill_index(&workers, request, path, headers)?;
-        candidates.get(index).cloned()
+        let (index, trace) = self.select_program_prefill_index(&workers, request, path, headers)?;
+        candidates
+            .get(index)
+            .cloned()
+            .map(|(id, worker)| (id, worker, trace))
     }
 
     /// The single place Program turns ask the prefill policy for an index.
@@ -1891,7 +1898,7 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, Option<KvDecisionTrace>)> {
         if workers.is_empty() {
             return None;
         }
@@ -1913,8 +1920,13 @@ impl VllmPDRouter {
         // the same "no feasible P" 503 as an empty pool instead of panicking the
         // request task.
         policy
-            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
-            .filter(|index| *index < workers.len())
+            .select_worker_with_observation(
+                workers,
+                request_text.as_deref(),
+                policy_headers.as_ref(),
+                KvDecisionStage::Prefill,
+            )
+            .filter(|(index, _)| *index < workers.len())
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
@@ -2530,6 +2542,7 @@ impl VllmPDRouter {
                 request_phase: Some("prefill"),
             },
         )
+        .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
         .await;
         let finished_prefill = self
             .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
@@ -2719,6 +2732,7 @@ impl VllmPDRouter {
                 request_phase: Some("decode"),
             },
         )
+        .instrument(attempt.dispatch_span(KvDecisionStage::Decode))
         .await
         {
             Ok(resp) => resp,
@@ -2821,6 +2835,7 @@ impl VllmPDRouter {
                 request_id.clone(),
                 &prefill_params,
             )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
             .await;
         attempt.finish_prefill();
         let prefill_kv = match prefill_result {
@@ -2888,6 +2903,7 @@ impl VllmPDRouter {
         let response = self
             .grpc_frontend
             .dispatch_decode(decode_worker.url(), prepared, request_id, decode_params)
+            .instrument(attempt.dispatch_span(KvDecisionStage::Decode))
             .await;
         let decode_outcome = grpc_decode_outcome(&response);
         let response = own_grpc_decode(response, attempt);
@@ -2935,12 +2951,15 @@ impl VllmPDRouter {
         };
 
         attempt.begin_decode();
-        let prefill = self.grpc_frontend.prefill(
-            prefill_worker.url(),
-            &prepared,
-            request_id.clone(),
-            &prefill_params,
-        );
+        let prefill = self
+            .grpc_frontend
+            .prefill(
+                prefill_worker.url(),
+                &prepared,
+                request_id.clone(),
+                &prefill_params,
+            )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Prefill));
         // Dropping a held response, e.g. when P fails after D's stream opened,
         // aborts D's stream.
         let decode = async {
@@ -2952,6 +2971,7 @@ impl VllmPDRouter {
                     request_id,
                     Some(decode_params),
                 )
+                .instrument(attempt.dispatch_span(KvDecisionStage::Decode))
                 .await;
             let decode_failed = response
                 .extensions()
@@ -3127,6 +3147,7 @@ impl VllmPDRouter {
                     request_phase: Some("prefill"),
                 },
             )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Prefill))
             .await;
             let finished = self
                 .finish_prefill_response(response, &prefill_base_url, &attempt)
@@ -3146,7 +3167,8 @@ impl VllmPDRouter {
                     route: Some(path),
                     request_phase: Some("decode"),
                 },
-            ),
+            )
+            .instrument(attempt.dispatch_span(KvDecisionStage::Decode)),
         );
 
         let prefill_response_json = match prefill_result {
@@ -5717,6 +5739,7 @@ mod tests {
     async fn pd_adapter_admission_preserves_plain_binding_and_forwarding() {
         use super::super::pd_types::Stage;
         use crate::config::{PolicyConfig, RouterConfig};
+        use crate::kv_decision::KvDecisionOutcome;
         use axum::{extract::State, routing::post, Json, Router};
         use tokio::sync::{mpsc, Semaphore};
 
@@ -5927,10 +5950,14 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 selection.prefill.fallback_reason,
-                Some("unsupported_cache_identity")
+                Some("pool_estimate_unavailable")
             );
             assert_eq!(selection.prefill.new_prefill_tokens, None);
             assert_eq!(selection.prefill.credited_prefix_tokens, None);
+            let receipt = &selection.prefill.trace.as_ref().unwrap().receipt;
+            assert_eq!(receipt.outcome, KvDecisionOutcome::PoolEstimateUnavailable);
+            assert_eq!(receipt.new_prefill_tokens, None);
+            assert_eq!(receipt.credited_tokens, None);
             assert_eq!(
                 selection.decode.affinity_outcome, outcome,
                 "{field}: {value}"
