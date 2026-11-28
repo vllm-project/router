@@ -4,8 +4,8 @@ pub(crate) mod config;
 pub use config::apply_kv_layout_file;
 pub mod request_hash;
 mod routing_provider;
-pub(crate) use routing_provider::PromptKey;
 pub use routing_provider::TieredMatchProvider;
+pub(crate) use routing_provider::{PlacementEvidence, PlacementPinError, PromptKey};
 #[doc(hidden)]
 pub use routing_provider::{RequestHashCache, SharedPrefixLookup};
 pub(crate) mod source;
@@ -25,6 +25,7 @@ pub(crate) fn next_owner_incarnation() -> u64 {
 
 pub(crate) mod layout;
 pub mod storage;
+pub(crate) use storage::SourceReadGuard;
 pub mod types;
 
 pub use discovery::{

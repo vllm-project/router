@@ -43,7 +43,7 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 }
 
 // Keep the existing HTTP type paths for callers of the load manager.
-pub(crate) use crate::policies::pd::{Loads, Stage};
+pub(crate) use crate::policies::pd::{Loads, Stage, StagePricing};
 pub use crate::policies::pd::{
     PdEndpoint, PdLoadSample, PdPrefillInput, PdRequestContext, PdSelection, StageDecision,
 };

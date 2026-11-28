@@ -15,8 +15,10 @@ use crate::kv_index::source::events::transport::retry_backoff;
 use crate::kv_index::storage::source_transaction::{StreamPhase as Phase, StreamState};
 use crate::kv_index::storage::IndexBatch;
 use crate::kv_index::types::SourceRecoveryReason as Reason;
-use crate::kv_index::{IngestionSignal, KVEvent, SourceBinding, SourceError};
+use crate::kv_index::{IngestionSignal, KVEvent, KVEventBatch, SourceBinding, SourceError};
 use crate::metrics::RouterMetrics;
+
+use super::apply::PreparedEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamLease(pub(crate) u64);
@@ -32,6 +34,13 @@ pub enum StreamError {
 pub struct EventStream {
     index: Arc<SourceBinding>,
     strict_recovery: bool,
+}
+
+pub(super) fn batch_contains_clear(batch: &KVEventBatch) -> bool {
+    batch
+        .events
+        .iter()
+        .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
 }
 
 impl EventStream {
@@ -111,131 +120,152 @@ impl EventStream {
         seq: u64,
         payload: &[u8],
     ) -> Result<(), StreamError> {
-        self.apply_publisher_payload(lease, seq, payload)
+        let batch = crate::kv_index::decode_batch(payload).ok();
+        self.apply_next_batch(lease, seq, batch.as_ref())
             .map(|_| ())
     }
 
-    pub(super) fn apply_publisher_payload(
+    pub(super) fn apply_next_batch(
         &self,
         lease: StreamLease,
         seq: u64,
-        payload: &[u8],
+        batch: Option<&KVEventBatch>,
     ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, false)
-    }
-
-    /// Start from a fresh SUB connection after the replay budget is exhausted.
-    /// Strict recovery can resume only after a worker-local clear.
-    pub(super) fn observe_live(
-        &self,
-        lease: StreamLease,
-        seq: u64,
-        payload: &[u8],
-    ) -> Result<bool, StreamError> {
-        self.apply_payload_at(lease, seq, payload, true)
-    }
-
-    fn apply_payload_at(
-        &self,
-        lease: StreamLease,
-        seq: u64,
-        payload: &[u8],
-        fresh: bool,
-    ) -> Result<bool, StreamError> {
-        let batch = crate::kv_index::decode_batch(payload);
-        let prepared = batch
-            .as_ref()
-            .ok()
-            .map(|batch| self.index.prepare_batch(batch));
-        let planned = prepared
-            .as_ref()
-            .and_then(|result| result.as_deref().ok())
-            .and_then(|events| {
-                super::apply::PreparedEvent::page_changes(events, self.index.max_entries)
-            });
-        self.with_state_for_pages(lease, planned, |state, tx| {
-            let cleared = batch.as_ref().is_ok_and(|batch| {
-                batch
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, KVEvent::AllBlocksCleared(_)))
-            });
-            if fresh {
-                if batch.is_err() {
-                    return Err(StreamError::Index(SourceError::InvalidBatch));
-                }
-                if self.strict_recovery && !cleared {
-                    return Err(StreamError::InvalidState);
-                }
-                self.index.reset_stream(state, tx, Some(seq), false);
-            }
-            let result = match (&batch, prepared) {
-                (Ok(batch), Some(prepared)) => {
-                    self.index.apply_prepared(state, tx, seq, batch, prepared)
-                }
-                _ => SourceBinding::fail(state, tx, &self.index.owner, SourceError::InvalidBatch),
-            };
-            if let Err(error) = result {
-                // A rejected batch means the publisher's layout and the declared
-                // one disagree; naming the reason helps fix a layout
-                // from a live system.
-                match error {
-                    SourceError::IntBlockHashes => {
-                        // The engine's default event encoding, so the fix belongs to
-                        // the engine invocation and the operator has to be told once.
-                        if !state.rejection_reported {
-                            state.rejection_reported = true;
-                            tracing::error!(
-                                seq,
-                                "KV event source publishes integer block hashes, which the sha256 \
-                             index cannot address; no prefix will be credited for this engine. \
-                             Start it with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0."
-                            );
-                        }
-                    }
-                    SourceError::RootHashMismatch => {
-                        if !state.rejection_reported {
-                            state.rejection_reported = true;
-                            tracing::warn!(
-                                source = %self.index.target.instance_id,
-                                rank = self.index.target.dp_rank,
-                                seq,
-                                error = ?error,
-                                "default KV hash root does not match; routing by load. Use sha256_cbor with PYTHONHASHSEED unset, or declare the worker's actual layout and seed."
-                            );
-                        }
-                    }
-                    _ => tracing::warn!(seq, error = ?error, "KV event batch rejected"),
-                }
-                // The cache is cleared, but the active lease must still be
-                // able to call restart_replay on this source.
-                state.phase = Phase::Replaying;
-                return Err(StreamError::Index(error));
-            }
-            if fresh {
-                self.index
-                    .publish_stream(state, tx, seq + 1)
-                    .map_err(StreamError::Index)?;
-                if !state.visible() {
-                    tracing::debug!(
-                        source = %self.index.target.instance_id,
-                        rank = self.index.target.dp_rank,
-                        seq,
-                        "fresh KV stream is waiting for a first-block Store to verify the hash root"
-                    );
-                }
-            }
+        self.with_prepared_batch(lease, batch, |state, tx, prepared| {
+            self.apply_prepared_batch(state, tx, seq, batch, prepared)?;
+            let cleared = batch.is_some_and(batch_contains_clear);
             if state.visible() {
                 if cleared {
                     self.record_recovery(Reason::ClearBarrier);
-                } else if fresh {
-                    self.record_recovery(Reason::FreshObservation);
                 } else if seq == 0 {
                     self.record_recovery(Reason::InitialSequence);
                 }
             }
             Ok(cleared)
         })
+    }
+
+    pub(super) fn reset_hidden_index_from_replay_clear(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        batch: &KVEventBatch,
+    ) -> Result<(), StreamError> {
+        self.with_prepared_batch(lease, Some(batch), |state, tx, prepared| {
+            if state.phase != Phase::Replaying || !batch_contains_clear(batch) {
+                return Err(StreamError::InvalidState);
+            }
+            self.index.reset_stream(state, tx, Some(seq), false);
+            self.apply_prepared_batch(state, tx, seq, Some(batch), prepared)
+        })
+    }
+
+    /// Start from a fresh SUB connection after the replay budget is exhausted.
+    /// Strict recovery can resume only after a worker-local clear.
+    pub(super) fn reset_and_try_publish_from_live_batch(
+        &self,
+        lease: StreamLease,
+        seq: u64,
+        batch: &KVEventBatch,
+    ) -> Result<bool, StreamError> {
+        self.with_prepared_batch(lease, Some(batch), |state, tx, prepared| {
+            let cleared = batch_contains_clear(batch);
+            if self.strict_recovery && !cleared {
+                return Err(StreamError::InvalidState);
+            }
+            self.index.reset_stream(state, tx, Some(seq), false);
+            self.apply_prepared_batch(state, tx, seq, Some(batch), prepared)?;
+            self.index
+                .publish_stream(state, tx, seq + 1)
+                .map_err(StreamError::Index)?;
+            if state.visible() {
+                self.record_recovery(if cleared {
+                    Reason::ClearBarrier
+                } else {
+                    Reason::FreshObservation
+                });
+            } else {
+                tracing::debug!(
+                    source = %self.index.target.instance_id,
+                    rank = self.index.target.dp_rank,
+                    seq,
+                    "fresh KV stream is waiting for a first-block Store to verify the hash root"
+                );
+            }
+            Ok(cleared)
+        })
+    }
+
+    fn with_prepared_batch<'a, R>(
+        &self,
+        lease: StreamLease,
+        batch: Option<&'a KVEventBatch>,
+        operation: impl FnOnce(
+            &mut StreamState,
+            &mut IndexBatch<'_>,
+            Result<Vec<PreparedEvent<'a>>, SourceError>,
+        ) -> Result<R, StreamError>,
+    ) -> Result<R, StreamError> {
+        let prepared = batch
+            .map(|batch| self.index.prepare_batch(batch))
+            .unwrap_or(Err(SourceError::InvalidBatch));
+        let planned = prepared
+            .as_deref()
+            .ok()
+            .and_then(|events| PreparedEvent::page_changes(events, self.index.max_entries));
+        self.with_state_for_pages(lease, planned, |state, tx| operation(state, tx, prepared))
+    }
+
+    fn apply_prepared_batch(
+        &self,
+        state: &mut StreamState,
+        tx: &mut IndexBatch<'_>,
+        seq: u64,
+        batch: Option<&KVEventBatch>,
+        prepared: Result<Vec<PreparedEvent<'_>>, SourceError>,
+    ) -> Result<(), StreamError> {
+        let result = match batch {
+            Some(batch) => self.index.apply_prepared(state, tx, seq, batch, prepared),
+            None => SourceBinding::fail(state, tx, &self.index.owner, SourceError::InvalidBatch),
+        };
+        if let Err(error) = result {
+            // A rejected batch means the publisher's layout and the declared
+            // one disagree; naming the reason helps fix a layout
+            // from a live system.
+            match error {
+                SourceError::IntBlockHashes => {
+                    // The engine's default event encoding, so the fix belongs to
+                    // the engine invocation and the operator has to be told once.
+                    if !state.rejection_reported {
+                        state.rejection_reported = true;
+                        tracing::error!(
+                            seq,
+                            "KV event source publishes integer block hashes, which the sha256 \
+                         index cannot address; no prefix will be credited for this engine. \
+                         Start it with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0."
+                        );
+                    }
+                }
+                SourceError::RootHashMismatch => {
+                    if !state.rejection_reported {
+                        state.rejection_reported = true;
+                        tracing::warn!(
+                            source = %self.index.target.instance_id,
+                            rank = self.index.target.dp_rank,
+                            seq,
+                            error = ?error,
+                            "default KV hash root does not match; routing by load. Use sha256_cbor with PYTHONHASHSEED unset, or declare the worker's actual layout and seed."
+                        );
+                    }
+                }
+                _ => tracing::warn!(seq, error = ?error, "KV event batch rejected"),
+            }
+            // The cache is cleared, but the active lease must still be
+            // able to call restart_replay on this source.
+            state.phase = Phase::Replaying;
+            return Err(StreamError::Index(error));
+        }
+        Ok(())
     }
 
     /// Publish a continuous replay; its caller must keep the cursor caught up
@@ -465,6 +495,18 @@ mod tests {
                 0,
             )
             .unwrap();
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    &[],
+                    &(-1_i64).to_be_bytes(),
+                    &[],
+                ],
+                0,
+            )
+            .unwrap();
         let request = recv(&replay).await;
         assert_eq!(request[2], 0_u64.to_be_bytes());
         let prompt: Vec<u32> = (0..1024).map(|i| 100 + i % 100).collect();
@@ -492,10 +534,9 @@ mod tests {
             },
             8,
         )
-        .with_source_binding(SourceLease {
-            gate: Arc::new(parking_lot::Mutex::new(())),
-            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+        .with_source_binding(SourceLease::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
         assert_eq!(
             EventStream::new(Arc::new(index)).begin_replay(),
             Err(StreamError::Index(SourceError::Untrusted))
@@ -528,9 +569,14 @@ mod tests {
         let evicted = gpu_remove(Some(0), vec![suffix.block_hashes[1].clone()]);
         root.block_hashes.truncate(1);
         root.token_ids.truncate(16);
-        let root_payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(0));
+        let root_batch = crate::kv_index::decode_batch(&event_payload(
+            1.0,
+            &[KVEvent::BlockStored(root)],
+            Some(0),
+        ))
+        .unwrap();
         stream
-            .apply_publisher_payload(lease, 0, &root_payload)
+            .apply_next_batch(lease, 0, Some(&root_batch))
             .unwrap();
         stream.finish_replay(lease, 1).unwrap();
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 16);
@@ -539,19 +585,24 @@ mod tests {
             .unwrap();
 
         stream
-            .observe_live(
+            .reset_and_try_publish_from_live_batch(
                 lease,
                 20,
-                &event_payload(1.0, &[KVEvent::BlockStored(suffix)], Some(0)),
+                &crate::kv_index::decode_batch(&event_payload(
+                    1.0,
+                    &[KVEvent::BlockStored(suffix)],
+                    Some(0),
+                ))
+                .unwrap(),
             )
             .unwrap();
         assert_eq!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
         stream
-            .apply_publisher_payload(lease, 21, &event_payload(1.0, &[evicted], Some(0)))
+            .apply_payload(lease, 21, &event_payload(1.0, &[evicted], Some(0)))
             .unwrap();
         stream
-            .apply_publisher_payload(lease, 22, &root_payload)
+            .apply_next_batch(lease, 22, Some(&root_batch))
             .unwrap();
         assert_ne!(index.control.generation(), 0);
         assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 32);
@@ -893,30 +944,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(request[2], 0_u64.to_be_bytes());
+        assert_eq!(request[2], 7_u64.to_be_bytes());
         assert_eq!(index.reusable_tokens(&prompt, usize::MAX), 0);
-        for (seq, event) in [
-            (0_i64, payload.as_slice()),
-            (1, clear.as_slice()),
-            (2, payload.as_slice()),
-            (3, clear.as_slice()),
-            (4, payload.as_slice()),
-            (5, missed_remove.as_slice()),
-            (6, payload.as_slice()),
-        ] {
-            replay
-                .send_multipart(
-                    [
-                        request[0].as_slice(),
-                        &[],
-                        b"epoch-quiet",
-                        &seq.to_be_bytes(),
-                        event,
-                    ],
-                    0,
-                )
-                .unwrap();
-        }
         replay
             .send_multipart(
                 [

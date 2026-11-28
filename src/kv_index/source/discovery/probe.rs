@@ -1,18 +1,20 @@
 //! Read worker model metadata and KV event source endpoints.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::time::Instant;
 use tonic::client::Grpc;
 use tonic_prost::ProstCodec;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::lifecycle::WorkerLifecycle;
+use super::lifecycle::{WorkerLifecycle, OPTIONAL_METADATA_BUDGET};
+use super::metrics_meta::EngineCacheConfigs;
 use super::{
-    discovered_block_size, metrics_meta, CacheCapabilities, KvEventSourceEntry,
-    KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe, SourcesUnavailable,
-    WorkerDiscovery, CONTROL_TIMEOUT,
+    discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
+    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
+    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -35,6 +37,10 @@ pub(super) struct WorkerDescriptor {
 }
 
 impl WorkerDescriptor {
+    pub(super) fn layout(&self) -> Option<&CacheCapabilities> {
+        self.hybrid.as_ref()
+    }
+
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()
@@ -66,6 +72,7 @@ impl KvIndexSupervisor {
         plain_only: bool,
         connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
+        deadline: Instant,
     ) -> Result<RegistrationProbe, String> {
         let mut worker = self.discover_for_role(base, connector).await;
         if plain_only
@@ -105,8 +112,54 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
+        if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
+            self.probe_admission_hashes(base, &mut worker, Some(deadline))
+                .await;
+        }
         Ok(RegistrationProbe { descriptor, worker })
     }
+
+    pub(super) async fn probe_admission_hashes(
+        &self,
+        worker_url: &str,
+        worker: &mut WorkerDiscovery,
+        deadline: Option<Instant>,
+    ) {
+        let (base, _) = split_worker_rank(worker_url);
+        if !needs_admission_hashes(base, worker) {
+            return;
+        }
+        // Leave enough time for the optional scrape inside the refresh deadline.
+        if deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) <= OPTIONAL_METADATA_BUDGET
+        }) {
+            debug!(
+                worker_url,
+                "Skipping KV hash probe because the refresh budget is exhausted"
+            );
+            return;
+        }
+        match tokio::time::timeout(
+            OPTIONAL_METADATA_BUDGET,
+            query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
+        )
+        .await
+        {
+            Ok(Ok(configs)) => worker.engine_cache_configs = Some(configs),
+            Ok(Err(error)) => debug!(worker_url, %error, "Optional KV hash probe failed"),
+            Err(_) => debug!(worker_url, "Optional KV hash probe timed out"),
+        }
+    }
+}
+
+pub(super) fn needs_admission_hashes(base: &str, worker: &WorkerDiscovery) -> bool {
+    worker.engine_cache_configs.is_none()
+        && worker.hybrid.is_some()
+        && !crate::backend::is_grpc_url(base)
+        && worker
+            .sources
+            .as_ref()
+            .is_ok_and(|sources| sources.values().any(events_enabled))
 }
 
 pub(super) fn grpc_kv_event_source_entries(
@@ -446,6 +499,14 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+#[derive(Debug)]
+pub(super) struct WorkerMetadata {
+    pub(super) server_info: Result<ServerInfo, String>,
+    pub(super) base_models: Option<HashSet<String>>,
+    /// Parsed reports can remain available when cache geometry is rejected.
+    pub(super) engine_cache_configs: Option<EngineCacheConfigs>,
+}
+
 /// Worker cache metadata, tried in the order a deployment is likely to answer it:
 /// the multi-backend control contract, the engine config endpoint, then the
 /// always-on `/metrics` scrape.
@@ -457,18 +518,35 @@ pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+) -> WorkerMetadata {
     let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
-        Ok(info) => return Ok((info, None)),
+        Ok(server_info) => {
+            return WorkerMetadata {
+                server_info: Ok(server_info),
+                base_models: None,
+                engine_cache_configs: None,
+            };
+        }
         Err(error) => error,
     };
 
-    query_metrics_metadata(client, worker_url, api_key)
-        .await
-        .and_then(|(info, models)| {
-            validate_worker_metadata(worker_url, "metrics", Ok(info)).map(|info| (info, models))
-        })
-        .map_err(|error| format!("{control_error}; {error}"))
+    let (metadata, engine_cache_configs) =
+        match query_engine_cache_configs(client, worker_url, api_key).await {
+            Ok(engines) => (
+                query_metrics_metadata(client, worker_url, api_key, &engines).await,
+                Some(engines),
+            ),
+            Err(error) => (Err(error), None),
+        };
+    let (server_info, base_models) = match metadata {
+        Ok((info, models)) => (Ok(info), models),
+        Err(error) => (Err(format!("{control_error}; {error}")), None),
+    };
+    WorkerMetadata {
+        server_info,
+        base_models,
+        engine_cache_configs,
+    }
 }
 
 /// The control endpoints can report server aliases. A metrics scrape cannot.
@@ -544,6 +622,14 @@ pub(super) async fn query_server_info_json(
     {
         Some("MooncakeHybridConnector" | "MooncakeConnectorV1") => Some(true),
         Some("MooncakeConnector") => Some(false),
+        Some("MooncakeConnectorV2") => config
+            .pointer("/model_config/hf_config")
+            .and_then(serde_json::Value::as_object)
+            .map(|config| {
+                config
+                    .get("compress_ratios")
+                    .is_some_and(|value| value.is_array() || value.is_object())
+            }),
         _ => None,
     };
     Ok(ServerInfo {
@@ -561,9 +647,9 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    engines: &EngineCacheConfigs,
 ) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
-    let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
-    let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
+    let hash_unit = metrics_meta::shared_hash_unit(engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
     })?;
     if let Some(layout) = engines
@@ -583,16 +669,28 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok((info, models.as_ref().map(base_model_names)))
+    Ok((
+        validate_worker_metadata(worker_url, "metrics", Ok(info))?,
+        models.as_ref().map(base_model_names),
+    ))
 }
 
 pub(super) async fn query_engine_cache_configs(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<BTreeMap<u32, metrics_meta::EngineCacheConfig>, String> {
+) -> Result<EngineCacheConfigs, String> {
     let text = query_worker_text(client, worker_url, "metrics", true, api_key).await?;
-    let engines = metrics_meta::parse_cache_config_info(&text);
+    let (engines, malformed_ranks) = metrics_meta::parse_cache_config_info(&text);
+    if malformed_ranks > 0 {
+        tracing::debug!(
+            worker_url,
+            metric = metrics_meta::CACHE_CONFIG_INFO,
+            label = "engine",
+            malformed_ranks,
+            "ignoring cache config samples with invalid engine ranks"
+        );
+    }
     if engines.is_empty() {
         return Err("metrics: no vllm:cache_config_info series".to_string());
     }

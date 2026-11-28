@@ -12,12 +12,25 @@ use smallvec::SmallVec;
 #[derive(Clone)]
 pub(in crate::kv_index) struct SourceLease {
     pub(in crate::kv_index) gate: Arc<Mutex<()>>,
-    pub(in crate::kv_index) active: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    hash_fenced: Arc<AtomicBool>,
 }
 
 impl SourceLease {
+    pub(in crate::kv_index) fn new(active: Arc<AtomicBool>) -> Self {
+        Self {
+            gate: Arc::new(Mutex::new(())),
+            active,
+            hash_fenced: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(in crate::kv_index) fn fence_hash(&self) {
+        self.hash_fenced.store(true, Ordering::Release);
+    }
+
     pub(in crate::kv_index) fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.active.load(Ordering::Acquire) && !self.hash_fenced.load(Ordering::Acquire)
     }
 
     pub(in crate::kv_index) fn with_active<T>(&self, operation: impl FnOnce() -> T) -> Option<T> {
@@ -75,7 +88,25 @@ pub struct SourceBinding {
     pub(in crate::kv_index) binding: Option<crate::kv_index::source::binding::SourceLease>,
 }
 
-type PageSnapshot<'a> = (SmallVec<[PageTiers<'a>; 1]>, SourceVersion, u64);
+/// The index version and stream generation captured by one page lookup.
+pub(in crate::kv_index) struct PlacementSnapshot {
+    pub(in crate::kv_index) version: SourceVersion,
+    generation: u64,
+}
+
+impl PlacementSnapshot {
+    pub(in crate::kv_index) fn is_current(
+        &self,
+        control: &StreamControl,
+        lease: Option<&SourceLease>,
+    ) -> bool {
+        control.generation() == self.generation
+            && self.version.is_current()
+            && lease.is_none_or(SourceLease::is_active)
+    }
+}
+
+type PageSnapshot<'a> = (SmallVec<[PageTiers<'a>; 1]>, PlacementSnapshot);
 
 impl SourceBinding {
     /// Test constructor keyed by a `PYTHONHASHSEED` instead of a root digest.
@@ -231,6 +262,16 @@ impl SourceBinding {
                 has_checkpoint
                     || self.replay_tokens != 0
                     || (has_compressed && truncates_compressed.unwrap_or(true))
+            }
+            Some(KvConnector::MooncakeV2) => {
+                // The Ascend pull scheduler checks the cache groups and HF
+                // compress_ratios, which Router can read from /server_info.
+                has_checkpoint
+                    || self
+                        .groups
+                        .iter()
+                        .any(|group| matches!(group.kind, GroupRule::SlidingWindow { .. }))
+                    || truncates_compressed == Some(true)
             }
             _ => false,
         };
@@ -499,7 +540,13 @@ impl SourceBinding {
         ) {
             return match matched {
                 PageMatch::Miss => None,
-                PageMatch::Hit(claims, version) => Some((claims, version, generation)),
+                PageMatch::Hit(claims, version) => Some((
+                    claims,
+                    PlacementSnapshot {
+                        version,
+                        generation,
+                    },
+                )),
             };
         }
         // Borrow unchanged evidence. Refresh all required groups together
@@ -535,12 +582,19 @@ impl SourceBinding {
                 }
                 let claims =
                     view.hash_page_runs(&self.owner, namespace, prepared, evidence, queries);
-                Some((claims, view.source_version(), state.reset_generation))
+                Some((
+                    claims,
+                    PlacementSnapshot {
+                        version: view.source_version(),
+                        generation: state.reset_generation,
+                    },
+                ))
             })
             .flatten()
     }
 
-    /// The credited prefix and the tier it is credited at. A page held in host
+    /// The credited prefix, its storage tier, and the snapshot that proves it.
+    /// A page held in host
     /// memory or on storage is still restorable, but the policy weighs it by the
     /// transfer credit of its tier, so the boundary is reported at the slowest
     /// tier that any group needs to satisfy it.
@@ -550,21 +604,18 @@ impl SourceBinding {
         tokens: &'a [u32],
         max_reusable_tokens: usize,
         cache: &mut RequestHashCache<'a>,
-    ) -> (u64, Option<StorageTier>) {
+    ) -> Option<(u64, StorageTier, PlacementSnapshot)> {
         let replay_tokens = if cache.count_replay_pages {
             0
         } else {
             self.replay_tokens
         };
-        let snapshot = self.page_snapshot(namespace, tokens, true, cache);
-        let Some((claims, version, reset_generation)) = snapshot else {
-            return (0, None);
-        };
+        let (claims, snapshot) = self.page_snapshot(namespace, tokens, true, cache)?;
         if claims
             .iter()
             .all(|pages| pages.prefix_len == 0 && pages.tail.is_empty())
         {
-            return (0, None);
+            return None;
         }
         let (credited, tier) = crate::kv_index::layout::credit_from_pages(
             &self.groups,
@@ -581,21 +632,15 @@ impl SourceBinding {
                 dense_lookups: &self.dense_lookups,
             },
         );
-        if tier.is_none() || u32::try_from(credited / self.keys.block_size() as u64).is_err() {
-            return (0, None);
+        let tier = tier?;
+        if u32::try_from(credited / self.keys.block_size() as u64).is_err()
+            || !self.snapshot_is_current(&snapshot)
+        {
+            return None;
         }
-        if !self.snapshot_is_current(&version, reset_generation) {
-            return (0, None);
-        }
-        (credited, tier)
+        Some((credited, tier, snapshot))
     }
-    pub(in crate::kv_index) fn snapshot_is_current(
-        &self,
-        version: &SourceVersion,
-        generation: u64,
-    ) -> bool {
-        self.control.generation() == generation
-            && self.index.source_version_is_current(version)
-            && self.binding.as_ref().is_none_or(SourceLease::is_active)
+    pub(in crate::kv_index) fn snapshot_is_current(&self, snapshot: &PlacementSnapshot) -> bool {
+        snapshot.is_current(&self.control, self.binding.as_ref())
     }
 }

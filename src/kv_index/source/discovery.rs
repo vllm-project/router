@@ -27,6 +27,7 @@ mod registration;
 
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use metrics_meta::EngineCacheConfigs;
 use observer::WorkerObservation;
 use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
 
@@ -163,6 +164,10 @@ pub(crate) struct WorkerDiscovery {
     base_models: Option<HashSet<String>>,
     pub(crate) hybrid: Option<CacheCapabilities>,
     pub(super) assumed_plain_full: bool,
+    /// Per-engine reports from discovery or the optional admission scrape.
+    /// None means no usable snapshot was collected, for example when probing
+    /// was inapplicable, skipped for budget, or failed.
+    engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
 /// What the optional KV event source control probe found. A 404/405 means the
@@ -229,8 +234,8 @@ pub struct KvIndexSupervisor {
     strict_recovery: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
-    /// Static KV event sources per prefill URL; these workers skip HTTP
-    /// discovery entirely.
+    /// Static KV event sources per prefill URL. A verified static layout can
+    /// still use the optional HTTP metrics probe for hash admission.
     static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
@@ -443,8 +448,7 @@ impl KvIndexSupervisor {
                 .await
                 .map(|info| (info, None));
         }
-        // Discovery awaits without the owner lock. A failed/stale re-add must
-        // leave the prior registration and its observed placement intact.
+        // Check the observed owner again after discovery before changing its bindings.
         let (observed, lifecycle) = {
             let workers = self.installed.workers.lock();
             let owner = workers.get(worker_url).map(|worker| worker.active.clone());
@@ -453,14 +457,33 @@ impl KvIndexSupervisor {
         };
         let discovery = self.discover(worker_url).await;
         let models = discovery.base_models.clone();
-        let info =
-            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;
-        Ok((info, models))
+        let hashes = observed
+            .as_ref()
+            .and_then(|_| discovery.engine_cache_configs.clone());
+        let installation = self.install_observed_worker(
+            worker_url,
+            discovery,
+            observed,
+            Some(lifecycle.clone()),
+            None,
+        );
+        if !installation
+            .as_ref()
+            .is_ok_and(|info| info.cache_key.is_some())
+        {
+            if let Some(hashes) = hashes {
+                self.fence_failed_registration(worker_url, &lifecycle, &hashes);
+            }
+        }
+        Ok((installation?, models))
     }
 
-    /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
+    /// Discover worker metadata and available hashes for a new registration.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        self.discover_for_role(worker_url, None).await
+        let mut discovery = self.discover_for_role(worker_url, None).await;
+        self.probe_admission_hashes(worker_url, &mut discovery, None)
+            .await;
+        discovery
     }
 
     async fn discover_for_role(
@@ -551,7 +574,7 @@ impl KvIndexSupervisor {
                 .filter(|info| info.vllm_version.is_none())
             {
                 info.vllm_version = tokio::time::timeout(
-                    CONTROL_TIMEOUT / 4,
+                    lifecycle::OPTIONAL_METADATA_BUDGET,
                     probe::query_vllm_version(&self.client, base, self.api_key.as_deref()),
                 )
                 .await
@@ -559,13 +582,14 @@ impl KvIndexSupervisor {
                 .flatten();
             }
         }
-        if !matches!(connector, Some(KvConnector::Nixl | KvConnector::Mooncake))
-            || !layout.ranks.iter().any(|rank| {
-                rank.groups
-                    .iter()
-                    .any(|group| group.kind == "mla_attention" && group.tokens_per_state.is_some())
-            })
-        {
+        if !matches!(
+            connector,
+            Some(KvConnector::Nixl | KvConnector::Mooncake | KvConnector::MooncakeV2)
+        ) || !layout.ranks.iter().any(|rank| {
+            rank.groups
+                .iter()
+                .any(|group| group.kind == "mla_attention" && group.tokens_per_state.is_some())
+        }) {
             return discovery;
         }
         if let Some(info) = discovery
@@ -575,11 +599,12 @@ impl KvIndexSupervisor {
             .filter(|info| info.mooncake_truncates_compressed.is_none())
         {
             // A cold /server_info can spend time collecting worker diagnostics.
-            let metadata_timeout = if connector == Some(KvConnector::Nixl) {
-                CONTROL_TIMEOUT / 2
-            } else {
-                CONTROL_TIMEOUT / 4
-            };
+            let metadata_timeout =
+                if matches!(connector, Some(KvConnector::Nixl | KvConnector::MooncakeV2)) {
+                    CONTROL_TIMEOUT / 2
+                } else {
+                    lifecycle::OPTIONAL_METADATA_BUDGET
+                };
             if let Ok(Ok(runtime)) = tokio::time::timeout(
                 metadata_timeout,
                 probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
@@ -702,6 +727,7 @@ impl KvIndexSupervisor {
                 if let Ok(info) = &mut discovery.server_info {
                     info.kv_block_size = layout.ranks.iter().find_map(|rank| rank.hash_block_size);
                 }
+                discovery.engine_cache_configs = Some(engines);
             }
             for rank in &mut layout.ranks {
                 if rank.model.trim().is_empty() {
@@ -821,6 +847,7 @@ fn failed_hybrid_discovery(probe: SourcesProbe, error: String) -> WorkerDiscover
         base_models: None,
         hybrid: None,
         assumed_plain_full: false,
+        engine_cache_configs: None,
     }
 }
 
@@ -876,6 +903,7 @@ async fn discover_worker(
             base_models: None,
             hybrid: None,
             assumed_plain_full: false,
+            engine_cache_configs: None,
         };
     }
     discover_full_attention_http_worker(client, worker_url, api_key).await
@@ -921,6 +949,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
             base_models: None,
             hybrid: config.hybrid.clone(),
             assumed_plain_full: false,
+            engine_cache_configs: None,
         };
     }
     let sources = config
@@ -962,6 +991,7 @@ fn static_worker_discovery(worker_url: &str, config: &StaticKvEventSources) -> W
         model_id: Ok(Some(model)),
         base_models: None,
         hybrid: config.hybrid.clone(),
+        engine_cache_configs: None,
         assumed_plain_full: config
             .hybrid
             .as_ref()
@@ -1014,16 +1044,14 @@ async fn discover_full_attention_http_worker(
         query_worker_metadata_and_models(client, worker_url, api_key),
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
-    let (server_info, base_models) = match server {
-        Ok((info, base_models)) => (Ok(info), base_models),
-        Err(error) => (Err(error), None),
-    };
+    let server_info = server.server_info;
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
     let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
-    discovery.base_models = base_models;
+    discovery.base_models = server.base_models;
+    discovery.engine_cache_configs = server.engine_cache_configs;
     discovery
 }
 
@@ -1092,6 +1120,7 @@ fn native_worker_discovery(
         base_models: None,
         hybrid,
         assumed_plain_full,
+        engine_cache_configs: None,
     }
 }
 

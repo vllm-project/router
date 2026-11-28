@@ -119,7 +119,7 @@ impl PdRouterBase {
                         base,
                         PdPrefillInput {
                             prompts,
-                            work_by_rank: HashMap::new(),
+                            image: None,
                             allow_credit: false,
                             fallback_reason: reason,
                         },
@@ -180,6 +180,7 @@ impl PdRouterBase {
                     headers,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    false,
                 )
                 .await
             }
@@ -234,22 +235,40 @@ impl PdRouterBase {
         // Deferred selection has no prefill pair. When any hybrid pairs are
         // configured, commit decode at admission for the entire pool.
         let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), &context);
-        let select = |loads: &Loads| {
-            select_pd_pair(
-                loads,
-                prefill_workers,
-                decode_workers,
-                prefill_policy.as_ref(),
-                decode_policy.as_ref(),
-                &context,
-                !defer,
-            )
-        };
-        let reserve_decode = !context.probe;
-        let admitted = if defer {
-            self.pd_load.admit_deferred(select)
-        } else {
-            self.pd_load.admit_with(select, reserve_decode)
+        let admitted = {
+            // Keep the source guards until admission has committed the selection.
+            let mut prefill_validated = None;
+            let mut decode_validated = None;
+            let select = |loads: &Loads| {
+                let context = PdRequestContext {
+                    prefill_pricing: context
+                        .prefill_pricing
+                        .map(|prices| prices.validate(prefill_workers, &mut prefill_validated)),
+                    decode_pricing: if !defer && !context.probe {
+                        context
+                            .decode_pricing
+                            .map(|prices| prices.validate(decode_workers, &mut decode_validated))
+                    } else {
+                        None
+                    },
+                    ..context.clone()
+                };
+                select_pd_pair(
+                    loads,
+                    prefill_workers,
+                    decode_workers,
+                    prefill_policy.as_ref(),
+                    decode_policy.as_ref(),
+                    &context,
+                    !defer,
+                )
+            };
+            let reserve_decode = !context.probe;
+            if defer {
+                self.pd_load.admit_deferred(select)
+            } else {
+                self.pd_load.admit_with(select, reserve_decode)
+            }
         };
         if let Some((selection, attempt)) = &admitted {
             let deferred = attempt.decode_pending_commit();
@@ -882,6 +901,7 @@ impl PdRouterBase {
                             .then_some(decode_index_policy),
                         ctx.router_config.kv_event_strict_recovery,
                         ctx.router_config.allows_hybrid_pd_sources(),
+                        ctx.router_config.epd.is_none(),
                     )
                     .await,
                 )
@@ -1092,7 +1112,8 @@ impl PdRouterBase {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            prefill_pricing: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -1626,7 +1647,8 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            prefill_pricing: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -1658,7 +1680,8 @@ mod tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            prefill_pricing: None,
+            decode_pricing: None,
             route: "/health_generate",
             probe: true,
         };
@@ -2214,7 +2237,7 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod admission_tests {
-    use super::super::pd_types::{PdEndpoint, PdLoadSample};
+    use super::super::pd_types::{PdEndpoint, PdLoadSample, StagePricing};
     use super::*;
     use crate::core::{BasicWorker, DPAwareWorker};
     use crate::policies::pd::{select_decode_stage, select_program_kv_prefill, Stage};
@@ -2264,26 +2287,34 @@ mod admission_tests {
         p: &[Arc<dyn Worker>],
         tokens: &[u32],
         policy: &KvAwarePolicy,
-    ) -> HashMap<String, super::super::pd_types::PdPrefillInput> {
-        p.iter()
+    ) -> (
+        HashMap<String, PdPrefillInput>,
+        crate::policies::PdWorkPrices,
+    ) {
+        let prompts: Arc<[Vec<u32>]> = Arc::from([tokens.to_vec()]);
+        let inputs: Vec<_> = p
+            .iter()
+            .map(|worker| (worker.as_ref(), prompts.as_ref(), true))
+            .collect();
+        let prices = kv_aware_ops(policy)
+            .unwrap()
+            .prepare_prefill_prices(&inputs, &mut crate::policies::PromptHashes::new())
+            .unwrap();
+        let inputs = p
+            .iter()
             .map(|worker| {
                 (
                     worker.base_url().to_owned(),
-                    super::super::pd_types::PdPrefillInput {
-                        prompts: Some(Arc::from(vec![tokens.to_vec()])),
-                        work_by_rank: HashMap::from([(
-                            worker.dp_rank(),
-                            kv_aware_ops(policy).unwrap().estimate_prefill_work(
-                                &[(worker.as_ref(), &[tokens.to_vec()], true)],
-                                &mut crate::policies::PromptHashes::new(),
-                            )[0],
-                        )]),
+                    PdPrefillInput {
+                        prompts: Some(prompts.clone()),
+                        image: None,
                         allow_credit: true,
                         fallback_reason: None,
                     },
                 )
             })
-            .collect()
+            .collect();
+        (inputs, prices)
     }
 
     #[cfg(all(feature = "cpu", feature = "ready"))]
@@ -2299,9 +2330,11 @@ mod admission_tests {
             .unwrap();
         assert_eq!(colocated.worker_index, 1);
         assert_eq!(colocated.new_prefill_tokens, 1);
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (first, a) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
@@ -2341,78 +2374,133 @@ mod admission_tests {
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
     }
 
+    #[cfg(all(feature = "cpu", feature = "ready"))]
     #[test]
-    fn dp_rank_decode_prices_are_matched_by_worker_url() {
-        let p = pool("p", 1);
-        let d: Vec<Arc<dyn Worker>> = (0..2)
+    fn pd_clear_after_pricing_removes_only_the_revoked_candidates_credit() {
+        use crate::kv_index::source::test_support::{event_batch, full_binding, warm_full};
+        use crate::kv_index::{CacheKey, KVEvent, RoutableTarget};
+        use crate::policies::{KvAwareOps, PromptHashes};
+
+        let policy = KvAwarePolicy::default();
+        let prompts = [vec![42; 33]];
+        // Same engine URL, independent rank snapshots and prices.
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
             .map(|rank| {
                 Arc::new(DPAwareWorker::new(
-                    "http://d:8000".to_string(),
+                    "http://worker:8000".into(),
                     rank,
                     2,
                     WorkerType::Decode,
                 )) as Arc<dyn Worker>
             })
             .collect();
-        assert_eq!(d[0].base_url(), d[1].base_url());
-        assert_ne!(d[0].url(), d[1].url());
-
-        let mut loads = Loads::new();
-        loads.insert(
-            (Stage::Decode, PdEndpoint::for_worker(d[0].as_ref())),
+        let mut sources = Vec::new();
+        for (index, (worker, warm)) in workers.iter().zip([32, 16]).enumerate() {
+            let target = RoutableTarget {
+                instance_id: worker.base_url().into(),
+                dp_rank: index as u32,
+            };
+            let source = Arc::new(full_binding(target.clone(), 16));
+            source.begin_empty(0);
+            warm_full(&source, 0, &prompts[0][..warm]);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: "model".into(),
+                    block_size: 16,
+                },
+                source.clone(),
+            );
+            sources.push(source);
+        }
+        let inputs: Vec<_> = workers
+            .iter()
+            .map(|worker| (worker.as_ref(), prompts.as_slice(), true))
+            .collect();
+        let prices = policy
+            .prepare_decode_prices(&inputs, &mut PromptHashes::new(), false)
+            .unwrap();
+        let (prefill_inputs, prefill_prices) = token_inputs(&workers, &prompts[0], &policy);
+        let other_decode = pool("other-decode", 1);
+        let manager = PdLoadManager::default();
+        let loads = Loads::from([(
+            (Stage::Decode, PdEndpoint::for_worker(workers[0].as_ref())),
             PdLoadSample {
-                active_decode_tokens: 100,
+                active_decode_tokens: 10,
                 ..Default::default()
             },
-        );
-        loads.insert(
-            (Stage::Decode, PdEndpoint::for_worker(d[1].as_ref())),
-            PdLoadSample {
-                active_decode_tokens: 60,
-                ..Default::default()
-            },
-        );
-        let policy = KvAwarePolicy::default();
-
-        // Without prices the less occupied rank wins.
-        let baseline = select_pd_pair(&loads, &p, &d, &policy, &policy, &context(), true).unwrap();
-        assert_eq!(
-            baseline.decode.endpoint,
-            PdEndpoint::for_worker(d[1].as_ref())
-        );
-
-        // A fully cached prefix on @0 (0 new tokens) beats @1's 50-token gap.
-        // Both keys are `Worker::url()`; keying by `base_url()` would collapse
-        // the two ranks and leave the whole table unusable.
-        let prices = HashMap::from([
-            (d[0].url().to_owned(), 0u64),
-            (d[1].url().to_owned(), 50u64),
-        ]);
-        let priced = PdRequestContext {
-            decode_context: Some(&prices),
-            ..context()
+        )]);
+        let select_decode = |prices: &crate::policies::ValidatedWorkPrices<'_>| {
+            let decode_context = PdRequestContext {
+                decode_pricing: Some(StagePricing::Validated(prices)),
+                ..context()
+            };
+            select_decode_stage(&loads, &workers, &policy, &decode_context).unwrap()
         };
-        let selection = select_pd_pair(&loads, &p, &d, &policy, &policy, &priced, true).unwrap();
-        assert_eq!(
-            selection.decode.endpoint,
-            PdEndpoint::for_worker(d[0].as_ref()),
-            "prefix credit on @0 must change the Decode choice"
-        );
 
-        // Missing one rank makes the table incomplete: the selector must ignore
-        // the price of the other rank and fall back to occupancy, where @1 wins.
-        let partial = HashMap::from([(d[0].url().to_owned(), 0u64)]);
-        let partial_context = PdRequestContext {
-            decode_context: Some(&partial),
-            ..context()
+        // Occupancy alone picks rank 1. Honoring its 17-token price while
+        // leaving rank 0 unpriced would pick rank 0 with 10 occupied tokens.
+        let partial = policy
+            .prepare_decode_prices(&inputs[1..], &mut PromptHashes::new(), false)
+            .unwrap();
+        assert_eq!(select_decode(&partial.validate(&workers)).worker_index, 1);
+
+        let select = |expected_tokens: [u64; 2], expected_worker: usize| {
+            let decode = prices.validate(&workers);
+            let tokens = decode.tokens();
+            assert_eq!(
+                [tokens[workers[0].url()], tokens[workers[1].url()]],
+                expected_tokens
+            );
+            assert_eq!(select_decode(&decode).worker_index, expected_worker);
+
+            let (selection, attempt) = {
+                let mut prefill_validated = None;
+                manager
+                    .admit(|loads| {
+                        let context = PdRequestContext {
+                            prefill_inputs: Some(&prefill_inputs),
+                            prefill_pricing: Some(
+                                StagePricing::Prepared(&prefill_prices)
+                                    .validate(&workers, &mut prefill_validated),
+                            ),
+                            ..context()
+                        };
+                        let work = context.prefill_work(workers[0].url()).unwrap();
+                        assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
+                        assert_eq!(work.device_miss_tokens, expected_tokens[0]);
+                        assert!(work.placement_verified);
+                        select_pd_pair(
+                            loads,
+                            &workers,
+                            &other_decode,
+                            &policy,
+                            &policy,
+                            &context,
+                            true,
+                        )
+                    })
+                    .unwrap()
+            };
+            let expected = expected_tokens[expected_worker];
+            assert_eq!(selection.prefill.worker_index, expected_worker);
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(expected));
+            assert_eq!(
+                sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+                expected
+            );
+            drop(attempt);
+            assert!(manager.snapshot().is_empty());
         };
-        let fallback =
-            select_pd_pair(&loads, &p, &d, &policy, &policy, &partial_context, true).unwrap();
-        assert_eq!(
-            fallback.decode.endpoint,
-            PdEndpoint::for_worker(d[1].as_ref()),
-            "a price table missing one DP rank must not credit the others"
-        );
+        select([1, 17], 0);
+        sources[0]
+            .apply_batch(
+                1,
+                &event_batch(vec![KVEvent::AllBlocksCleared(Default::default())]),
+            )
+            .unwrap();
+        select([33, 17], 1);
     }
 
     #[cfg(all(feature = "cpu", feature = "ready"))]
@@ -2422,18 +2510,31 @@ mod admission_tests {
         let d = pool("d", 1);
         let tokens: Vec<u32> = (0..400).collect();
         let policy = KvAwarePolicy::default();
-        let mut inputs = token_inputs(&p, &tokens, &policy);
-        for (worker, local_miss) in p.iter().zip([100, 200]) {
-            inputs
-                .get_mut(worker.base_url())
-                .unwrap()
-                .work_by_rank
-                .get_mut(&worker.dp_rank())
-                .unwrap()
-                .device_miss_tokens = local_miss;
+        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        use crate::kv_index::{CacheKey, RoutableTarget};
+        for (worker, prefix) in p.iter().zip([300, 200]) {
+            let target = RoutableTarget {
+                instance_id: worker.base_url().into(),
+                dp_rank: 0,
+            };
+            let source = Arc::new(full_binding(target.clone(), 4));
+            source.begin_empty(0);
+            warm_full(&source, 0, &tokens[..prefix]);
+            policy.register_target_with_cache_identity(
+                worker.url(),
+                target,
+                CacheKey {
+                    model: "model".into(),
+                    block_size: 4,
+                },
+                source,
+            );
         }
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let context = PdRequestContext {
             prefill_inputs: Some(&inputs),
+            prefill_pricing: Some(StagePricing::Validated(&validated)),
             ..context()
         };
         let manager = PdLoadManager::default();
@@ -2487,8 +2588,10 @@ mod admission_tests {
         let mut context = context();
 
         let policy = prefix_policy_with_blocks(&p, &tokens, 12);
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let manager = Arc::new(PdLoadManager::default());
         let (first, a) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
@@ -2515,9 +2618,11 @@ mod admission_tests {
         let (_, unknown) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context(), true))
             .unwrap();
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut context = context();
         context.prefill_inputs = Some(&inputs);
+        context.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (selection, known) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
             .unwrap();
@@ -2554,7 +2659,8 @@ mod admission_tests {
             affinity_key: None,
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            prefill_pricing: None,
+            decode_pricing: None,
             route: "/v1/completions",
             probe: false,
         }
@@ -2643,7 +2749,8 @@ mod admission_tests {
             affinity_key: Some(affinity_key(session)),
             lora_name: None,
             cache_salt: None,
-            decode_context: None,
+            prefill_pricing: None,
+            decode_pricing: None,
             route: "/v1/completions",
             probe: false,
         }
@@ -2911,9 +3018,11 @@ mod admission_tests {
         let policy = resident_prefix_policy(&p, &tokens).with_shared_affinity(Arc::new(
             crate::policies::KvAffinityTable::with_ttl(Some(Duration::from_secs(1800))),
         ));
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut ctx = context_with_session("session-a");
         ctx.prefill_inputs = Some(&inputs);
+        ctx.prefill_pricing = Some(StagePricing::Validated(&validated));
         let (first, a) = admit_with(&manager, &p, &d, &policy, &ctx);
         assert_eq!(first.prefill.worker_index, 1);
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
@@ -3088,9 +3197,11 @@ mod admission_tests {
         let d = pool("d", 1);
         let policy = KvAwarePolicy::default();
         let tokens: Vec<u32> = (0..33).collect();
-        let inputs = token_inputs(&p, &tokens, &policy);
+        let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+        let validated = prices.validate(&p);
         let mut ctx = context();
         ctx.prefill_inputs = Some(&inputs);
+        ctx.prefill_pricing = Some(StagePricing::Validated(&validated));
 
         // Every admission starts from an idle pool again, so the same
         // equal-cost tie is met on each turn.
@@ -3397,7 +3508,8 @@ mod admission_tests {
                 affinity_key: None,
                 lora_name: None,
                 cache_salt: None,
-                decode_context: None,
+                prefill_pricing: None,
+                decode_pricing: None,
                 route: "/v1/completions",
                 probe: false,
             }

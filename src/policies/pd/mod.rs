@@ -9,7 +9,7 @@ pub(crate) use program::{recommend_program_decode, select_program_prefill};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
-pub(crate) use types::{Loads, Stage};
+pub(crate) use types::{Loads, Stage, StagePricing};
 pub use types::{
     PdEndpoint, PdLoadSample, PdPrefillInput, PdRequestContext, PdSelection, StageDecision,
 };
@@ -291,7 +291,7 @@ fn select_stage(
                 Some((
                     input,
                     input.prompts.as_deref()?,
-                    *input.work_by_rank.get(&worker.dp_rank())?,
+                    context.prefill_work(worker.url())?,
                 ))
             })
             .collect();
@@ -387,7 +387,7 @@ fn select_stage(
         let decode_prices = if !decode_tokens_known {
             None
         } else {
-            context.decode_context.filter(|prices| {
+            context.marginal_decode_context().filter(|prices| {
                 projected
                     .iter()
                     .all(|worker| prices.contains_key(worker.url()))
@@ -457,7 +457,7 @@ fn select_stage(
         } else {
             // Report what the selector actually used, not whether a table merely
             // existed: a table that failed the completeness filter above fell back
-            // to occupancy even though `context.decode_context` was `Some`.
+            // to occupancy even though `context.marginal_decode_context()` was `Some`.
             match (decode_tokens_known, decode_prices_used) {
                 (true, true) => "context_tokens_marginal",
                 (true, false) => "context_tokens",
@@ -512,7 +512,7 @@ fn select_stage(
             Stage::Decode => {
                 let additional = if decode_prices_used {
                     context
-                        .decode_context
+                        .marginal_decode_context()
                         .and_then(|prices| prices.get(worker.url()))
                         .copied()
                         .unwrap_or(0)

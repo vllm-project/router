@@ -30,6 +30,9 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
+#[doc(hidden)]
+pub use kv_aware::PdWorkPrices;
+pub(crate) use kv_aware::ValidatedWorkPrices;
 pub use kv_aware::{
     cost_components, kv_aware_ops, AffinityKey, AffinityRecord, CandidateView, CostComponents,
     CostDecision, CostParams, DecodeWorkEstimate, InMemorySlotManager, KvAffinityTable, KvAwareOps,

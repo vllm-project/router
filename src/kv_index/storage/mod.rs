@@ -64,6 +64,30 @@ pub(crate) struct SourceVersion {
     generation: u64,
 }
 
+pub(crate) struct SourceReadGuard<'a> {
+    _read: parking_lot::RwLockReadGuard<'a, SourceData>,
+}
+
+impl SourceVersion {
+    pub(crate) fn target(&self) -> &RoutableTarget {
+        &self.source.target
+    }
+
+    /// Ordinary store/remove keeps the version current. Suspension, resume,
+    /// and retirement invalidate it.
+    pub(crate) fn is_current(&self) -> bool {
+        self.generation.is_multiple_of(2)
+            && self.source.generation.load(Ordering::Acquire) == self.generation
+    }
+
+    pub(crate) fn try_read(&self) -> Option<SourceReadGuard<'_>> {
+        Some(SourceReadGuard {
+            // Batched prompts can pin the same source while already holding its read guard.
+            _read: self.source.access.try_read_recursive()?,
+        })
+    }
+}
+
 impl SourceLock {
     fn new(target: RoutableTarget, committed: u64) -> Self {
         Self {
@@ -126,14 +150,6 @@ impl KvBlockIndexer {
                 ))
             })
             .clone()
-    }
-
-    /// Check a snapshot after dropping its locks. Ordinary store/remove is a
-    /// valid snapshot transition; suspension, resume, or retirement invalidates
-    /// the result. This does not reserve engine blocks.
-    pub(crate) fn source_version_is_current(&self, version: &SourceVersion) -> bool {
-        version.generation.is_multiple_of(2)
-            && version.source.generation.load(Ordering::Acquire) == version.generation
     }
 
     /// Hide a source while contiguous replay repairs its observations.

@@ -248,7 +248,7 @@ impl PdWarmRemoteRuntime {
         request: &Value,
         path: &str,
         workers: &[Arc<dyn Worker>],
-        inputs: &HashMap<String, super::pd_types::PdPrefillInput>,
+        prices: &crate::policies::PdWorkPrices,
     ) -> HashMap<super::pd_types::PdEndpoint, u64> {
         if !self.config.warm_remote || runtime.discovery {
             return HashMap::new();
@@ -294,33 +294,32 @@ impl PdWarmRemoteRuntime {
             return HashMap::new();
         }
         let profile = engine.profile;
-        let candidates = workers
-            .iter()
-            .filter_map(|worker| {
-                let target = super::pd_program_adapter::worker_target(worker);
-                let local = inputs
-                    .get(worker.base_url())?
-                    .work_by_rank
-                    .get(&worker.dp_rank())?
-                    .device_miss_tokens;
-                (self.worth_reading(local, miss)
-                    && self.pressure_ok(runtime, &target)
-                    && self.warm_beats_cold(
-                        runtime,
-                        &dispatch.target_id,
-                        &profile,
-                        prompt.len(),
-                        local,
-                        miss,
-                    ))
-                .then(|| {
-                    (
-                        super::pd_types::PdEndpoint::for_worker(worker.as_ref()),
-                        target,
-                    )
+        let candidates = {
+            let validated = prices.validate(workers);
+            workers
+                .iter()
+                .filter_map(|worker| {
+                    let target = super::pd_program_adapter::worker_target(worker);
+                    let local = validated.prefill_work(worker.url())?.device_miss_tokens;
+                    (self.worth_reading(local, miss)
+                        && self.pressure_ok(runtime, &target)
+                        && self.warm_beats_cold(
+                            runtime,
+                            &dispatch.target_id,
+                            &profile,
+                            prompt.len(),
+                            local,
+                            miss,
+                        ))
+                    .then(|| {
+                        (
+                            super::pd_types::PdEndpoint::for_worker(worker.as_ref()),
+                            target,
+                        )
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         // A P which has never served this Program can still be the best reader.
         let profile = profile.as_str();
         futures_util::stream::iter(candidates)
@@ -778,6 +777,21 @@ async fn local_prefix(
         .and_then(|n| usize::try_from(n).ok())
 }
 
+/// Keep placement evidence valid through a synchronous Program load update.
+pub(super) fn with_prefill_work<T>(
+    worker: &Arc<dyn Worker>,
+    prices: Option<crate::policies::PdWorkPrices>,
+    apply: impl FnOnce(Option<u64>) -> T,
+) -> T {
+    let validated = prices
+        .as_ref()
+        .map(|prices| prices.validate(std::slice::from_ref(worker)));
+    let local = validated
+        .as_ref()
+        .and_then(|prices| prices.prefill_work(worker.url()));
+    apply(local.map(|work| work.device_miss_tokens))
+}
+
 /// Fully separate from native PD: unsupported exact-token/capability requests use
 /// the native two-stage path.
 ///
@@ -803,7 +817,7 @@ pub(super) async fn execute(
     targets: &[ProgramTarget],
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
-    cold_work: impl Fn() -> Option<u64> + Sync,
+    cold_prices: impl Fn() -> Option<crate::policies::PdWorkPrices> + Sync,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -886,7 +900,7 @@ pub(super) async fn execute(
     let d_metric = d.base_url.strip_prefix("http://").unwrap_or(&d.base_url);
     let warm_pressure_ok = warm_remote.pressure_ok(runtime, p);
     let remote_miss = prompt.len().saturating_sub(coverage).max(1) as u64;
-    let local_work = cold_work();
+    let local_work = with_prefill_work(prefill_worker, cold_prices(), |local| local);
     let mut route = if warm_remote.config.warm_remote
         && pe.bidirectional
         && pe.fail_on_load_error
@@ -1020,8 +1034,12 @@ pub(super) async fn execute(
     }
     let event_revision = warm_remote.revision_for(d);
     let started = Instant::now();
-    let local_work = cold_work();
-    let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker, local_work);
+    let (attempt, priced) = with_prefill_work(prefill_worker, cold_prices(), |local| {
+        (
+            pd_load.admit_bound(prefill_worker.clone(), decode_worker, local),
+            local.is_some(),
+        )
+    });
     let result = async {
         let d_params = if route == PdPath::LocalAppend {
             attempt.finish_prefill();
@@ -1037,20 +1055,24 @@ pub(super) async fn execute(
                 return Err("P epoch changed after capacity wait".into());
             }
             // A newly selected reader may have restarted while it waited for P capacity.
-            if route == PdPath::WarmRemote && local_work.is_some()
+            if route == PdPath::WarmRemote && priced
                 && identify_uncached(client, p, headers, &warm_remote.config).await.as_ref().ok() != Some(&pe) {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
                 return Err("P epoch changed before warm read".into());
             }
             warm_remote.refresh_loss();
-            let warm = candidate.as_ref().filter(|c| {
-                route == PdPath::WarmRemote && Some(warm_remote.revision_for(&c.source)) == source_revision && warm_remote.pressure_ok(runtime, p)
-                    && local_work.is_none_or(|local| warm_remote.worth_reading(local, remote_miss))
-                    && warm_remote.rejection(c, &dispatch, &prompt, identity).is_none()
+            let warm = with_prefill_work(prefill_worker, cold_prices(), |local| {
+                let warm = candidate.as_ref().filter(|c| {
+                    route == PdPath::WarmRemote
+                        && Some(warm_remote.revision_for(&c.source)) == source_revision
+                        && warm_remote.pressure_ok(runtime, p)
+                        && local.is_none_or(|tokens| warm_remote.worth_reading(tokens, remote_miss))
+                        && warm_remote.rejection(c, &dispatch, &prompt, identity).is_none()
+                });
+                let charged = if warm.is_some() { local.map(|tokens| tokens.min(remote_miss)) } else { local };
+                attempt.reprice_prefill(charged);
+                warm
             });
-            if warm.is_some() {
-                attempt.reprice_prefill(local_work.map(|local| local.min(remote_miss)));
-            }
             if route == PdPath::WarmRemote && warm.is_none() {
                 route = PdPath::ColdRemote;
                 predicted = None;
@@ -1083,7 +1105,7 @@ pub(super) async fn execute(
                 warm_remote.read_outcome_in_profile(false, &de.profile);
                 route = PdPath::ColdRemote;
                 predicted = None;
-                attempt.reprice_prefill(cold_work());
+                with_prefill_work(prefill_worker, cold_prices(), |local| attempt.reprice_prefill(local));
                 // New transport ID, one bounded retry; no source metadata is reinserted.
                 value = prefill(
                     client,
@@ -1233,7 +1255,9 @@ pub(super) async fn execute(
             {
                 return Some(Err("P epoch changed before local cold retry".into()));
             }
-            attempt.restart_prefill(cold_work());
+            with_prefill_work(prefill_worker, cold_prices(), |local| {
+                attempt.restart_prefill(local)
+            });
             RouterMetrics::record_pd_prefill_request(p_metric);
             let value = prefill(
                 client,

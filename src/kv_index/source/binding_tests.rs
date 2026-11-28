@@ -31,7 +31,7 @@ impl SourceBinding {
             max_reusable_tokens,
             &mut RequestHashCache::for_single_target(),
         )
-        .0
+        .map_or(0, |(credited, _, _)| credited)
     }
 }
 
@@ -695,10 +695,10 @@ fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
         first.apply_batch(0, &qwen_batch()).unwrap();
         let tokens = prompt();
         let mut cache = crate::kv_index::RequestHashCache::default();
-        let (_claims, version, generation) = first
+        let (_claims, snapshot) = first
             .page_snapshot(None, &tokens, false, &mut cache)
             .unwrap();
-        assert!(first.snapshot_is_current(&version, generation));
+        assert!(first.snapshot_is_current(&snapshot));
         let writer = first.clone();
         let (sent, received) = mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -719,7 +719,7 @@ fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
             .recv_timeout(Duration::from_secs(2))
             .expect("page evidence must not hold the stream read lock");
         handle.join().unwrap();
-        assert!(!first.snapshot_is_current(&version, generation));
+        assert!(!first.snapshot_is_current(&snapshot));
         assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 }
@@ -733,10 +733,7 @@ fn retired_source_cannot_reactivate_a_shared_domain() {
     let active = Arc::new(AtomicBool::new(true));
     let old = index(8)
         .with_shared_index(shared.clone())
-        .with_source_binding(SourceLease {
-            active: active.clone(),
-            gate: Arc::new(parking_lot::Mutex::new(())),
-        });
+        .with_source_binding(SourceLease::new(active.clone()));
     old.begin_replay(0);
     old.apply_batch(0, &qwen_batch()).unwrap();
     active.store(false, Ordering::Release);
@@ -1268,6 +1265,38 @@ fn salted_events_leave_replay_open_for_the_unsalted_chain() {
 }
 
 #[test]
+fn salted_image_events_preserve_unrelated_prefix_credit() {
+    use crate::kv_index::source::test_support::{
+        full_binding, full_store, warm_full, TEST_IMAGE_HASH,
+    };
+    use rmpv::Value;
+
+    let index = full_binding(target(), 16);
+    let warm: Vec<_> = (100..133).collect();
+    index.begin_empty(0);
+    warm_full(&index, 0, &warm[..32]);
+    assert_eq!(index.reusable_tokens(&warm, usize::MAX), 32);
+
+    let image = Value::Array(vec![TEST_IMAGE_HASH.into(), 0.into()]);
+    let salt = Value::from("private-request");
+    let tokens: Vec<_> = (0..33).collect();
+    for (seq, keys) in [
+        vec![Value::Array(vec![image.clone(), salt.clone()]), Value::Nil],
+        vec![Value::Array(vec![salt]), Value::Array(vec![image])],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut store = full_store(&tokens[..32], 16, None);
+        store.extra_keys = Some(keys);
+        let batch = event_batch(vec![KVEvent::BlockStored(store)]);
+        assert_eq!(index.apply_batch(seq as u64 + 1, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&warm, usize::MAX), 32);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+    }
+}
+
+#[test]
 fn declared_adapter_store_does_not_hide_layout_errors() {
     for error in ["group", "kind", "locality", "block size", "token packing"] {
         let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);
@@ -1537,6 +1566,47 @@ fn qwen4_compressed_group_accepts_mla_events_and_rejects_other_specs() {
         wrong.apply_batch(0, &qwen4_batch(Some("full_attention"))),
         Err(SourceError::InvalidBatch)
     );
+}
+
+#[test]
+fn qwen4_compressed_partial_stores_extend_prefix_reuse() {
+    let tokens = prompt();
+    let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+    let groups = qwen4_groups();
+    let batch = event_batch(
+        groups
+            .iter()
+            .flat_map(|group| {
+                let spec = if group.kind == GroupRule::Checkpoint {
+                    "mamba"
+                } else {
+                    "mla_attention"
+                };
+                [
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        320,
+                        &tokens[..320],
+                        &hashes[19..20],
+                    )),
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        16,
+                        &tokens[464..480],
+                        &hashes[29..30],
+                    )),
+                ]
+            })
+            .collect(),
+    );
+    let index = SourceBinding::new(target(), groups, 16, 0, 8)
+        .unwrap()
+        .with_partial_hash_hits(true);
+    index.begin_empty(0);
+    assert_eq!(index.apply_batch(0, &batch), Ok(()));
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 480);
 }
 
 #[test]
@@ -1943,8 +2013,10 @@ fn bounded_replay_credits_one_window_below_the_engine() {
         let mut cache = crate::kv_index::RequestHashCache::for_single_target();
         cache.count_replay_pages = true;
         assert_eq!(
-            index.credit_parts(None, &tokens, usize::MAX, &mut cache),
-            (896, Some(crate::kv_index::StorageTier::Device))
+            index
+                .credit_parts(None, &tokens, usize::MAX, &mut cache)
+                .map(|(tokens, tier, _)| (tokens, tier)),
+            Some((896, crate::kv_index::StorageTier::Device))
         );
     }
 }
