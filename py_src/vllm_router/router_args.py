@@ -66,7 +66,7 @@ class RouterArgs:
     bootstrap_port_annotation: str = "vllm.ai/bootstrap-port"
     # ZMQ service discovery address for vLLM PD mode
     vllm_discovery_address: Optional[str] = None
-    # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
+    # KV connector for PD disaggregation.
     kv_connector: str = "nixl"
     # Explicit Program-level scheduling switch and optional JSON overrides.
     enable_program_scheduling: bool = False
@@ -481,10 +481,11 @@ class RouterArgs:
             f"--{prefix}kv-connector",
             type=str,
             default=RouterArgs.kv_connector,
-            choices=["nixl", "mooncake", "moriio"],
+            choices=["nixl", "mooncake", "mooncake-v2", "moriio"],
             help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
+            "'mooncake-v2' uses vLLM-Ascend MooncakeConnectorV2 in pull mode. "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
         # Prometheus configuration

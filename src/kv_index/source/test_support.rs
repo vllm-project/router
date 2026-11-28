@@ -61,6 +61,44 @@ pub(crate) fn warm_full(binding: &SourceBinding, seq: u64, tokens: &[u32]) {
     binding.apply_batch(seq, &batch).unwrap();
 }
 
+pub(crate) const TEST_IMAGE_HASH: &str =
+    "4de7f18a2817e217a8658d9ebb2b92460614615a862572c4c162f9f822393993";
+
+pub(crate) const TEST_IMAGE_BLOCK_HASHES: [&str; 2] = [
+    "702e3c6a2d000b3eb7efba64ac0d2faecbc18c68da6e7b43bbf3a61dfcc4d110",
+    "0ade0d242ddfcfc955a0bdc7a83168cf2cce2c9b3543a93320e976c369e01ca7",
+];
+
+pub(crate) fn warm_test_image(binding: &SourceBinding) {
+    let store = image_store(TEST_IMAGE_HASH, TEST_IMAGE_BLOCK_HASHES);
+    binding
+        .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(store)]))
+        .unwrap();
+}
+
+/// Independent vLLM hashes for tokens 0..128, with the image spanning 60..68.
+pub(crate) fn image_store(hash: &str, blocks: [&str; 2]) -> BlockStored {
+    let mut store = full_store(&(0..128).collect::<Vec<_>>(), 64, None);
+    store.block_hashes = blocks
+        .map(|hash| {
+            ExternalBlockHash::Bytes(
+                (0..hash.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hash[i..i + 2], 16).unwrap())
+                    .collect(),
+            )
+        })
+        .into();
+    store.extra_keys = Some(
+        [60, -4]
+            .map(|offset| {
+                rmpv::Value::Array(vec![rmpv::Value::Array(vec![hash.into(), offset.into()])])
+            })
+            .into(),
+    );
+    store
+}
+
 pub(crate) fn stored_block(
     block_hashes: Vec<ExternalBlockHash>,
     token_ids: Vec<u32>,
