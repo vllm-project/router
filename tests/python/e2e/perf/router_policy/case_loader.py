@@ -148,7 +148,8 @@ def prepare_trace(
         if trace_type == "agentX" and not expected_sha256:
             raise ValueError("AgentX replay requires runtime.trace_sha256")
         if expected_sha256:
-            actual = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+            body = trace_path.read_bytes().replace(b"\r\n", b"\n")
+            actual = hashlib.sha256(body).hexdigest()
             if actual != expected_sha256:
                 raise ValueError(
                     f"{trace_type} trace SHA256 mismatch: expected {expected_sha256}, got {actual}"

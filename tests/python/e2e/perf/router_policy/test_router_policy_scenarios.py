@@ -15,7 +15,6 @@ from tests.python.e2e.perf.router_policy.case_loader import (
     cell_output_dir,
     cell_run_suffix,
     load_case,
-    router_policy_result_path,
 )
 from tests.python.e2e.perf.router_policy.stack_launcher import run_router_policy_cell
 
@@ -200,7 +199,7 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
         expected_inventory = None
     run_suffix = cell_run_suffix()
     out = cell_output_dir(case, run_suffix=run_suffix)
-    cell_out = run_router_policy_cell(
+    return run_router_policy_cell(
         case_file,
         replay_validator=partial(
             validate_replay, expected_inventory=expected_inventory
@@ -209,31 +208,8 @@ def _run_cell(case_file: Path, concurrency: int) -> Path:
         out_dir=out,
         run_suffix=run_suffix,
     )
-    stats = json.loads((cell_out / "calibration.json").read_text(encoding="utf-8"))
-    errors = (
-        stats["replay_validation"]["errors"] + stats["router_policy_checks"]["errors"]
-    )
-    assert not errors, "\n".join(errors)
-    summary = router_policy_result_path(
-        stats["scenario"], stats["concurrency"], stats["task_num"], run_suffix
-    )
-    assert summary.is_file(), f"missing results JSON {summary}"
-    return cell_out
 
 
 def test_router_policy_replay_cell(case_file: Path, concurrency: int):
     """Workers → router → replay; one concurrency from a scenario JSON."""
-    out = _run_cell(case_file, concurrency)
-    req_path = out / "result" / "requests.jsonl"
-    assert req_path.is_file(), f"missing replay output {req_path}"
-    rows = [
-        json.loads(line)
-        for line in req_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert rows, "replay produced no requests"
-    failed = [r for r in rows if r.get("status") != "success"]
-    assert not failed, (
-        f"{len(failed)} non-success of {len(rows)} requests "
-        f"(first status={failed[0].get('status')!r})"
-    )
+    _run_cell(case_file, concurrency)

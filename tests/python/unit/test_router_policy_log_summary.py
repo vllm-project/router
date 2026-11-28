@@ -11,17 +11,12 @@ from tests.python.e2e.perf.router_policy import case_loader, log_summary
 pytestmark = [pytest.mark.ready, pytest.mark.cpu]
 
 
-@pytest.fixture
-def summary_module():
-    return log_summary
-
-
 def accepted_replay(result_dir, rows, *, task_num):
     """Stub an accepted validation result to isolate summary behavior."""
     return {"errors": []}
 
 
-def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypatch):
+def test_calibration_counts_filtered_samples(tmp_path, monkeypatch):
     rows = [
         dict(
             status="success",
@@ -47,8 +42,8 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
         "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
     )
     case = SimpleNamespace(
-        policy="kv_aware_aff",
-        scenario="pd_disagg_kv_aware_affinity",
+        policy="kv_aware",
+        scenario="pd_disagg_kv_aware",
         prefill_count=2,
         concurrency=8,
         task_num=3,
@@ -56,10 +51,8 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     )
     run = SimpleNamespace(case=case, out=tmp_path)
     # No workers/dashboard publication: verify the actual serialized calibration.
-    monkeypatch.setattr(
-        summary_module, "emit_run_summary", lambda *args, **kwargs: None
-    )
-    summary_module.write_calibration(
+    monkeypatch.setattr(log_summary, "emit_run_summary", lambda *args, **kwargs: None)
+    log_summary.write_calibration(
         run,
         replay_validator=accepted_replay,
         result_dir=result,
@@ -68,8 +61,8 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
         stalled=False,
     )
     stats = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
-    assert stats["router_policy"] == stats["arm"] == "kv_aware_aff"
-    assert stats["scenario"] == "pd_disagg_kv_aware_affinity"
+    assert stats["router_policy"] == stats["arm"] == "kv_aware"
+    assert stats["scenario"] == "pd_disagg_kv_aware"
     assert stats["topology"] == "pd_disaggregated"
     assert stats["success"] == 3
     assert stats["ttft_s"]["n"] == 2
@@ -85,10 +78,10 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     assert stats["incomplete_latency_metrics"] == ["ttft_s", "tpot_ms"]
 
 
-def test_empty_samples(summary_module, calibration_run):
+def test_empty_samples(calibration_run):
     run = calibration_run
     with pytest.raises(SystemExit, match="1"):
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=accepted_replay,
             result_dir=run.out / "result",
@@ -106,7 +99,7 @@ def test_empty_samples(summary_module, calibration_run):
 @pytest.mark.parametrize(
     "metadata,expected", [({"n": 7}, 7), ({"count": 5}, 5), ({}, None)]
 )
-def test_precomputed_jct_count(summary_module, prefill_run, metadata, expected):
+def test_precomputed_jct_count(prefill_run, metadata, expected):
     run = prefill_run
     result = run.out / "result"
     row = json.loads((result / "requests.jsonl").read_text(encoding="utf-8"))
@@ -116,7 +109,7 @@ def test_precomputed_jct_count(summary_module, prefill_run, metadata, expected):
     (result / "summary.json").write_text(
         json.dumps({"duration_seconds": duration}), encoding="utf-8"
     )
-    assert _calibrate_prefill(summary_module, run)["jct_s"] == {
+    assert _calibrate_prefill(run)["jct_s"] == {
         "n": expected,
         "mean": 1.5,
         "p50": 1.4,
@@ -133,13 +126,12 @@ def calibration_run(tmp_path, monkeypatch):
     (tmp_path / "after").mkdir()
     (tmp_path / "after/router.prom").write_text(
         'vllm_router_kv_placement_lookups_total{result="miss"} 1\n'
-        'vllm_router_pd_affinity_decisions_total{stage="decode",outcome="bind"} 1\n'
         'vllm_router_prefix_routing_decisions_total{policy="kv_aware",stage="regular",outcome="sticky_hit"} 1\n',
         encoding="utf-8",
     )
     case = SimpleNamespace(
-        policy="kv_aware_aff",
-        scenario="pd_disagg_kv_aware_affinity",
+        policy="kv_aware",
+        scenario="pd_disagg_kv_aware",
         prefill_count=2,
         concurrency=16,
         task_num=1,
@@ -160,12 +152,12 @@ def calibration_run(tmp_path, monkeypatch):
     ],
 )
 def test_invalid_measurements_fail_before_publication(
-    summary_module, calibration_run, prefill_count, missing, expected, capsys
+    calibration_run, prefill_count, missing, expected, capsys
 ):
     run = calibration_run
     run.case.prefill_count = prefill_count
     prefix = "pd_disagg" if prefill_count else "pd_merge"
-    run.case.scenario = f"{prefix}_kv_aware_affinity"
+    run.case.scenario = f"{prefix}_kv_aware"
     row = dict(
         request_id="request-0-0",
         session_id="session-0",
@@ -190,7 +182,7 @@ def test_invalid_measurements_fail_before_publication(
         (result / "summary.json").write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(SystemExit, match="1"):
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=accepted_replay,
             result_dir=result,
@@ -212,6 +204,44 @@ def test_invalid_measurements_fail_before_publication(
     assert not list((run.out / "published").rglob("*.json"))
 
 
+@pytest.mark.parametrize("replay_rc", [0, 42])
+def test_failure_summary_prints_all_applicable_diagnostics(
+    calibration_run, replay_rc, capsys
+):
+    run = calibration_run
+    stats = dict(
+        ok=False,
+        success=0,
+        requests=28,
+        missing_latency_metrics=["ttft_s", "tpot_ms", "jct_s"],
+        incomplete_latency_metrics=["ttft_s"],
+        latency_coverage={"ttft_s": {"actual": 0, "expected": 28}},
+        replay_validation={"errors": ["request count mismatch: expected 28, got 0"]},
+        router_policy_checks={"errors": ["zero KV placement lookups"]},
+        snapshot_errors=["metrics snapshot failed for router: 503"],
+    )
+    (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
+    with pytest.raises(SystemExit, match="1"):
+        log_summary.emit_run_summary(run, stats, replay_rc=replay_rc, stalled=True)
+    diagnostics = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("DIAGNOSTIC ")
+    ]
+    for reason in (
+        "missing latency measurements: ttft_s, tpot_ms, jct_s",
+        "incomplete latency measurements: ttft_s=0/28",
+        "replay completeness: request count mismatch: expected 28, got 0",
+        "zero KV placement lookups",
+        "metrics snapshot failed for router: 503",
+        "stalled or non-success rows in requests.jsonl",
+    ):
+        assert f"DIAGNOSTIC {reason}" in diagnostics
+    if replay_rc:
+        assert "DIAGNOSTIC replay failed (exit 42)" in diagnostics
+    assert not list((run.out / "published").rglob("*.json"))
+
+
 @pytest.mark.parametrize(
     "prefill_count,task_num,request_count",
     [(0, 8, 28), (2, 12, 144)],
@@ -219,7 +249,6 @@ def test_invalid_measurements_fail_before_publication(
 )
 @pytest.mark.parametrize("missing_field", ["ttft_seconds", "latency_seconds"])
 def test_incomplete_timing_coverage_blocks_publication(
-    summary_module,
     calibration_run,
     prefill_count,
     task_num,
@@ -252,7 +281,7 @@ def test_incomplete_timing_coverage_blocks_publication(
     )
 
     with pytest.raises(SystemExit, match="1"):
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=accepted_replay,
             result_dir=run.out / "result",
@@ -291,7 +320,7 @@ def test_incomplete_timing_coverage_blocks_publication(
     ids=["nan", "infinity", "negative", "latency_before_ttft", "boolean", "text"],
 )
 def test_invalid_timing_samples_cannot_satisfy_coverage(
-    summary_module, calibration_run, prefill_count, field, value
+    calibration_run, prefill_count, field, value
 ):
     run = calibration_run
     run.case.prefill_count = prefill_count
@@ -316,7 +345,7 @@ def test_invalid_timing_samples_cannot_satisfy_coverage(
     )
 
     with pytest.raises(SystemExit, match="1"):
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=accepted_replay,
             result_dir=run.out / "result",
@@ -335,7 +364,7 @@ def test_invalid_timing_samples_cannot_satisfy_coverage(
 @pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
 @pytest.mark.parametrize("include_failed", [False, True])
 def test_coverage_counts_eligible_successes_and_publishes_complete_metrics(
-    summary_module, calibration_run, prefill_count, include_failed
+    calibration_run, prefill_count, include_failed
 ):
     run = calibration_run
     run.case.prefill_count = prefill_count
@@ -361,7 +390,7 @@ def test_coverage_counts_eligible_successes_and_publishes_complete_metrics(
     )
 
     def calibrate():
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=accepted_replay,
             result_dir=run.out / "result",
@@ -398,9 +427,7 @@ def test_coverage_counts_eligible_successes_and_publishes_complete_metrics(
     [{}, {"scenario": None}, {"scenario": ""}, {"scenario": " \t"}, {"scenario": 1}],
     ids=["missing", "null", "empty", "whitespace", "non_string"],
 )
-def test_publication_requires_scenario(
-    summary_module, calibration_run, topology, scenario_metadata
-):
+def test_publication_requires_scenario(calibration_run, topology, scenario_metadata):
     run = calibration_run
     stats = dict(
         ok=True,
@@ -412,16 +439,14 @@ def test_publication_requires_scenario(
     )
     (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
 
-    summary_module.emit_run_summary(run, stats, replay_rc=0, stalled=False)
+    log_summary.emit_run_summary(run, stats, replay_rc=0, stalled=False)
     assert not list((run.out / "published").rglob("*.json"))
     assert (
         json.loads((run.out / "calibration.json").read_text(encoding="utf-8")) == stats
     )
 
 
-def test_same_policy_topologies_publish_separate_results(
-    summary_module, calibration_run
-):
+def test_same_policy_topologies_publish_separate_results(calibration_run):
     run = calibration_run
     published = []
     for prefix, topology in [
@@ -437,7 +462,7 @@ def test_same_policy_topologies_publish_separate_results(
             task_num=8,
         )
         (run.out / "calibration.json").write_text(json.dumps(stats), encoding="utf-8")
-        summary_module.emit_run_summary(run, stats, replay_rc=0, stalled=False)
+        log_summary.emit_run_summary(run, stats, replay_rc=0, stalled=False)
         expected = case_loader.router_policy_result_path(
             stats["scenario"], 16, 8, "unit_test"
         )
@@ -452,12 +477,12 @@ def test_same_policy_topologies_publish_separate_results(
 @pytest.mark.parametrize("prefill_count", [0, 2])
 @pytest.mark.parametrize("jct_count", [None, 0, 8])
 def test_publication_schema_and_precomputed_jct(
-    summary_module, calibration_run, prefill_count, jct_count
+    calibration_run, prefill_count, jct_count
 ):
     run = calibration_run
     run.case.prefill_count = prefill_count
     prefix = "pd_disagg" if prefill_count else "pd_merge"
-    run.case.scenario = f"{prefix}_kv_aware_affinity"
+    run.case.scenario = f"{prefix}_kv_aware"
     result = run.out / "result"
     row = dict(
         request_id="request-0-0",
@@ -477,7 +502,7 @@ def test_publication_schema_and_precomputed_jct(
 
     if jct_count == 0:
         with pytest.raises(SystemExit, match="1"):
-            summary_module.write_calibration(
+            log_summary.write_calibration(
                 run,
                 replay_validator=accepted_replay,
                 result_dir=result,
@@ -488,7 +513,7 @@ def test_publication_schema_and_precomputed_jct(
         assert not list((run.out / "published").rglob("*.json"))
         return
 
-    summary_module.write_calibration(
+    log_summary.write_calibration(
         run,
         replay_validator=accepted_replay,
         result_dir=result,
@@ -502,9 +527,8 @@ def test_publication_schema_and_precomputed_jct(
     stats = json.loads(published.read_text(encoding="utf-8"))
     assert stats["ok"] is True
     assert stats["scenario"] == run.case.scenario
-    assert stats["router_policy"] == stats["arm"] == "kv_aware_aff"
+    assert stats["router_policy"] == stats["arm"] == "kv_aware"
     assert stats["topology"] == ("pd_disaggregated" if prefill_count else "pd_merged")
-    assert "routing_policy" not in stats
     assert stats["jct_s"]["n"] == jct_count
 
 
@@ -578,8 +602,8 @@ def prefill_run(calibration_run):
     return run
 
 
-def _calibrate_prefill(summary_module, run):
-    summary_module.write_calibration(
+def _calibrate_prefill(run):
+    log_summary.write_calibration(
         run,
         replay_validator=accepted_replay,
         result_dir=run.out / "result",
@@ -590,7 +614,7 @@ def _calibrate_prefill(summary_module, run):
     return json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
 
 
-def test_supplied_replay_validator_can_prevent_publication(summary_module, prefill_run):
+def test_supplied_replay_validator_can_prevent_publication(prefill_run):
     run = prefill_run
     calls = []
 
@@ -599,7 +623,7 @@ def test_supplied_replay_validator_can_prevent_publication(summary_module, prefi
         return {"errors": ["injected replay validation failure"]}
 
     with pytest.raises(SystemExit, match="1"):
-        summary_module.write_calibration(
+        log_summary.write_calibration(
             run,
             replay_validator=reject_replay,
             result_dir=run.out / "result",
@@ -620,16 +644,20 @@ def test_supplied_replay_validator_can_prevent_publication(summary_module, prefi
     assert not list((run.out / "published").rglob("*.json"))
 
 
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
-@pytest.mark.parametrize("policy", ["kv_aware", "kv_aware_aff"])
+@pytest.mark.parametrize(
+    "prefill_count,policy",
+    [(0, "kv_aware"), (0, "kv_aware_aff"), (2, "kv_aware")],
+    ids=["merged_kv", "merged_affinity", "pd_kv"],
+)
 def test_unavailable_kv_index_fails_before_publication(
-    summary_module, prefill_run, prefill_count, policy, capsys
+    prefill_run, prefill_count, policy, capsys
 ):
     run = prefill_run
     run.case.prefill_count = prefill_count
     run.case.policy = policy
     prefix = "pd_disagg" if prefill_count else "pd_merge"
-    run.case.scenario = f"{prefix}_{policy}"
+    suffix = "kv_aware_affinity" if policy == "kv_aware_aff" else policy
+    run.case.scenario = f"{prefix}_{suffix}"
     snapshot = run.out / "after/router.prom"
     snapshot.write_text(
         'vllm_router_kv_placement_lookups_total{result="index_unavailable"} 100\n'
@@ -638,7 +666,7 @@ def test_unavailable_kv_index_fails_before_publication(
     )
 
     with pytest.raises(SystemExit, match="1"):
-        _calibrate_prefill(summary_module, run)
+        _calibrate_prefill(run)
 
     stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
     assert stats["requests"] == stats["success"] == 1
@@ -647,15 +675,21 @@ def test_unavailable_kv_index_fails_before_publication(
     assert not list((run.out / "published").rglob("*.json"))
 
 
-@pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
-@pytest.mark.parametrize("policy", ["kv_aware", "kv_aware_aff"])
+@pytest.mark.parametrize(
+    "prefill_count,policy",
+    [(0, "kv_aware"), (0, "kv_aware_aff"), (2, "kv_aware")],
+    ids=["merged_kv", "merged_affinity", "pd_kv"],
+)
 @pytest.mark.parametrize("result", ["hit", "miss"])
 def test_verified_kv_lookup_allows_publication(
-    summary_module, prefill_run, prefill_count, policy, result
+    prefill_run, prefill_count, policy, result
 ):
     run = prefill_run
     run.case.prefill_count = prefill_count
     run.case.policy = policy
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    suffix = "kv_aware_affinity" if policy == "kv_aware_aff" else policy
+    run.case.scenario = f"{prefix}_{suffix}"
     snapshot = run.out / "after/router.prom"
     # Labels can be reordered and additional labels must not hide valid activity.
     with snapshot.open("a", encoding="utf-8") as stream:
@@ -663,7 +697,7 @@ def test_verified_kv_lookup_allows_publication(
             f'vllm_router_kv_placement_lookups_total{{worker="0",result="{result}"}} 2\n'
             f'vllm_router_kv_placement_lookups_total{{result="{result}",worker="1"}} 3\n'
         )
-    stats = _calibrate_prefill(summary_module, run)
+    stats = _calibrate_prefill(run)
 
     assert stats["ok"] is True
     checks = stats["router_policy_checks"]
@@ -672,7 +706,7 @@ def test_verified_kv_lookup_allows_publication(
     if policy == "kv_aware":
         assert "affinity" not in checks
     else:
-        assert checks["affinity"]["stage"] == ("decode" if prefill_count else "regular")
+        assert checks["affinity"]["stage"] == "regular"
     published = case_loader.router_policy_result_path(
         run.case.scenario, 16, run.case.task_num, "unit_test"
     )
@@ -681,9 +715,7 @@ def test_verified_kv_lookup_allows_publication(
 
 @pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
 @pytest.mark.parametrize("sample", [None, "", "0", "NaN", "+Inf", "-1", "invalid"])
-def test_missing_or_invalid_lookup_counters_fail(
-    summary_module, prefill_run, prefill_count, sample
-):
+def test_missing_or_invalid_lookup_counters_fail(prefill_run, prefill_count, sample):
     run = prefill_run
     run.case.prefill_count = prefill_count
     run.case.policy = "kv_aware"
@@ -698,7 +730,7 @@ def test_missing_or_invalid_lookup_counters_fail(
             encoding="utf-8",
         )
     with pytest.raises(SystemExit, match="1"):
-        _calibrate_prefill(summary_module, run)
+        _calibrate_prefill(run)
     stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
     assert len(stats["router_policy_checks"]["errors"]) == 1
     assert "sha256_cbor" in stats["router_policy_checks"]["errors"][0]
@@ -706,61 +738,48 @@ def test_missing_or_invalid_lookup_counters_fail(
 
 
 @pytest.mark.parametrize(
-    "prefill_count,metric,labels,passes",
+    "metric,labels,passes",
     [
-        (2, "pd_affinity", 'stage="decode",outcome="bind"', True),
-        (2, "pd_affinity", 'outcome="sticky_hit",stage="decode"', True),
-        (2, "pd_affinity", 'stage="prefill",outcome="bind"', False),
-        (2, "pd_affinity", 'stage="decode",outcome="no_session"', False),
-        (2, "pd_affinity", 'stage="decode",outcome="capacity_bypass"', False),
         (
-            2,
-            "prefix_routing",
-            'policy="kv_aware",stage="regular",outcome="sticky_hit"',
-            False,
-        ),
-        (
-            0,
             "prefix_routing",
             'policy="kv_aware",stage="regular",outcome="sticky_hit"',
             True,
         ),
         (
-            0,
             "prefix_routing",
             'policy="cache_aware",stage="regular",outcome="sticky_hit"',
             False,
         ),
         (
-            0,
             "prefix_routing",
             'policy="kv_aware",stage="prefill",outcome="sticky_hit"',
             False,
         ),
         (
-            0,
             "prefix_routing",
             'policy="kv_aware",stage="regular",outcome="prefix_cost"',
             False,
         ),
-        (0, "pd_affinity", 'stage="decode",outcome="bind"', False),
+        ("pd_affinity", 'stage="decode",outcome="bind"', False),
     ],
 )
 def test_affinity_requires_the_matching_stage_and_outcome(
-    summary_module, prefill_run, prefill_count, metric, labels, passes, capsys
+    prefill_run, metric, labels, passes, capsys
 ):
     run = prefill_run
-    run.case.prefill_count = prefill_count
+    run.case.prefill_count = 0
+    run.case.policy = "kv_aware_aff"
+    run.case.scenario = "pd_merge_kv_aware_affinity"
     (run.out / "after/router.prom").write_text(
         'vllm_router_kv_placement_lookups_total{result="miss"} 1\n'
         f"vllm_router_{metric}_decisions_total{{{labels}}} 1\n",
         encoding="utf-8",
     )
     if passes:
-        assert _calibrate_prefill(summary_module, run)["ok"] is True
+        assert _calibrate_prefill(run)["ok"] is True
     else:
         with pytest.raises(SystemExit, match="1"):
-            _calibrate_prefill(summary_module, run)
+            _calibrate_prefill(run)
         stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
         assert len(stats["router_policy_checks"]["errors"]) == 1
         assert "affinity decisions" in capsys.readouterr().out
@@ -768,19 +787,17 @@ def test_affinity_requires_the_matching_stage_and_outcome(
 
 
 @pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
-def test_cache_aware_skips_index_and_affinity_checks(
-    summary_module, prefill_run, prefill_count
-):
+def test_cache_aware_skips_index_and_affinity_checks(prefill_run, prefill_count):
     run = prefill_run
     run.case.policy = "cache_aware"
     run.case.prefill_count = prefill_count
     (run.out / "after/router.prom").unlink()
-    stats = _calibrate_prefill(summary_module, run)
+    stats = _calibrate_prefill(run)
     assert stats["ok"] is True
     assert stats["router_policy_checks"] == {"errors": []}
 
 
-def test_prefill_deltas_exclude_decode_and_copy_to_results(summary_module, prefill_run):
+def test_prefill_deltas_exclude_decode_and_copy_to_results(prefill_run):
     run = prefill_run
     ignored = (
         'vllm:prompt_tokens_by_source_total{source="local_cache_hit"} 900000\n'
@@ -817,7 +834,7 @@ def test_prefill_deltas_exclude_decode_and_copy_to_results(summary_module, prefi
             run, "after", worker, hits=9999, queries=10000, computed=500000
         )
 
-    stats = _calibrate_prefill(summary_module, run)
+    stats = _calibrate_prefill(run)
     assert stats["prefill"] == {
         "prefix_cache_hit_rate": 0.25,
         "new_prompt_tokens": 300,
@@ -854,18 +871,18 @@ def test_prefill_deltas_exclude_decode_and_copy_to_results(summary_module, prefi
     ids=["pd_merge", "1p1d", "2p2d"],
 )
 def test_prefill_workers_follow_topology(
-    summary_module, prefill_run, worker_count, prefill_count, indices, tokens, skew
+    prefill_run, worker_count, prefill_count, indices, tokens, skew
 ):
     run = prefill_run
     run.case.worker_count = worker_count
     run.case.prefill_count = prefill_count
     if not prefill_count:
-        run.case.scenario = "pd_merge_kv_aware_affinity"
+        run.case.scenario = "pd_merge_kv_aware"
     for worker in (2, 3):
         _write_prefill_snapshot(
             run, "after", worker, hits=40, queries=200, computed=1080
         )
-    prefill = _calibrate_prefill(summary_module, run)["prefill"]
+    prefill = _calibrate_prefill(run)["prefill"]
     assert [worker["worker_index"] for worker in prefill["workers"]] == indices
     assert prefill["new_prompt_tokens"] == tokens
     assert prefill["new_prompt_tokens_max_mean"] == pytest.approx(skew)
@@ -880,9 +897,7 @@ def test_prefill_workers_follow_topology(
         ("new_prompt_tokens", "vllm:prompt_tokens_by_source_total"),
     ],
 )
-def test_missing_prefill_counters_are_unknown(
-    summary_module, prefill_run, phase, field, counter
-):
+def test_missing_prefill_counters_are_unknown(prefill_run, phase, field, counter):
     run = prefill_run
     path = run.out / phase / "engine0.prom"
     path.write_text(
@@ -894,7 +909,7 @@ def test_missing_prefill_counters_are_unknown(
         + "\n",
         encoding="utf-8",
     )
-    stats = _calibrate_prefill(summary_module, run)
+    stats = _calibrate_prefill(run)
     assert stats["ok"] is True
     prefill = stats["prefill"]
     assert prefill["workers"][0][field] is None
@@ -908,7 +923,7 @@ def test_missing_prefill_counters_are_unknown(
 
 
 @pytest.mark.parametrize("value", ["NaN", "+Inf", "-1", "1e400", "invalid"])
-def test_invalid_prefill_compute_counter_is_unknown(summary_module, prefill_run, value):
+def test_invalid_prefill_compute_counter_is_unknown(prefill_run, value):
     _write_prefill_snapshot(
         prefill_run,
         "after",
@@ -918,28 +933,28 @@ def test_invalid_prefill_compute_counter_is_unknown(summary_module, prefill_run,
         computed=value,
         extra='vllm:prompt_tokens_by_source_total{engine="1",source="local_compute"} 10\n',
     )
-    stats = _calibrate_prefill(summary_module, prefill_run)
+    stats = _calibrate_prefill(prefill_run)
     assert stats["ok"] is True
     assert stats["prefill"]["new_prompt_tokens"] is None
     assert stats["prefill"]["workers"][0]["new_prompt_tokens"] is None
     assert "engine0.new_prompt_tokens" in stats["prefill"]["unavailable_metrics"]
 
 
-def test_prefill_counter_reset_is_unknown(summary_module, prefill_run):
+def test_prefill_counter_reset_is_unknown(prefill_run):
     _write_prefill_snapshot(prefill_run, "after", 0, hits=40, queries=200, computed=40)
-    stats = _calibrate_prefill(summary_module, prefill_run)
+    stats = _calibrate_prefill(prefill_run)
     assert stats["ok"] is True
     assert stats["prefill"]["new_prompt_tokens"] is None
     assert "engine0.new_prompt_tokens" in stats["prefill"]["unavailable_metrics"]
 
 
-def test_zero_prefill_counters_are_preserved(summary_module, prefill_run):
+def test_zero_prefill_counters_are_preserved(prefill_run):
     for phase in ("before", "after"):
         for worker in range(4):
             _write_prefill_snapshot(
                 prefill_run, phase, worker, hits=0, queries=0, computed=0
             )
-    prefill = _calibrate_prefill(summary_module, prefill_run)["prefill"]
+    prefill = _calibrate_prefill(prefill_run)["prefill"]
     assert prefill["new_prompt_tokens"] == 0
     assert prefill["new_prompt_tokens_max_mean"] is None
     assert prefill["prefix_cache_hit_rate"] is None

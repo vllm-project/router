@@ -65,8 +65,7 @@ launched. Each policy cell still starts fresh engines and a fresh router,
 preserving a cold KV cache for each replay. `ENGINES_READY` and `ROUTER_READY`
 report startup time. In `calibration.json`, `wall_seconds` includes startup
 and cleanup, while `makespan_seconds` is the measured request window.
-The nightly 180-minute PD timeout is a job budget; actual H100 runtime needs
-GPU measurement.
+The 180-minute PD budget is provisional until measured on the four-L4 lane.
 
 All six scenarios use the same vLLM 0.30.0 KV-event contract described in the
 [KV-aware worker requirements](https://github.com/vllm-project/router/blob/main/docs/load_balancing/kv_aware.md#worker-requirements).
@@ -131,10 +130,18 @@ records the affected metrics in `incomplete_latency_metrics`, and prevents
 dashboard publication. The console diagnostic includes each actual/expected
 count; `calibration.json` retains the available samples for diagnosis. These
 are measurement-completeness checks with no performance thresholds.
+Every applicable failure reason is printed as a separate `DIAGNOSTIC` line,
+including replay, measurement, completeness, KV-index, and final-snapshot errors.
 These checks apply to both merged and disaggregated cells. A replay with all
 requests successful still fails if no valid TPOT samples remain (for example,
 all outputs have at most one token) or JCT durations are unavailable. Its
 `calibration.json` is retained for diagnosis.
+The initial `before` metrics snapshot fails fast. The final `after` snapshot
+collects endpoint failures in `snapshot_errors` and continues scraping the
+remaining endpoints. Any final-snapshot error sets `ok=false` and prevents
+publication, while replay statistics and validation are retained in calibration.
+Worker counters and cache ratios are `null` when required snapshot files are
+unavailable.
 
 Before publication, `replay_validation` checks the persisted requests against
 AgentInfer's `result/replay-source-analysis.json` and `result/replay-plan.json`,
@@ -234,7 +241,9 @@ and `gap_scale=0.002`. AgentInfer's `replay_agentX.yaml` supplies the matching
 token-ID replay settings. See [data provenance and reproduction](data/README.md).
 
 The shared cell launcher calls `prepare_trace()` before starting workers.
-PD cases verify `runtime.trace_sha256` against the bundled slice. Unpinned
+PD cases verify `runtime.trace_sha256` against the bundled slice. Hashing
+normalizes CRLF to LF without rewriting the trace; other content changes still
+fail the digest check. Unpinned
 merged cases check the local file or download optional `TRACELAB_JSONL_URL`
 into the cell directory as `trace.jsonl`. This override does not affect the
 pinned PD cases. Downloads replace the cell's trace atomically, and failures

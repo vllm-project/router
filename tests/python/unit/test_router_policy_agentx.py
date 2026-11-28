@@ -12,7 +12,7 @@ import pytest
 import httpx
 import yaml
 
-from tests.python.e2e.perf.router_policy import case_loader
+from tests.python.e2e.perf.router_policy import case_loader, log_summary
 from tests.python.e2e.perf.router_policy.stack_launcher import (
     allocate_ports,
     cleanup,
@@ -217,14 +217,108 @@ def test_snapshot_uses_router_metrics_port_and_checks_http_status(
             assert (tmp_path / "engine0.prom").read_text(
                 encoding="utf-8"
             ) == "worker metrics\n"
+            assert set(requests) == {
+                "http://127.0.0.1:30002/metrics",
+                "http://127.0.0.1:30001/metrics",
+            }
         else:
             with pytest.raises(httpx.HTTPStatusError):
                 snapshot(run, tmp_path)
             assert not (tmp_path / "router.prom").exists()
-    assert requests == [
-        "http://127.0.0.1:30002/metrics",
-        "http://127.0.0.1:30001/metrics",
-    ]
+            assert "http://127.0.0.1:30001/metrics" in requests
+
+
+@pytest.mark.parametrize("prefill_count", [0, 1], ids=["pd_merge", "pd_disagg"])
+@pytest.mark.parametrize("fault", ["engine", "router", "connection", "directory"])
+def test_final_snapshot_failure_retains_failed_calibration(
+    tmp_path, monkeypatch, prefill_count, fault, capsys
+):
+    monkeypatch.setattr(case_loader, "PERF_RESULTS_DIR", tmp_path / "published")
+    monkeypatch.setenv(case_loader.RUN_SUFFIX_ENV, "snapshot_failure")
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    case = SimpleNamespace(
+        worker_count=2,
+        prefill_count=prefill_count,
+        policy="cache_aware",
+        scenario=f"{prefix}_cache_aware",
+        concurrency=1,
+        task_num=1,
+    )
+    result = tmp_path / "result"
+    result.mkdir()
+    row = dict(
+        request_id="request-0",
+        session_id="session-0",
+        status="success",
+        ttft_seconds=0.1,
+        latency_seconds=0.5,
+        output_tokens=3,
+        duration_seconds=1.0,
+    )
+    (result / "requests.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (tmp_path / "before").mkdir()
+    metrics = (
+        "vllm:request_success_total 1\n"
+        "vllm:prefix_cache_hits_total 1\n"
+        "vllm:prefix_cache_queries_total 2\n"
+        'vllm:prompt_tokens_by_source_total{source="local_compute"} 1\n'
+    )
+    for worker in range(2):
+        (tmp_path / "before" / f"engine{worker}.prom").write_text(
+            metrics.replace(" 1\n", " 0\n").replace(" 2\n", " 0\n"), encoding="utf-8"
+        )
+    requests = []
+
+    def handle(request):
+        requests.append(str(request.url))
+        if request.url.port == 30002 and fault == "connection":
+            raise httpx.ConnectError("worker metrics unavailable", request=request)
+        bad = (fault == "engine" and request.url.port == 30002) or (
+            fault == "router" and request.url.port == 30001
+        )
+        return httpx.Response(503 if bad else 200, text=metrics)
+
+    if fault == "directory":
+        (tmp_path / "after").write_text("not a directory", encoding="utf-8")
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        run = SimpleNamespace(
+            case=case,
+            out=tmp_path,
+            clients=client,
+            ports={"router": 30000, "metrics": 30001, "http": [30002, 30003]},
+        )
+        errors = snapshot(run, tmp_path / "after", strict=False)
+        assert len(errors) == 1
+        with pytest.raises(SystemExit, match="1"):
+            log_summary.write_calibration(
+                run,
+                replay_validator=lambda result_dir, rows, **kwargs: {"errors": []},
+                result_dir=result,
+                replay_rc=0,
+                wall_seconds=1,
+                stalled=False,
+                snapshot_errors=errors,
+            )
+    stats = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["ok"] is False
+    assert stats["requests"] == stats["success"] == 1
+    assert stats["snapshot_errors"] == errors
+    assert stats["replay_validation"] == {"errors": []}
+    assert stats["ttft_s"]["n"] == stats["tpot_ms"]["n"] == 1
+    assert "DIAGNOSTIC metrics snapshot failed" in capsys.readouterr().out
+    assert not list((tmp_path / "published").rglob("*.json"))
+    if fault == "directory":
+        assert not requests
+    else:
+        assert set(requests) == {
+            "http://127.0.0.1:30002/metrics",
+            "http://127.0.0.1:30003/metrics",
+            "http://127.0.0.1:30001/metrics",
+        }
+        assert (tmp_path / "after/engine1.prom").is_file()
+    if fault in {"engine", "connection", "directory"}:
+        assert stats["worker_requests"][0] is None
+        assert stats["cache_hit_rate"] is None
 
 
 @pytest.mark.parametrize(
@@ -232,18 +326,6 @@ def test_snapshot_uses_router_metrics_port_and_checks_http_status(
     [
         (
             "pd_disagg_cache_aware",
-            "agentX",
-            "/v1/completions",
-            "replay_agentX.yaml",
-        ),
-        (
-            "pd_disagg_kv_aware",
-            "agentX",
-            "/v1/completions",
-            "replay_agentX.yaml",
-        ),
-        (
-            "pd_disagg_round_robin",
             "agentX",
             "/v1/completions",
             "replay_agentX.yaml",

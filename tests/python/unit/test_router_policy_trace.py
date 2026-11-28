@@ -127,10 +127,44 @@ def test_pinned_tracelab_rejects_changed_data(tmp_path, monkeypatch):
     assert not (tmp_path / "run").exists()
 
 
+@pytest.mark.parametrize("trace_type", ["agentX", "tracelab"])
+@pytest.mark.parametrize("tampered", [False, True])
+def test_pinned_trace_accepts_crlf_but_rejects_content_changes(
+    tmp_path, trace_type, tampered, monkeypatch
+):
+    monkeypatch.delenv("TRACELAB_JSONL_URL", raising=False)
+    original = b'{"session": "first"}\n{"session": "second"}\n'
+    expected = hashlib.sha256(original).hexdigest()
+    body = original.replace(b"\n", b"\r\n")
+    if tampered:
+        body = body.replace(b"first", b"changed")
+    trace = tmp_path / "trace.jsonl"
+    trace.write_bytes(body)
+    if tampered:
+        with pytest.raises(ValueError, match="SHA256 mismatch"):
+            case_loader.prepare_trace(
+                trace,
+                out_dir=tmp_path / "run",
+                trace_type=trace_type,
+                expected_sha256=expected,
+            )
+    else:
+        assert (
+            case_loader.prepare_trace(
+                trace,
+                out_dir=tmp_path / "run",
+                trace_type=trace_type,
+                expected_sha256=expected,
+            )
+            == trace
+        )
+    assert trace.read_bytes() == body
+
+
 def test_pd_agentx_fits_all_pd_cases():
     suite = Path(__file__).parents[1] / "e2e/perf/router_policy"
     trace = suite / "data" / extract_agentx_ci.TRACE_FILE
-    body = trace.read_bytes()
+    body = trace.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(body).hexdigest() == extract_agentx_ci.TRACE_SHA256
     sessions = [json.loads(line) for line in body.splitlines()]
     assert len(sessions) == len({session["id"] for session in sessions}) == 12

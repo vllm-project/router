@@ -601,18 +601,31 @@ def _require_resolved_kv_events(run: RouterPolicyStack) -> None:
             raise RuntimeError(f"{label} still advertises port 0: {unresolved}")
 
 
-def snapshot(run: RouterPolicyStack, dest: Path):
-    dest.mkdir(parents=True, exist_ok=True)
+def snapshot(run: RouterPolicyStack, dest: Path, *, strict: bool = True) -> list[str]:
+    """Scrape metrics; the final snapshot collects errors for calibration."""
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if strict:
+            raise
+        return [f"metrics snapshot failed for {dest}: {exc}"]
     ports = run.ports
     endpoints = {
         f"engine{i}.prom": f"http://127.0.0.1:{ports['http'][i]}/metrics"
         for i in range(run.case.worker_count)
     }
     endpoints["router.prom"] = f"http://127.0.0.1:{ports['metrics']}/metrics"
+    errors = []
     for filename, url in endpoints.items():
-        response = run.clients.get(url)
-        response.raise_for_status()
-        (dest / filename).write_text(response.text, encoding="utf-8")
+        try:
+            response = run.clients.get(url)
+            response.raise_for_status()
+            (dest / filename).write_text(response.text, encoding="utf-8")
+        except (httpx.HTTPError, OSError) as exc:
+            if strict:
+                raise
+            errors.append(f"metrics snapshot failed for {url}: {exc}")
+    return errors
 
 
 def run_router_policy_cell(
@@ -836,7 +849,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             replay.wait(timeout=120)
         except subprocess.TimeoutExpired:
             graceful_stop(replay, 30, process_group=True, kill_grace=15)
-        snapshot(run, run.out / "after")
+        snapshot_errors = snapshot(run, run.out / "after", strict=False)
         replay_rc = replay.returncode
         if replay_rc not in (0, None):
             print(f"REPLAY exit code {replay_rc}", flush=True)
@@ -848,6 +861,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             replay_rc=replay_rc,
             wall_seconds=time.monotonic() - started,
             stalled=stalled,
+            snapshot_errors=snapshot_errors,
         )
     finally:
         cleanup(run)

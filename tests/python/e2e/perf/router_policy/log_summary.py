@@ -111,37 +111,33 @@ def emit_run_summary(
         print_artifacts(out, workers, extras=summary_extra)
         if not stats.get("ok"):
             failed = True
+            diagnostics = []
             if replay_rc not in (0, None):
-                print(f"DIAGNOSTIC replay failed (exit {replay_rc})", flush=True)
-            elif stats.get("missing_latency_metrics"):
-                print(
-                    "DIAGNOSTIC missing latency measurements: "
-                    + ", ".join(stats["missing_latency_metrics"]),
-                    flush=True,
+                diagnostics.append(f"replay failed (exit {replay_rc})")
+            if stats.get("missing_latency_metrics"):
+                diagnostics.append(
+                    "missing latency measurements: "
+                    + ", ".join(stats["missing_latency_metrics"])
                 )
-            elif stats.get("incomplete_latency_metrics"):
+            if stats.get("incomplete_latency_metrics"):
                 coverage = stats["latency_coverage"]
-                print(
-                    "DIAGNOSTIC incomplete latency measurements: "
+                diagnostics.append(
+                    "incomplete latency measurements: "
                     + ", ".join(
                         f"{metric}={coverage[metric]['actual']}/{coverage[metric]['expected']}"
                         for metric in stats["incomplete_latency_metrics"]
-                    ),
-                    flush=True,
+                    )
                 )
-            elif stats.get("replay_validation", {}).get("errors"):
-                for error in stats["replay_validation"]["errors"]:
-                    print(f"DIAGNOSTIC replay completeness: {error}", flush=True)
-            elif stats.get("router_policy_checks", {}).get("errors"):
-                for error in stats["router_policy_checks"]["errors"]:
-                    print(f"DIAGNOSTIC {error}", flush=True)
-            elif stalled or stats["success"] != stats["requests"]:
-                print(
-                    "DIAGNOSTIC stalled or non-success rows in requests.jsonl",
-                    flush=True,
-                )
-            else:
-                print("DIAGNOSTIC cell was not ok", flush=True)
+            diagnostics.extend(
+                f"replay completeness: {error}"
+                for error in stats.get("replay_validation", {}).get("errors", [])
+            )
+            diagnostics.extend(stats.get("router_policy_checks", {}).get("errors", []))
+            diagnostics.extend(stats.get("snapshot_errors", []))
+            if stalled or stats["success"] != stats["requests"]:
+                diagnostics.append("stalled or non-success rows in requests.jsonl")
+            for diagnostic in diagnostics or ["cell was not ok"]:
+                print(f"DIAGNOSTIC {diagnostic}", flush=True)
     _publish_cell_summary(buf.getvalue())
     if failed:
         raise SystemExit(1)
@@ -161,7 +157,11 @@ def print_failure_diagnostics(run: RouterPolicyStack, *, hint: str = "") -> None
 
 def sum_metric(path, name):
     total = 0.0
-    for line in Path(path).read_text().splitlines():
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
         match = METRIC.match(line)
         if match and match.group(1) == name:
             total += float(match.group(3))
@@ -174,7 +174,7 @@ def _prefill_counters(path: Path) -> dict[str, float | None]:
     counters: dict[str, float | None] = dict.fromkeys(PREFILL_COUNTERS.values())
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
+    except OSError:
         return counters
     invalid: set[str] = set()
     for line in lines:
@@ -265,14 +265,9 @@ def _router_policy_checks(run: RouterPolicyStack) -> dict[str, Any]:
         "miss": (placement_metric, {"result": "miss"}),
     }
     if run.case.policy == "kv_aware_aff":
-        if run.case.prefill_count:
-            affinity_metric = "vllm_router_pd_affinity_decisions_total"
-            affinity_labels = {"stage": "decode"}
-            outcomes = ("bind", "sticky_hit")
-        else:
-            affinity_metric = "vllm_router_prefix_routing_decisions_total"
-            affinity_labels = {"policy": "kv_aware", "stage": "regular"}
-            outcomes = ("sticky_hit",)
+        affinity_metric = "vllm_router_prefix_routing_decisions_total"
+        affinity_labels = {"policy": "kv_aware", "stage": "regular"}
+        outcomes = ("sticky_hit",)
         selectors.update(
             {
                 outcome: (affinity_metric, {**affinity_labels, "outcome": outcome})
@@ -282,9 +277,10 @@ def _router_policy_checks(run: RouterPolicyStack) -> dict[str, Any]:
 
     counters: dict[str, float | None] = dict.fromkeys(selectors, 0.0)
     snapshot = run.out / "after/router.prom"
-    lines = (
-        snapshot.read_text(encoding="utf-8").splitlines() if snapshot.is_file() else []
-    )
+    try:
+        lines = snapshot.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
     for line in lines:
         match = PROM_SAMPLE.fullmatch(line.strip())
         if not match:
@@ -478,6 +474,7 @@ def write_calibration(
     replay_rc: int | None,
     wall_seconds: float,
     stalled: bool,
+    snapshot_errors: list[str] | None = None,
 ) -> None:
     """Write calibration.json from the replay rows, then print the summary."""
 
@@ -516,6 +513,24 @@ def write_calibration(
                 tpot_ms.append(sample)
     output_tokens = sum(r.get("output_tokens") or 0 for r in ok)
     makespan = _makespan_seconds(ok)
+    worker_requests = []
+    cache_hits, cache_queries = [], []
+    for i in range(case.worker_count):
+        before, after = (
+            run.out / "before" / f"engine{i}.prom",
+            run.out / "after" / f"engine{i}.prom",
+        )
+        start = sum_metric(before, "vllm:request_success_total")
+        end = sum_metric(after, "vllm:request_success_total")
+        worker_requests.append(
+            end - start if start is not None and end is not None else None
+        )
+        cache_hits.append(sum_metric(after, "vllm:prefix_cache_hits_total"))
+        cache_queries.append(sum_metric(after, "vllm:prefix_cache_queries_total"))
+    cache_hit_rate = None
+    if all(value is not None for value in (*cache_hits, *cache_queries)):
+        queries = sum(cache_queries)
+        cache_hit_rate = sum(cache_hits) / queries if queries else None
     stats = {
         "arm": case.policy,
         "returncode": replay_rc,
@@ -548,33 +563,9 @@ def write_calibration(
             "p90": pct(lat, 90),
             "max": max(lat) if lat else None,
         },
-        "worker_requests": [
-            sum_metric(
-                run.out / "after" / f"engine{i}.prom", "vllm:request_success_total"
-            )
-            - sum_metric(
-                run.out / "before" / f"engine{i}.prom",
-                "vllm:request_success_total",
-            )
-            for i in range(case.worker_count)
-        ],
-        "cache_hit_rate": (lambda h, q: h / q if q else None)(
-            sum(
-                sum_metric(
-                    run.out / p / f"engine{i}.prom",
-                    "vllm:prefix_cache_hits_total",
-                )
-                for i in range(case.worker_count)
-                for p in ["after"]
-            ),
-            sum(
-                sum_metric(
-                    run.out / "after" / f"engine{i}.prom",
-                    "vllm:prefix_cache_queries_total",
-                )
-                for i in range(case.worker_count)
-            ),
-        ),
+        "worker_requests": worker_requests,
+        "cache_hit_rate": cache_hit_rate,
+        "snapshot_errors": list(snapshot_errors or []),
         "prefill": _prefill_metrics(run),
         "router_policy_checks": _router_policy_checks(run),
         "replay_validation": replay_validator(result_dir, rows, task_num=case.task_num),
@@ -604,6 +595,8 @@ def write_calibration(
     if stats["router_policy_checks"]["errors"]:
         stats["ok"] = False
     if stats["replay_validation"]["errors"]:
+        stats["ok"] = False
+    if stats["snapshot_errors"]:
         stats["ok"] = False
     stats = add_missing_metadata(
         stats,

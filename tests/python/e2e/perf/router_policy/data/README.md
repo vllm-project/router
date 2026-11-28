@@ -62,7 +62,9 @@ The source SHA-256 is
 The output SHA-256 is
 `1f37cb060e4609c5d52db9ca2d3674b23d32c6c42f3ed4a2cb4861e78b1f772b`.
 The extractor verifies both digests before writing the fixture. All three
-PD cases check the output digest before GPU startup, and publication requires
+PD cases check the output digest before GPU startup, normalizing CRLF to LF
+without rewriting the file. Other content changes still fail verification.
+Publication requires
 exactly twelve distinct source sessions and 144 matched requests. Nightly
 uses the committed subset and does not download the full source. Reproduction
 instructions and hashes live here and in the extractor; no manifest is needed.
