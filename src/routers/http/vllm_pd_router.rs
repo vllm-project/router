@@ -10,6 +10,8 @@ use super::pd_types::{
     error_chain, PDRouterError, PdAttempt, PdEndpoint, PdPrefillInput, PdRequestContext,
     StagePricing,
 };
+use super::pd_warm_remote::PdWarmRemoteRuntime;
+use super::program_adapter::ProgramCompletion;
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -44,6 +46,59 @@ type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 type MooncakePrefillTable = HashMap<u16, HashMap<String, MooncakePrefillInfo>>;
 
 const MOONCAKE_DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
+
+struct ProgramPrefillSelection {
+    permit_key: String,
+    worker: Arc<dyn Worker>,
+    input: Option<PdPrefillInput>,
+}
+
+struct ProgramDecodeKvRequest<'a> {
+    router: &'a VllmPDRouter,
+    body: &'a Value,
+    path: &'a str,
+    headers: Option<&'a HeaderMap>,
+}
+
+#[async_trait]
+impl crate::program_scheduling::SessionRankScorer for ProgramDecodeKvRequest<'_> {
+    async fn recommend(
+        &self,
+        candidates: &[crate::program_scheduling::ProgramBindingCandidate],
+    ) -> Result<Option<String>, crate::program_scheduling::ScheduleError> {
+        let model = self.body.get("model").and_then(Value::as_str);
+        let eligible: Vec<_> = candidates
+            .iter()
+            .filter_map(|rank| {
+                let worker = self.router.program_decode_worker(&rank.target_id)?;
+                crate::policies::pd::model_eligible(worker.as_ref(), model)
+                    .then_some((rank, worker))
+            })
+            .collect();
+        let state = self.router.pd_router.kv_state.as_ref();
+        let kv = state.and_then(|state| kv_aware_ops(state.decode_policy.as_deref()?));
+        let prices = async {
+            let state = state?;
+            let workers: Vec<_> = eligible
+                .iter()
+                .map(|(_, worker)| Arc::clone(worker))
+                .collect();
+            let prepared = state
+                .price_decode_workers(
+                    &workers,
+                    kv?,
+                    &super::router::session_render_body(self.body, true),
+                    self.path,
+                    self.headers,
+                    None,
+                )
+                .await?;
+            let tokens = prepared.validate(&workers).tokens().clone();
+            Some(tokens)
+        };
+        Ok(crate::policies::pd::recommend_program_decode(&eligible, kv, prices).await)
+    }
+}
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
@@ -1273,7 +1328,7 @@ impl VllmPDRouter {
             .iter()
             .filter(|worker| {
                 worker.is_available()
-                    && super::pd_router::model_eligible(
+                    && crate::policies::pd::model_eligible(
                         worker.as_ref(),
                         request.get("model").and_then(Value::as_str),
                     )
@@ -1445,7 +1500,7 @@ impl VllmPDRouter {
         pin: Option<&PdEndpoint>,
     ) {
         candidates.retain(|worker| {
-            worker.is_available() && super::pd_router::model_eligible(worker.as_ref(), model_id)
+            worker.is_available() && crate::policies::pd::model_eligible(worker.as_ref(), model_id)
         });
         if let Some(pin) = pin {
             candidates.retain(|worker| &PdEndpoint::for_worker(worker.as_ref()) == pin);
@@ -1572,7 +1627,7 @@ impl VllmPDRouter {
                         .map(|prices| prices.validate(&candidates, &mut validated)),
                     ..context
                 };
-                super::pd_router::select_decode_stage(
+                crate::policies::pd::select_decode_stage(
                     loads,
                     &candidates,
                     decode_policy.as_ref(),
@@ -1658,18 +1713,36 @@ impl VllmPDRouter {
                 .map(|worker| pd_program_adapter::worker_target(&worker))
                 .collect::<Vec<_>>()
         };
+        // Render and dispatch the same prompt. Transfer addresses and block
+        // IDs can only come from registered engines.
+        if let Some(object) = request.as_object_mut() {
+            object.remove("kv_transfer_params");
+        }
+        let scorer = runtime
+            .scheduler
+            .uses_kv_binding()
+            .then_some(ProgramDecodeKvRequest {
+                router: self,
+                body: &request,
+                path,
+                headers,
+            });
         let completion = match runtime
-            .acquire(headers, &request, path, &decode_targets)
+            .acquire(
+                headers,
+                &request,
+                path,
+                &decode_targets,
+                scorer
+                    .as_ref()
+                    .map(|s| s as &dyn crate::program_scheduling::SessionRankScorer),
+            )
             .await
         {
             Ok(Some(completion)) => completion,
             Ok(None) => return None,
             Err(error) => return Some(pd_program_adapter::error_response(error)),
         };
-        // Transfer addresses and block IDs can only come from registered engines.
-        if let Some(object) = request.as_object_mut() {
-            object.remove("kv_transfer_params");
-        }
         let target_id = completion.dispatch().target_id.clone();
         // Admission waits, so resolve the committed D against the live pool
         // instead of the candidate list used to propose targets before the wait.
@@ -1679,102 +1752,106 @@ impl VllmPDRouter {
                 "Program decode target left the pool",
             ));
         };
-        // Snapshot once per turn: upstream returns a Result now, and the
-        // cold fallback below reuses the selection made from this snapshot.
-        let prefill_candidates = match self.program_prefill_candidates() {
-            Ok(candidates) => candidates,
+        let policy = self.policy_registry.get_prefill_policy();
+        let kv = kv_aware_ops(policy.as_ref());
+        if kv.is_some() || runtime.scheduler.uses_kv_binding() {
+            super::router::encode_session_xargs(&mut request);
+        }
+        let model = request.get("model").and_then(Value::as_str);
+        let warm = runtime
+            .warm_remote
+            .as_ref()
+            .filter(|_| !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl));
+        let selected = match self
+            .select_program_prefill(
+                runtime,
+                &completion,
+                &decode_worker,
+                &policy,
+                warm,
+                &request,
+                path,
+                headers,
+            )
+            .await
+        {
+            Ok(selected) => selected,
             Err(error) => {
                 RouterMetrics::record_pd_error("server_selection");
                 return Some(program_unavailable(&completion, &error));
             }
         };
-        // One selection per turn. The warm-remote attempt consumes this turn's
-        // selection, and a cold fallback dispatches the P it already chose
-        // instead of asking the policy a second time. The selection also takes
-        // the same request inputs as the cold path (prompt text or cache routing
-        // key, plus headers), so hash and cache-aware policies keep their
-        // affinity on the warm path too.
-        let mut selected = None;
-        if let Some(warm_remote) = &runtime.warm_remote {
-            // The warm-remote protocol has no discovery incarnation fence, and
-            // execute() rejects discovery; keep discovery on the native PD path.
-            if !self.use_discovery && matches!(self.kv_connector, KvConnector::Nixl) {
-                // Only the warm attempt consumes the bare worker list; the cold
-                // path derives its own from `prefill_candidates`.
-                let prefill_workers = prefill_candidates
-                    .iter()
-                    .map(|(_, worker)| worker.clone())
-                    .collect::<Vec<_>>();
-                if let Some(index) =
-                    self.select_program_prefill_index(&prefill_workers, &request, path, headers)
-                {
-                    // The target and the worker it charges travel together, so
-                    // execute() derives both from the same index.
-                    let prefills = prefill_candidates
-                        .iter()
-                        .map(|(_, worker)| {
-                            (pd_program_adapter::worker_target(worker), worker.clone())
-                        })
-                        .collect::<Vec<_>>();
-                    let started = Instant::now();
-                    if let Some(result) = super::pd_warm_remote::execute(
-                        runtime,
-                        warm_remote.clone(),
-                        &self.pd_router.client,
-                        &completion,
-                        &request,
-                        path,
-                        headers,
-                        &prefills,
-                        &decode_targets,
-                        index,
-                        &self.pd_router.pd_load,
-                        decode_worker.clone(),
-                    )
-                    .await
-                    {
-                        RouterMetrics::record_pd_request(path);
-                        RouterMetrics::record_pd_request_duration(path, started.elapsed());
-                        return Some(match result {
-                            Ok((response, Some(context))) => {
-                                pd_program_adapter::track_warm_remote_response(
-                                    response, completion, streaming, context,
-                                )
-                            }
-                            Ok((response, None)) => pd_program_adapter::track_forwarded_response(
-                                response, completion, streaming,
-                            ),
-                            Err(error) => {
-                                RouterMetrics::record_pd_error("program_warm_remote");
-                                completion.finish(false);
-                                (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
-                            }
-                        });
+        let ProgramPrefillSelection {
+            permit_key: prefill_id,
+            worker: prefill_worker,
+            input,
+        } = selected;
+        // Re-read the current placement index after waiting or before a retry.
+        // Keep the rendered token IDs, so this check performs no network I/O.
+        let cold_prices = || {
+            let input = input.as_ref()?;
+            let tokens = input.prompts.as_deref()?;
+            let credit = input.allow_credit
+                && self
+                    .pd_router
+                    .kv_state
+                    .as_ref()?
+                    .model_creditable(prefill_worker.base_url(), model);
+            let mut hashes = crate::policies::PromptHashes::new();
+            if let ([tokens], Some(image)) = (tokens, input.image.as_ref()) {
+                hashes.register_image(tokens, image);
+            }
+            kv?.prepare_prefill_prices(&[(prefill_worker.as_ref(), tokens, credit)], &mut hashes)
+        };
+        if let Some(warm_remote) = warm {
+            let started = Instant::now();
+            if let Some(result) = super::pd_warm_remote::execute(
+                runtime,
+                warm_remote.clone(),
+                &self.pd_router.client,
+                &completion,
+                &request,
+                path,
+                headers,
+                &prefill_worker,
+                &decode_targets,
+                &self.pd_router.pd_load,
+                decode_worker.clone(),
+                &cold_prices,
+            )
+            .await
+            {
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, started.elapsed());
+                return Some(match result {
+                    Ok((response, Some(context))) => {
+                        pd_program_adapter::track_warm_remote_response(
+                            response, completion, streaming, context,
+                        )
                     }
-                    // execute() declined the warm/local protocol for this turn
-                    // (request shape, engine capability): the cold path reuses
-                    // the P selected above rather than consuming a second one.
-                    selected = Some(prefill_candidates[index].clone());
-                }
+                    Ok((response, None)) => pd_program_adapter::track_forwarded_response(
+                        response, completion, streaming,
+                    ),
+                    Err(error) => {
+                        RouterMetrics::record_pd_error("program_warm_remote");
+                        completion.finish(false);
+                        (StatusCode::SERVICE_UNAVAILABLE, error).into_response()
+                    }
+                });
             }
         }
-        let Some((prefill_id, prefill_worker)) = selected
-            .or_else(|| self.select_program_prefill(&prefill_candidates, &request, path, headers))
-        else {
-            RouterMetrics::record_pd_error("server_selection");
-            return Some(program_unavailable(
-                &completion,
-                "No feasible registered P/D pair",
-            ));
-        };
-        let permit = match runtime.reserve_prefill(&prefill_id).await {
+        let permit = match runtime
+            .reserve_prefill(&prefill_id, completion.dispatch())
+            .await
+        {
             Ok(permit) => permit,
             Err(error) => {
                 completion.finish(false);
                 return Some(pd_program_adapter::error_response(error));
             }
         };
-        if !self.program_targets_are_live(&prefill_id, &target_id) {
+        if !self.program_targets_are_live(&prefill_id, &target_id, &prefill_worker, &decode_worker)
+        {
             return Some(program_unavailable(
                 &completion,
                 "PD target changed while waiting for prefill capacity",
@@ -1783,10 +1860,14 @@ impl VllmPDRouter {
         // Program turns bypass native selection, so charge their P and D
         // occupancy explicitly; otherwise they would be invisible to native
         // admission and to `/metrics`.
-        let attempt = self
-            .pd_router
-            .pd_load
-            .admit_bound(prefill_worker.clone(), decode_worker.clone());
+        let attempt =
+            super::pd_warm_remote::with_prefill_work(&prefill_worker, cold_prices(), |local| {
+                self.pd_router.pd_load.admit_bound(
+                    prefill_worker.clone(),
+                    decode_worker.clone(),
+                    local,
+                )
+            });
         let result = self
             .process_vllm_two_stage_request(
                 request,
@@ -1824,11 +1905,8 @@ impl VllmPDRouter {
         }
         self.pd_router
             .worker_registry
-            .get_decode_workers()
-            .into_iter()
-            .find(|worker| {
-                worker.is_available() && pd_program_adapter::worker_target(worker).id == target_id
-            })
+            .get_by_url(target_id)
+            .filter(|worker| worker.is_available() && worker.worker_type() == WorkerType::Decode)
     }
 
     /// P candidates as `(admission id, worker)`. Discovered registrations stay
@@ -1859,43 +1937,72 @@ impl VllmPDRouter {
         }
     }
 
-    /// P is chosen anew for every admitted turn so D continuity cannot pin a
-    /// prefill worker.
-    fn select_program_prefill(
+    /// Choose one P per turn. Warm execution and cold fallback share its permit key.
+    #[allow(clippy::too_many_arguments)]
+    async fn select_program_prefill(
         &self,
-        candidates: &[ProgramPrefillCandidate],
+        runtime: &PdProgramRuntime,
+        completion: &ProgramCompletion,
+        decode_worker: &Arc<dyn Worker>,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        warm: Option<&Arc<PdWarmRemoteRuntime>>,
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-    ) -> Option<(String, Arc<dyn Worker>)> {
-        if candidates.is_empty() {
-            return None;
-        }
-        let workers = candidates
-            .iter()
-            .map(|(_, worker)| worker.clone())
-            .collect::<Vec<_>>();
-        let index = self.select_program_prefill_index(&workers, request, path, headers)?;
-        candidates.get(index).cloned()
-    }
-
-    /// The single place Program turns ask the prefill policy for an index.
-    ///
-    /// Warm-remote and cold dispatch share it so a turn consumes exactly one
-    /// selection and both paths feed the policy the same inputs: the prompt or
-    /// cache routing key when the policy reads the request, and the request
-    /// headers when it needs affinity.
-    fn select_program_prefill_index(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Option<usize> {
-        if workers.is_empty() {
-            return None;
-        }
-        let policy = self.policy_registry.get_prefill_policy();
+    ) -> Result<ProgramPrefillSelection, String> {
+        let mut prefill_candidates = self.program_prefill_candidates()?;
+        let kv = kv_aware_ops(policy.as_ref());
+        let state = self.pd_router.kv_state.as_ref();
+        let d_endpoint = PdEndpoint::for_worker(decode_worker.as_ref());
+        let pairs = state.and_then(|s| {
+            let workers = prefill_candidates
+                .iter()
+                .map(|(_, w)| w.clone())
+                .collect::<Vec<_>>();
+            s.allowed_worker_pairs(&workers, std::slice::from_ref(decode_worker))
+        });
+        let model = request.get("model").and_then(Value::as_str);
+        prefill_candidates.retain(|(_, p)| {
+            p.is_available()
+                && crate::policies::pd::model_eligible(p.as_ref(), model)
+                && pairs.as_ref().is_none_or(|set| {
+                    set.contains(&(PdEndpoint::for_worker(p.as_ref()), d_endpoint.clone()))
+                })
+        });
+        let workers: Vec<_> = prefill_candidates.iter().map(|(_, p)| p.clone()).collect();
+        let (mut inputs, prices, _) = if let (Some(_), Some(state)) = (kv, state) {
+            state
+                .prepare_stages(
+                    &workers,
+                    policy,
+                    &[],
+                    policy,
+                    request,
+                    path,
+                    headers,
+                    None,
+                    true,
+                )
+                .await
+        } else {
+            (HashMap::new(), None, None)
+        };
+        let remote_miss = if let (Some(prices), Some(warm)) = (prices.as_ref(), warm) {
+            warm.prefill_remote_misses(
+                runtime,
+                &self.pd_router.client,
+                headers,
+                completion.dispatch(),
+                &pd_program_adapter::worker_target(decode_worker),
+                request,
+                path,
+                &workers,
+                prices,
+            )
+            .await
+        } else {
+            HashMap::new()
+        };
         let request_text = if policy.needs_cache_routing_key() {
             Some(crate::protocols::spec::cache_routing::for_route(
                 request, path,
@@ -1908,51 +2015,74 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        // Both callers index the worker slice with this value. A policy that
-        // returns an out-of-range index is a policy bug, but it must degrade to
-        // the same "no feasible P" 503 as an empty pool instead of panicking the
-        // request task.
-        policy
-            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
-            .filter(|index| *index < workers.len())
+        let validated = prices.as_ref().map(|p| p.validate(&workers));
+        let context = PdRequestContext {
+            worker_pairs: None,
+            prefill_inputs: Some(&inputs),
+            model_id: model,
+            legacy_policy_input: request_text.as_deref(),
+            prefill_cache: None,
+            decode_cache: None,
+            headers: policy_headers.as_ref(),
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            prefill_pricing: validated.as_ref().map(StagePricing::Validated),
+            decode_pricing: None,
+            route: path,
+            probe: false,
+        };
+        let index = crate::policies::pd::select_program_prefill(
+            || self.pd_router.pd_load.snapshot(),
+            &workers,
+            policy.as_ref(),
+            &context,
+            &remote_miss,
+        );
+        let index = index.ok_or_else(|| "No feasible registered P/D pair".to_owned())?;
+        let (permit_key, worker) = prefill_candidates.swap_remove(index);
+        let input = inputs.remove(worker.base_url());
+        Ok(ProgramPrefillSelection {
+            permit_key,
+            worker,
+            input,
+        })
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
     /// registration or a removed worker must not receive the dispatch.
-    fn program_targets_are_live(&self, prefill_id: &str, decode_id: &str) -> bool {
-        let prefill_live = if self.use_discovery {
-            self.service_registry
+    fn program_targets_are_live(
+        &self,
+        prefill_id: &str,
+        decode_id: &str,
+        prefill: &Arc<dyn Worker>,
+        decode: &Arc<dyn Worker>,
+    ) -> bool {
+        if self.use_discovery {
+            return self
+                .service_registry
                 .get_prefill_instances()
                 .iter()
-                .any(|(address, _)| pd_program_adapter::discovered_target(address).id == prefill_id)
-        } else {
-            self.pd_router
-                .worker_registry
-                .get_prefill_workers()
-                .iter()
-                .any(|worker| {
-                    worker.is_available()
-                        && pd_program_adapter::worker_target(worker).id == prefill_id
+                .any(|(address, _)| {
+                    pd_program_adapter::discovered_target(address).id == prefill_id
                 })
-        };
-        let decode_live = if self.use_discovery {
-            pd_program_adapter::discovered_decode_instance_by_id(
-                &self.service_registry,
-                self.intra_node_data_parallel_size,
-                decode_id,
-            )
-            .is_some()
-        } else {
-            self.pd_router
-                .worker_registry
-                .get_decode_workers()
-                .iter()
-                .any(|worker| {
-                    worker.is_available()
-                        && pd_program_adapter::worker_target(worker).id == decode_id
-                })
-        };
-        prefill_live && decode_live
+                && pd_program_adapter::discovered_decode_instance_by_id(
+                    &self.service_registry,
+                    self.intra_node_data_parallel_size,
+                    decode_id,
+                )
+                .is_some();
+        }
+        // Re-registering the same URL creates a different worker incarnation.
+        let registry = &self.pd_router.worker_registry;
+        [
+            (prefill, registry.get_prefill_workers()),
+            (decode, registry.get_decode_workers()),
+        ]
+        .into_iter()
+        .all(|(selected, pool)| {
+            selected.is_available() && pool.iter().any(|w| Arc::ptr_eq(w, selected))
+        })
     }
 
     /// Select a P/D pair among the discovered instances. Request headers reach
@@ -3266,9 +3396,6 @@ impl VllmPDRouter {
                 addr
             );
 
-            // Create underlying PD router with empty worker lists (they'll be discovered dynamically)
-            let pd_router = PdRouterBase::new(vec![], vec![], ctx).await?;
-
             // Initialize service discovery
             let mut service_registry = ServiceRegistry::new();
 
@@ -3285,6 +3412,15 @@ impl VllmPDRouter {
 
             // The Program runtime observes the same registry the request path reads.
             let service_registry = Arc::new(service_registry);
+            let pd_router = PdRouterBase::new_with_discovery(
+                vec![],
+                vec![],
+                ctx,
+                ctx.router_config
+                    .uses_program_kv_binding()
+                    .then(|| service_registry.clone()),
+            )
+            .await?;
             let program_runtime = PdProgramRuntime::new(ctx, service_registry.clone(), true)?;
 
             Ok(Self {
@@ -3995,7 +4131,7 @@ mod tests {
 
     async fn test_vllm_pd_router() -> VllmPDRouter {
         let config = crate::config::RouterConfig {
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             ..Default::default()
         };
         let ctx = Arc::new(
@@ -4376,7 +4512,7 @@ mod tests {
         ];
         let config = crate::config::RouterConfig {
             kv_connector: KvConnector::Mooncake,
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 2,
@@ -4467,7 +4603,7 @@ mod tests {
         let prefill_url = format!("{}/prefill", bootstraps[0]);
         let config = crate::config::RouterConfig {
             kv_connector: KvConnector::Mooncake,
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 2,
@@ -4526,6 +4662,7 @@ mod tests {
                 router.kv_connector,
                 HashMap::new(),
                 router.pd_router.worker_registry.clone(),
+                None,
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
                 false,
@@ -4915,7 +5052,7 @@ mod tests {
             let context = Arc::new(
                 crate::server::AppContext::new(
                     RouterConfig {
-                        policy: PolicyConfig::Random,
+                        policy: PolicyConfig::Random.into(),
                         kv_connector: KvConnector::Nixl,
                         disable_retries: true,
                         disable_circuit_breaker: true,
@@ -5766,7 +5903,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             kv_aware_session_affinity_ttl_secs: Some(1800),
             ..Default::default()
         };
@@ -6150,8 +6288,6 @@ mod tests {
                 mode: RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![(p.clone(), None)],
                     decode_urls: vec![d.clone()],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
                 policy: PolicyConfig::KvAware {
@@ -6160,7 +6296,8 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                },
+                }
+                .into(),
                 worker_startup_timeout_secs: 5,
                 ..RouterConfig::default()
             };
@@ -6488,8 +6625,6 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), None)],
                 decode_urls: vec![d0.clone(), d1.clone()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             policy: PolicyConfig::KvAware {
@@ -6498,7 +6633,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             worker_startup_timeout_secs: 5,
             ..RouterConfig::default()
         };
@@ -6615,17 +6751,20 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d.clone()],
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::KvAware {
+                discovery_address: None,
+            },
+            policy: crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::RoundRobin),
+                native_decode: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
             },
-            policy: PolicyConfig::RoundRobin,
+
             pd_kv_event_sources: HashMap::from([(
                 d.clone(),
                 crate::config::types::PdKvEventSources {
@@ -6740,17 +6879,20 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d.clone()],
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::KvAware {
+                discovery_address: None,
+            },
+            policy: crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::RoundRobin),
+                native_decode: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
             },
-            policy: PolicyConfig::RoundRobin,
+
             pd_kv_event_sources: HashMap::from([(
                 d.clone(),
                 crate::config::types::PdKvEventSources {
@@ -7002,12 +7144,11 @@ mod tests {
                 balance_rel_threshold: 1.5,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
-            },
+            }
+            .into(),
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d0.clone()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             epd: Some(EpdConfig {
@@ -7223,7 +7364,7 @@ mod tests {
     #[tokio::test]
     async fn discovered_zmq_addresses_preserve_pinned_and_expanded_ranks() {
         let config = crate::config::RouterConfig {
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             ..Default::default()
         };
         let ctx = Arc::new(
@@ -8160,6 +8301,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_failures_release_only_owned_reservation() {
+        // Own the failing endpoint: close each accepted TCP connection without
+        // sending an HTTP response, regardless of local services or proxies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_url = format!("http://{}", listener.local_addr().unwrap());
+        let broken_server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
             for mode in [
                 "prefill_http",
@@ -8169,7 +8319,7 @@ mod tests {
                 "decode_timeout",
             ] {
                 let prefill_url = if mode == "prefill_transport" {
-                    "http://127.0.0.1:1".to_string()
+                    broken_url.clone()
                 } else if mode == "prefill_http" {
                     spawn_test_server(
                         axum::Router::new()
@@ -8184,7 +8334,7 @@ mod tests {
                     .await
                 };
                 let decode_url = if mode == "decode_transport" {
-                    "http://127.0.0.1:1".to_string()
+                    broken_url.clone()
                 } else if mode == "decode_timeout" {
                     spawn_test_server(
                         axum::Router::new()
@@ -8208,6 +8358,7 @@ mod tests {
                     Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
                 let mut router = test_vllm_pd_router().await;
                 router.http_client = reqwest::Client::builder()
+                    .no_proxy()
                     .timeout(std::time::Duration::from_millis(200))
                     .build()
                     .unwrap();
@@ -8241,5 +8392,6 @@ mod tests {
                 decode.decrement_load();
             }
         }
+        broken_server.abort();
     }
 }

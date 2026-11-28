@@ -1,12 +1,8 @@
 use crate::core::Worker;
-use crate::policies::{
-    AffinityKey, AffinityRecord, PdWorkPrices, PrefillWorkEstimate, RequestHeaders,
-    ValidatedWorkPrices,
-};
+use crate::policies::AffinityRecord;
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Custom error type for PD router operations
@@ -46,45 +42,11 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
     chain.join(" caused by: ")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PdEndpoint {
-    pub http_url: String,
-    pub dp_rank: Option<usize>,
-}
-
-impl PdEndpoint {
-    pub(super) fn for_worker(worker: &dyn Worker) -> Self {
-        Self {
-            http_url: worker.base_url().to_owned(),
-            dp_rank: worker.dp_rank(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum Stage {
-    Prefill,
-    Decode,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PdLoadSample {
-    pub prefill_requests: usize,
-    pub active_prefill_tokens: u64,
-    pub unknown_prefill_requests: usize,
-    pub pending_decode_requests: usize,
-    pub active_decode_requests: usize,
-    /// Logical context tokens of Decode requests admitted but not yet
-    /// dispatched. Their KV is not on the engine yet, so they are waiting work.
-    pub pending_decode_tokens: u64,
-    /// Logical context tokens of Decode requests already dispatched. Each
-    /// sequence contributes its full prompt length; shared physical prefix
-    /// blocks still count once per request: sequences share one copy.
-    pub active_decode_tokens: u64,
-    /// Admitted Decode requests whose prompt length the Router does not know.
-    /// Any candidate holding one is compared by request counts.
-    pub unknown_decode_requests: usize,
-}
+// Keep the existing HTTP type paths for callers of the load manager.
+pub(crate) use crate::policies::pd::{Loads, Stage, StagePricing};
+pub use crate::policies::pd::{
+    PdEndpoint, PdLoadSample, PdPrefillInput, PdRequestContext, PdSelection, StageDecision,
+};
 
 impl PdLoadSample {
     fn publish(self, stage: Stage, endpoint: &PdEndpoint) {
@@ -135,113 +97,12 @@ impl PdLoadSample {
         }
     }
 
-    pub(super) fn occupancy(self, stage: Stage) -> usize {
-        match stage {
-            Stage::Prefill => self.prefill_requests,
-            Stage::Decode => self.pending_decode_requests + self.active_decode_requests,
-        }
-    }
-
-    /// The unit Decode ranks by, when it can be known.
-    ///
-    /// `None` as soon as one admitted request on this endpoint has an unknown
-    /// prompt length: mixing a known token figure with an unknown one would
-    /// compare different units across the pool, and request counts are the
-    /// documented fallback.
-    pub(super) fn decode_tokens(self) -> Option<u64> {
-        (self.unknown_decode_requests == 0).then(|| {
-            self.pending_decode_tokens
-                .saturating_add(self.active_decode_tokens)
-        })
-    }
-
     fn idle(self) -> bool {
         self.prefill_requests == 0
             && self.active_prefill_tokens == 0
             && self.unknown_prefill_requests == 0
             && self.pending_decode_requests == 0
             && self.active_decode_requests == 0
-    }
-}
-
-pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
-
-/// Backend-effective tokens prepared outside the admission transaction.
-#[derive(Debug, Clone)]
-pub struct PdPrefillInput {
-    pub prompts: Option<Arc<[Vec<u32>]>>,
-    pub(crate) image: Option<crate::kv_index::request_hash::ImagePrefix>,
-    pub allow_credit: bool,
-    pub fallback_reason: Option<&'static str>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum StagePricing<'a> {
-    Prepared(&'a PdWorkPrices),
-    Validated(&'a ValidatedWorkPrices<'a>),
-}
-
-/// Token inputs are keyed by the P base URL: each backend renders its own
-/// effective input, so different tokenizer/template configurations never mix.
-#[derive(Clone)]
-pub struct PdRequestContext<'a> {
-    pub worker_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
-    pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
-    pub model_id: Option<&'a str>,
-    pub legacy_policy_input: Option<&'a str>,
-    pub(crate) prefill_cache: Option<&'a crate::policies::PreparedCacheSelection>,
-    pub(crate) decode_cache: Option<&'a crate::policies::PreparedCacheSelection>,
-    pub headers: Option<&'a RequestHeaders>,
-    /// Stable session identity for the optional kv_aware decode binding.
-    /// Resolved at request entry, only when the affinity switch is on;
-    /// `None` selects per request on both stages.
-    pub affinity_key: Option<AffinityKey>,
-    /// Borrowed LoRA name from the request; used for Decode binding only with an eligible affinity key.
-    pub lora_name: Option<&'a str>,
-    /// Request cache salt scoping the binding digest.
-    pub cache_salt: Option<&'a str>,
-    /// Prefill work per candidate, validated before admission ranks the workers.
-    pub(super) prefill_pricing: Option<StagePricing<'a>>,
-    /// Marginal Decode context per candidate, validated at its own commit.
-    pub(super) decode_pricing: Option<StagePricing<'a>>,
-    pub route: &'a str,
-    /// True when this admission is a health probe: it takes a pair but starts
-    /// no sequence, so it must not reserve Decode occupancy.
-    pub probe: bool,
-}
-
-impl<'a> StagePricing<'a> {
-    /// The caller keeps the guard slot outside the selection callback so it
-    /// outlives both the callback and the ledger write.
-    pub(super) fn validate<'b>(
-        self,
-        workers: &[Arc<dyn Worker>],
-        validated: &'b mut Option<ValidatedWorkPrices<'a>>,
-    ) -> StagePricing<'b>
-    where
-        'a: 'b,
-    {
-        if let Self::Prepared(prices) = self {
-            StagePricing::Validated(validated.insert(prices.validate(workers)))
-        } else {
-            self
-        }
-    }
-}
-
-impl PdRequestContext<'_> {
-    pub(super) fn prefill_work(&self, worker_url: &str) -> Option<PrefillWorkEstimate> {
-        match self.prefill_pricing {
-            Some(StagePricing::Validated(prices)) => prices.prefill_work(worker_url),
-            _ => None,
-        }
-    }
-
-    pub(super) fn marginal_decode_context(&self) -> Option<&HashMap<String, u64>> {
-        match self.decode_pricing {
-            Some(StagePricing::Validated(prices)) => Some(prices.tokens()),
-            _ => None,
-        }
     }
 }
 
@@ -252,37 +113,12 @@ fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
         .map(|new| new.saturating_add(prefill.credited_prefix_tokens.unwrap_or(0)))
 }
 
-#[derive(Debug, Clone)]
-pub struct StageDecision {
-    pub fallback_reason: Option<&'static str>,
-    pub credited_prefix_tokens: Option<u64>,
-    pub worker_index: usize,
-    pub endpoint: PdEndpoint,
-    pub score: Option<f64>,
-    /// Immutable token work charged to this attempt after KV credit.
-    pub new_prefill_tokens: Option<u64>,
-    /// How session affinity shaped this stage's choice: bind / sticky_hit /
-    /// no_session / capacity_bypass, set only while the switch is on.
-    pub affinity_outcome: Option<&'static str>,
-    /// Held binding reference for this stage's decision; the admission
-    /// attempt releases it on cleanup.
-    pub affinity: Option<Arc<AffinityRecord>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PdSelection {
-    pub prefill: StageDecision,
-    pub decode: StageDecision,
-}
-
 #[derive(Debug, Default)]
 pub struct PdLoadManager {
     loads: Arc<Mutex<Loads>>,
 }
 
 impl PdLoadManager {
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(super) fn snapshot(&self) -> Loads {
         self.loads.lock().clone()
     }
@@ -373,10 +209,10 @@ impl PdLoadManager {
             prefill: selection.prefill.endpoint.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
             decode_prompt_tokens: prompt,
             state: Mutex::new(AttemptState {
                 prefill: true,
+                prefill_tokens: selection.prefill.new_prefill_tokens,
                 decode: decode_state,
                 decode_endpoint,
                 affinity,
@@ -430,12 +266,12 @@ impl PdLoadManager {
     ///
     /// Program scheduling picks the decode engine by affinity before dispatch,
     /// so it cannot go through policy selection, but its occupancy must stay
-    /// visible to native admission and to `/metrics`. The prefill token count is
-    /// unknown here, so the attempt is charged as an unknown-size prefill.
+    /// visible to native admission and to `/metrics`. Known P token costs share the native ledger.
     pub(super) fn admit_bound(
         &self,
         prefill_worker: Arc<dyn Worker>,
         decode_worker: Arc<dyn Worker>,
+        prefill_tokens: Option<u64>,
     ) -> PdAttempt {
         let prefill = PdEndpoint::for_worker(prefill_worker.as_ref());
         let decode = PdEndpoint::for_worker(decode_worker.as_ref());
@@ -443,7 +279,10 @@ impl PdLoadManager {
             let mut loads = self.loads.lock();
             let p = loads.entry((Stage::Prefill, prefill.clone())).or_default();
             p.prefill_requests += 1;
-            p.unknown_prefill_requests += 1;
+            match prefill_tokens {
+                Some(tokens) => p.active_prefill_tokens += tokens,
+                None => p.unknown_prefill_requests += 1,
+            }
             p.publish(Stage::Prefill, &prefill);
             let d = loads.entry((Stage::Decode, decode.clone())).or_default();
             d.pending_decode_requests += 1;
@@ -456,7 +295,6 @@ impl PdLoadManager {
             prefill,
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: None,
             // The prompt length is unknown here, so the Decode charge is
             // unknown too and the pool stays on request counts for this
             // attempt.
@@ -464,6 +302,7 @@ impl PdLoadManager {
 
             state: Mutex::new(AttemptState {
                 prefill: true,
+                prefill_tokens,
                 decode: DecodeState::Pending,
                 decode_endpoint: Some(decode),
                 affinity: None,
@@ -487,6 +326,7 @@ enum DecodeState {
 #[derive(Debug)]
 struct AttemptState {
     prefill: bool,
+    prefill_tokens: Option<u64>,
     decode: DecodeState,
     /// Committed decode endpoint; `None` while the commitment is deferred.
     decode_endpoint: Option<PdEndpoint>,
@@ -502,7 +342,6 @@ struct AttemptInner {
     prefill: PdEndpoint,
     prefill_worker: Mutex<Option<Arc<dyn Worker>>>,
     decode_worker: Mutex<Option<Arc<dyn Worker>>>,
-    prefill_tokens: Option<u64>,
     /// Prompt length this attempt will hold on a Decode engine, counted once per request:
     /// the request's sequences share one copy of those blocks. `None` when the prompt was
     /// never measured.
@@ -538,7 +377,7 @@ impl AttemptInner {
         let key = (Stage::Prefill, self.prefill.clone());
         if let Some(load) = loads.get_mut(&key) {
             load.prefill_requests -= 1;
-            if let Some(tokens) = self.prefill_tokens {
+            if let Some(tokens) = state.prefill_tokens {
                 load.active_prefill_tokens -= tokens;
             } else {
                 load.unknown_prefill_requests -= 1;
@@ -702,6 +541,49 @@ impl PdAttempt {
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
+    /// A rejected LocalAppend can start one remote P leg on the same D reservation.
+    pub(super) fn restart_prefill(&self, tokens: Option<u64>) {
+        let mut state = self.0.state.lock();
+        debug_assert!(!state.prefill);
+        let mut loads = self.0.loads.lock();
+        let load = loads
+            .entry((Stage::Prefill, self.0.prefill.clone()))
+            .or_default();
+        load.prefill_requests += 1;
+        match tokens {
+            Some(tokens) => load.active_prefill_tokens += tokens,
+            None => load.unknown_prefill_requests += 1,
+        }
+        load.publish(Stage::Prefill, &self.0.prefill);
+        if let Some(worker) = self.0.prefill_worker.lock().as_ref() {
+            worker.increment_load();
+        }
+        state.prefill = true;
+        state.prefill_tokens = tokens;
+    }
+
+    /// Adjust an in-flight P leg on a warm-to-cold retry.
+    pub(super) fn reprice_prefill(&self, tokens: Option<u64>) {
+        let mut state = self.0.state.lock();
+        if !state.prefill || state.prefill_tokens == tokens {
+            return;
+        }
+        let mut loads = self.0.loads.lock();
+        let load = loads
+            .get_mut(&(Stage::Prefill, self.0.prefill.clone()))
+            .expect("active prefill charge");
+        match state.prefill_tokens {
+            Some(old) => load.active_prefill_tokens -= old,
+            None => load.unknown_prefill_requests -= 1,
+        }
+        match tokens {
+            Some(new) => load.active_prefill_tokens += new,
+            None => load.unknown_prefill_requests += 1,
+        }
+        state.prefill_tokens = tokens;
+        load.publish(Stage::Prefill, &self.0.prefill);
+    }
+
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }

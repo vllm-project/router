@@ -74,7 +74,7 @@ vllm-router \
   --program-scheduling-config-json "${PROGRAM_CONFIG_JSON}"
 ```
 
-`--policy` remains the native request-level fallback for requests without Program identity. `binding_strategy` in `program-scheduling.json` independently selects the initial Rank for a new Program. After startup, verify that the diagnostics contain the expected number of concrete DP Ranks and fresh backend observations before sending production traffic.
+The shared `--policy` applies to native requests and to the initial Program placement. To choose a different Program algorithm, set the `program` field of the same policy. To preserve the old implicit Program default, specify `"program":"consistent_hash"`. After startup, verify that the diagnostics contain the expected number of concrete DP Ranks and fresh backend observations before sending production traffic.
 
 ```bash
 curl -fsS http://127.0.0.1:3001/health
@@ -95,10 +95,10 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 |---|---:|---|
 | `program_scheduling_enable_key` | `vllm_xargs.agentic_context` | Selects which identity inputs opt a request into Program scheduling. The default accepts only canonical `vllm_xargs.agentic_context`; `auto` additionally accepts the documented `agent_hint` and framework Header schemas. |
 | `binding_only` | `false` | Preserves Program identity and initial Program-to-Rank binding but bypasses RequestPool admission, Progress-TTL pause, and resume scheduling. This isolates the effect of Program affinity. |
+| `enable_acting_ttl` | `true` | On a mixed HTTP pool, set to `false` to release an idle active seat immediately when a turn ends, even if the request supplies a positive retention hint. Program binding, capacity admission, and resume stay enabled. PD uses its separate TTL settings. |
 | `global_queue` | `false` | When `false`, a paused Program can resume only on its bound Rank. When `true`, resume first tries the previous Rank and may then select another Rank that passes the cross-Rank capacity gates. |
 | `resume_order` | `mru` | Orders ordinary Rank-local resume candidates within the same force-resume, request-priority, and segment-yield tier. Supported values are `mru` and `fcfs`; cross-Rank resume is always FCFS. |
 | `cross_rank_headroom_ratio` | `1.2` | Controls cross-Rank migration conservatism. A destination must have at least the source Rank's free capacity plus this multiple of the Program's complete estimated context. It has no effect when `global_queue` is `false`. |
-| `binding_strategy` | `consistent_hash` | Selects the initial home Rank for each new Program generation. Supported values are `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, and `cache_aware`; it does not replace admission or resume decisions. |
 | `hash_virtual_nodes` | `160` | Sets the number of virtual nodes used by `consistent_hash` initial binding. It has no effect on the other binding strategies. |
 | `token_capacity_per_dp_rank` | `null` | Supplies the logical KV-token capacity of each concrete DP Rank. A value enables token-based admission, growth reserve, capacity repair, and cross-Rank headroom checks; `null` falls back to the Program-count guard. `reasoning_token_balance` requires this value. The deprecated input alias `token_capacity_per_target` is accepted but is never emitted when the configuration is serialized. |
 | `token_count_mode` | `exact` | Apply available prepared counts after matching Engine settlements, otherwise estimate. `estimated` is a supported compatibility override, not deprecated. `shadow` is an advanced diagnostic that keeps estimated decisions and records prepared counterfactuals even after verification. See [Input-token facts](#input-token-facts). |
@@ -131,6 +131,16 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `decode_throughput_model.context_step_seconds_per_token` | `1.420458414996201e-7` | Sets the additional decode-step latency contributed by each token in the sum of full Program contexts. |
 
 For `max_active_programs_per_target` and `admission_waiting_request_threshold`, omitting the field or setting it to `0` uses the default shown above. With a waiting threshold of `0`, the gate stays active and blocks ordinary admission or resume to a Rank as soon as one backend request is waiting there.
+
+## Session admission for HTTP chat
+
+With full Program scheduling enabled, an opted-in chat turn whose effective Program ID equals its session ID shares a FIFO with other turns in that session and model pool. For example, `{"vllm_xargs":{"agentic_context":{"session_id":"S"}}}` selects Program `S`. An explicit `program_id` of `S` selects the same FIFO. Router encodes an object-valued context as a JSON string when forwarding the admitted request to vLLM HTTP, whose extra arguments accept scalar values. A separate `task_id` can group sessions. An explicit current agent or different Program ID continues to use the existing Program identity rules.
+
+The FIFO head obtains the eligible Ranks for its own context and expected output allowance. Router scores that snapshot outside the scheduler lock. Admission checks the ticket and the chosen Rank again, charges its logical seat, and hands the HTTP sender a dispatch. With a live binding, continuations wait for any additional capacity on that Rank. Losing the current Rank triggers selection for the next pending head. An idle session waits for a real turn before rebinding. An empty pool returns HTTP 503. A full pool retains its queue age until capacity becomes available or the queue deadline returns HTTP 429.
+
+Use `--policy '{"default":"round_robin","program":"kv_aware"}' --enable-program-scheduling` to score eligible session Ranks against the model pool's KV index. For engines without discovery, configure the live publisher, replay endpoint, topic and hash settings as described in [Static event endpoints](../load_balancing/kv_aware.md#static-event-endpoints). Missing or incompatible cache evidence falls back to execution load within the eligible set. A fixed-target send charges the actual worker for the lifetime of that attempt, including its stream. With this configuration, ordinary traffic uses round robin and Program generations outside full session admission use consistent hashing.
+
+For a pool migrating from the session-only `S:lead` convention, drain existing generations and in-flight streams before switching binaries. Apply the same drain on rollback and restore a binding strategy supported by the retiring version. Use a fresh Router process per drained pool. Compare queue duration, token reuse, output throughput and client TTFT against the pool's own objectives. The executable replay in `scripts/bench_session_admission.py` runs an ABBA comparison against two dedicated HTTP engines and resets their prefix caches between arms.
 
 ## Canonical request metadata
 

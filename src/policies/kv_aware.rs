@@ -164,6 +164,9 @@ impl<'a> KvRequestTokens<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillWorkEstimate {
     pub new_prefill_tokens: u64,
+    /// Work after confirmed device-local reuse only. Explicit Program warm
+    /// reads price their own transport and must not double-credit another tier.
+    pub device_miss_tokens: u64,
     /// The candidate was eligible for KV credit at lookup. The commit check can
     /// fall back to full input while this remains true.
     pub placement_verified: bool,
@@ -183,6 +186,7 @@ pub struct DecodeWorkEstimate {
 }
 
 struct PdWorkPrice {
+    device_miss_tokens: u64,
     additional_tokens: u64,
     input_tokens: u64,
     target: RoutableTarget,
@@ -193,6 +197,11 @@ impl PdWorkPrice {
     fn prefill_estimate(&self, new_prefill_tokens: u64) -> PrefillWorkEstimate {
         PrefillWorkEstimate {
             new_prefill_tokens,
+            device_miss_tokens: if new_prefill_tokens == self.input_tokens {
+                self.input_tokens
+            } else {
+                self.device_miss_tokens
+            },
             placement_verified: self.identity_verified,
         }
     }
@@ -976,7 +985,7 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// Device prefix plus one external continuation, matching vLLM's two-segment
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+fn prefix_credits(candidate: &CandidateView<'_>, params: &CostParams) -> (u64, f64) {
     let device_blocks = crate::kv_index::layout::full_attention_prefix(
         candidate
             .matches
@@ -1014,8 +1023,16 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
     let credited_blocks = f64::from(device_blocks) + best_continuation;
     // External reuse may have a different alignment, but it cannot eliminate
     // the last-token logits work either.
-    (credited_blocks * f64::from(params.block_size))
-        .min(candidate.input_tokens.saturating_sub(1) as f64)
+    let effective = (credited_blocks * f64::from(params.block_size))
+        .min(candidate.input_tokens.saturating_sub(1) as f64);
+    (
+        u64::from(device_blocks) * u64::from(params.block_size),
+        effective,
+    )
+}
+
+fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+    prefix_credits(candidate, params).1
 }
 
 fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
@@ -1319,6 +1336,7 @@ impl KvAwarePolicy {
             }
             let mut input_tokens = 0u64;
             let mut additional_tokens = 0u64;
+            let mut device_reused_tokens = 0u64;
             for tokens in prompts {
                 let context = u64::try_from(tokens.len()).unwrap_or(u64::MAX);
                 input_tokens = input_tokens.saturating_add(context);
@@ -1348,7 +1366,9 @@ impl KvAwarePolicy {
                 };
                 let additional = match stage {
                     WorkStage::Prefill if !matches.is_empty() => {
-                        request_prefill_tokens(&candidate, &params)
+                        let (device, effective) = prefix_credits(&candidate, &params);
+                        device_reused_tokens = device_reused_tokens.saturating_add(device);
+                        (context as f64 - effective).max(0.0).ceil() as u64
                     }
                     WorkStage::Prefill => context,
                     WorkStage::Decode { .. } => {
@@ -1371,6 +1391,7 @@ impl KvAwarePolicy {
                 additional_tokens = additional_tokens.saturating_add(additional);
             }
             PdWorkPrice {
+                device_miss_tokens: input_tokens.saturating_sub(device_reused_tokens),
                 additional_tokens: if identity_verified {
                     additional_tokens
                 } else {
@@ -1669,6 +1690,84 @@ impl KvAwarePolicy {
         let (worker_index, _, decision) =
             self.decision_for_position(&plan, &candidates, &costs, &components, position);
         Some((worker_index, decision))
+    }
+
+    /// Score only the admission snapshot. No affinity record, slot or worker load is acquired.
+    pub(crate) fn recommend_binding(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        input: QualifiedKvInput<'_>,
+        lora: Option<&str>,
+        salt: Option<&str>,
+    ) -> Option<usize> {
+        let mut plan = self.prepare_selection(workers, input, lora, salt, true)?;
+        plan.discard_revoked_credit();
+        let mut pins = Vec::new();
+        for (i, binding) in plan.bindings.iter().enumerate() {
+            if !plan.grouped[i].is_empty() || plan.prefill_tokens[i].is_some() {
+                let evidence = plan
+                    .placement
+                    .iter()
+                    .filter(|proof| proof.target() == &binding.target);
+                if let Some(guards) = pin_credit(evidence) {
+                    pins.extend(guards);
+                } else {
+                    plan.grouped[i].clear();
+                    plan.prefill_tokens[i] = None;
+                }
+            }
+        }
+        let candidates = self.candidate_views(workers, &plan);
+        let has_credit = candidates.iter().enumerate().any(|(i, c)| {
+            let params = CostParams {
+                block_size: plan.bindings[i].block_size,
+                ..self.params
+            };
+            request_prefill_tokens(c, &params) < c.input_tokens as u64
+        });
+        let position = if has_credit {
+            let (costs, components) = self.score_candidates(&plan, &candidates)?;
+            self.pick_position(true, &costs, &components, None)?
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, candidate)| {
+                    (
+                        candidate.load.active_requests,
+                        candidate.load.active_prefill_tokens,
+                    )
+                })
+                .map(|(i, _)| i)?
+        };
+        crate::metrics::RouterMetrics::record_prefix_routing_decision(
+            "kv_aware",
+            "session_binding",
+            if has_credit {
+                "prefix_cost"
+            } else {
+                "load_only"
+            },
+        );
+        Some(plan.healthy[position])
+    }
+
+    /// A dispatch already owns placement. Take execution load only on its destination.
+    pub(crate) fn account_fixed_target(
+        &self,
+        worker: &Arc<dyn Worker>,
+        input: QualifiedKvInput<'_>,
+        lora: Option<&str>,
+        salt: Option<&str>,
+    ) -> Option<KvSelectionReceipt> {
+        self.select_worker_with_qualified_inputs(
+            std::slice::from_ref(worker),
+            input,
+            lora,
+            salt,
+            None,
+            &[],
+        )
     }
 
     /// Select, reserve, and bind atomically. KV queries run outside every
@@ -2942,6 +3041,42 @@ mod tests {
             binding.clone(),
         );
         binding
+    }
+
+    #[test]
+    fn session_scoring_is_read_only_and_only_fixed_dispatch_takes_load() {
+        let workers: Vec<Arc<dyn Worker>> = ["a", "b"]
+            .map(|id| {
+                Arc::new(BasicWorker::new(
+                    format!("http://{id}"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .to_vec();
+        let policy = KvAwarePolicy::default();
+        let slots = policy.slot_manager().unwrap();
+        workers[0].increment_load();
+        let ids = [1, 2, 3];
+        let input = QualifiedKvInput {
+            tokens: KvRequestTokens::Shared(Some(&ids)),
+            eligibility: None,
+        };
+        assert_eq!(
+            policy.recommend_binding(&workers, input, None, Some("salt")),
+            Some(1)
+        );
+        assert_eq!((workers[0].load(), workers[1].load()), (1, 0));
+        let target = policy.target_for_worker(workers[1].as_ref());
+        assert_eq!(slots.sample(&target).active_requests, 0);
+        let receipt = policy
+            .account_fixed_target(&workers[1], input, None, Some("salt"))
+            .unwrap();
+        assert_eq!(slots.sample(&target).active_prefill_tokens, 3);
+        assert_eq!(workers[1].load(), 1);
+        release_receipt(&workers[1..], &receipt);
+        assert_eq!(slots.sample(&target).active_requests, 0);
+        assert_eq!(workers[1].load(), 0);
+        workers[0].decrement_load();
     }
 
     #[test]
@@ -4618,10 +4753,12 @@ mod tests {
         first.release_ref();
         assert!(!second.is_expired(Instant::now() + ttl * 2));
 
-        let released_at = Instant::now();
+        let earliest_deadline = Instant::now() + ttl;
         second.release_ref();
-        assert!(!second.is_expired(released_at + ttl));
+        let latest_deadline = Instant::now() + ttl;
         let deadline = second.state.lock().idle_deadline.unwrap();
+        assert!((earliest_deadline..=latest_deadline).contains(&deadline));
+        assert!(!second.is_expired(deadline - Duration::from_nanos(1)));
         assert!(second.is_expired(deadline));
         second.state.lock().idle_deadline = Some(Instant::now() - ttl);
         assert!(table.acquire(&digest).is_none());

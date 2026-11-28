@@ -503,92 +503,30 @@ class TestStartupValidation:
             # Should create router instance
             router_mod.from_args.assert_called_once()
 
-    def test_policy_warning_during_startup(self):
-        """Test policy warning during startup in PD mode."""
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"prefill": "power_of_two"},
+            {"native_decode": "round_robin"},
+            {
+                "program": "consistent_hash",
+                "prefill": "kv_aware",
+                "native_decode": "round_robin",
+            },
+        ],
+    )
+    def test_role_policy_reaches_native_router(self, overrides):
+        policy = {"default": "cache_aware", **overrides}
         args = RouterArgs(
             vllm_pd_disaggregation=True,
-            prefill_urls=[("http://prefill1:8000", None)],
-            decode_urls=["http://decode1:8001"],
-            policy="cache_aware",
-            prefill_policy="power_of_two",
-            decode_policy="round_robin",
+            prefill_urls=[("http://p:8000", None)],
+            decode_urls=["http://d:8001"],
+            policy=policy,
         )
-
-        with patch("vllm_router.launch_router.Router") as router_mod:
-            mock_router_instance = MagicMock()
-            router_mod.from_args = MagicMock(return_value=mock_router_instance)
-
-            # The policy messages are emitted by router_args logger
-            with patch("vllm_router.router_args.logger") as mock_logger:
-                launch_router(args)
-
-                # Should log warning about policy usage
-                mock_logger.warning.assert_called_once()
-                warning_call = mock_logger.warning.call_args[0][0]
-                assert (
-                    "Both --prefill-policy and --decode-policy are specified"
-                    in warning_call
-                )
-
-                # Should create router instance
-                router_mod.from_args.assert_called_once()
-
-    def test_policy_info_during_startup(self):
-        """Test policy info logging during startup in PD mode."""
-        # Test with only prefill policy specified
-        args = RouterArgs(
-            vllm_pd_disaggregation=True,
-            prefill_urls=[("http://prefill1:8000", None)],
-            decode_urls=["http://decode1:8001"],
-            policy="cache_aware",
-            prefill_policy="power_of_two",
-            decode_policy=None,
-        )
-
-        with patch("vllm_router.launch_router.Router") as router_mod:
-            mock_router_instance = MagicMock()
-            router_mod.from_args = MagicMock(return_value=mock_router_instance)
-
-            # The policy messages are emitted by router_args logger
-            with patch("vllm_router.router_args.logger") as mock_logger:
-                launch_router(args)
-
-                # Should log info about policy usage
-                mock_logger.info.assert_called_once()
-                info_call = mock_logger.info.call_args[0][0]
-                assert "Using --prefill-policy 'power_of_two'" in info_call
-                assert "and --policy 'cache_aware'" in info_call
-
-                # Should create router instance
-                router_mod.from_args.assert_called_once()
-
-    def test_policy_info_decode_only_during_startup(self):
-        """Test policy info logging during startup with only decode policy specified."""
-        args = RouterArgs(
-            vllm_pd_disaggregation=True,
-            prefill_urls=[("http://prefill1:8000", None)],
-            decode_urls=["http://decode1:8001"],
-            policy="cache_aware",
-            prefill_policy=None,
-            decode_policy="round_robin",
-        )
-
-        with patch("vllm_router.launch_router.Router") as router_mod:
-            mock_router_instance = MagicMock()
-            router_mod.from_args = MagicMock(return_value=mock_router_instance)
-
-            # The policy messages are emitted by router_args logger
-            with patch("vllm_router.router_args.logger") as mock_logger:
-                launch_router(args)
-
-                # Should log info about policy usage
-                mock_logger.info.assert_called_once()
-                info_call = mock_logger.info.call_args[0][0]
-                assert "Using --policy 'cache_aware'" in info_call
-                assert "and --decode-policy 'round_robin'" in info_call
-
-                # Should create router instance
-                router_mod.from_args.assert_called_once()
+        with patch("vllm_router.router._Router") as native:
+            launch_router(args)
+        assert native.call_args.kwargs["policy"] == policy
+        native.return_value.start.assert_called_once()
 
 
 class TestStartupErrorHandling:
@@ -672,24 +610,20 @@ class TestStartupFlow:
                 ("http://prefill2:8000", None),
             ],
             decode_urls=["http://decode1:8001", "http://decode2:8001"],
-            policy="power_of_two",
-            prefill_policy="cache_aware",
-            decode_policy="round_robin",
+            policy={
+                "default": "power_of_two",
+                "prefill": "cache_aware",
+                "native_decode": "round_robin",
+            },
         )
 
         with patch("vllm_router.launch_router.Router") as router_mod:
             mock_router_instance = MagicMock()
             router_mod.from_args = MagicMock(return_value=mock_router_instance)
 
-            with patch("vllm_router.router_args.logger") as mock_logger:
-                launch_router(args)
-
-                # Verify complete flow
-                router_mod.from_args.assert_called_once()
-                mock_router_instance.start.assert_called_once()
-
-                # Verify policy warning was logged
-                mock_logger.warning.assert_called_once()
+            launch_router(args)
+            router_mod.from_args.assert_called_once_with(args)
+            mock_router_instance.start.assert_called_once()
 
     def test_complete_startup_flow_with_all_features(self):
         """Test complete startup flow with all features enabled."""

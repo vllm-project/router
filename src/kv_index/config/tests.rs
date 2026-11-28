@@ -174,11 +174,10 @@ fn loads_one_kv_layout_for_both_pd_stages() {
         let mode = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(prefill.to_owned(), None)],
             decode_urls: vec![decode.to_owned()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
-        let policy = serde_json::from_value(serde_json::json!({"type": "kv_aware"})).unwrap();
+        let policy: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type": "kv_aware"})).unwrap();
         let mut config = RouterConfig::new(mode, policy);
         apply_kv_layout_file(
             &path,

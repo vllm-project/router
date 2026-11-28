@@ -65,7 +65,11 @@ impl PdProgramRuntime {
         }
         let observer_warm_remote = warm_remote.clone();
         let scheduler = Arc::new(ProgramScheduler::new(
-            ProgramSchedulerConfig::from_program_config(config, true),
+            ProgramSchedulerConfig::from_program_config(
+                config,
+                true,
+                ctx.router_config.policy.program(),
+            ),
         ));
         let observation_scheduler = scheduler.clone();
         let workers = ctx.worker_registry.clone();
@@ -255,13 +259,15 @@ impl PdProgramRuntime {
         request: &Value,
         path: &str,
         targets: &[ProgramTarget],
+        scorer: Option<&dyn crate::program_scheduling::SessionRankScorer>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
         let pool = model_pool(headers, request);
-        let Some(mut identity) = ProgramIdentity::from_request_with_enable_key(
+        let Some(mut identity) = ProgramIdentity::resolve(
             headers,
             Some(request),
             Some(&pool),
             self.scheduler.enable_key(),
+            true,
         )?
         else {
             return Ok(None);
@@ -285,13 +291,22 @@ impl PdProgramRuntime {
         };
         let default_output = self.scheduler.config.progress_ttl.decode_buffer_tokens;
         reserve_output_budget(&mut identity, request, path, default_output);
+        // All PD Programs, including nested agents, bind from the head turn's
+        // eligible D ranks. The optional scorer only ranks that eligible set.
+        identity.session_admission = true;
+        self.scheduler.sync_targets(identity.model_pool(), targets);
+        let routing_text = self
+            .scheduler
+            .uses_cache_aware_binding()
+            .then(|| crate::protocols::spec::cache_routing::for_route(request, path));
         let dispatch = self
             .scheduler
-            .acquire(
+            .acquire_with_scorer(
                 identity,
                 crate::program_scheduling::ContextTokens::estimated(tokens),
                 targets,
-                None,
+                routing_text,
+                scorer,
             )
             .await?;
         Ok(Some(ProgramCompletion::new(
@@ -305,6 +320,7 @@ impl PdProgramRuntime {
     pub async fn reserve_prefill(
         &self,
         worker_id: &str,
+        dispatch: &crate::program_scheduling::ProgramDispatch,
     ) -> Result<OwnedSemaphorePermit, ScheduleError> {
         let gate = self
             .prefill_gates
@@ -312,7 +328,12 @@ impl PdProgramRuntime {
             .entry(worker_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.prefill_limit)))
             .clone();
-        tokio::time::timeout(self.queue_timeout, gate.acquire_owned())
+        let remaining = self
+            .queue_timeout
+            .checked_sub(dispatch.request_arrived_at().elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(ScheduleError::QueueTimeout)?;
+        tokio::time::timeout(remaining, gate.acquire_owned())
             .await
             .map_err(|_| ScheduleError::QueueTimeout)?
             .map_err(|_| ScheduleError::NoTargets)
@@ -486,23 +507,9 @@ pub(super) fn discovered_decode_instances(
     services: &ServiceRegistry,
     configured_dp: usize,
 ) -> Vec<(String, String)> {
-    services
-        .get_decode_instances()
+    decode_instance_entries(services, configured_dp)
         .into_iter()
-        .flat_map(|(address, zmq)| {
-            let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
-            if rank.is_some() || size == 1 {
-                vec![(address, zmq)]
-            } else {
-                (0..size)
-                    .map(|rank| (format!("{address}@{rank}"), zmq.clone()))
-                    .collect()
-            }
-        })
+        .map(|(address, zmq, _)| (address, zmq))
         .collect()
 }
 
@@ -527,18 +534,32 @@ pub(super) fn discovered_decode_worker(
     let (address, _, size) = decode_instance_entries(services, configured_dp)
         .into_iter()
         .find(|(url, _, _)| discovered_target(url).id == target_id)?;
-    let (base, rank) = dp_utils::parse_worker_url(&address);
-    let url = if base.starts_with("http://") || base.starts_with("https://") {
-        base.clone()
-    } else {
-        format!("http://{base}")
-    };
-    Some(match rank {
+    Some(discovery_worker(&address, size))
+}
+
+pub(super) fn discovered_decode_workers(
+    services: &ServiceRegistry,
+    configured_dp: usize,
+) -> Vec<Arc<dyn Worker>> {
+    decode_instance_entries(services, configured_dp)
+        .into_iter()
+        .map(|(address, _, size)| discovery_worker(&address, size))
+        .collect()
+}
+
+fn discovery_worker(address: &str, size: usize) -> Arc<dyn Worker> {
+    let target = discovered_target(address);
+    match target.dp_rank {
         // DPAwareWorker strips the `@rank` suffix from dispatched URLs, so the
         // bound rank survives endpoint construction.
-        Some(rank) => Arc::new(DPAwareWorker::new(url, rank, size, WorkerType::Decode)),
-        None => Arc::new(BasicWorker::new(url, WorkerType::Decode).with_dp_size(size)),
-    })
+        Some(rank) => Arc::new(DPAwareWorker::new(
+            target.base_url,
+            rank,
+            size,
+            WorkerType::Decode,
+        )),
+        None => Arc::new(BasicWorker::new(target.base_url, WorkerType::Decode).with_dp_size(size)),
+    }
 }
 
 /// Registered decode endpoints expanded to one entry per schedulable DP rank,
@@ -548,14 +569,11 @@ fn decode_instance_entries(
     configured_dp: usize,
 ) -> Vec<(String, String, usize)> {
     services
-        .get_decode_instances()
+        .get_instance_snapshots(ServiceType::Decode)
         .into_iter()
-        .flat_map(|(address, zmq)| {
+        .flat_map(|(address, zmq, reported_dp)| {
             let (_, rank) = dp_utils::parse_worker_url(&address);
-            let size = decode_instance_size(
-                services.get_reported_dp_size(&address, ServiceType::Decode),
-                configured_dp,
-            );
+            let size = decode_instance_size(reported_dp, configured_dp);
             if rank.is_some() || size == 1 {
                 vec![(address, zmq, size)]
             } else {
@@ -689,7 +707,10 @@ fn track_response_inner(
         .map_or(PdTrackedBody::MAX_BUFFER, |context| {
             context.response_buffer_limit()
         });
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+    // A fixed-length HTTP/1 body can be dropped after the last data frame
+    // without an EOF poll. EOF settles the Program turn and publishes its KV.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     Response::from_parts(
         parts,
         Body::from_stream(PdTrackedBody {
@@ -840,6 +861,92 @@ mod tests {
     use crate::program_scheduling::ProgramSchedulerConfig;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn non_kv_pd_binding_waits_for_capacity_at_first_placement_and_rebind() {
+        use crate::config::RouterConfig;
+        use crate::program_scheduling::BackendObservation;
+        use std::time::Instant;
+
+        for policy in ["round_robin", "consistent_hash"] {
+            let config = RouterConfig {
+                policy: serde_json::from_value(json!(policy)).unwrap(),
+                program_scheduling: Some(
+                    serde_json::from_value(json!({
+                        "token_capacity_per_dp_rank": 1000,
+                        "enable_batch_gain_admission": false,
+                        "decode_buffer_tokens": 8,
+                        "metrics_interval_seconds": 0.05,
+                        "queue_timeout_seconds": 1
+                    }))
+                    .unwrap(),
+                ),
+                ..Default::default()
+            };
+            let ctx =
+                Arc::new(AppContext::new(config, reqwest::Client::new(), 1, None, vec![]).unwrap());
+            let runtime = PdProgramRuntime::new(&ctx, Arc::new(ServiceRegistry::new()), false)
+                .unwrap()
+                .unwrap();
+            // Drive topology and fresh backend observations explicitly.
+            runtime.observer.abort();
+            let request = json!({"model":"test", "prompt":[1, 2], "max_tokens":1,
+                "vllm_xargs":{"agentic_context":{"program_id":"agent", "expected_resume":true}}});
+            let pool = model_pool(None, &request);
+            let targets = ["a", "b", "c"].map(discovered_target);
+            let observe = |targets: &[ProgramTarget], free: Option<&ProgramTarget>| {
+                let scheduler = &runtime.scheduler;
+                scheduler.sync_targets(&pool, targets);
+                scheduler.apply_observations(
+                    scheduler.begin_observation(targets),
+                    targets.iter().map(|target| BackendObservation {
+                        target_id: target.id.clone(),
+                        base_url: target.base_url.clone(),
+                        dp_rank: target.dp_rank,
+                        kv_cache_usage: Some(if free.is_some_and(|rank| rank.id == target.id) {
+                            0.0
+                        } else {
+                            1.0
+                        }),
+                        running_requests: Some(0),
+                        waiting_requests: Some(0),
+                        observed_at: Instant::now(),
+                    }),
+                );
+                scheduler.tick();
+            };
+
+            observe(&targets, None);
+            let first = runtime.acquire(None, &request, "/v1/completions", &targets, None);
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            observe(&targets, Some(&targets[2]));
+            let first = first.await.unwrap().unwrap();
+            assert_eq!(first.dispatch().target_id, targets[2].id, "{policy}");
+            first.finish(true);
+
+            // A different D is free, but an ordinary continuation waits for its bound D.
+            observe(&targets, Some(&targets[0]));
+            let next = runtime.acquire(None, &request, "/v1/completions", &targets, None);
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            observe(&targets, Some(&targets[2]));
+            let next = next.await.unwrap().unwrap();
+            assert_eq!(next.dispatch().target_id, targets[2].id, "{policy}");
+            next.finish(true);
+
+            // Remove the bound D while idle. Only the next turn knows what must fit.
+            let remaining = &targets[..2];
+            observe(remaining, None);
+            let rebound = runtime.acquire(None, &request, "/v1/completions", remaining, None);
+            tokio::pin!(rebound);
+            assert!(futures::poll!(&mut rebound).is_pending());
+            observe(remaining, Some(&targets[1]));
+            let rebound = rebound.await.unwrap().unwrap();
+            assert_eq!(rebound.dispatch().target_id, targets[1].id, "{policy}");
+            rebound.finish(true);
+        }
+    }
 
     #[test]
     fn decode_target_is_resolved_from_live_discovery_after_admission() {

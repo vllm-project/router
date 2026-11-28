@@ -341,11 +341,15 @@ class TestConfigurationValidation:
                     vllm_pd_disaggregation=True,
                     prefill_urls=[("http://prefill1:8000", None)],
                     decode_urls=["http://decode1:8001"],
-                    prefill_policy=prefill_policy,
-                    decode_policy=decode_policy,
+                    policy={
+                        "default": "round_robin",
+                        "prefill": prefill_policy,
+                        "native_decode": decode_policy,
+                    },
                 )
-                assert args.prefill_policy == prefill_policy
-                assert args.decode_policy == decode_policy
+                args._validate_router_args()
+                assert args.policy["prefill"] == prefill_policy
+                assert args.policy["native_decode"] == decode_policy
 
     def test_cors_validation(self):
         """Test CORS configuration validation."""

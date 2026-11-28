@@ -17,6 +17,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
         "sticky_least_loaded": PolicyType.StickyLeastLoaded,
+        "rendezvous_hash": PolicyType.RendezvousHash,
     }
     return policy_map[policy_str]
 
@@ -28,7 +29,7 @@ class Router:
     Args:
         worker_urls: List of URLs for worker nodes that will handle requests. Each URL should include
             the protocol, host, and port (e.g., ['http://worker1:8000', 'http://worker2:8000'])
-        policy: Load balancing policy to use. Options:
+        policy: Shared policy name or dict with default, program, prefill and native_decode. Options:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
@@ -74,10 +75,6 @@ class Router:
         vllm_pd_disaggregation: Enable vLLM PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
-        prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).
-            If not specified, uses the main policy. Default: None
-        decode_policy: Specific load balancing policy for decode nodes (PD mode only).
-            If not specified, uses the main policy. Default: None
         router_temperature: Softmax temperature for kv_aware. Default: 0.0
         kv_penalty_host: Host-tier transfer credit for kv_aware. Default: 0.8
         kv_penalty_external: External-tier transfer credit for kv_aware. Default: 0.6
@@ -127,22 +124,19 @@ class Router:
     def from_args(args: RouterArgs) -> "Router":
         """Create a router from a RouterArgs instance."""
 
-        args_dict = vars(args)
+        args_dict = vars(args).copy()
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
             if args_dict["service_discovery"] or args_dict["vllm_pd_disaggregation"]
             else args_dict["worker_urls"]
         )
-        args_dict["policy"] = policy_from_str(args_dict["policy"])
         args_dict["prefill_urls"] = (
             args_dict["prefill_urls"] if args_dict["vllm_pd_disaggregation"] else None
         )
         args_dict["decode_urls"] = (
             args_dict["decode_urls"] if args_dict["vllm_pd_disaggregation"] else None
         )
-        args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
-        args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
 
         # remove mini_lb parameter
         args_dict.pop("mini_lb")

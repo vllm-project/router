@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -65,7 +66,7 @@ class TestKvLauncherArgs:
         kwargs = native_router.call_args.kwargs
         assert kwargs["kv_aware_session_affinity_ttl_secs"] == 1800
         assert kwargs["pd_kv_events"] == sources
-        assert kwargs["policy"] == policy_from_str("kv_aware")
+        assert kwargs["policy"] == "kv_aware"
         assert router._router is native_router.return_value
 
 
@@ -93,8 +94,6 @@ class TestRouterArgs:
         assert args.kv_penalty_disk == 0.3
 
         # Test PD-specific defaults
-        assert args.prefill_policy is None
-        assert args.decode_policy is None
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -210,8 +209,6 @@ class TestRouterArgs:
             decode=None,
             router_policy="round_robin",
             router_vllm_pd_disaggregation=False,
-            router_prefill_policy=None,
-            router_decode_policy=None,
             router_worker_startup_timeout_secs=300,
             router_worker_startup_check_interval=15,
             router_cache_threshold=0.7,
@@ -332,10 +329,12 @@ class TestRouterArgs:
                 ["http://prefill2:8000", "none"],
             ],
             router_decode=[["http://decode1:8001"], ["http://decode2:8001"]],
-            router_policy="cache_aware",
+            router_policy={
+                "default": "cache_aware",
+                "prefill": "power_of_two",
+                "native_decode": "round_robin",
+            },
             router_vllm_pd_disaggregation=True,
-            router_prefill_policy="power_of_two",
-            router_decode_policy="round_robin",
             # Include all required fields with defaults
             router_worker_startup_timeout_secs=600,
             router_worker_startup_check_interval=30,
@@ -391,9 +390,11 @@ class TestRouterArgs:
             ("http://prefill2:8000", None),
         ]
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
-        assert router_args.prefill_policy == "power_of_two"
-        assert router_args.decode_policy == "round_robin"
-        assert router_args.policy == "cache_aware"  # Main policy still set
+        assert router_args.policy == {
+            "default": "cache_aware",
+            "prefill": "power_of_two",
+            "native_decode": "round_robin",
+        }
 
     def test_from_cli_args_without_prefix(self):
         """Test creating RouterArgs from CLI arguments without router prefix."""
@@ -405,8 +406,6 @@ class TestRouterArgs:
             prefill=None,
             decode=None,
             vllm_pd_disaggregation=False,
-            prefill_policy=None,
-            decode_policy=None,
             worker_startup_timeout_secs=600,
             worker_startup_check_interval=30,
             cache_threshold=0.3,
@@ -464,8 +463,8 @@ class TestRouterArgs:
         for kwargs in [
             {"policy": "kv_aware"},
             {"policy": "kv_aware", "enable_igw": True},
-            {"policy": "round_robin", "prefill_policy": "kv_aware"},
-            {"policy": "round_robin", "decode_policy": "kv_aware"},
+            {"policy": {"default": "round_robin", "prefill": "kv_aware"}},
+            {"policy": {"default": "round_robin", "native_decode": "kv_aware"}},
         ]:
             args = RouterArgs(
                 vllm_pd_disaggregation=True,
@@ -482,9 +481,11 @@ class TestRouterArgs:
         args = RouterArgs(
             vllm_pd_disaggregation=True,
             service_discovery=True,
-            policy="kv_aware",
-            prefill_policy="round_robin",
-            decode_policy="consistent_hash",
+            policy={
+                "default": "kv_aware",
+                "prefill": "round_robin",
+                "native_decode": "consistent_hash",
+            },
         )
         args._validate_router_args()
 
@@ -534,8 +535,6 @@ class TestParseRouterArgs:
         assert router_args.policy == "round_robin"
 
     def test_kv_aware_cli_flags_reach_the_rust_router(self, monkeypatch):
-        from vllm_router_rs import PolicyType
-
         args = parse_router_args(
             [
                 "--policy",
@@ -561,7 +560,7 @@ class TestParseRouterArgs:
         monkeypatch.setattr("vllm_router.router._Router", FakeRustRouter)
         Router.from_args(args)
 
-        assert captured["policy"] == PolicyType.KvAware
+        assert captured["policy"] == "kv_aware"
         assert captured["kv_aware_session_affinity_ttl_secs"] == 1800
         assert captured["router_temperature"] == 0.25
         assert captured["kv_penalty_host"] == 0.7
@@ -573,14 +572,30 @@ class TestParseRouterArgs:
         with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
             RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
 
-    def test_kv_aware_is_a_pd_stage_policy(self):
-        for stage in ["prefill", "decode"]:
-            args = parse_router_args([f"--{stage}-policy", "kv_aware"])
-            assert getattr(args, f"{stage}_policy") == "kv_aware"
+    @pytest.mark.parametrize("role", ["program", "prefill", "native_decode"])
+    def test_kv_aware_is_a_role_policy(self, role):
+        policy = {"default": "random", role: "kv_aware"}
+        args = parse_router_args(["--policy", json.dumps(policy)])
+        assert args.policy == policy
+        Router.from_args(args)
+
+    @pytest.mark.parametrize("flag", ["--prefill-policy", "--decode-policy"])
+    def test_removed_stage_flags_are_rejected(self, flag):
+        with pytest.raises(SystemExit):
+            parse_router_args([flag, "kv_aware"])
+
+    def test_native_router_accepts_typed_policy_and_validates_overrides(self):
+        from vllm_router_rs import Router as NativeRouter
+
+        NativeRouter(worker_urls=[], policy={"default": {"type": "random"}})
+        with pytest.raises(ValueError, match="unknown request routing policy"):
+            NativeRouter(
+                worker_urls=[], policy={"default": "random", "prefill": "typo"}
+            )
 
     def test_parse_program_scheduling_json(self):
         """Keep the opt-in scheduler configuration opaque until Rust validation."""
-        config = '{"global_queue":true,"binding_strategy":"program_round_robin"}'
+        config = '{"global_queue":true,"resume_order":"fcfs"}'
         router_args = parse_router_args(
             [
                 "--enable-program-scheduling",
@@ -605,10 +620,8 @@ class TestParseRouterArgs:
             "http://decode1:8001",
             "--decode",
             "http://decode2:8001",
-            "--prefill-policy",
-            "power_of_two",
-            "--decode-policy",
-            "round_robin",
+            "--policy",
+            '{"default":"cache_aware","prefill":"power_of_two","native_decode":"round_robin"}',
         ]
 
         router_args = parse_router_args(args)
@@ -619,8 +632,11 @@ class TestParseRouterArgs:
             ("http://prefill2:8000", None),
         ]
         assert router_args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
-        assert router_args.prefill_policy == "power_of_two"
-        assert router_args.decode_policy == "round_robin"
+        assert router_args.policy == {
+            "default": "cache_aware",
+            "prefill": "power_of_two",
+            "native_decode": "round_robin",
+        }
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""

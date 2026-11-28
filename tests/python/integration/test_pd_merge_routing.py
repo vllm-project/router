@@ -23,8 +23,7 @@ _PROGRAM_SCHEDULING_CONFIG = (
     '{"token_capacity_per_dp_rank":100000,'
     '"enable_batch_gain_admission":false,"decode_buffer_tokens":8,'
     '"metrics_interval_seconds":0.02,"queue_timeout_seconds":5,'
-    '"force_resume_timeout_seconds":1,'
-    '"binding_strategy":"program_round_robin"}'
+    '"force_resume_timeout_seconds":1}'
 )
 
 

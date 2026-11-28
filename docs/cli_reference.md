@@ -100,9 +100,7 @@ and the Rust OpenAI backend use different configuration paths. See
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
-| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD prefill policy; unset inherits `--policy`. |
-| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--policy` | Algorithm name or JSON | `cache_aware` | Same | `cache_aware` | Use one shared algorithm, or specify `default` plus optional `program`, `prefill` and `native_decode`. Omitted roles inherit `default`. |
 | `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | KV-aware selection temperature for regular routing and PD prefill; zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | Transfer credit for an authorized external KV source. Worker events alone cannot establish shared-pool residency. |
@@ -114,6 +112,14 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--eviction-interval` | `u64` | `120` | — | — | Seconds between cache-aware approximation-tree eviction operations (Rust spelling). |
 | `--eviction-interval-secs` | — | — | `integer` | `120` | Seconds between cache-aware approximation-tree eviction operations (Python spelling). |
 | `--max-tree-size` | `usize` | `1 << 25` | `integer` | `33554432` | Per-worker character budget per model, trimmed during cache eviction. |
+
+The shared policy accepts `random`, `round_robin`, `cache_aware`, `kv_aware`,
+`power_of_two`, `consistent_hash`, `sticky_least_loaded`, and `rendezvous_hash`.
+The `program` override additionally accepts `least_program_count` and
+`reasoning_token_balance`. The latter requires a per-rank token capacity.
+For example, `--policy '{"default":"kv_aware","native_decode":"round_robin"}'`
+uses KV-aware selection for Program placement and prefill, and round robin
+for native PD decode. Enable Program scheduling to use Program placement.
 
 Cache-aware tuning applies only to policies using `cache_aware`. Load balancing
 is triggered when both `(max_load - min_load) > balance_abs_threshold` and
@@ -154,7 +160,7 @@ vllm-router --vllm-pd-disaggregation \
   --prefill http://prefill-1:8000 9000 \
   --prefill http://prefill-2:8000 none \
   --decode http://decode-1:8001 --decode http://decode-2:8001 \
-  --prefill-policy cache_aware --decode-policy power_of_two
+  --policy '{"default":"cache_aware","native_decode":"power_of_two"}'
 ```
 
 Python converts omitted `--prefill` and `--decode` values to empty worker lists.

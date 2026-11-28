@@ -36,19 +36,55 @@ pub enum PolicyType {
     PowerOfTwo,
     ConsistentHash,
     StickyLeastLoaded,
+    RendezvousHash,
+}
+
+#[derive(FromPyObject)]
+enum PyPolicy<'py> {
+    Name(String),
+    Roles(Bound<'py, pyo3::types::PyDict>),
+    Legacy(PolicyType),
+}
+
+impl PyPolicy<'_> {
+    fn into_spec(self) -> PyResult<String> {
+        match self {
+            Self::Name(name) => Ok(name),
+            Self::Roles(roles) => roles
+                .py()
+                .import("json")?
+                .call_method1("dumps", (roles,))?
+                .extract(),
+            Self::Legacy(policy) => Ok(match policy {
+                PolicyType::Random => "random",
+                PolicyType::RoundRobin => "round_robin",
+                PolicyType::CacheAware => "cache_aware",
+                PolicyType::KvAware => "kv_aware",
+                PolicyType::PowerOfTwo => "power_of_two",
+                PolicyType::ConsistentHash => "consistent_hash",
+                PolicyType::StickyLeastLoaded => "sticky_least_loaded",
+                PolicyType::RendezvousHash => "rendezvous_hash",
+            }
+            .to_owned()),
+        }
+    }
+}
+
+#[pyfunction]
+fn _validate_policy(policy: &str) -> PyResult<()> {
+    config::PolicyTuning::default()
+        .parse(policy)
+        .map(|_| ())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 #[pyclass]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
-    policy: PolicyType,
-    router_temperature: f64,
-    kv_penalty_host: f64,
-    kv_penalty_external: f64,
-    kv_penalty_disk: f64,
+    policy: config::RoutingPolicy,
     kv_aware_session_affinity_ttl_secs: Option<u64>,
     pd_kv_events: Vec<String>,
     kv_event_source: Vec<String>,
@@ -61,11 +97,6 @@ struct Router {
     pd_pair: Vec<String>,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
-    cache_threshold: f32,
-    balance_abs_threshold: usize,
-    balance_rel_threshold: f32,
-    eviction_interval_secs: u64,
-    max_tree_size: usize,
     max_payload_size: usize,
     wasm_middleware: Option<String>,
     wasm_middleware_sha256: Option<String>,
@@ -91,8 +122,7 @@ struct Router {
     vllm_discovery_address: Option<String>,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
-    prefill_policy: Option<PolicyType>,
-    decode_policy: Option<PolicyType>,
+
     max_concurrent_requests: usize,
     cors_allowed_origins: Vec<String>,
     // Retry configuration
@@ -132,38 +162,7 @@ struct Router {
 impl Router {
     /// Convert PyO3 Router to RouterConfig
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
-        use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
-        };
-
-        // Convert policy helper function
-        let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
-            match policy {
-                PolicyType::Random => ConfigPolicyConfig::Random,
-                PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
-                PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                    eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: self.max_tree_size,
-                },
-                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
-                    router_temperature: self.router_temperature,
-                    kv_penalty_host: self.kv_penalty_host,
-                    kv_penalty_external: self.kv_penalty_external,
-                    kv_penalty_disk: self.kv_penalty_disk,
-                    static_kv_event_sources: Box::default(),
-                },
-                PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5, // Default value
-                },
-                PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
-                    virtual_nodes: 160, // Default value
-                },
-                PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
-            }
-        };
+        use config::{DiscoveryConfig, MetricsConfig, RoutingMode};
 
         // Determine routing mode
         let mode = if self.enable_igw {
@@ -175,8 +174,6 @@ impl Router {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -186,8 +183,8 @@ impl Router {
         };
 
         // Convert main policy and attach static regular-mode KV event sources.
-        let mut policy = convert_policy(&self.policy);
-        let sources = config::KvSourceOptions {
+        let mut policy = self.policy.clone();
+        let mut sources = config::KvSourceOptions {
             layout: self.kv_hybrid_layout.as_deref(),
             publishers: &self.kv_event_source,
             pd_publishers: &self.pd_kv_events,
@@ -197,17 +194,11 @@ impl Router {
             model: self.kv_event_model.as_deref(),
         }
         .load(&mode)?;
-        if let ConfigPolicyConfig::KvAware {
-            static_kv_event_sources,
-            ..
-        } = &mut policy
-        {
-            **static_kv_event_sources = sources.regular;
-        } else if !sources.regular.is_empty() {
-            return Err(config::ConfigError::IncompatibleConfig {
-                reason: "--kv-event-source requires the kv_aware policy".to_string(),
-            });
-        }
+        let mut program_scheduling = config::ProgramSchedulingConfig::resolve(
+            self.enable_program_scheduling,
+            self.program_scheduling_config_json.as_deref(),
+        )?;
+        sources.install_regular(&mut policy, program_scheduling.as_mut())?;
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -289,10 +280,7 @@ impl Router {
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: parse_kv_connector(&self.kv_connector)?,
-            program_scheduling: config::ProgramSchedulingConfig::resolve(
-                self.enable_program_scheduling,
-                self.program_scheduling_config_json.as_deref(),
-            )?,
+            program_scheduling,
         })
     }
 }
@@ -321,7 +309,7 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::RoundRobin,
+        policy = PyPolicy::Legacy(PolicyType::RoundRobin),
         host = String::from("127.0.0.1"),
         port = 3001,
         worker_startup_timeout_secs = 600,
@@ -352,8 +340,8 @@ impl Router {
         vllm_discovery_address = None,
         prefill_urls = None,
         decode_urls = None,
-        prefill_policy = None,
-        decode_policy = None,
+
+
         max_concurrent_requests = 32768,
         cors_allowed_origins = vec![],
         // Retry defaults
@@ -408,7 +396,7 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
-        policy: PolicyType,
+        policy: PyPolicy<'_>,
         host: String,
         port: u16,
         worker_startup_timeout_secs: u64,
@@ -439,8 +427,7 @@ impl Router {
         vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
-        prefill_policy: Option<PolicyType>,
-        decode_policy: Option<PolicyType>,
+
         max_concurrent_requests: usize,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
@@ -501,15 +488,24 @@ impl Router {
                 "wasm_middleware_sha256 requires wasm_middleware",
             ));
         }
+        let policy = config::PolicyTuning {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+            router_temperature,
+            kv_penalty_host,
+            kv_penalty_external,
+            kv_penalty_disk,
+        }
+        .parse(&policy.into_spec()?)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Router {
             host,
             port,
             worker_urls,
             policy,
-            router_temperature,
-            kv_penalty_host,
-            kv_penalty_external,
-            kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
             pd_kv_events,
             kv_event_source,
@@ -522,11 +518,6 @@ impl Router {
             pd_pair,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
-            cache_threshold,
-            balance_abs_threshold,
-            balance_rel_threshold,
-            eviction_interval_secs,
-            max_tree_size,
             max_payload_size,
             wasm_middleware,
             wasm_middleware_sha256,
@@ -552,8 +543,7 @@ impl Router {
             vllm_discovery_address,
             prefill_urls,
             decode_urls,
-            prefill_policy,
-            decode_policy,
+
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,
@@ -662,6 +652,7 @@ impl Router {
 
 #[pymodule]
 fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(_validate_policy, m)?)?;
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
     Ok(())

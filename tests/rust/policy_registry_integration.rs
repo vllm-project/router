@@ -21,7 +21,7 @@ async fn igw_kv_affinity_survives_load_changes_and_rebinds_after_registration() 
     };
     let workers = Arc::new(WorkerRegistry::new());
     let policies = Arc::new(PolicyRegistry::new_with_affinity_ttl(
-        config.policy.clone(),
+        config.policy.default.clone(),
         Some(std::time::Duration::from_secs(60)),
     ));
     let manager = RouterManager::new(

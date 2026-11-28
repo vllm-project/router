@@ -66,11 +66,9 @@ mod test_pd_routing {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             disable_retries: true,
             disable_circuit_breaker: true,
@@ -341,11 +339,9 @@ mod test_pd_routing {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
                 consumer_zmq_addrs: Default::default(),
@@ -563,11 +559,9 @@ mod test_pd_routing {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}/p"), None)],
                 decode_urls: vec![format!("{base}/d")],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             epd: Some(EpdConfig {
                 encoder_urls: vec![format!("{base}/e")],
                 consumer_zmq_addrs: Default::default(),
@@ -753,8 +747,6 @@ mod test_pd_routing {
                         "http://decode1:8080".to_string(),
                         "http://decode2:8080".to_string(),
                     ],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
                 PolicyConfig::Random,
@@ -763,8 +755,6 @@ mod test_pd_routing {
                 RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
                     decode_urls: vec!["http://decode:8080".to_string()],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
                 PolicyConfig::PowerOfTwo {
@@ -779,8 +769,6 @@ mod test_pd_routing {
                         ("http://p3:8080".to_string(), Some(9002)),
                     ],
                     decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
                 PolicyConfig::CacheAware {
@@ -799,7 +787,7 @@ mod test_pd_routing {
                 pd_kv_event_sources: Default::default(),
                 pd_worker_pairs: Default::default(),
                 kv_event_strict_recovery: false,
-                policy,
+                policy: policy.into(),
                 host: "127.0.0.1".to_string(),
                 port: 3001,
                 max_payload_size: 1024 * 1024,

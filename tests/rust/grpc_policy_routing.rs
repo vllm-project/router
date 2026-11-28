@@ -28,7 +28,7 @@ use vllm_router_rs::routers::RouterTrait;
 fn config(urls: Vec<String>, policy: PolicyConfig) -> RouterConfig {
     RouterConfig {
         mode: RoutingMode::Regular { worker_urls: urls },
-        policy,
+        policy: policy.into(),
         connection_mode: vllm_router_rs::config::ConnectionMode::Grpc,
         worker_startup_timeout_secs: 5,
         worker_startup_check_interval_secs: 30,
@@ -549,7 +549,6 @@ async fn program_scheduling_sticks_to_program() {
     cfg.program_scheduling = Some(
         serde_json::from_value(json!({
             "binding_only": true,
-            "binding_strategy": "program_round_robin",
             "queue_timeout_seconds": 2,
             "metrics_interval_seconds": 0.05
         }))

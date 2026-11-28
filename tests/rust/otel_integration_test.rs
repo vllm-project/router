@@ -55,7 +55,7 @@ fn test_router_config(worker_url: &str) -> RouterConfig {
         mode: RoutingMode::Regular {
             worker_urls: vec![worker_url.to_string()],
         },
-        policy: PolicyConfig::RoundRobin,
+        policy: PolicyConfig::RoundRobin.into(),
         host: "127.0.0.1".to_string(),
         port: 0,
         ..Default::default()

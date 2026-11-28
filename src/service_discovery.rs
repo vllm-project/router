@@ -709,7 +709,7 @@ mod tests {
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
             worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new_with_affinity_ttl(
-                router_config.policy.clone(),
+                router_config.policy.default.clone(),
                 router_config
                     .kv_aware_session_affinity_ttl_secs
                     .map(std::time::Duration::from_secs),

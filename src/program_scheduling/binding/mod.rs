@@ -5,152 +5,96 @@
 
 use super::ProgramIdentity;
 use super::ProgramRef;
-use crate::policies::{CacheAwareCandidate, CacheAwarePolicy, ConsistentHashPolicy};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt::Debug;
+pub(crate) use crate::policies::binding::make_binding_policy;
+pub use crate::policies::binding::{
+    ProgramBindingCandidate, ProgramBindingPolicy, ProgramBindingStrategy,
+};
+use std::collections::HashMap;
 
-/// Initial binding algorithm selected for Program generations.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgramBindingStrategy {
-    /// Preserve stable session/task affinity with a consistent hash ring.
-    #[default]
-    ConsistentHash,
-    /// Assign each new Program generation to the next backend in target order.
-    ProgramRoundRobin,
-    /// Select the backend with the fewest accounted Programs.
-    LeastProgramCount,
-    /// Select the backend with the greatest unaccounted token capacity.
-    ReasoningTokenBalance,
-    /// Combine request-text prefix affinity with current KV headroom.
-    CacheAware,
+/// Model-pool scoped home bindings. Actual runtime placement lives in the scheduler.
+#[derive(Debug, Default)]
+pub(crate) struct BindingTable {
+    entries: HashMap<ProgramBindingKey, String>,
 }
 
-/// Program-level load snapshot used only for initial binding.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProgramBindingCandidate {
-    /// Stable backend or DP-rank identifier.
-    pub target_id: String,
-    /// Active Programs plus paused reasoning Programs bound to the target.
-    pub accounted_programs: usize,
-    /// Private tokens of active Programs plus paused reasoning Programs.
-    pub accounted_tokens: f64,
-    /// Explicit per-target token capacity required by token balance.
-    pub capacity_tokens: Option<usize>,
-    /// Current target KV pressure normalized to [0, 1].
-    pub kv_pressure: f64,
-    /// Whether the new Program fits the Cache-aware immediate-admission gate.
-    pub immediately_admissible: bool,
+impl BindingTable {
+    pub(crate) fn binding(&self, identity: &ProgramIdentity) -> Option<&str> {
+        self.entries
+            .get(&ProgramBindingKey::from(identity))
+            .map(String::as_str)
+    }
+
+    pub(crate) fn commit(&mut self, identity: &ProgramIdentity, target: &str) {
+        self.entries
+            .insert(ProgramBindingKey::from(identity), target.to_owned());
+    }
+
+    pub(crate) fn release_program(&mut self, program: &ProgramRef) {
+        self.entries.remove(&ProgramBindingKey {
+            model_pool: program.model_pool().to_owned(),
+            program_id: program.program_id().to_owned(),
+        });
+    }
+
+    pub(crate) fn remove_target(&mut self, model_pool: &str, target: &str) {
+        self.entries
+            .retain(|key, bound| key.model_pool != model_pool || bound != target);
+    }
 }
 
-/// One initial Program binding algorithm.
-///
-/// Implementations receive a target list sorted by `target_id`. They must not
-/// apply admission capacity, resume ordering, or cross-rank migration rules.
-pub trait ProgramBindingPolicy: Send + Sync + Debug {
-    /// Select the home backend for one previously unbound Program generation.
-    fn select(
-        &mut self,
-        identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        routing_text: Option<&str>,
-    ) -> Option<String>;
-
-    fn commit_placement(&self, _model_pool: &str, _text: &str, _target_id: &str) {}
-
-    fn remove_target(&self, _model_pool: &str, _target_id: &str) {}
-}
-
-/// Stable Program binding table plus one selected initial-binding policy.
-///
-/// ProgramScheduler serializes calls to this object with its state lock. The
-/// table records home affinity only; it does not record runtime placement.
+/// Compatibility API for callers that bind directly. The Router uses a separate
+/// policy and binding table so admission can operate without a selector.
 #[derive(Debug)]
 pub struct ProgramBindings {
     policy: Box<dyn ProgramBindingPolicy>,
-    bindings: HashMap<ProgramBindingKey, String>,
+    table: BindingTable,
 }
 
 impl ProgramBindings {
-    /// Construct a binding table using one of the behavior-compatible policies.
     pub fn new(strategy: ProgramBindingStrategy, hash_virtual_nodes: u32) -> Self {
-        let policy: Box<dyn ProgramBindingPolicy> = match strategy {
-            ProgramBindingStrategy::ConsistentHash => {
-                Box::new(ConsistentHashBinding::new(hash_virtual_nodes))
-            }
-            ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
-            ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
-            ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
-            ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
-        };
         Self {
-            policy,
-            bindings: HashMap::new(),
+            policy: make_binding_policy(strategy, hash_virtual_nodes),
+            table: BindingTable::default(),
         }
     }
 
-    /// Return an existing binding, or establish one for a new generation.
     pub fn bind(
         &mut self,
         identity: &ProgramIdentity,
         candidates: &[ProgramBindingCandidate],
         routing_text: Option<&str>,
     ) -> Option<String> {
-        let key = ProgramBindingKey::from(identity);
-        let live_targets: BTreeSet<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.target_id.as_str())
-            .collect();
-        if let Some(target_id) = self.bindings.get(&key) {
-            if live_targets.contains(target_id.as_str()) {
-                return Some(target_id.clone());
+        if let Some(bound) = self.binding(identity) {
+            if candidates.iter().any(|c| c.target_id == bound) {
+                return Some(bound.to_owned());
             }
         }
         let mut ordered = candidates.to_vec();
-        ordered.sort_by(|left, right| left.target_id.cmp(&right.target_id));
-        let target_id = self.policy.select(identity, &ordered, routing_text)?;
-        self.bindings.insert(key, target_id.clone());
-        Some(target_id)
+        ordered.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        let target = self.policy.select(identity, &ordered, routing_text)?;
+        self.table.commit(identity, &target);
+        Some(target)
     }
 
-    /// Look up the home backend without making a new policy decision.
     pub fn binding(&self, identity: &ProgramIdentity) -> Option<&str> {
-        self.bindings
-            .get(&ProgramBindingKey::from(identity))
-            .map(String::as_str)
+        self.table.binding(identity)
     }
-
-    /// Release the binding for one Program generation.
     pub fn release(&mut self, identity: &ProgramIdentity) -> Option<String> {
-        self.bindings.remove(&ProgramBindingKey::from(identity))
+        self.table
+            .entries
+            .remove(&ProgramBindingKey::from(identity))
+    }
+    pub fn remove_target(&mut self, target: &str) -> usize {
+        let previous = self.table.entries.len();
+        self.table.entries.retain(|_, bound| bound != target);
+        previous - self.table.entries.len()
     }
 
-    /// Release by exact runtime reference after lifecycle termination.
-    pub(crate) fn release_program(&mut self, program: &ProgramRef) -> Option<String> {
-        self.bindings.remove(&ProgramBindingKey {
-            model_pool: program.model_pool().to_string(),
-            program_id: program.program_id().to_string(),
-        })
-    }
-
-    /// Invalidate bindings whose backend disappeared from discovery.
-    ///
-    /// The scheduler may rebind the returned Programs using its normal target
-    /// synchronization path. This method never chooses a resume placement.
-    pub fn remove_target(&mut self, target_id: &str) -> usize {
-        let previous_len = self.bindings.len();
-        self.bindings.retain(|_, bound| bound != target_id);
-        previous_len - self.bindings.len()
-    }
-
-    pub(crate) fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
         self.policy
             .commit_placement(program.model_pool(), text, target_id);
-    }
-
-    pub(crate) fn remove_affinity_target(&self, model_pool: &str, target_id: &str) {
-        self.policy.remove_target(model_pool, target_id);
     }
 }
 
@@ -166,185 +110,6 @@ impl From<&ProgramIdentity> for ProgramBindingKey {
             model_pool: identity.model_pool().to_string(),
             program_id: identity.program_id().to_string(),
         }
-    }
-}
-
-#[derive(Debug)]
-struct ConsistentHashBinding {
-    virtual_nodes: u32,
-    rings: HashMap<String, (Vec<String>, BTreeMap<u64, String>)>,
-}
-
-impl ConsistentHashBinding {
-    fn new(virtual_nodes: u32) -> Self {
-        Self {
-            virtual_nodes,
-            rings: HashMap::new(),
-        }
-    }
-
-    fn ring<'a>(&'a mut self, model_pool: &str, targets: &[String]) -> &'a BTreeMap<u64, String> {
-        let rebuild = self
-            .rings
-            .get(model_pool)
-            .is_none_or(|(current, _)| current != targets);
-        if rebuild {
-            let mut ring = BTreeMap::new();
-            for target_id in targets {
-                for virtual_node in 0..self.virtual_nodes {
-                    let virtual_key = format!("{target_id}:{virtual_node}");
-                    ring.insert(
-                        ConsistentHashPolicy::fbi_hash(&virtual_key),
-                        target_id.clone(),
-                    );
-                }
-            }
-            self.rings
-                .insert(model_pool.to_string(), (targets.to_vec(), ring));
-        }
-        &self
-            .rings
-            .get(model_pool)
-            .expect("ring was inserted above")
-            .1
-    }
-}
-
-impl ProgramBindingPolicy for ConsistentHashBinding {
-    fn select(
-        &mut self,
-        identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        _routing_text: Option<&str>,
-    ) -> Option<String> {
-        let targets: Vec<String> = candidates
-            .iter()
-            .map(|candidate| candidate.target_id.clone())
-            .collect();
-        let ring = self.ring(identity.model_pool(), &targets);
-        if ring.is_empty() {
-            return None;
-        }
-        let hash = ConsistentHashPolicy::fbi_hash(identity.placement_hash_key());
-        ring.range(hash..)
-            .next()
-            .or_else(|| ring.iter().next())
-            .map(|(_, target_id)| target_id.clone())
-    }
-}
-
-#[derive(Debug, Default)]
-struct RoundRobinBinding {
-    next_by_model: HashMap<String, usize>,
-}
-
-impl ProgramBindingPolicy for RoundRobinBinding {
-    fn select(
-        &mut self,
-        identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        _routing_text: Option<&str>,
-    ) -> Option<String> {
-        if candidates.is_empty() {
-            return None;
-        }
-        let next = self
-            .next_by_model
-            .entry(identity.model_pool().to_string())
-            .or_default();
-        let target_id = candidates[*next % candidates.len()].target_id.clone();
-        *next = next.wrapping_add(1);
-        Some(target_id)
-    }
-}
-
-#[derive(Debug)]
-struct LeastProgramCountBinding;
-
-impl ProgramBindingPolicy for LeastProgramCountBinding {
-    fn select(
-        &mut self,
-        _identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        _routing_text: Option<&str>,
-    ) -> Option<String> {
-        candidates
-            .iter()
-            .min_by_key(|candidate| (candidate.accounted_programs, candidate.target_id.as_str()))
-            .map(|candidate| candidate.target_id.clone())
-    }
-}
-
-#[derive(Debug)]
-struct ReasoningTokenBalanceBinding;
-
-impl ProgramBindingPolicy for ReasoningTokenBalanceBinding {
-    fn select(
-        &mut self,
-        _identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        _routing_text: Option<&str>,
-    ) -> Option<String> {
-        candidates
-            .iter()
-            .map(|candidate| {
-                let capacity = candidate
-                    .capacity_tokens
-                    .expect("reasoning-token balance requires explicit capacity")
-                    as f64;
-                (candidate, capacity - candidate.accounted_tokens)
-            })
-            .max_by(|(left, left_remaining), (right, right_remaining)| {
-                left_remaining
-                    .total_cmp(right_remaining)
-                    .then_with(|| right.target_id.cmp(&left.target_id))
-            })
-            .map(|(candidate, _)| candidate.target_id.clone())
-    }
-}
-
-#[derive(Debug, Default)]
-struct CacheAwareBinding {
-    affinity: CacheAwarePolicy,
-}
-
-impl ProgramBindingPolicy for CacheAwareBinding {
-    fn select(
-        &mut self,
-        identity: &ProgramIdentity,
-        candidates: &[ProgramBindingCandidate],
-        routing_text: Option<&str>,
-    ) -> Option<String> {
-        let eligible = candidates
-            .iter()
-            .filter(|candidate| candidate.immediately_admissible)
-            .collect::<Vec<_>>();
-        let candidates = if eligible.is_empty() {
-            candidates.iter().collect::<Vec<_>>()
-        } else {
-            eligible
-        }
-        .into_iter()
-        .map(|candidate| CacheAwareCandidate {
-            target_id: &candidate.target_id,
-            kv_pressure: candidate.kv_pressure,
-        })
-        .collect::<Vec<_>>();
-        self.affinity
-            .evaluate_initial_placement(
-                identity.model_pool(),
-                routing_text.unwrap_or_default(),
-                &candidates,
-            )
-            .map(|placement| placement.target_id)
-    }
-
-    fn commit_placement(&self, model_pool: &str, text: &str, target_id: &str) {
-        self.affinity.commit_placement(model_pool, text, target_id);
-    }
-
-    fn remove_target(&self, model_pool: &str, target_id: &str) {
-        self.affinity.remove_placement_target(model_pool, target_id);
     }
 }
 
@@ -426,6 +191,35 @@ mod tests {
                 .as_deref(),
             Some("rank-1")
         );
+    }
+
+    #[test]
+    fn inherited_request_algorithms_select_among_program_candidates() {
+        let program = identity("shared-policy");
+        let candidates = [candidate("a", 3, 0.0, 100), candidate("b", 1, 0.0, 100)];
+        for strategy in [
+            ProgramBindingStrategy::Random,
+            ProgramBindingStrategy::PowerOfTwo,
+            ProgramBindingStrategy::RendezvousHash,
+            ProgramBindingStrategy::StickyLeastLoaded,
+        ] {
+            let mut policy = make_binding_policy(strategy, 160);
+            assert_eq!(policy.select(&program, &[], None), None);
+            assert_eq!(
+                policy.select(&program, &candidates[..1], None).as_deref(),
+                Some("a")
+            );
+            let selected = policy.select(&program, &candidates, None).unwrap();
+            match strategy {
+                ProgramBindingStrategy::PowerOfTwo | ProgramBindingStrategy::StickyLeastLoaded => {
+                    assert_eq!(selected, "b")
+                }
+                ProgramBindingStrategy::RendezvousHash => {
+                    assert_eq!(Some(selected), policy.select(&program, &candidates, None))
+                }
+                _ => assert!(candidates.iter().any(|c| c.target_id == selected)),
+            }
+        }
     }
 
     #[test]

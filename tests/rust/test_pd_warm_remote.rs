@@ -238,9 +238,12 @@ fn warm_router_config(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: prefill_urls.clone(),
             decode_urls: vec![d.url.clone()],
-            prefill_policy: Some(policy.clone()),
-            decode_policy: Some(PolicyConfig::RoundRobin),
             discovery_address: None,
+        },
+        policy: vllm_router_rs::config::RoutingPolicy {
+            prefill: Some(policy.clone()),
+            native_decode: Some(PolicyConfig::RoundRobin),
+            ..vllm_router_rs::config::RoutingPolicy::from(PolicyConfig::Random)
         },
         ..Default::default()
     };
@@ -349,6 +352,84 @@ async fn exact_two_turns_take_engine_metadata_once_and_reject_rewrite() {
         .pointer("/kv_transfer_params/remote_request_id")
         .is_none());
 }
+#[tokio::test]
+async fn real_http_body_completion_publishes_the_warm_source() {
+    let p = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let router = Arc::new(router(&p, &d).await);
+    let app = axum::Router::new().route(
+        "/v1/completions",
+        axum::routing::post(move |Json(body): Json<Value>| {
+            let router = router.clone();
+            async move {
+                let request = serde_json::from_value(body).unwrap();
+                router.route_completion(None, &request, Some("test")).await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/completions", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for prompt in [vec![1, 2, 3], next_prompt()] {
+        let response = client
+            .post(&url)
+            .json(&completion_body("transport", &prompt, true, false))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let _: Value = response.json().await.unwrap();
+    }
+    server.abort();
+    let calls = prefill_calls(&p, &next_prompt());
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].pointer("/kv_transfer_params/remote_engine_id"),
+        Some(&json!("d-engine"))
+    );
+}
+
+#[tokio::test]
+async fn kv_prefill_prices_the_same_history_on_two_readers_and_respects_minimum_gain() {
+    let policy = PolicyConfig::KvAware {
+        router_temperature: 0.0,
+        kv_penalty_host: 0.8,
+        kv_penalty_external: 0.6,
+        kv_penalty_disk: 0.3,
+        static_kv_event_sources: Box::default(),
+    };
+    for (minimum, expect_read) in [(1, true), (64, false)] {
+        let p0 = engine(true, false, false).await;
+        let p1 = engine(true, false, false).await;
+        let d = engine(false, false, false).await;
+        let router = router_with_prefills(
+            &[&p0, &p1],
+            &d,
+            policy.clone(),
+            false,
+            json!({"warm_min_extra_tokens":minimum}),
+        )
+        .await;
+        assert_eq!(call(&router, vec![1, 2, 3], false).await.0, StatusCode::OK);
+        assert_eq!(call(&router, next_prompt(), false).await.0, StatusCode::OK);
+        let calls: Vec<_> = [&p0, &p1]
+            .iter()
+            .flat_map(|p| prefill_calls(p, &next_prompt()))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .pointer("/kv_transfer_params/remote_engine_id")
+                .is_some(),
+            expect_read
+        );
+        assert_eq!(d.state.calls.lock().unwrap().len(), 2);
+    }
+}
+
 #[tokio::test]
 async fn capability_probe_is_cached_across_turns() {
     let p = engine(true, false, false).await;

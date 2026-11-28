@@ -8,9 +8,8 @@ use super::output_length::PendingOutputPrediction;
 use super::prediction_profile::PredictionProfileStore;
 use super::return_time::PendingReturnPrediction;
 use super::{
-    ContextTokens, ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
-    ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
-    TokenCountMode, TokenizerFingerprint,
+    ContextTokens, ProgramBindingStrategy, ProgramRef, ProgramRuntime, ProgramSchedulingEnableKey,
+    ProgramTarget, ProgressTtlConfig, ProgressTtlFactors, TokenCountMode, TokenizerFingerprint,
 };
 use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -46,14 +45,15 @@ pub struct ProgramSchedulerConfig {
     pub enable_key: ProgramSchedulingEnableKey,
     /// Preserve Program identity and binding but bypass Router admission.
     pub binding_only: bool,
+    pub enable_acting_ttl: bool,
     /// Permit paused reasoning Programs to resume on another target.
     pub global_queue: bool,
     /// Ordinary resume order after force-resume, priority, and one-shot yield.
     pub resume_order: ProgramResumeOrder,
     /// Required destination-over-source headroom in complete Program contexts.
     pub cross_rank_headroom_ratio: f64,
-    /// Initial Program generation binding policy.
-    pub binding_strategy: ProgramBindingStrategy,
+    /// Initial placement algorithm resolved from the router policy.
+    pub placement_policy: ProgramBindingStrategy,
     /// Consistent-hash virtual nodes used only by Program binding.
     pub hash_virtual_nodes: u32,
     /// Coarse Program-count guard when explicit token capacity is unavailable.
@@ -99,10 +99,11 @@ impl Default for ProgramSchedulerConfig {
             pd_prefill_kv_window: Duration::from_secs(10),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
+            enable_acting_ttl: true,
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: 1.2,
-            binding_strategy: ProgramBindingStrategy::ConsistentHash,
+            placement_policy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
             max_active_programs_per_target: 64,
             token_count_mode: TokenCountMode::default(),
@@ -135,18 +136,13 @@ pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> u
     (2 * prefill_permits.max(1)).clamp(4, 64)
 }
 
-impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
-    fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
-        Self::from_program_config(config, false)
-    }
-}
-
 impl ProgramSchedulerConfig {
     /// Build the scheduler config for one routing mode. PD mode comes from the
     /// active `--vllm-pd-disaggregation` route, not from a second config flag.
     pub fn from_program_config(
         config: &crate::config::types::ProgramSchedulingConfig,
         pd_mode: bool,
+        placement_policy: ProgramBindingStrategy,
     ) -> Self {
         // Auto sizing is a PD-mode concept. A regular-mode config that omitted
         // the fields deserializes the zero defaults; keep the historical
@@ -176,10 +172,11 @@ impl ProgramSchedulerConfig {
             pd_prefill_kv_window: Duration::from_secs_f64(config.pd.prefill_kv_window_seconds),
             enable_key: config.enable_key,
             binding_only: config.binding_only,
+            enable_acting_ttl: config.enable_acting_ttl,
             global_queue: config.global_queue,
             resume_order: config.resume_order,
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
-            binding_strategy: config.binding_strategy,
+            placement_policy,
             hash_virtual_nodes: config.hash_virtual_nodes,
             max_active_programs_per_target,
             token_count_mode: config.token_count_mode,
@@ -218,6 +215,7 @@ impl ProgramSchedulerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProgramPauseReason {
     TtlExpired,
+    ActingRetentionDisabled,
     CapacityRepair,
     MaxSegmentYield,
     RequestFailed,
@@ -228,6 +226,7 @@ impl ProgramPauseReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::TtlExpired => "ttl_expired",
+            Self::ActingRetentionDisabled => "acting_retention_disabled",
             Self::CapacityRepair => "capacity_repair",
             Self::MaxSegmentYield => "max_segment_yield",
             Self::RequestFailed => "request_failed",
@@ -239,6 +238,9 @@ impl ProgramPauseReason {
 /// Scheduling facts associated with one exact live Program generation.
 #[derive(Debug, Clone)]
 pub(crate) struct ProgramDecisionState {
+    pub(crate) session_admission: bool,
+    pub(crate) binding_ticket: Option<u64>,
+    pub(crate) committed_ticket: Option<u64>,
     pub(crate) placement_key: String,
     pub(crate) placement_hash_key: String,
     pub(crate) task_id: Option<String>,
@@ -302,6 +304,9 @@ impl ProgramDecisionState {
     ) -> Self {
         Self {
             placement_key,
+            session_admission: false,
+            binding_ticket: None,
+            committed_ticket: None,
             placement_hash_key,
             task_id: None,
             session_id: None,
@@ -462,13 +467,17 @@ impl CapacityAccountingSource {
 #[derive(Debug)]
 pub(crate) struct ProgramSchedulerState {
     pub(crate) runtime: ProgramRuntime,
-    pub(crate) bindings: ProgramBindings,
+    pub(crate) bindings: super::binding::BindingTable,
     pub(crate) decisions: HashMap<ProgramRef, ProgramDecisionState>,
     pub(crate) targets: BTreeMap<String, ProgramTarget>,
     pub(crate) model_targets: HashMap<String, BTreeSet<String>>,
     pub(crate) model_target_snapshots: HashMap<String, Arc<[ProgramTarget]>>,
     /// Monotonic fence for target topology or target-attribute changes.
     pub(crate) target_snapshot_revision: u64,
+    pub(crate) registry_revisions: HashMap<String, u64>,
+    pub(crate) capacity_waiters: HashMap<String, VecDeque<ProgramRef>>,
+    pub(crate) next_ticket: u64,
+    pub(crate) admission_revision: u64,
     pub(crate) rank_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) global_queues: HashMap<String, VecDeque<ProgramRef>>,
     pub(crate) observations: HashMap<String, RankObservationState>,
@@ -525,12 +534,16 @@ impl ProgramSchedulerState {
     pub(crate) fn new(config: &ProgramSchedulerConfig) -> Self {
         Self {
             runtime: ProgramRuntime::default(),
-            bindings: ProgramBindings::new(config.binding_strategy, config.hash_virtual_nodes),
+            bindings: super::binding::BindingTable::default(),
             decisions: HashMap::new(),
             targets: BTreeMap::new(),
             model_targets: HashMap::new(),
             model_target_snapshots: HashMap::new(),
             target_snapshot_revision: 0,
+            registry_revisions: HashMap::new(),
+            capacity_waiters: HashMap::new(),
+            next_ticket: 0,
+            admission_revision: 0,
             rank_queues: HashMap::new(),
             global_queues: HashMap::new(),
             observations: HashMap::new(),
@@ -593,7 +606,11 @@ mod tests {
 
         let parsed: crate::config::types::ProgramSchedulingConfig =
             serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
-        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
+        let runtime = ProgramSchedulerConfig::from_program_config(
+            &parsed,
+            true,
+            ProgramBindingStrategy::default(),
+        );
         assert_eq!(runtime.max_active_programs_per_target, 8);
         assert_eq!(runtime.admission_waiting_request_threshold, 8);
         assert!(runtime.pd_exclusive_capacity_accounting);
@@ -604,7 +621,8 @@ mod tests {
         // historical admission pool and overload gate.
         let regular: crate::config::types::ProgramSchedulingConfig =
             serde_json::from_str("{}").unwrap();
-        let runtime = ProgramSchedulerConfig::from(&regular);
+        let runtime =
+            ProgramSchedulerConfig::from_program_config(&regular, false, Default::default());
         assert!(!runtime.pd_mode);
         assert_eq!(runtime.max_active_programs_per_target, 64);
         assert_eq!(runtime.admission_waiting_request_threshold, 1);

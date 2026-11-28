@@ -315,15 +315,14 @@ In prefill-decode disaggregated mode, you can configure separate policies for pr
 ```bash
 vllm-router \
   --mode pd \
-  --prefill-policy consistent_hash \
-  --decode-policy round_robin \
+  --policy '{"default":"consistent_hash","native_decode":"round_robin"}' \
   --prefill-workers http://prefill1:8000,http://prefill2:8000 \
   --decode-workers http://decode1:8000,http://decode2:8000
 ```
 
 This allows optimizing each stage independently:
 - **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+- **Decode**: Inherits the main policy; override with `policy.native_decode` (for example `round_robin`)
 
 `grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
 warns at startup when a worker reports an older `engine_version`, and

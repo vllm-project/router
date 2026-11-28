@@ -261,14 +261,12 @@ impl Rig {
             Path::SplitPdSequential | Path::SplitPdConcurrent => RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(consumer_url.clone(), None)],
                 decode_urls: vec![decode_url],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
         };
         let config = RouterConfig {
             mode,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             kv_connector: KvConnector::Nixl,
             epd: Some(EpdConfig {
                 encoder_urls: vec![e0_url, e1_url],

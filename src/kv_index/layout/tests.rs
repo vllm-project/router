@@ -1052,8 +1052,6 @@ mod declarations {
         let mode = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(worker.into(), None)],
             decode_urls: vec!["http://decode".into()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
         let source = EventSource {

@@ -168,8 +168,7 @@ generate_router_command() {
     echo "    --vllm-discovery-address ${ROUTER_HOST}:${ROUTER_DISCOVERY_PORT} \\"
     echo "    --host ${ROUTER_HOST} \\"
     echo "    --port ${ROUTER_HTTP_PORT} \\"
-    echo "    --prefill-policy consistent_hash \\"
-    echo "    --decode-policy consistent_hash"
+    echo "    --policy consistent_hash"
 }
 
 show_usage_examples() {

@@ -282,7 +282,7 @@ worker's gRPC control service, and `/health_generate` returns `501`.
 cache reset. `power_of_two` uses the router's own in-flight counts, since
 `grpc://` workers serve no HTTP `/get_load`.
 
-`--prefill-policy kv_aware` and `cache_aware` score the token ids the router
+The `kv_aware` and `cache_aware` prefill policies score the token ids the router
 sends P, so gRPC P/D needs no HTTP `/tokenize`. KV event sources come from
 each prefill's `Control.GetKvEventSources`, or from
 `--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does

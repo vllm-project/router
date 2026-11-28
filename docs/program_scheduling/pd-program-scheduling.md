@@ -119,7 +119,6 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `token_capacity_per_dp_rank` | required in PD | KV tokens of one D rank; capacity and low-watermark checks use it |
 | `max_active_programs_per_target` | `0` (auto) | auto = `2 × pd.max_prefill_requests_per_target`, clamped to `[4, 64]`; set explicitly to reproduce a run |
 | `admission_waiting_request_threshold` | `0` (auto) | auto = `2 × pd.max_prefill_requests_per_target`, clamped to `[4, 64]`; `1` makes the active-Program bound ineffective |
-| `binding_strategy` | `consistent_hash` | `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, `cache_aware` |
 | `global_queue` | `false` | one Router-wide Program queue instead of per-rank queues |
 | `resume_order` | `mru` | `mru` or `fcfs` |
 | `queue_timeout_seconds` | `600` | per-turn Router queue bound; exceeding it returns HTTP 429 |
@@ -145,6 +144,20 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `kv_events` | `false` | subscribe to KV events for advisory residency; never authorizes a transfer |
 | `kv_hash_mode` | `sha256` | `sha256`, `python_hash_seed`, `xxhash_cbor` |
 
+### First-turn Decode selection
+
+For every Program binding policy, the head turn first filters D ranks by the turn's demand, available capacity and queue limits. If all online ranks are full, the turn keeps its queue position until capacity changes or its deadline expires. An ordinary continuation checks its bound D. When that D leaves the pool, a waiting head turn repeats capacity-first selection. An idle Program waits for its next turn before rebinding.
+
+Set `--policy '{"default":"round_robin","program":"kv_aware"}'` to score the first Decode placement of each Program. Configure KV events for the D ranks (worker discovery or `--pd-kv-events`). The native `policy.native_decode` and the per-turn `policy.prefill` can be configured independently.
+
+With `kv_aware`, the Router compares the eligible ranks using existing Program token reservations plus the prompt tokens that would have to be added on that D. It uses the D rank's own device cache and the engine's token IDs, including worker-rendered chat inputs. If the full set cannot be priced, the Router compares load across eligible ranks. Admission rechecks the recommendation before binding. An ordinary continuation keeps its D. A new session with the same prefix can choose the same D while it has room. The counter `vllm_router_prefix_routing_decisions_total` reports `stage="program_decode"` and an outcome of `prefix_cost`, `load_fallback`, or `single_candidate`. A single eligible D skips token rendering and scoring.
+
+### Per-turn prefill selection
+
+With `policy.prefill` set to `kv_aware`, each admitted Program turn selects a P after the scheduler commits its D. The Router uses backend-effective prompt tokens, the P rank’s confirmed device prefix and its outstanding prefill token work. An unpriced candidate or an unknown-size backlog switches the comparison to request counts for the whole eligible pool. Configure a KV event source for each P that should receive local prefix credit. An inherited KV-aware policy follows the same path.
+
+For exact-token completions on bidirectional NIXL, a reader with compatible capabilities can also receive credit for the portion of a retained D prefix that extends past its local prefix. The Router checks the source again after acquiring the P permit. A cold retry keeps the selected worker and adjusts the same in-flight token charge.
+
 ### `pd` — warm remote KV reuse
 
 | Field | Default | Notes |
@@ -152,6 +165,7 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `warm_remote` | `false` | enable D→P warm reads |
 | `protocol_revision` | `vllm-0.28.0-pd-feedback-v1` | must match the engine overlay |
 | `warm_min_p_kv_usage` | `0.0` | only route warm when the target P's scraped KV usage is at least this value (`0` = always) |
+| `warm_min_extra_tokens` | `1` | minimum additional compute tokens saved by a remote read when P work is known. An entirely overlapping prefix stays local. |
 | `warm_max_p_running` | unlimited | only route warm when the target P's scraped running requests are at most this value |
 | `max_prefix_tokens` | `32768` | largest verified prefix that may be published or pulled |
 | `max_candidate_tokens` | `2097152` | total retained prefix tokens across candidates |

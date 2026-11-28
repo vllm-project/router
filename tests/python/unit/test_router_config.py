@@ -284,9 +284,11 @@ class TestRouterConfigValidation:
             vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
             decode_urls=["http://decode1:8001"],
-            policy="cache_aware",
-            prefill_policy="power_of_two",
-            decode_policy="round_robin",
+            policy={
+                "default": "cache_aware",
+                "prefill": "power_of_two",
+                "native_decode": "round_robin",
+            },
         )
 
         # Should not raise validation error
@@ -306,9 +308,7 @@ class TestRouterConfigValidation:
             vllm_pd_disaggregation=True,
             prefill_urls=[("http://prefill1:8000", None)],
             decode_urls=["http://decode1:8001"],
-            policy="cache_aware",
-            prefill_policy="power_of_two",
-            decode_policy=None,
+            policy={"default": "cache_aware", "prefill": "power_of_two"},
         )
 
         # Should not raise validation error

@@ -79,6 +79,32 @@ pub struct ConfiguredKvSources {
     pub pd: std::collections::HashMap<String, PdKvEventSources>,
 }
 
+impl ConfiguredKvSources {
+    pub fn install_regular(
+        &mut self,
+        policy: &mut crate::config::RoutingPolicy,
+        program: Option<&mut crate::config::ProgramSchedulingConfig>,
+    ) -> ConfigResult<()> {
+        if self.regular.is_empty() {
+            return Ok(());
+        }
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &mut policy.default
+        {
+            **static_kv_event_sources = std::mem::take(&mut self.regular);
+        } else if let Some(program) = program.filter(|_| policy.program().uses_kv_index()) {
+            program.binding_kv_sources = std::mem::take(&mut self.regular);
+        } else {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--kv-event-source requires kv_aware routing or Program binding".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl KvSourceOptions<'_> {
     pub fn load(&self, mode: &RoutingMode) -> ConfigResult<ConfiguredKvSources> {
         let is_pd = matches!(mode, RoutingMode::VllmPrefillDecode { .. });
@@ -370,11 +396,17 @@ fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
-    if let PolicyConfig::KvAware {
-        static_kv_event_sources,
-        ..
-    } = &config.policy
-    {
+    let static_sources = match &config.policy.default {
+        PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } => Some(static_kv_event_sources.as_ref()),
+        _ => config
+            .program_scheduling
+            .as_ref()
+            .map(|p| &p.binding_kv_sources),
+    };
+    if let Some(static_kv_event_sources) = static_sources {
         if !static_kv_event_sources.is_empty() {
             let RoutingMode::Regular { worker_urls } = &config.mode else {
                 return Err(ConfigError::IncompatibleConfig {
@@ -454,15 +486,10 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     });
                 }
                 let prefill_kv = prefill_keyed
-                    && matches!(
-                        config.mode.get_prefill_policy(&config.policy),
-                        PolicyConfig::KvAware { .. }
-                    );
+                    && matches!(config.policy.prefill(), PolicyConfig::KvAware { .. });
                 let decode_kv = decode_keyed
-                    && matches!(
-                        config.mode.get_decode_policy(&config.policy),
-                        PolicyConfig::KvAware { .. }
-                    );
+                    && (config.uses_program_kv_binding()
+                        || matches!(config.policy.native_decode(), PolicyConfig::KvAware { .. }));
                 if !prefill_kv && !decode_kv {
                     let stage = match (prefill_keyed, decode_keyed) {
                         (true, true) => "prefill and decode",
@@ -493,9 +520,9 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .hybrid
                     .as_ref()
                     .is_some_and(|layout| !layout.is_plain_full_attention());
-                if hybrid_layout && config.program_scheduling.is_some() {
+                if hybrid_layout && !config.allows_hybrid_pd_sources() {
                     return Err(invalid(
-                        "hybrid PD sources do not support Program scheduling",
+                        "hybrid Program routing requires NIXL, local-only KV scoring, and a non-KV-aware native Decode policy",
                     ));
                 }
                 if let Some(layout) = &sources.hybrid {

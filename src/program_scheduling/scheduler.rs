@@ -19,17 +19,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Router-owned Program scheduler.
+pub use super::routing::ProgramRouter as ProgramScheduler;
+
+/// Admission and lifecycle of Programs. This component owns no binding selector.
 #[derive(Debug)]
-pub struct ProgramScheduler {
+pub struct ProgramAdmission {
     pub(crate) config: ProgramSchedulerConfig,
     pub(crate) policy: ProgressTtlPolicyMath,
     pub(crate) state: Mutex<ProgramSchedulerState>,
 }
 
-impl ProgramScheduler {
+pub(super) struct RebindWork {
+    pub(super) program: ProgramRef,
+    pub(super) identity: ProgramIdentity,
+    waiting_requests: usize,
+    lost_current_target: bool,
+}
+
+impl ProgramAdmission {
     /// Construct an opt-in scheduler without changing native Router policy.
-    pub fn new(config: ProgramSchedulerConfig) -> Self {
+    pub(super) fn new(config: ProgramSchedulerConfig) -> Self {
         let policy = ProgressTtlPolicyMath::new(config.progress_ttl.clone());
         let mut state = ProgramSchedulerState::new(&config);
         if config.prediction_profile.mode != PredictionMode::Off {
@@ -171,44 +180,18 @@ impl ProgramScheduler {
         self.config.enable_key
     }
 
-    /// Whether initial Program binding needs the request text for prefix affinity.
-    pub fn uses_cache_aware_binding(&self) -> bool {
-        self.config.binding_strategy == super::ProgramBindingStrategy::CacheAware
-    }
-
-    /// Synchronize one model pool's concrete backend and internal-DP targets.
-    pub fn sync_targets(&self, model_pool: &str, targets: &[ProgramTarget]) {
-        self.sync_target_snapshot(model_pool, Arc::from(targets));
-    }
-
-    /// Synchronize a cached immutable target snapshot.
-    pub fn sync_target_snapshot(&self, model_pool: &str, targets: Arc<[ProgramTarget]>) {
-        self.sync_target_snapshots([(model_pool.to_string(), targets)]);
-    }
-
-    /// Atomically synchronize cached target snapshots for multiple model pools.
-    pub fn sync_target_snapshots(
-        &self,
-        snapshots: impl IntoIterator<Item = (String, Arc<[ProgramTarget]>)>,
-    ) {
-        let mut state = self.state.lock();
-        for (model_pool, targets) in snapshots {
-            self.sync_target_snapshot_locked(&mut state, &model_pool, targets);
-        }
-    }
-
-    fn sync_target_snapshot_locked(
+    pub(super) fn sync_pool(
         &self,
         state: &mut ProgramSchedulerState,
         model_pool: &str,
         targets: Arc<[ProgramTarget]>,
-    ) {
+    ) -> Option<(Vec<String>, Vec<RebindWork>)> {
         if state
             .model_target_snapshots
             .get(model_pool)
             .is_some_and(|current| Arc::ptr_eq(current, &targets))
         {
-            return;
+            return None;
         }
         let incoming = targets
             .iter()
@@ -227,7 +210,7 @@ impl ProgramScheduler {
             state
                 .model_target_snapshots
                 .insert(model_pool.to_string(), targets);
-            return;
+            return None;
         }
         state.target_snapshot_revision = state
             .target_snapshot_revision
@@ -256,11 +239,16 @@ impl ProgramScheduler {
             .cloned()
             .collect::<Vec<_>>();
         for target_id in &removed {
-            state.bindings.remove_target(target_id);
-            state.bindings.remove_affinity_target(model_pool, target_id);
-            state.rank_queues.remove(target_id);
-            state.rank_factors.remove(target_id);
-            state.observations.remove(target_id);
+            state.bindings.remove_target(model_pool, target_id);
+            if !state
+                .model_targets
+                .values()
+                .any(|targets| targets.contains(target_id))
+            {
+                state.rank_queues.remove(target_id);
+                state.rank_factors.remove(target_id);
+                state.observations.remove(target_id);
+            }
         }
         let affected = state
             .runtime
@@ -272,83 +260,22 @@ impl ProgramScheduler {
                     .last_target
                     .as_ref()
                     .is_none_or(|target| !current_ids.contains(target));
-                needs_rebinding.then(|| {
-                    (
-                        program.reference.clone(),
-                        program.expected_resume,
-                        program.waiting_requests,
-                        decision
-                            .last_target
-                            .as_ref()
-                            .is_some_and(|target| removed.contains(target)),
-                        decision.placement_key.clone(),
+                needs_rebinding.then(|| RebindWork {
+                    program: program.reference.clone(),
+                    identity: ProgramIdentity::for_rebinding(
+                        program.reference,
                         decision.placement_hash_key.clone(),
-                    )
+                        decision.placement_key.clone(),
+                        program.expected_resume,
+                    ),
+                    waiting_requests: program.waiting_requests,
+                    lost_current_target: decision
+                        .last_target
+                        .as_ref()
+                        .is_some_and(|target| removed.contains(target)),
                 })
             })
-            .collect::<Vec<_>>();
-        for (
-            program,
-            expected_resume,
-            waiting_requests,
-            target_disappeared,
-            placement_key,
-            placement_hash_key,
-        ) in affected
-        {
-            let placement_invalidated = state.runtime.invalidate_placement(&program, &removed);
-            if target_disappeared {
-                if let Some(target) = state
-                    .decisions
-                    .get(&program)
-                    .and_then(|decision| decision.last_target.as_deref())
-                {
-                    RouterMetrics::record_agent_aware_transition(target, "health_failover");
-                }
-            }
-            state.bindings.release_program(&program);
-            for queue in state.rank_queues.values_mut() {
-                queue.retain(|queued| queued != &program);
-            }
-            for queue in state.global_queues.values_mut() {
-                queue.retain(|queued| queued != &program);
-            }
-            let identity = ProgramIdentity::for_rebinding(
-                &program,
-                placement_hash_key,
-                placement_key,
-                expected_resume,
-            );
-            let candidates = self.binding_candidates(state, &identity, Instant::now());
-            let replacement = state.bindings.bind(&identity, &candidates, None);
-            if let Some(decision) = state.decisions.get_mut(&program) {
-                decision.home_target = replacement.clone();
-                decision.last_target = replacement.clone();
-                if placement_invalidated || target_disappeared {
-                    let now = Instant::now();
-                    decision.paused_at = Some(now);
-                    decision.pause_when_idle = false;
-                    decision.ttl_deadline = None;
-                    decision.segment_started_at = None;
-                    Self::restart_shared_prefix_freshness(decision, now);
-                }
-            }
-            if waiting_requests > 0 {
-                if self.config.global_queue {
-                    state
-                        .global_queues
-                        .entry(model_pool.to_string())
-                        .or_default()
-                        .push_back(program);
-                } else if let Some(target) = replacement {
-                    state
-                        .rank_queues
-                        .entry(target)
-                        .or_default()
-                        .push_back(program);
-                }
-            }
-        }
+            .collect();
         let referenced = state
             .model_targets
             .values()
@@ -357,6 +284,95 @@ impl ProgramScheduler {
         state
             .targets
             .retain(|target_id, _| referenced.contains(target_id));
+        Some((removed, affected))
+    }
+
+    pub(super) fn begin_rebind(
+        &self,
+        state: &mut ProgramSchedulerState,
+        work: &RebindWork,
+        removed: &[String],
+    ) -> bool {
+        let placement_invalidated = state.runtime.invalidate_placement(&work.program, removed);
+        if work.lost_current_target {
+            if let Some(target) = state
+                .decisions
+                .get(&work.program)
+                .and_then(|decision| decision.last_target.as_deref())
+            {
+                RouterMetrics::record_agent_aware_transition(target, "health_failover");
+            }
+        }
+        state.bindings.release_program(&work.program);
+        for queue in state.rank_queues.values_mut() {
+            queue.retain(|queued| queued != &work.program);
+        }
+        for queue in state.global_queues.values_mut() {
+            queue.retain(|queued| queued != &work.program);
+        }
+        placement_invalidated || work.lost_current_target
+    }
+
+    pub(super) fn finish_rebind(
+        &self,
+        state: &mut ProgramSchedulerState,
+        work: RebindWork,
+        replacement: Option<String>,
+        invalidated: bool,
+    ) {
+        let program = work.program;
+        if let Some(decision) = state.decisions.get_mut(&program) {
+            decision.binding_ticket = None;
+            decision.committed_ticket = None;
+            decision.home_target = replacement.clone();
+            decision.last_target = replacement.clone();
+            if invalidated {
+                let now = Instant::now();
+                decision.paused_at = Some(now);
+                decision.pause_when_idle = false;
+                decision.ttl_deadline = None;
+                decision.segment_started_at = None;
+                Self::restart_shared_prefix_freshness(decision, now);
+            }
+        }
+        if work.waiting_requests > 0
+            && replacement.is_none()
+            && state.decisions[&program].session_admission
+        {
+            self.enqueue_capacity_waiter(state, &program);
+            state.runtime.notify_front(&program);
+        } else if work.waiting_requests > 0 {
+            if self.config.global_queue {
+                state
+                    .global_queues
+                    .entry(program.model_pool().to_owned())
+                    .or_default()
+                    .push_back(program);
+            } else if let Some(target) = replacement {
+                state
+                    .rank_queues
+                    .entry(target)
+                    .or_default()
+                    .push_back(program);
+            }
+        }
+    }
+
+    pub(super) fn commit_binding(
+        &self,
+        state: &mut ProgramSchedulerState,
+        identity: &ProgramIdentity,
+        proposed: String,
+    ) -> Option<String> {
+        if !state
+            .model_targets
+            .get(identity.model_pool())?
+            .contains(&proposed)
+        {
+            return None;
+        }
+        state.bindings.commit(identity, &proposed);
+        Some(proposed)
     }
 
     /// Current target snapshot for one model pool.
@@ -527,6 +543,7 @@ impl ProgramScheduler {
                 "Program scheduling diagnostic"
             );
         }
+        Self::wake_capacity_waiters(&mut state);
     }
 
     pub(crate) fn binding_candidates(
@@ -624,14 +641,14 @@ impl ProgramScheduler {
             .collect()
     }
 
-    pub(crate) fn ensure_decision_state(
+    pub(crate) fn update_program(
         &self,
         state: &mut ProgramSchedulerState,
         identity: &ProgramIdentity,
         reference: ProgramRef,
         context: impl Into<ContextTokens>,
+        home_target: Option<String>,
         now: Instant,
-        routing_text: Option<&str>,
     ) {
         let context = context.into();
         let _ = state.lineage.observe(
@@ -640,13 +657,17 @@ impl ProgramScheduler {
             identity.parent_program_id(),
             identity.root_program_id(),
         );
-        let preserve_front = self.config.pd_mode
-            && state.runtime.view(&reference).is_some_and(|p| {
-                // A newly retained tail request must not change the current
-                // front or in-flight turn's budget or context scope in either
-                // direction.
-                p.in_flight_requests > 0 || p.waiting_requests > 1
-            });
+        // A session pays for the FIFO head at claim time. A tail arrival cannot
+        // modify the charge used to decide whether the head fits.
+        let preserve_front = state
+            .decisions
+            .get(&reference)
+            .is_some_and(|d| d.session_admission)
+            || (self.config.pd_mode
+                && state
+                    .runtime
+                    .view(&reference)
+                    .is_some_and(|p| p.in_flight_requests > 0 || p.waiting_requests > 1));
         if let Some(decision) = state.decisions.get_mut(&reference) {
             if !preserve_front {
                 if self.config.pd_mode {
@@ -683,8 +704,6 @@ impl ProgramScheduler {
                 .unwrap_or_else(|| decision.step_id.saturating_add(1));
             return;
         }
-        let candidates = self.binding_candidates(state, identity, now);
-        let home_target = state.bindings.bind(identity, &candidates, routing_text);
         let mut decision = ProgramDecisionState::new(
             identity.placement_key().to_string(),
             identity.placement_hash_key().to_string(),
@@ -692,6 +711,7 @@ impl ProgramScheduler {
             context,
             now,
         );
+        decision.session_admission = identity.session_admission;
         decision.task_id = identity.task_id().map(str::to_string);
         decision.session_id = identity.session_id().map(str::to_string);
         decision.agent_id = identity.agent_id().map(str::to_string);
@@ -1067,7 +1087,7 @@ mod tests {
         let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
         {
             let mut state = scheduler.state.lock();
-            ProgramScheduler::adjust_usage(&mut state, "rank-0", 50.0);
+            ProgramAdmission::adjust_usage(&mut state, "rank-0", 50.0);
         }
         scheduler.apply_observations(
             epoch,
@@ -1153,7 +1173,7 @@ mod tests {
     #[test]
     fn cache_aware_cold_burst_accounts_bound_unadmitted_programs() {
         let config = ProgramSchedulerConfig {
-            binding_strategy: ProgramBindingStrategy::CacheAware,
+            placement_policy: ProgramBindingStrategy::CacheAware,
             progress_ttl: ProgressTtlConfig {
                 token_capacity: Some(1_000),
                 ..ProgressTtlConfig::default()

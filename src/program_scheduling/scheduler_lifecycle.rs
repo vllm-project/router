@@ -4,6 +4,8 @@
 //! Periodic ticks evaluate existing deadlines and never create request facts.
 
 use super::return_time;
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{
@@ -68,7 +70,7 @@ impl CapacityVictim {
     }
 }
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     /// Run the historical request-arrival decision sequence before dispatch.
     pub(crate) fn run_request_arrival_decisions(
         &self,
@@ -76,7 +78,9 @@ impl ProgramScheduler {
         now: Instant,
     ) {
         self.release_expired_paused(state, now);
-        self.expire_acting_ttls(state, now);
+        if self.config.pd_mode || self.config.enable_acting_ttl {
+            self.expire_acting_ttls(state, now);
+        }
         self.repair_capacity(state, now);
         self.schedule_waiting(state, now);
     }
@@ -189,20 +193,19 @@ impl ProgramScheduler {
         let cache_miss_impact_seconds = self.policy.cache_miss_impact_seconds(
             observed_prompt_tokens.saturating_sub(shared_prefix_for_cost),
         );
-        let policy_acting_ttl = state
-            .rank_factors
-            .get(&target_id)
-            .map(|factors| {
-                self.policy
-                    .fitted_acting_ttl(factors, cache_miss_impact_seconds)
-            })
-            .unwrap_or_default();
-        let mut acting_ttl = dispatch
-            .request_hints()
-            .kv_retention_ttl
-            .unwrap_or(policy_acting_ttl);
-        if self.config.pd_mode {
-            acting_ttl = if self.config.pd_explicit_ttl {
+        let policy_acting_ttl = if self.config.enable_acting_ttl || self.config.pd_mode {
+            state
+                .rank_factors
+                .get(&target_id)
+                .map_or(std::time::Duration::ZERO, |factors| {
+                    self.policy
+                        .fitted_acting_ttl(factors, cache_miss_impact_seconds)
+                })
+        } else {
+            std::time::Duration::ZERO
+        };
+        let mut acting_ttl = if self.config.pd_mode {
+            if self.config.pd_explicit_ttl {
                 pd_ttl
                     .or(dispatch.request_hints().kv_retention_ttl)
                     .unwrap_or_default()
@@ -211,8 +214,15 @@ impl ProgramScheduler {
                 pd_ttl
                     .unwrap_or_default()
                     .min(self.config.progress_ttl.max_acting_ttl)
-            };
-        }
+            }
+        } else if self.config.enable_acting_ttl {
+            dispatch
+                .request_hints()
+                .kv_retention_ttl
+                .unwrap_or(policy_acting_ttl)
+        } else {
+            std::time::Duration::ZERO
+        };
         let ttl_window_samples = state
             .rank_factors
             .get(&target_id)
@@ -265,6 +275,8 @@ impl ProgramScheduler {
                             } else {
                                 ProgramPauseReason::RequestFailed
                             })
+                        } else if !self.config.pd_mode && !self.config.enable_acting_ttl {
+                            CompletionAction::Pause(ProgramPauseReason::ActingRetentionDisabled)
                         } else {
                             CompletionAction::StartActingTtl
                         }
@@ -600,10 +612,16 @@ impl ProgramScheduler {
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);
         }
-        if self.config.pd_mode {
+        if self.config.pd_mode
+            || state
+                .decisions
+                .get(dispatch.program())
+                .is_some_and(|d| d.session_admission)
+        {
             state.runtime.notify_front(dispatch.program());
         }
         self.run_periodic_decisions(&mut state, now);
+        Self::wake_capacity_waiters(&mut state);
     }
 
     /// Evaluate deadlines, repair capacity, and admit rank-local waiters.
@@ -622,11 +640,15 @@ impl ProgramScheduler {
                 .paused_retention_ttl
                 .max(std::time::Duration::from_secs(60)),
         );
-        self.expire_acting_ttls(state, now);
-        self.release_expired_paused(state, now);
+        let mut changed = (self.config.pd_mode || self.config.enable_acting_ttl)
+            && self.expire_acting_ttls(state, now);
+        changed |= self.release_expired_paused(state, now);
         if !self.config.binding_only {
-            self.repair_capacity(state, now);
-            self.schedule_waiting(state, now);
+            changed |= self.repair_capacity(state, now);
+            changed |= self.schedule_waiting(state, now);
+        }
+        if changed {
+            Self::wake_capacity_waiters(state);
         }
     }
 
@@ -742,6 +764,7 @@ impl ProgramScheduler {
             if let Some((target_id, tokens)) = active_relief {
                 Self::adjust_usage(state, &target_id, -tokens);
             }
+            Self::remove_capacity_waiter(state, program);
             state.decisions.remove(program);
             state.bindings.release_program(program);
         }
@@ -1256,6 +1279,61 @@ mod tests {
         let state = scheduler.state.lock();
         let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
         assert!(!snapshot.return_time_profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_acting_ttl_ignores_the_hint_but_still_gates_the_next_program() {
+        use crate::config::types::ProgramSchedulingConfig;
+        let config = ProgramSchedulingConfig::resolve(
+            true,
+            Some(r#"{"enable_acting_ttl":false,"max_active_programs_per_target":1}"#),
+        )
+        .unwrap()
+        .unwrap();
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::from_program_config(
+            &config,
+            false,
+            Default::default(),
+        ));
+        let targets = [ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        }];
+        let request = json!({"vllm_xargs":{"agentic_context":{
+            "program_id":"a", "expected_resume":true, "kv_retention_ttl_seconds":60.0
+        }}});
+        let a = ProgramIdentity::from_request(None, Some(&request), Some("model"))
+            .unwrap()
+            .unwrap();
+        let first = scheduler.acquire(a, 100, &targets, None).await.unwrap();
+        let second = scheduler.acquire(identity("b"), 100, &targets, None);
+        tokio::pin!(second);
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "B cannot pass A on a one-seat Rank"
+        );
+
+        scheduler.complete(&first, true, false, Some(100), None);
+        {
+            let state = scheduler.state.lock();
+            assert_eq!(
+                state.runtime.state(first.program()),
+                Some((ProgramState::Paused, ProgramStatus::Acting))
+            );
+            let decision = &state.decisions[first.program()];
+            assert_eq!(decision.ttl_deadline, None);
+            assert_eq!(
+                decision.last_pause_reason,
+                Some(ProgramPauseReason::ActingRetentionDisabled)
+            );
+        }
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.target_id, first.target_id);
+        scheduler.complete(&second, true, true, Some(100), None);
     }
 
     #[tokio::test]

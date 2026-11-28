@@ -188,7 +188,7 @@ async fn grpc_frontend_cache_parity_metrics_streaming_and_retries() {
         mode: RoutingMode::Regular {
             worker_urls: vec![worker.grpc_url.clone()],
         },
-        policy: PolicyConfig::RoundRobin,
+        policy: PolicyConfig::RoundRobin.into(),
         disable_circuit_breaker: true,
         kv_aware_session_affinity_ttl_secs: None,
         retry: RetryConfig {
@@ -298,7 +298,7 @@ async fn grpc_abort_does_not_count_as_a_successful_program_round(
 ) {
     use vllm_router_rs::routers::RouterTrait;
     let config = RouterConfig {
-        policy: PolicyConfig::RoundRobin,
+        policy: PolicyConfig::RoundRobin.into(),
         program_scheduling: Some(serde_json::from_value(json!({})).unwrap()),
         ..Default::default()
     };
@@ -359,7 +359,8 @@ async fn grpc_kv_routing_keeps_unavailable_control_a_legal_fallback(
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             ..Default::default()
         };
         let context = common::create_test_context(config.clone());

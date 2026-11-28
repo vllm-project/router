@@ -128,6 +128,18 @@ pub fn init_metrics() {
         "vllm_router_agent_aware_queue_wait_seconds",
         "Time retained in the Program RequestPool before dispatch"
     );
+    describe_counter!(
+        "router_program_admission_capacity_scans_total",
+        "Capacity scans for unbound session FIFO heads"
+    );
+    describe_histogram!(
+        "router_program_admission_eligible_ranks",
+        "Number of immediately admissible ranks found per session capacity scan"
+    );
+    describe_counter!(
+        "router_program_admission_selections_total",
+        "Session binding proposals by commit result"
+    );
     describe_gauge!(
         "vllm_router_agent_aware_fitted_ttl_seconds",
         "Representative fitted acting TTL by target"

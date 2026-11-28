@@ -1,5 +1,7 @@
 //! End-to-end HTTP PD tests: two turns, actual rank headers, opt-out and body drop.
 #![cfg(all(feature = "cpu", feature = "ready"))]
+#[path = "common/grpc_kv_fixture.rs"]
+mod kv_fixture;
 use axum::{
     extract::{Json, State},
     http::HeaderMap,
@@ -53,6 +55,10 @@ async fn mock_with_options(
     let app = Router::new().route("/health", get(|| async { "ok" }))
         .route("/get_server_info", get(move || async move { Json(json!({"model_id":"test","data_parallel_size":dp_size})) }))
         .route("/v1/models", get(|| async { Json(json!({"data":[{"id":"test"}]})) }))
+        .route("/v1/chat/completions/render", post(|Json(body): Json<Value>| async move {
+            assert!(body.pointer("/vllm_xargs/agentic_context").is_some_and(Value::is_string));
+            Json(json!({"token_ids": (0..65).collect::<Vec<_>>() }))
+        }))
         .route("/metrics", get(move || async move {
             (0..dp_size).map(|rank| format!("vllm:kv_cache_usage_perc{{engine=\"{rank}\"}} 0\nvllm:num_requests_running{{engine=\"{rank}\"}} 0\nvllm:num_requests_waiting{{engine=\"{rank}\"}} 0\n")).collect::<String>()
         }))
@@ -207,10 +213,9 @@ async fn router_with_capacity(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(p.url.clone(), None)],
             decode_urls: vec![d.url.clone()],
-            prefill_policy: Some(PolicyConfig::RoundRobin),
-            decode_policy: Some(PolicyConfig::RoundRobin),
             discovery_address: None,
         },
+        policy: PolicyConfig::RoundRobin.into(),
         intra_node_data_parallel_size: dp_size,
         worker_startup_timeout_secs: 2,
         disable_circuit_breaker: true,
@@ -227,24 +232,153 @@ async fn router_with_capacity(
             .unwrap(),
         );
     }
+    build_router(config).await
+}
+
+async fn build_router(config: RouterConfig) -> VllmPDRouter {
+    let RoutingMode::VllmPrefillDecode {
+        prefill_urls,
+        decode_urls,
+        ..
+    } = config.mode.clone()
+    else {
+        unreachable!()
+    };
     ConfigValidator::validate(&config).unwrap();
     let ctx = Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
-    let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
-    ctx.policy_registry.set_prefill_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
-            Some(&kv_affinity_table),
-        ),
-    );
-    ctx.policy_registry.set_decode_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
-            Some(&kv_affinity_table),
-        ),
-    );
-    VllmPDRouter::new(vec![(p.url.clone(), None)], vec![d.url.clone()], None, &ctx)
+    VllmPDRouter::new(prefill_urls, decode_urls, None, &ctx)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn new_sessions_use_decode_events_and_bound_turns_keep_their_rank() {
+    use vllm_router_rs::config::{KvConnector, PdKvEventSources};
+    // Mirror the cache contents to rule out a stable hash or a cold tie-break.
+    for hot in [0, 1] {
+        let p = mock(true).await;
+        let d0 = controlled_mock(false, Some(Arc::new(tokio::sync::Semaphore::new(8)))).await;
+        let d1 = controlled_mock(false, Some(Arc::new(tokio::sync::Semaphore::new(8)))).await;
+        let decodes = [&d0, &d1];
+        let mut publishers = [
+            kv_fixture::KvPublisher::bind(),
+            kv_fixture::KvPublisher::bind(),
+        ];
+        if hot == 1 {
+            for publisher in &mut publishers {
+                publisher.groups = &["mamba", "mamba", "mamba", "full_attention"];
+            }
+        }
+        let sources = decodes
+            .iter()
+            .zip(&publishers)
+            .map(|(d, publisher)| {
+                (
+                    d.url.clone(),
+                    PdKvEventSources {
+                        endpoints: vec![publisher.endpoint.clone()],
+                        replay_endpoints: Some(vec![publisher.replay_endpoint.clone()]),
+                        model: Some("test".into()),
+                        block_size: 16,
+                        hybrid: Some(publisher.layout("test", 16)),
+                    },
+                )
+            })
+            .collect();
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(p.url.clone(), None)],
+                decode_urls: decodes.iter().map(|d| d.url.clone()).collect(),
+                discovery_address: None,
+            },
+            policy: serde_json::from_value(if hot == 0 {
+                json!({"default":"round_robin","program":"kv_aware"})
+            } else {
+                json!({"default":"kv_aware","native_decode":"round_robin"})
+            }).unwrap(),
+            kv_connector: KvConnector::Nixl,
+            pd_kv_event_sources: sources,
+            program_scheduling: Some(serde_json::from_value(json!({
+                "token_capacity_per_dp_rank":10000,
+                "enable_batch_gain_admission":false, "max_active_programs_per_target":1,
+                "decode_buffer_tokens":8, "metrics_interval_seconds":0.02, "queue_timeout_seconds":2,
+                "force_resume_timeout_seconds":1,
+                "pd":{"explicit_ttl":true}
+            })).unwrap()),
+            worker_startup_timeout_secs: 2, disable_circuit_breaker: true,
+            ..Default::default()
+        };
+        let router = build_router(config).await;
+        let common: Vec<u32> = (0..65).collect();
+        let other: Vec<u32> = (100..165).collect();
+        tokio::join!(
+            publishers[hot].restore(&common[..64], 16),
+            publishers[1 - hot].restore(&other[..64], 16)
+        );
+        // The unqualified prefix must earn no credit for salted requests.
+        // With both D ranks idle, load fallback rotates equal-cost ties.
+        for session in ["salted-1", "salted-2"] {
+            let request = serde_json::from_value(json!({
+                "model":"test","prompt":common,"max_tokens":8,"cache_salt":"tenant",
+                "vllm_xargs":{"agentic_context":{"session_id":session,"expected_resume":false}}
+            }))
+            .unwrap();
+            let response = router.route_completion(None, &request, Some("test")).await;
+            assert!(response.status().is_success());
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+        for d in &decodes {
+            assert_eq!(d.calls.lock().unwrap().len(), 1);
+        }
+        // A chat and a token-ID completion from different sessions share the
+        // same prefix. The chat ends its reservation before A arrives.
+        let chat = serde_json::from_value(json!({
+            "model":"test", "messages":[{"role":"user","content":"shared code"}], "max_tokens":8,
+            "vllm_xargs":{"agentic_context":{"session_id":"chat","expected_resume":false}}
+        }))
+        .unwrap();
+        let response = router.route_chat(None, &chat, Some("test")).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(decodes[hot].calls.lock().unwrap().len(), 2);
+        for (session, tokens, expected) in [
+            ("A", &common, hot),
+            ("A", &other, hot),      // the opposite D now has the better prefix
+            ("B", &common, 1 - hot), // hot still owns A's only active slot
+        ] {
+            let request = serde_json::from_value(json!({
+                "model":"test","prompt":tokens,"max_tokens":8,
+                "vllm_xargs":{"agentic_context":{"session_id":session,"expected_resume":true,
+                    "kv_retention_ttl_seconds":60.0}}
+            }))
+            .unwrap();
+            let before = decodes[expected].calls.lock().unwrap().len();
+            let response = router.route_completion(None, &request, Some("test")).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert_eq!(
+                decodes[expected].calls.lock().unwrap().len(),
+                before + 1,
+                "session {session}, hot={hot}, expected={expected}"
+            );
+        }
+    }
 }
 fn request(program: bool) -> vllm_router_rs::protocols::spec::CompletionRequest {
     let mut request = json!({"model":"test","prompt":"hello","max_tokens":8});
@@ -380,8 +514,6 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
             decode_urls: vec!["http://d:8000".into()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         },
         program_scheduling: Some(valid),

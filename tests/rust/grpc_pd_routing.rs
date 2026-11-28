@@ -117,11 +117,14 @@ async fn pd_router_with_kv_sources(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: prefill_urls.clone(),
             decode_urls: vec![decode.grpc_url.clone()],
-            prefill_policy: Some(prefill_policy.clone()),
-            decode_policy: None,
             discovery_address: None,
         },
-        policy: PolicyConfig::RoundRobin,
+        policy: vllm_router_rs::config::RoutingPolicy {
+            prefill: Some(prefill_policy.clone()),
+            native_decode: None,
+            ..vllm_router_rs::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
+        },
+
         pd_kv_event_sources,
         pd_worker_pairs: Default::default(),
         kv_connector,
@@ -435,9 +438,12 @@ async fn check_grpc_deferred_decode(cache_aware: bool, new_worker: bool) {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: p_urls.clone(),
             decode_urls: d_urls.clone(),
-            prefill_policy: Some(PolicyConfig::RoundRobin),
-            decode_policy: Some(decode_policy.clone()),
             discovery_address: None,
+        },
+        policy: vllm_router_rs::config::RoutingPolicy {
+            prefill: Some(PolicyConfig::RoundRobin),
+            native_decode: Some(decode_policy.clone()),
+            ..vllm_router_rs::config::RoutingPolicy::from(PolicyConfig::Random)
         },
         kv_connector: KvConnector::Nixl,
         worker_startup_timeout_secs: 5,

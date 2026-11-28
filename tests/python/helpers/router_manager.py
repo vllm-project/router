@@ -1,9 +1,10 @@
+import json
 import os
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import requests
 
@@ -26,15 +27,13 @@ class RouterManager:
     def start_router(
         self,
         worker_urls: Optional[List[str]] = None,
-        policy: str = "round_robin",
+        policy: Union[str, Dict[str, str]] = "round_robin",
         port: Optional[int] = None,
         extra: Optional[Dict] = None,
         # PD options
         vllm_pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
-        prefill_policy: Optional[str] = None,
-        decode_policy: Optional[str] = None,
         # Prefer the Rust binary when testing features that live in the host crate
         # (e.g. WASM middleware) without requiring a rebuilt Python wheel.
         router_bin: Optional[str] = None,
@@ -42,6 +41,7 @@ class RouterManager:
         *,
         timeout: float = 30.0,
     ) -> ProcHandle:
+        policy_arg = policy if isinstance(policy, str) else json.dumps(policy)
         worker_urls = worker_urls or []
         port = port or find_free_port()
         router_bin = router_bin or os.environ.get("VLLM_ROUTER_TEST_BIN")
@@ -53,7 +53,7 @@ class RouterManager:
                 "--port",
                 str(port),
                 "--policy",
-                policy,
+                policy_arg,
             ]
         else:
             cmd = [
@@ -65,7 +65,7 @@ class RouterManager:
                 "--port",
                 str(port),
                 "--policy",
-                policy,
+                policy_arg,
             ]
         prom_port = find_free_port()
         # The API port isn't bound yet, so the allocator can return it again.
@@ -89,10 +89,6 @@ class RouterManager:
             if decode_urls:
                 for url in decode_urls:
                     cmd.extend(["--decode", url])
-            if prefill_policy:
-                cmd.extend(["--prefill-policy", prefill_policy])
-            if decode_policy:
-                cmd.extend(["--decode-policy", decode_policy])
 
         # Map supported extras to CLI flags (subset for integration)
         if extra:

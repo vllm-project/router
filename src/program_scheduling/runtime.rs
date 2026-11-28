@@ -89,6 +89,7 @@ impl ProgramRuntime {
         target_id: String,
         dispatched_at: Instant,
     ) -> Option<ProgramDispatch> {
+        self.request_pool.front(handle)?;
         let key = RuntimeKey::from(handle.program());
         let program = self.programs.get_mut(&key)?;
         if &program.reference != handle.program() {
@@ -419,7 +420,11 @@ impl ProgramRuntime {
         })
     }
 
-    /// Wake the front retained request after an accepted transition.
+    /// Check the exact attempt before changing its placement or charge.
+    pub(crate) fn is_front(&self, handle: &ProgramRequestHandle) -> bool {
+        self.request_pool.front(handle).is_some()
+    }
+
     pub(crate) fn notify_front(&self, program_ref: &ProgramRef) {
         self.request_pool.notify_front(program_ref);
     }

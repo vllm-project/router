@@ -3,6 +3,8 @@
 //! These mechanisms bound starvation while ordinary local resume remains
 //! configurable as FCFS or MRU.
 
+use super::scheduler::ProgramAdmission;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
 use super::{ProgramRef, ProgramState, ProgramStatus};
@@ -26,7 +28,7 @@ impl ForceResumeEstimate {
     }
 }
 
-impl ProgramScheduler {
+impl ProgramAdmission {
     /// Freeze the current work-ahead estimate when a Program enters a rank queue.
     pub(crate) fn set_force_resume_deadline(
         &self,

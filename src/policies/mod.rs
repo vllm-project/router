@@ -9,16 +9,20 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+pub(crate) mod binding;
 mod cache_aware;
+pub(crate) mod config;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+pub(crate) mod pd;
 mod power_of_two;
 mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+pub(crate) mod selection;
 mod sticky_least_loaded;
 
 pub use cache_aware::PreparedCacheSelection;
@@ -26,8 +30,6 @@ pub use cache_aware::{CacheAwareCandidate, CacheAwarePlacement, CacheAwarePolicy
 pub use consistent_hash::ConsistentHashPolicy;
 pub use consistent_hash::VIRTUAL_NODES_PER_WORKER;
 pub use factory::PolicyFactory;
-#[cfg(all(test, feature = "cpu", feature = "ready"))]
-pub(crate) use kv_aware::kv_aware_policy;
 #[doc(hidden)]
 pub use kv_aware::PdWorkPrices;
 pub(crate) use kv_aware::ValidatedWorkPrices;
@@ -39,6 +41,7 @@ pub use kv_aware::{
     SlotManager, StagePick, TemperaturePicker, TieredMatchProvider, TransferCredits,
     WorkerTokenInputs,
 };
+pub(crate) use kv_aware::{kv_aware_policy, QualifiedKvInput};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

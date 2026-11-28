@@ -5,9 +5,9 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    CacheAwarePolicy, ConsistentHashPolicy, KvAffinityTable, KvAwarePolicy, LoadBalancingPolicy,
+    PolicyFactory, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy, RoundRobinPolicy,
+    StickyLeastLoadedPolicy,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ impl PolicyRegistry {
     ) -> Self {
         let kv_affinity_table = Arc::new(KvAffinityTable::with_ttl(affinity_ttl));
         let default_policy =
-            Self::create_policy_from_config(&default_policy_config, &kv_affinity_table);
+            PolicyFactory::create_from_config(&default_policy_config, Some(&kv_affinity_table));
 
         Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
@@ -209,56 +209,6 @@ impl PolicyRegistry {
         }
     }
 
-    /// Create a policy from a PolicyConfig
-    fn create_policy_from_config(
-        config: &PolicyConfig,
-        kv_affinity_table: &Arc<KvAffinityTable>,
-    ) -> Arc<dyn LoadBalancingPolicy> {
-        match config {
-            PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-            PolicyConfig::Random => Arc::new(RandomPolicy::new()),
-            PolicyConfig::CacheAware {
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                eviction_interval_secs,
-                max_tree_size,
-            } => {
-                let cache_config = CacheAwareConfig {
-                    cache_threshold: *cache_threshold,
-                    balance_abs_threshold: *balance_abs_threshold,
-                    balance_rel_threshold: *balance_rel_threshold,
-                    eviction_interval_secs: *eviction_interval_secs,
-                    max_tree_size: *max_tree_size,
-                };
-                Arc::new(CacheAwarePolicy::with_config(cache_config))
-            }
-            PolicyConfig::KvAware {
-                router_temperature,
-                kv_penalty_host,
-                kv_penalty_external,
-                kv_penalty_disk,
-                ..
-            } => Arc::new(
-                KvAwarePolicy::new(CostParams {
-                    router_temperature: *router_temperature,
-                    transfer_credits: TransferCredits {
-                        device: 1.0,
-                        host_pinned: *kv_penalty_host,
-                        external: *kv_penalty_external,
-                        disk: *kv_penalty_disk,
-                    },
-                    ..CostParams::default()
-                })
-                .with_shared_affinity(Arc::clone(kv_affinity_table)),
-            ),
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
-            PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
-            PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
-            PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
-        }
-    }
-
     /// Get current model->policy mappings (for debugging/monitoring)
     pub fn get_all_mappings(&self) -> HashMap<String, String> {
         let policies = self.model_policies.read().unwrap();
@@ -306,6 +256,20 @@ impl PolicyRegistry {
         let mut counts = self.model_worker_counts.write().unwrap();
         counts.clear();
         self.kv_affinity_table.clear();
+    }
+
+    pub(crate) fn for_model(&self, model: Option<&str>) -> Arc<dyn LoadBalancingPolicy> {
+        model.map_or_else(
+            || self.get_default_policy(),
+            |model| self.get_policy_or_default(model),
+        )
+    }
+
+    pub(crate) fn configure_pd(&self, policy: &crate::config::RoutingPolicy) {
+        let build =
+            |config| PolicyFactory::create_from_config(config, Some(&self.kv_affinity_table));
+        self.set_prefill_policy(build(policy.prefill()));
+        self.set_decode_policy(build(policy.native_decode()));
     }
 
     /// Set the prefill policy for PD mode
