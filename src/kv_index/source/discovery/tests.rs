@@ -2627,6 +2627,51 @@ async fn descriptor_failures_preserve_then_retire_and_rebuild_the_same_source_re
 }
 
 #[test]
+fn placement_evidence_comes_from_the_accepted_retry() {
+    use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
+    use crate::kv_index::{KVEvent, RequestHashCache, RoutableTarget};
+
+    let lifecycle = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
+    let source = full_binding(
+        RoutableTarget {
+            instance_id: "worker".into(),
+            dp_rank: 0,
+        },
+        16,
+    );
+    let prompt = [42; 33];
+    source.begin_empty(0);
+    warm_full(&source, 0, &prompt[..32]);
+    let mut cache = RequestHashCache::for_single_target();
+    cache.placement = Some(Vec::new());
+
+    let mut calls = 0;
+    let hits = lifecycle.match_rank(&source, &mut cache, |cache| {
+        calls += 1;
+        let hit = source.lookup_placement(&prompt, 16, None, 0, cache);
+        assert!(hit.is_some());
+        if calls == 1 {
+            source
+                .apply_batch(
+                    1,
+                    &event_batch(vec![
+                        KVEvent::AllBlocksCleared(Default::default()),
+                        KVEvent::BlockStored(full_store(&prompt[..32], 16, None)),
+                    ]),
+                )
+                .unwrap();
+        }
+        hit
+    });
+
+    assert_eq!(calls, 2);
+    assert_eq!(hits[0].segments, [(0, 2)]);
+    let evidence = cache.placement.unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert!(!evidence[0].is_revoked());
+}
+
+#[test]
 fn rank_credit_does_not_cross_revocation_and_empty_replay() {
     use crate::kv_index::source::test_support::{full_binding, warm_full};
     use crate::policies::TieredMatchProvider;
@@ -2660,9 +2705,9 @@ fn rank_credit_does_not_cross_revocation_and_empty_replay() {
             stream.finish_replay(lease, 0).unwrap();
             lifecycle.state.lock().trusted = true;
         }
-        scores
+        (!scores.is_empty()).then_some(scores)
     });
-    assert!(scored.is_empty());
+    assert!(scored.is_none());
     assert_eq!(calls, 2);
 }
 
@@ -2670,7 +2715,6 @@ fn rank_credit_does_not_cross_revocation_and_empty_replay() {
 fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
     use crate::kv_index::source::test_support::{event_batch, full_binding, full_store, warm_full};
     use crate::kv_index::{BlockRemoved, KVEvent, RequestHashCache, RoutableTarget};
-    use crate::policies::TieredMatchProvider;
     use std::cell::Cell;
     for repeat in [false, true] {
         let life = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
@@ -2694,14 +2738,14 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
             || {
                 calls += 1;
                 if calls == 2 && !repeat {
-                    return source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
+                    return source.lookup_placement(&tokens, 16, None, 0, &mut cache);
                 }
                 clock.set(clock.get() + Duration::from_secs(6));
                 assert!(!life.trusted_at(&life.state.lock(), || clock.get()));
                 let seq = 2 * (calls - 1);
                 warm_full(&source, seq, &tokens[..16]);
-                let hits = source.matches_with_cache(&tokens, 16, None, 0, &mut cache);
-                assert_eq!(hits[0].segments, [(0, 1)]);
+                let hits = source.lookup_placement(&tokens, 16, None, 0, &mut cache);
+                assert!(hits.is_some());
                 let removed = KVEvent::BlockRemoved(BlockRemoved {
                     block_hashes: full_store(&tokens[..16], 16, None).block_hashes,
                     medium: Some("GPU".into()),
@@ -2721,7 +2765,7 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
                 hits
             },
         );
-        assert!(result.is_empty());
+        assert!(result.is_none());
         assert_eq!(calls, 2);
     }
 }

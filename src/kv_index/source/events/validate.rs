@@ -105,7 +105,12 @@ pub(super) fn validate_store(
         }
     }
     let partial = partial_hash_hits
-        && matches!(group.kind, GroupRule::FullAttention | GroupRule::Checkpoint)
+        && matches!(
+            group.kind,
+            GroupRule::FullAttention
+                | GroupRule::CompressedFullAttention { .. }
+                | GroupRule::Checkpoint
+        )
         && store.block_size < group.block_size
         && store.block_size as usize == hash_block_size
         && store.block_hashes.len() == 1

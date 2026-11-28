@@ -31,7 +31,7 @@ impl SourceBinding {
             max_reusable_tokens,
             &mut RequestHashCache::for_single_target(),
         )
-        .0
+        .map_or(0, |(credited, _, _)| credited)
     }
 }
 
@@ -695,10 +695,10 @@ fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
         first.apply_batch(0, &qwen_batch()).unwrap();
         let tokens = prompt();
         let mut cache = crate::kv_index::RequestHashCache::default();
-        let (_claims, version, generation) = first
+        let (_claims, snapshot) = first
             .page_snapshot(None, &tokens, false, &mut cache)
             .unwrap();
-        assert!(first.snapshot_is_current(&version, generation));
+        assert!(first.snapshot_is_current(&snapshot));
         let writer = first.clone();
         let (sent, received) = mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -719,7 +719,7 @@ fn snapshot_calculation_does_not_block_same_source_writes_or_survive_reset() {
             .recv_timeout(Duration::from_secs(2))
             .expect("page evidence must not hold the stream read lock");
         handle.join().unwrap();
-        assert!(!first.snapshot_is_current(&version, generation));
+        assert!(!first.snapshot_is_current(&snapshot));
         assert_eq!(first.reusable_tokens(&prompt(), usize::MAX), 528);
     }
 }
@@ -1569,6 +1569,47 @@ fn qwen4_compressed_group_accepts_mla_events_and_rejects_other_specs() {
 }
 
 #[test]
+fn qwen4_compressed_partial_stores_extend_prefix_reuse() {
+    let tokens = prompt();
+    let hashes = BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+    let groups = qwen4_groups();
+    let batch = event_batch(
+        groups
+            .iter()
+            .flat_map(|group| {
+                let spec = if group.kind == GroupRule::Checkpoint {
+                    "mamba"
+                } else {
+                    "mla_attention"
+                };
+                [
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        320,
+                        &tokens[..320],
+                        &hashes[19..20],
+                    )),
+                    KVEvent::BlockStored(gpu_store(
+                        group.group_idx,
+                        spec,
+                        16,
+                        &tokens[464..480],
+                        &hashes[29..30],
+                    )),
+                ]
+            })
+            .collect(),
+    );
+    let index = SourceBinding::new(target(), groups, 16, 0, 8)
+        .unwrap()
+        .with_partial_hash_hits(true);
+    index.begin_empty(0);
+    assert_eq!(index.apply_batch(0, &batch), Ok(()));
+    assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 480);
+}
+
+#[test]
 fn compressed_group_must_align_with_its_block_size() {
     let mut groups = qwen4_groups();
     groups[3].kind = GroupRule::CompressedFullAttention {
@@ -1972,8 +2013,10 @@ fn bounded_replay_credits_one_window_below_the_engine() {
         let mut cache = crate::kv_index::RequestHashCache::for_single_target();
         cache.count_replay_pages = true;
         assert_eq!(
-            index.credit_parts(None, &tokens, usize::MAX, &mut cache),
-            (896, Some(crate::kv_index::StorageTier::Device))
+            index
+                .credit_parts(None, &tokens, usize::MAX, &mut cache)
+                .map(|(tokens, tier, _)| (tokens, tier)),
+            Some((896, crate::kv_index::StorageTier::Device))
         );
     }
 }
