@@ -16,6 +16,27 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: mark as end-to-end test")
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-gpu-platform",
+        choices=("cuda", "rocm"),
+        help="Fail a dedicated KV-aware lane if two GPUs are unavailable.",
+    )
+
+
+def pytest_sessionstart(session):
+    platform = session.config.getoption("--require-gpu-platform")
+    if platform:
+        from tests.python.helpers.mark import device_count, is_cuda, is_rocm
+
+        available = is_cuda() if platform == "cuda" else is_rocm()
+        count = device_count()
+        if not available or count < 2:
+            raise pytest.UsageError(
+                f"KV-aware lane requires two available {platform} GPUs; visible={count}"
+            )
+
+
 @pytest.fixture(scope="session")
 def kv_aware_two_workers():
     """``vllm-rs serve`` ×2; health via each worker OpenAI ``/health`` port."""

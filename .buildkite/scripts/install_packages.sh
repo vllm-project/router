@@ -10,6 +10,7 @@
 #
 # rust and nvidia_pd install apt packages from ci_apt_packages.conf.
 # router-bin downloads target/release/vllm-router and checks that it runs.
+# Names under .buildkite/requirements/ install only that Python dependency set.
 # lm-eval installs the ROCm accuracy harness; vLLM and MoRI stay in the image.
 # A sourced python call downloads the binary, creates /tmp/venv, and runs
 # pip install -e .[dev]. python-wheel uses the same apt set and venv, then
@@ -32,15 +33,21 @@ require_sourced() {
   fi
 }
 
+install_python_set() {
+  local set_name="$1"
+  python3 -m pip install --disable-pip-version-check --quiet \
+    -r "${root}/requirements/${set_name}.txt"
+}
+
 activate_venv() {
   python3 -m venv /tmp/venv
   # shellcheck disable=SC1091
   source /tmp/venv/bin/activate
-  pip install -U pip
+  python3 -m pip install --disable-pip-version-check --quiet --upgrade pip
 }
 
 if [ "$#" -ne 1 ] || [ -z "${1}" ]; then
-  echo "usage: install_packages.sh <rust|nvidia_pd|router-bin|lm-eval|python|python-wheel>" >&2
+  echo "usage: install_packages.sh <name> (see script modes and requirements/)" >&2
   exit 1
 fi
 
@@ -52,11 +59,9 @@ if [ "${name}" = "router-bin" ]; then
   exit 0
 fi
 
-if [ "${name}" = "lm-eval" ]; then
-  python3 -m pip install --no-cache-dir \
-    requests \
-    openai \
-    'lm-eval[api]==0.4.12'
+root="$(cd "$(dirname "${script_path}")/.." && pwd)"
+if [ -f "${root}/requirements/${name}.txt" ]; then
+  install_python_set "${name}"
   exit 0
 fi
 
@@ -65,7 +70,6 @@ if [ "${name}" = "python-wheel" ]; then
   apt_name="python"
 fi
 
-root="$(cd "$(dirname "${script_path}")/.." && pwd)"
 config="${root}/ci_apt_packages.conf"
 packages=""
 
@@ -88,8 +92,8 @@ if [ -z "${packages}" ]; then
     fi
   done < "${config}"
   echo "  router-bin"
-  echo "  lm-eval"
   echo "  python-wheel"
+  echo "Python dependency sets: ${root}/requirements/*.txt"
   exit 1
 fi
 
@@ -107,5 +111,5 @@ if [ "${name}" = "python" ]; then
 elif [ "${name}" = "python-wheel" ]; then
   require_sourced
   activate_venv
-  pip install build
+  python3 -m pip install --disable-pip-version-check --quiet build
 fi

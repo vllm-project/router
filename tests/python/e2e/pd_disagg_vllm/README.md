@@ -1,6 +1,6 @@
 # P/D Disaggregation Integration Tests using vLLM
 
-This directory contains integration tests for Prefill/Decode (P/D) disaggregation using vLLM's NixlConnector.
+This directory contains integration tests for Prefill/Decode (P/D) disaggregation using vLLM's NixlConnector and ROCm MoRI backends.
 
 ## Overview
 
@@ -62,6 +62,10 @@ MORIIO_READ_MODE=false bash ./run_moriio_rdma_accuracy_test.sh
 ## Running Tests
 
 ### Prerequisites
+
+The following examples use the NVIDIA/Nixl runner. ROCm requirements are
+listed under [ROCm MoRI runners](#4-rocm-mori-runners).
+
 - Docker installed and running
 - NVIDIA Docker runtime configured
 - At least 4 GPUs available (for full test suite)
@@ -109,6 +113,31 @@ Test with FlashInfer attention backend:
 TEST_FLASHINFER=1 ./tp_config_sweep_test.sh
 ```
 
+### Optional MoRI RDMA lifecycle validation
+
+After acquiring the shared host lease on an allocated two-host pair, run
+from this test directory (see [ROCm prerequisites](#4-rocm-mori-runners)):
+
+```bash
+HSA_NO_SCRATCH_RECLAIM=0 VLLM_ROCM_USE_SKINNY_GEMM=0 MORIIO_READ_MODE=true \
+RUN_PD_LIFECYCLE=true SMOKE_ONLY=false \
+bash ./run_moriio_rdma_accuracy_test.sh
+```
+
+The current pinned image needs `VLLM_ROCM_USE_SKINNY_GEMM=0` for the validated
+read-mode path. When the L3 matrix opts into the lifecycle probe, its read leg
+defaults this value to `0`; the conditional does not alter the write leg. The
+standalone launcher forwards only a non-empty caller override.
+
+The existing eval container runs completion, full-stream, active-client-disconnect,
+and recovery waves, before the normal accuracy evaluation. Defaults are
+`PD_PROBE_CONCURRENCY="1 2 4 8"`, `PD_PROBE_ROUNDS=2`, and
+`PD_PROBE_TIMEOUT=60` seconds per request. The probe stops at the first failed
+wave without retrying or increasing concurrency. Test read and write mode in
+separate allocated runs. `SKIP_LM_EVAL=true` selects diagnostics without the
+accuracy evaluation; `SMOKE_ONLY=true` with the probe is rejected before launch.
+Default CI scheduling, accuracy concurrency, and thresholds are unchanged.
+
 ## Test Flow
 
 1. **Setup Phase**
@@ -140,6 +169,23 @@ TEST_FLASHINFER=1 ./tp_config_sweep_test.sh
    - Stops all Docker containers
    - Removes Docker network
    - Reports test results
+
+### MoRI lifecycle results
+
+`LOG_DIR/pd-lifecycle.json` records each phase, outcome, and HTTP error status,
+with an atomic checkpoint after each wave. `status=running` means incomplete,
+not passed. Full streams need non-empty text, a normal finish reason, and
+`[DONE]`. Requests that finish before disconnection are recorded as `untested`.
+The probe continues past an inconclusive wave, but fails at the end if no wave
+observed a live disconnect. A recovery completion wave follows each disconnect
+wave unless a request has failed. The existing RDMA artifact glob includes the
+report alongside P/D/router logs.
+
+A pass demonstrates client-visible progress after disconnects, not engine abort
+propagation, KV reclamation, absence of leaks, or semantic accuracy. Inspect
+engine errors and resource trends separately; cached GPU memory need not return
+to zero. A timeout is a failure, not proof of server-side timeout handling.
+This is MoRIIO qualification, not UMBP, multi-P/D, or gRPC coverage.
 
 ## GPU Requirements
 
@@ -213,12 +259,18 @@ docker network rm vllm_pd_test_network
 
 ## CI/CD Integration
 
-These tests are integrated into the Buildkite pipeline. L1 runs one completion from `.buildkite/test-ready.yml`. Full GSM8K runs from `.buildkite/test-nightly.yml`.
+The NVIDIA tests are integrated into the Buildkite pipeline. L1 runs one completion from `.buildkite/test-ready.yml`. Full GSM8K runs from `.buildkite/test-nightly.yml`.
 
-The tests run on a 4-GPU (L4) queue with a 30-minute timeout:
+The NVIDIA tests run on a 4-GPU (L4) queue with a 30-minute timeout:
 - Uses Llama-3.2-1B-Instruct (fits well on L4 GPUs)
 - Tests multiple TP configurations
 - Validates both streaming and non-streaming requests
+
+### Opting into MoRI RDMA lifecycle checks
+
+To opt in on the existing L3 RDMA jobs, set `RUN_PD_LIFECYCLE=true` in a
+scheduled default-branch `NIGHTLY=1` build or a PR build labeled `nightly-test`.
+For a manual default-branch build, also set `RUN_ROCM_RDMA=1` and `NIGHTLY=1`.
 
 ## References
 
