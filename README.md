@@ -118,7 +118,7 @@ Load an independently built WASM Component plugin (see `examples/wasm_middleware
     --wasm-middleware-route /v1/chat/completions
 ```
 
-Additional paths can be attached with repeated `--wasm-middleware-route` flags (must be one of the protected inference routes). Without `--wasm-middleware`, the Router does not initialize Wasmtime.
+To select which protected inference routes run the plugin, repeat `--wasm-middleware-route` for each path. This list replaces the default. To attach a custom generate route, specify the same path in `--extra-generate-paths` and `--wasm-middleware-route`. Without `--wasm-middleware`, the router does not initialize Wasmtime.
 
 v0.1 resource / fail-closed defaults on attached routes (not configurable via CLI yet):
 

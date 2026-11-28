@@ -1319,7 +1319,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             wasm_config.routes
         );
         Some(Arc::new(
-            crate::wasm_middleware::WasmMiddlewareRuntime::load(wasm_config).map_err(|err| {
+            crate::wasm_middleware::WasmMiddlewareRuntime::load_with_generate_paths(
+                wasm_config,
+                &config.extra_generate_paths,
+            )
+            .map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("failed to load --wasm-middleware: {err}"),
