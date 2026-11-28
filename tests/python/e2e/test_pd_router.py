@@ -1,5 +1,4 @@
 import logging
-import socket
 import subprocess
 import time
 from types import SimpleNamespace
@@ -8,22 +7,19 @@ from typing import Optional
 import pytest
 import requests
 
-from tests.python.helpers.process import graceful_stop
+from tests.python.helpers.process import (
+    graceful_stop,
+    release_all_port_holders,
+    reserve_port,
+    wait_workers_ready,
+)
 from tools.e2e.vllm_test_compat import (
     import_run_eval,
     vllm_worker_command,
     vllm_worker_popen_env,
 )
 
-run_eval = import_run_eval()
-
 logger = logging.getLogger(__name__)
-
-
-def _find_available_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _wait_health(url: str, timeout: float = 180.0) -> None:
@@ -76,8 +72,9 @@ def _popen_launch_prefill_worker(
     bootstrap_port: int,
     ib_device: Optional[str] = None,
     base_gpu_id: int = 0,
+    *,
+    port: int,
 ) -> SimpleNamespace:
-    port = _find_available_port()
     url = f"http://127.0.0.1:{port}"
     extra = [
         "--disaggregation-mode",
@@ -92,14 +89,16 @@ def _popen_launch_prefill_worker(
     )
     env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
     proc = subprocess.Popen(cmd, env=env)
-    _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url, bootstrap_port=bootstrap_port)
 
 
 def _popen_launch_decode_worker(
-    model: str, ib_device: Optional[str] = None, base_gpu_id: int = 0
+    model: str,
+    ib_device: Optional[str] = None,
+    base_gpu_id: int = 0,
+    *,
+    port: int,
 ) -> SimpleNamespace:
-    port = _find_available_port()
     url = f"http://127.0.0.1:{port}"
     extra = ["--disaggregation-mode", "decode"]
     if ib_device:
@@ -109,7 +108,6 @@ def _popen_launch_decode_worker(
     )
     env = vllm_worker_popen_env(base_gpu_id=base_gpu_id)
     proc = subprocess.Popen(cmd, env=env)
-    _wait_health(url, timeout=300.0)
     return SimpleNamespace(proc=proc, url=url)
 
 
@@ -133,33 +131,64 @@ def pd_cluster(e2e_model: str):
         pytest.fail("PD e2e requires CUDA backend, but CUDA is not available")
 
     workers: list[SimpleNamespace] = []
+    port_holders = []
     router_proc = None
     try:
         ib_device = _detect_ib_device()
+        ports = [reserve_port(port_holders) for _ in range(8)]
+        (
+            pf1_port,
+            pf1_bootstrap,
+            pf2_port,
+            pf2_bootstrap,
+            dc1_port,
+            dc2_port,
+            rport,
+            pport,
+        ) = ports
 
         # Launch 4 workers across 4 GPUs: prefill on 0,1 and decode on 2,3
+        release_all_port_holders(port_holders[:2])
         pf1 = _popen_launch_prefill_worker(
             e2e_model,
-            bootstrap_port=_find_available_port(),
+            bootstrap_port=pf1_bootstrap,
             ib_device=ib_device,
             base_gpu_id=0,
+            port=pf1_port,
         )
+        workers.append(pf1)
+        release_all_port_holders(port_holders[2:4])
         pf2 = _popen_launch_prefill_worker(
             e2e_model,
-            bootstrap_port=_find_available_port(),
+            bootstrap_port=pf2_bootstrap,
             ib_device=ib_device,
             base_gpu_id=1,
+            port=pf2_port,
         )
-        dc1 = _popen_launch_decode_worker(e2e_model, ib_device=ib_device, base_gpu_id=2)
-        dc2 = _popen_launch_decode_worker(e2e_model, ib_device=ib_device, base_gpu_id=3)
+        workers.append(pf2)
+        release_all_port_holders(port_holders[4:5])
+        dc1 = _popen_launch_decode_worker(
+            e2e_model, ib_device=ib_device, base_gpu_id=2, port=dc1_port
+        )
+        workers.append(dc1)
+        release_all_port_holders(port_holders[5:6])
+        dc2 = _popen_launch_decode_worker(
+            e2e_model, ib_device=ib_device, base_gpu_id=3, port=dc2_port
+        )
+        workers.append(dc2)
         prefills = [pf1, pf2]
         decodes = [dc1, dc2]
-        workers.extend(prefills + decodes)
+        wait_workers_ready(
+            [
+                (f"{worker.url}/health", worker.proc, f"worker {index}")
+                for index, worker in enumerate(workers)
+            ],
+            300,
+            prefix="pd e2e",
+        )
 
         # PD router with two prefill and two decode endpoints
-        rport = _find_available_port()
         router_url = f"http://127.0.0.1:{rport}"
-        pport = _find_available_port()
 
         prefill = [(pf.url, pf.bootstrap_port) for pf in prefills]
         decode = [dc.url for dc in decodes]
@@ -187,6 +216,7 @@ def pd_cluster(e2e_model: str):
             "127.0.0.1",
         ]
 
+        release_all_port_holders(port_holders[6:])
         router_proc = subprocess.Popen(cmd)
         _wait_health(router_url, timeout=180.0)
 
@@ -198,6 +228,7 @@ def pd_cluster(e2e_model: str):
             graceful_stop(router_proc)
         for w in workers:
             graceful_stop(w.proc)
+        release_all_port_holders(port_holders)
 
 
 @pytest.mark.e2e
@@ -205,6 +236,7 @@ def test_pd_mmlu(e2e_model: str, pd_cluster):
     """
     Launch 4 workers, start a PD router (2 prefill + 2 decode), then run MMLU.
     """
+    run_eval = import_run_eval()
     args = SimpleNamespace(
         base_url=pd_cluster.router_url,
         model=e2e_model,

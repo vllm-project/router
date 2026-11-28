@@ -22,9 +22,11 @@ def test_setup_failure_removes_stale_worker_logs(tmp_path):
         (ROOT / ".buildkite/test-nightly.yml").read_text(encoding="utf-8")
     )
     step = next(
-        s
-        for s in pipeline["steps"]
-        if isinstance(s, dict) and s.get("key") == "rocm-kv-aware-e2e"
+        step
+        for group in pipeline["steps"]
+        if isinstance(group, dict)
+        for step in group.get("steps", [group])
+        if isinstance(step, dict) and step.get("key") == "rocm-kv-aware-e2e"
     )
     # Relocate only the artifact root. Fail at the first external setup command.
     command = (
@@ -60,7 +62,11 @@ def test_gpu_preflight_prevents_skipped_success(tmp_path, platform, available, c
     key = "rocm-kv-aware-e2e" if platform == "rocm" else "kv-aware-e2e"
     pipeline = yaml.safe_load((ROOT / ".buildkite" / lane).read_text(encoding="utf-8"))
     step = next(
-        s for s in pipeline["steps"] if isinstance(s, dict) and s.get("key") == key
+        step
+        for group in pipeline["steps"]
+        if isinstance(group, dict)
+        for step in group.get("steps", [group])
+        if isinstance(step, dict) and step.get("key") == key
     )
     # Keep the real CLI, session hook and hardware marks; replace model work only.
     probe = tmp_path / "test_probe.py"

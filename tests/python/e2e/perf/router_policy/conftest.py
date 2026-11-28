@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from tests.python.e2e.perf.router_policy.case_loader import concurrency_levels
 
-SCENARIO_DIR = Path(__file__).resolve().parent
-if str(SCENARIO_DIR) not in sys.path:
-    sys.path.insert(0, str(SCENARIO_DIR))
-
-CASES_DIR = SCENARIO_DIR / "cases"
+CASES_DIR = Path(__file__).parent / "cases"
 
 
 @pytest.fixture(autouse=True)
@@ -30,8 +26,6 @@ def _router_policy_cell_gap():
 
 def _scenario_cells() -> list[tuple[Path, int]]:
     """One JSON per policy; expand benchmark_params.max-concurrency into cells."""
-
-    from case_loader import concurrency_levels
 
     cells: list[tuple[Path, int]] = []
     for path in sorted(CASES_DIR.glob("*.json")):

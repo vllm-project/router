@@ -18,8 +18,26 @@
 #
 # Test-specific env (MORIIO_READ_MODE, LM_EVAL_LIMIT, LOG_DIR) stays on the step.
 
+# Shared GPU job retry policy, following vllm-omni.
+# Manual retries are available after a successful job. Automatic retries cover
+# agent loss, stop, and refusal, with one retry for each matching rule.
+x-hardware-retry: &hardware_retry
+  manual:
+    allowed: true
+    permit_on_passed: true
+  automatic:
+    - exit_status: -1
+      limit: 1
+    - exit_status: 128
+      limit: 1
+    - signal_reason: agent_stop
+      limit: 1
+    - signal_reason: agent_refused
+      limit: 1
+
 mirror_hardwares:
   l4_4:
+    retry: *hardware_retry
     agents:
       queue: l4-k8s
     plugins:
@@ -83,6 +101,7 @@ mirror_hardwares:
               path: /fsx/hf_cache
               type: DirectoryOrCreate
   l4_1:
+    retry: *hardware_retry
     agents:
       queue: l4-k8s
     plugins:
@@ -146,6 +165,7 @@ mirror_hardwares:
               path: /fsx/hf_cache
               type: DirectoryOrCreate
   l4_2:
+    retry: *hardware_retry
     agents:
       queue: l4-k8s
     plugins:
@@ -209,6 +229,7 @@ mirror_hardwares:
               path: /fsx/hf_cache
               type: DirectoryOrCreate
   mi300_2:
+    retry: *hardware_retry
     agents:
       queue: router_rocm_mi300_2
     plugins:
@@ -240,9 +261,11 @@ mirror_hardwares:
         - stack=67108864
         propagate-environment: true
   mi300_rdma:
+    retry: *hardware_retry
     agents:
       queue: router_rocm_mi300_2
   h100_2:
+    retry: *hardware_retry
     agents:
       queue: mithril-h100-pool
     plugins:

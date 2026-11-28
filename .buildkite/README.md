@@ -40,7 +40,7 @@ on `release-pipeline.yml` (the `router-release` pipeline) publishes images.
 | --- | --- | --- | --- |
 | `test-ready.yml` | L1 ready | non-default branch labeled `ready` | Rust and Python unit/integration tests, one NVIDIA P/D completion, and kv_aware e2e on 2× L4 (`ROCM_ONLY != 1` on the GPU jobs) |
 | `test-merge.yml` | L2 merge | default branch (except `NIGHTLY=1`), its merge queue, or any other branch labeled `merge-test` | one-mode xGMI smoke and RDMA `SMOKE_ONLY` |
-| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab c16 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X (scheduled builds only) |
+| `test-nightly.yml` | L3 nightly | default branch with `NIGHTLY=1`, or any other branch labeled `nightly-test` | Rust and Python unit/integration tests (skipped when the PR also has `ready`), full NVIDIA GSM8K (`ROCM_ONLY != 1`), gRPC prefix-KV perf on 2× H100 (`ROCM_ONLY != 1`), router_policy TraceLab merged c8 / AgentX PD c12 on 4× L4 (`ROCM_ONLY != 1`), L1 prefix-encoding perf on 1× L4 with Qwen3-0.6B (`ROCM_ONLY != 1`, 24 waves), full xGMI matrix, full RDMA, kv_aware e2e on 2× MI300X (scheduled builds only) |
 | `release-pipeline.yml` | release | tag / release pipeline | wheels and images only |
 
 A pull request labeled `ready` uploads `test-ready.yml`, including forks,
@@ -170,8 +170,26 @@ Full GSM8K stays in `test-nightly.yml`. Both include forks.
 **Key features:**
 - Requires 4 GPUs (runs on `l4-k8s`)
 - 60 minute timeout
-- Automatic retry (up to 2 attempts) for flaky failures
-- Manual retry option available
+- Shared retry policy from `ci_mirror_hardwares.yml`
+- Manual retry available after successful jobs
+
+### Shared hardware retry
+
+The `x-hardware-retry` block in
+[`ci_mirror_hardwares.yml`](ci_mirror_hardwares.yml) controls all six CUDA and
+ROCm hardware presets. The uploader expands `retry: *hardware_retry` into each
+job together with its agents and plugins. Update that block to change the
+policy across the ready, merge, and nightly test pipelines.
+
+The policy follows
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_mirror_hardwares.yml).
+It permits manual retries after a successful job and retries exit statuses
+`-1` and `128`, or signal reasons `agent_stop` and `agent_refused`, once per
+matching rule. Test failures (exit `1`) and process OOM (exit `137`) require
+manual retries.
+
+An explicit step-level `retry` replaces the complete shared policy. For
+example, an automatic-only override also replaces the shared manual settings.
 
 ### ROCm MoRI coverage
 
@@ -196,7 +214,7 @@ build with `RUN_ROCM_RDMA=1`.
 
 ROCm-only scheduled builds should set both `NIGHTLY=1` and `ROCM_ONLY=1`.
 `ROCM_ONLY=1` skips the NVIDIA four-GPU step, the H100 gRPC perf job, and the
-L4 router_policy perf job while retaining the CPU build that supplies the router
+router_policy perf jobs while retaining the CPU build that supplies the router
 artifact to the ROCm jobs.
 
 The L3 matrices use a digest-pinned ROCm vLLM image and run health, sanity,
@@ -307,7 +325,7 @@ Builds Docker image for the router.
 ## Agent Queues
 
 - `medium_cpu_queue_premerge`: CPU-only tasks (builds, lints, unit tests)
-- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy c16)
+- `l4-k8s`: NVIDIA L4 GPU tests on EKS (4-GPU P/D disaggregation; 4-GPU router_policy merged c8 / PD c12)
 - `mithril-h100-pool`: NVIDIA H100 SXM tests (2-GPU gRPC prefix-KV perf)
 - `router_rocm_mi300_2`: MI300X MoRI tests and the single-host, two-GPU KV-aware functional lane (`spawn=1`)
 - `default`: General purpose queue

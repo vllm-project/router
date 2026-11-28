@@ -33,9 +33,11 @@ def test_pipeline_settings_and_cleanup(
         (ROOT / ".buildkite/test-nightly.yml").read_text(encoding="utf-8")
     )
     step = next(
-        s
-        for s in pipeline["steps"]
-        if isinstance(s, dict) and s.get("key") == "pd-disagg-moriio-rdma-test"
+        step
+        for group in pipeline["steps"]
+        if isinstance(group, dict)
+        for step in group.get("steps", [group])
+        if isinstance(step, dict) and step.get("key") == "pd-disagg-moriio-rdma-test"
     )
     command = (
         step["command"].replace("{{matrix.read_mode}}", read_mode).replace("$$", "$")

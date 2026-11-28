@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 from tests.python.e2e.perf.path import get_perf_results_dir, get_perf_run_dir
 
@@ -87,8 +90,13 @@ def _resolve_python(case_value: str, repo: Path) -> str:
     return found if found else val
 
 
-def packaged_replay_agentx_yaml() -> Path:
-    """TraceLab replay template from pip-installed ``agentinfer``."""
+def packaged_replay_agentx_yaml(trace_type: str = "tracelab") -> Path:
+    """Replay template for the selected adapter in pip-installed ``agentinfer``."""
+
+    templates = {"tracelab": "replay_tracelab.yaml", "agentX": "replay_agentX.yaml"}
+    if trace_type not in templates:
+        raise ValueError(f"unsupported router policy trace type: {trace_type}")
+    filename = templates[trace_type]
 
     try:
         import agentinfer
@@ -101,14 +109,14 @@ def packaged_replay_agentx_yaml() -> Path:
 
     package_root = Path(agentinfer.__file__).resolve().parent
     for relative in (
-        Path("agentbench/configs/replay_tracelab.yaml"),
-        Path("agentinfer/agentbench/configs/replay_tracelab.yaml"),
+        Path("agentbench/configs") / filename,
+        Path("agentinfer/agentbench/configs") / filename,
     ):
         candidate = package_root / relative
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        f"replay_tracelab.yaml not found under installed agentinfer ({package_root})"
+        f"{filename} not found under installed agentinfer ({package_root})"
     )
 
 
@@ -117,6 +125,50 @@ def load_case(case_file: Path) -> dict[str, Any]:
     if not isinstance(case, dict):
         raise ValueError(f"case root must be an object: {case_file}")
     return case
+
+
+def prepare_trace(
+    trace_path: Path,
+    *,
+    out_dir: Path,
+    trace_type: str = "tracelab",
+    expected_sha256: str = "",
+) -> Path:
+    """Verify pinned data or resolve an unpinned TraceLab URL override."""
+
+    url = (
+        _env_first("TRACELAB_JSONL_URL")
+        if trace_type == "tracelab" and not expected_sha256
+        else ""
+    )
+    if not url:
+        if not trace_path.is_file():
+            label = "AgentX" if trace_type == "agentX" else "TraceLab"
+            raise FileNotFoundError(f"{label} replay file does not exist: {trace_path}")
+        if trace_type == "agentX" and not expected_sha256:
+            raise ValueError("AgentX replay requires runtime.trace_sha256")
+        if expected_sha256:
+            body = trace_path.read_bytes().replace(b"\r\n", b"\n")
+            actual = hashlib.sha256(body).hexdigest()
+            if actual != expected_sha256:
+                raise ValueError(
+                    f"{trace_type} trace SHA256 mismatch: expected {expected_sha256}, got {actual}"
+                )
+        return trace_path
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    destination = out_dir / "trace.jsonl"
+    with tempfile.NamedTemporaryFile(
+        dir=out_dir, suffix=".download", delete=False
+    ) as temp:
+        temporary = Path(temp.name)
+    try:
+        with urlopen(url, timeout=60) as response, temporary.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 def resolve_runtime(case: dict[str, Any]) -> dict[str, Any]:
@@ -171,6 +223,7 @@ class RouterPolicyCase:
 
     path: Path
     id: str
+    scenario: str
     model: str
     served_model_name: str
     python: str
@@ -179,6 +232,7 @@ class RouterPolicyCase:
     perf_work_root: Path
     trace_path: Path
     trace_type: str
+    trace_sha256: str
     endpoint: str
     replay_config: Path
     agent_infer: Path | None
@@ -187,6 +241,7 @@ class RouterPolicyCase:
     task_num: int
     concurrency: int
     worker_count: int
+    prefill_count: int
     gap_scale: float
     max_inflight: int
     stall_secs: int
@@ -210,8 +265,8 @@ def concurrency_levels(case: dict[str, Any]) -> list[int]:
 def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any]:
     """Copy a scenario JSON and pin one concurrency.
 
-    The cell id stays ``c<n>-<policy>`` so three levels from one file do not
-    share an output directory.
+    Each scenario/concurrency pair needs its own output directory so cells
+    from the same JSON do not overwrite each other's replay files.
     """
 
     stamped = dict(case)
@@ -219,8 +274,9 @@ def case_at_concurrency(case: dict[str, Any], concurrency: int) -> dict[str, Any
     bench["max-concurrency"] = int(concurrency)
     stamped["benchmark_params"] = bench
     router = case.get("router_params") or {}
-    policy = str(router.get("policy") or case.get("id") or "router_policy")
-    stamped["id"] = f"c{int(concurrency)}-{policy}"
+    scenario = str(case.get("id") or router.get("policy") or "router_policy")
+    stamped["scenario"] = scenario
+    stamped["id"] = f"c{int(concurrency)}-{scenario}"
     return stamped
 
 
@@ -244,14 +300,25 @@ def load_router_policy_case(
     workers = raw.get("workers") or {}
     router = dict(raw.get("router_params") or {})
     case_id = str(raw["id"])
-    policy = str(
-        router.get("policy") or raw.get("router_policy") or case_id.split("-", 1)[-1]
-    )
+    policy = str(router.get("policy") or raw.get("router_policy") or raw["scenario"])
     replay_path = str(runtime.get("replay_config_path") or "").strip()
+    trace_type = str(runtime.get("trace_type") or "tracelab")
     agent_infer = str(runtime.get("agent_infer") or "").strip()
+    worker_count = int(workers.get("count", 4))
+    prefill_count = int(workers.get("prefill_count", 0))
+    if not 0 <= prefill_count < worker_count:
+        raise ValueError(
+            f"{case_id}: invalid prefill_count {prefill_count} for {worker_count} workers"
+        )
+    if prefill_count and (
+        router.get("protocol", "grpc") != "grpc"
+        or int((workers.get("per_worker") or {}).get("cpu_kv_bytes", 0))
+    ):
+        raise ValueError(f"{case_id}: PD requires gRPC and GPU KV transfer")
     return RouterPolicyCase(
         path=case_file,
         id=case_id,
+        scenario=str(raw["scenario"]),
         model=runtime["model"],
         served_model_name=runtime["served_model_name"],
         python=runtime["python"],
@@ -259,17 +326,22 @@ def load_router_policy_case(
         router_bin=runtime["router_binary"],
         perf_work_root=PERF_RUN_DIR,
         trace_path=Path(runtime["trace_path"]),
-        trace_type=str(runtime.get("trace_type") or "tracelab"),
-        endpoint=str(runtime.get("endpoint") or "/v1/chat/completions"),
+        trace_type=trace_type,
+        trace_sha256=str(runtime.get("trace_sha256") or ""),
+        endpoint=str(
+            runtime.get("endpoint")
+            or ("/v1/completions" if trace_type == "agentX" else "/v1/chat/completions")
+        ),
         replay_config=Path(replay_path)
         if replay_path
-        else packaged_replay_agentx_yaml(),
+        else packaged_replay_agentx_yaml(trace_type),
         agent_infer=Path(agent_infer) if agent_infer else None,
         openssl_lib_dir=str(runtime.get("openssl_lib_dir") or ""),
         policy=policy,
         task_num=int(bench.get("task-num", 128)),
         concurrency=int(bench.get("max-concurrency", 8)),
-        worker_count=int(workers.get("count", 4)),
+        worker_count=worker_count,
+        prefill_count=prefill_count,
         gap_scale=float(bench.get("gap_scale", 0.0)),
         max_inflight=int(bench.get("max_inflight", 1)),
         stall_secs=int(bench.get("stall_secs", 900)),
@@ -301,12 +373,12 @@ def cell_output_dir(case: dict[str, Any], *, run_suffix: str | None = None) -> P
 
 
 def router_policy_result_path(
-    policy: str, concurrency: int, task_num: int, run_suffix: str
+    scenario: str, concurrency: int, task_num: int, run_suffix: str
 ) -> Path:
-    """``results/perf/router_policy/<policy>_<stamp>/c<concurrency>_t<task_num>.json``."""
+    """``results/perf/router_policy/<scenario>_<stamp>/c<concurrency>_t<task_num>.json``."""
 
     return (
         PERF_RESULTS_DIR
-        / f"{policy}_{run_suffix}"
+        / f"{scenario}_{run_suffix}"
         / f"c{int(concurrency)}_t{int(task_num)}.json"
     )

@@ -37,23 +37,23 @@ steps:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
+        env:
+          MORIIO_READ_MODE: "true"
+          LM_EVAL_LIMIT: "20"
+          LM_EVAL_BASELINE: "0.38"
+          MORIIO_BACKEND: "xgmi"
+          MODEL_NAMES: "Qwen/Qwen3-0.6B"
+          ROUTER_BIN: "/workdir/target/release/vllm-router"
+          LOG_DIR: "/workdir/target/ci-logs/moriio-smoke"
+          ENGINE_STARTUP_TIMEOUT: "3600"
         command: |
           timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
           # Bash defers this trap until its foreground command finishes,
           # keeping timeout's kill-after active during harness cleanup.
           trap 'exit 143' TERM
-          export MORIIO_READ_MODE=true
-          export LM_EVAL_LIMIT=20
-          export LM_EVAL_BASELINE=0.38
-          export MORIIO_BACKEND=xgmi
-          export MODEL_NAMES=Qwen/Qwen3-0.6B
-          export ROUTER_BIN=/workdir/target/release/vllm-router
-          export LOG_DIR=/workdir/target/ci-logs/moriio-smoke
-          export ENGINE_STARTUP_TIMEOUT=3600
 
           bash .buildkite/scripts/install_packages.sh router-bin
           bash .buildkite/scripts/install_packages.sh lm-eval
-
           bash tests/python/e2e/pd_disagg_vllm/run_moriio_accuracy_test.sh
           BASH
         artifact_paths:
@@ -68,6 +68,17 @@ steps:
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
+    env:
+      SMOKE_ONLY: "true"
+      MORIIO_READ_MODE: "true"
+      MODEL_NAMES: "Qwen/Qwen3-0.6B"
+      ROUTER_BIN: "target/release/vllm-router"
+      LOG_DIR: "target/ci-logs/moriio-rdma-smoke"
+      ENGINE_STARTUP_TIMEOUT: "3600"
+      NUM_LM_EVAL_CONCURRENT: "1"
+      WORKER_SSH_HOST: "vllm-router-rocm-worker"
+      COORDINATOR_FABRIC_IP: "192.168.200.1"
+      WORKER_FABRIC_IP: "192.168.200.2"
     command: |
       timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
       # Bash defers this trap until its foreground command finishes,
@@ -75,18 +86,6 @@ steps:
       trap 'exit 143' TERM
 
       bash .buildkite/scripts/install_packages.sh router-bin
-
-      export SMOKE_ONLY="true"
-      export MORIIO_READ_MODE="true"
-      export MODEL_NAMES="Qwen/Qwen3-0.6B"
-      export ROUTER_BIN="$$PWD/target/release/vllm-router"
-      export LOG_DIR="$$PWD/target/ci-logs/moriio-rdma-smoke"
-      export ENGINE_STARTUP_TIMEOUT=3600
-      export NUM_LM_EVAL_CONCURRENT=1
-      export WORKER_SSH_HOST=vllm-router-rocm-worker
-      export COORDINATOR_FABRIC_IP=192.168.200.1
-      export WORKER_FABRIC_IP=192.168.200.2
-
       bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
       BASH
     mirror_hardwares: mi300_rdma

@@ -7,8 +7,9 @@ Flow:
   4. Wait until router passes HTTP /health.
   5. Run agentinfer replay bench against the router.
 
-Workload is the TraceLab 8-session / 28-request subset
-(``data/tracelab-ci-uniform-28.jsonl``). Replay executes that plan and writes
+Merged cases use the TraceLab 8-session / 28-request subset; disaggregated
+cases use the context-capped AgentX 12-session / 144-request subset.
+Replay executes the selected plan and writes
 ``result/requests.jsonl`` (per-request TTFT/latency — analysis output, not the bench input).
 
 Configuration: ``AGENTX_CASE_FILE`` points to one self-contained case JSON
@@ -24,40 +25,39 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import yaml
 
-SCENARIO_DIR = Path(__file__).resolve().parent
-if str(SCENARIO_DIR) not in sys.path:
-    sys.path.insert(0, str(SCENARIO_DIR))
-
-from case_loader import (  # noqa: E402
+from tests.python.e2e.perf.router_policy.case_loader import (
     RouterPolicyCase,
     cell_run_suffix,
     load_router_policy_case,
+    prepare_trace,
 )
-from tests.python.e2e.perf.binaries import preflight_router_bin  # noqa: E402
-from log_summary import (  # noqa: E402
+from tests.python.e2e.perf.binaries import preflight_router_bin
+from tests.python.e2e.perf.router_policy.log_summary import (
+    ReplayValidator,
     print_failure_diagnostics,
     write_calibration,
 )
-from tests.python.helpers.process import (  # noqa: E402
+from tests.python.helpers.process import (
     RunningProc,
+    launch_process,
     launch_router,
     launch_worker,
+    wait_workers_ready,
     graceful_stop,
     release_all_port_holders,
     release_router_port_holders,
     release_worker_port_holders,
     reserve_port,
     router_cmd,
-    stream_process,
     vllm_rs_serve_cmd,
 )
 
@@ -68,7 +68,9 @@ class RouterPolicyStack:
 
     case: RouterPolicyCase
     out: Path
-    env: dict[str, str]
+    env: dict[
+        str, str
+    ]  # Per-case overrides; helpers/process.py inherits the parent env.
     gpus: list[str]
     clients: httpx.Client
     ports: dict[str, Any] = field(default_factory=dict)
@@ -77,6 +79,7 @@ class RouterPolicyStack:
     replay_stream: RunningProc | None = None
     port_holders: list[socket.socket | None] = field(default_factory=list)
     kv_port_holders: list[socket.socket | None] = field(default_factory=list)
+    nixl_port_holders: list[socket.socket | None] = field(default_factory=list)
     did_cleanup: bool = False
 
 
@@ -98,35 +101,32 @@ def open_cell(case: RouterPolicyCase, *, out_dir: Path | None) -> RouterPolicySt
         flush=True,
     )
 
-    env = os.environ.copy()
     py = case.python
     py_prefix = str(Path(py).parent) if ("/" in py or "\\" in py) else ""
-    path_parts = [p for p in (py_prefix, env.get("PATH", "")) if p]
-    env_updates: dict[str, str] = {
-        "PATH": os.pathsep.join(path_parts),
-        "XDG_CACHE_HOME": str(case.perf_work_root / "cache"),
-        "HF_HOME": str(case.perf_work_root / "cache/huggingface"),
-        "VLLM_CACHE_ROOT": str(case.perf_work_root / "cache/vllm"),
-        "TRITON_CACHE_DIR": str(case.perf_work_root / "cache/triton"),
+    env: dict[str, str] = {
         "VLLM_ROUTER_MODEL": case.model,
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
         "TOKENIZERS_PARALLELISM": "false",
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
         "RUST_LOG": os.environ.get("RUST_LOG", "info"),
         "AGENTX_TASK_STAGGER": str(case.task_stagger),
     }
+    if py_prefix:
+        env["PATH"] = os.pathsep.join(
+            p for p in (py_prefix, os.environ.get("PATH", "")) if p
+        )
     if case.agent_infer is not None:
-        existing = env.get("PYTHONPATH", "").strip()
-        env_updates["PYTHONPATH"] = (
+        existing = os.environ.get("PYTHONPATH", "").strip()
+        env["PYTHONPATH"] = (
             str(case.agent_infer)
             if not existing
             else f"{case.agent_infer}{os.pathsep}{existing}"
         )
-    env.update(env_updates)
     if case.openssl_lib_dir:
         env["LD_LIBRARY_PATH"] = (
-            case.openssl_lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+            case.openssl_lib_dir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
         )
-    gpus = env.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     if gpus == [""]:
         gpus = [str(i) for i in range(case.worker_count)]
     if len(gpus) < case.worker_count:
@@ -151,20 +151,17 @@ def _start_replay(
     Path(str(log) + ".command.json").write_text(
         json.dumps(command, indent=2), encoding="utf-8"
     )
-    proc = subprocess.Popen(
+    running = launch_process(
         command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        label="replay",
+        log_path=log,
+        log_prefix="router_policy",
         env=run.env,
         start_new_session=True,
-        text=True,
-        bufsize=1,
     )
-    run.replay_proc = proc
-    run.replay_stream = stream_process(
-        proc, label="replay", log_path=log, log_prefix="router_policy"
-    )
-    return proc
+    run.replay_proc = running.proc
+    run.replay_stream = running
+    return running.proc
 
 
 def cleanup(run: RouterPolicyStack) -> None:
@@ -182,16 +179,13 @@ def cleanup(run: RouterPolicyStack) -> None:
     run.stack.clear()
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
+    release_all_port_holders(run.nixl_port_holders)
 
 
 def interrupted(*_):
     if _active is not None:
         cleanup(_active)
     raise SystemExit(130)
-
-
-signal.signal(signal.SIGTERM, interrupted)
-signal.signal(signal.SIGINT, interrupted)
 
 
 # Outside the usual ephemeral range, so vLLM's own bind(0) calls during
@@ -240,6 +234,7 @@ def allocate_ports(run: RouterPolicyStack) -> None:
 
     release_all_port_holders(run.port_holders)
     release_all_port_holders(run.kv_port_holders)
+    release_all_port_holders(run.nixl_port_holders)
     holders: list[socket.socket | None] = []
     kv_holders: list[socket.socket | None] = []
     n = run.case.worker_count
@@ -252,6 +247,8 @@ def allocate_ports(run: RouterPolicyStack) -> None:
     }
     alloc["router"] = reserve()
     alloc["metrics"] = reserve()
+    if run.case.prefill_count:
+        alloc["nixl_side"] = [reserve_port(run.nixl_port_holders) for _ in range(n)]
     kv_pub: list[int] = []
     kv_replay: list[int] = []
     for _ in range(n):
@@ -276,6 +273,7 @@ def engine_command(run: RouterPolicyStack, i: int):
         "max_num_seqs": pw.get("max_num_seqs", 16),
         "max_num_batched_tokens": pw.get("max_num_batched_tokens", 32768),
         "enable_prefix_caching": True,
+        "prefix_caching_hash_algo": pw.get("prefix_caching_hash_algo", "sha256_cbor"),
         "dtype": pw.get("dtype", "bfloat16"),
         "gpu_memory_utilization": pw.get("gpu_memory_utilization"),
         "kv_cache_metrics": bool(pw.get("kv_cache_metrics")),
@@ -295,6 +293,12 @@ def engine_command(run: RouterPolicyStack, i: int):
                 "self_describing_kv_events": True,
             },
         }
+    if run.case.prefill_count:
+        engine["kv_transfer_config"] = {
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer" if i < run.case.prefill_count else "kv_consumer",
+        }
+        engine["disable_hybrid_kv_cache_manager"] = True
     engine["safetensors_load_strategy"] = "prefetch"
     engine["kv_events_config"] = {
         "enable_kv_cache_events": True,
@@ -302,6 +306,8 @@ def engine_command(run: RouterPolicyStack, i: int):
         "endpoint": f"tcp://127.0.0.1:{ports['kv_pub'][i]}",
         "replay_endpoint": f"tcp://127.0.0.1:{ports['kv_replay'][i]}",
         "buffer_steps": 10000,
+        # vLLM 0.30 has no instance_topic option; use a fresh topic per start.
+        "topic": uuid4().hex,
     }
     return vllm_rs_serve_cmd(
         run.case.vllm_rs,
@@ -318,6 +324,55 @@ def engine_command(run: RouterPolicyStack, i: int):
     )
 
 
+def start_workers(run: RouterPolicyStack, *, timeout: float = 1800) -> None:
+    """Launch all workers before waiting for health, sharing one startup deadline."""
+    case, ports = run.case, run.ports
+    deadline = time.monotonic() + timeout
+    workers = []
+    try:
+        for i in range(case.worker_count):
+            release_worker_port_holders(run.port_holders, i, case.worker_count)
+            _release_kv_port_holders(run, i)
+            worker_env = run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]}
+            if case.prefill_count:
+                run.nixl_port_holders[i].close()
+                run.nixl_port_holders[i] = None
+                worker_env.update(
+                    VLLM_NIXL_SIDE_CHANNEL_HOST="127.0.0.1",
+                    VLLM_NIXL_SIDE_CHANNEL_PORT=str(ports["nixl_side"][i]),
+                    UCX_TLS=os.environ.get("UCX_TLS", "all"),
+                )
+            worker_cmd = engine_command(run, i)
+            worker_log = run.out / f"engine{i}.log"
+            Path(str(worker_log) + ".command.json").write_text(
+                json.dumps(worker_cmd, indent=2), encoding="utf-8"
+            )
+            worker = launch_worker(
+                worker_cmd,
+                label=f"engine{i}",
+                env=worker_env,
+                log_prefix="router_policy",
+                log_path=worker_log,
+            )
+            run.stack.append(worker)
+            workers.append(worker)
+        wait_workers_ready(
+            [
+                (
+                    f"http://127.0.0.1:{ports['http'][i]}/health",
+                    worker.proc,
+                    worker.label,
+                )
+                for i, worker in enumerate(workers)
+            ],
+            max(0, deadline - time.monotonic()),
+            prefix="router_policy",
+        )
+    except Exception:
+        cleanup(run)
+        raise
+
+
 def router_command(run: RouterPolicyStack):
     rp = run.case.router
     ports = run.ports
@@ -328,14 +383,15 @@ def router_command(run: RouterPolicyStack):
     scheme = str(rp.get("protocol", "grpc"))
     url_key = "grpc" if scheme == "grpc" else "http"
     ttl = rp.get("kv_aware_session_affinity_ttl_secs")
-    return router_cmd(
+    urls = [f"{scheme}://127.0.0.1:{port}" for port in ports[url_key]]
+    prefill_count = run.case.prefill_count
+    cmd = router_cmd(
         run.case.router_bin,
         host="127.0.0.1",
         port=ports["router"],
-        worker_urls=[
-            f"{scheme}://127.0.0.1:{ports[url_key][i]}"
-            for i in range(run.case.worker_count)
-        ],
+        worker_urls=urls if not prefill_count else None,
+        vllm_pd_disaggregation=bool(prefill_count),
+        kv_connector="nixl" if prefill_count else None,
         worker_startup_timeout_secs=int(rp.get("worker_startup_timeout_secs", 60)),
         prometheus_host="127.0.0.1",
         prometheus_port=ports["metrics"],
@@ -353,6 +409,13 @@ def router_command(run: RouterPolicyStack):
             ttl if ttl and policy == "kv_aware_aff" else None
         ),
     )
+
+    if prefill_count:
+        for url in urls[:prefill_count]:
+            cmd.extend(["--prefill", url])
+        for url in urls[prefill_count:]:
+            cmd.extend(["--decode", url])
+    return cmd
 
 
 def runtime_config(run: RouterPolicyStack):
@@ -380,11 +443,11 @@ def runtime_config(run: RouterPolicyStack):
         "trace_same_agent_gap_offset_seconds": 0.0,
         "interval_mode": "trace",
         "max_inflight_requests": case.max_inflight,
+        "sample_seed": 0,
         "request_timeout_seconds": 3600,
     }
     if case.trace_type == "tracelab":
         replay_fields.update(
-            sample_seed=0,
             context_adjustment_mode="strict",
             context_micro_trim_max_tokens=64,
             context_micro_trim_max_ratio=0.005,
@@ -538,21 +601,37 @@ def _require_resolved_kv_events(run: RouterPolicyStack) -> None:
             raise RuntimeError(f"{label} still advertises port 0: {unresolved}")
 
 
-def snapshot(run: RouterPolicyStack, dest):
-    dest.mkdir(parents=True, exist_ok=True)
+def snapshot(run: RouterPolicyStack, dest: Path, *, strict: bool = True) -> list[str]:
+    """Scrape metrics; the final snapshot collects errors for calibration."""
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if strict:
+            raise
+        return [f"metrics snapshot failed for {dest}: {exc}"]
     ports = run.ports
-    for i in range(run.case.worker_count):
-        (dest / f"engine{i}.prom").write_text(
-            run.clients.get(f"http://127.0.0.1:{ports['http'][i]}/metrics").text
-        )
-    (dest / "router.prom").write_text(
-        run.clients.get(f"http://127.0.0.1:{ports['metrics']}/metrics").text
-    )
+    endpoints = {
+        f"engine{i}.prom": f"http://127.0.0.1:{ports['http'][i]}/metrics"
+        for i in range(run.case.worker_count)
+    }
+    endpoints["router.prom"] = f"http://127.0.0.1:{ports['metrics']}/metrics"
+    errors = []
+    for filename, url in endpoints.items():
+        try:
+            response = run.clients.get(url)
+            response.raise_for_status()
+            (dest / filename).write_text(response.text, encoding="utf-8")
+        except (httpx.HTTPError, OSError) as exc:
+            if strict:
+                raise
+            errors.append(f"metrics snapshot failed for {url}: {exc}")
+    return errors
 
 
 def run_router_policy_cell(
     case_file: Path,
     *,
+    replay_validator: ReplayValidator,
     concurrency: int | None = None,
     out_dir: Path | None = None,
     run_suffix: str | None = None,
@@ -566,16 +645,35 @@ def run_router_policy_cell(
         run_suffix = cell_run_suffix()
     os.environ["AGENTX_RUN_SUFFIX"] = run_suffix
     case = load_router_policy_case(case_path, concurrency=concurrency)
+    trace_dir = (
+        out_dir
+        if out_dir is not None
+        else case.perf_work_root / f"{case.id}-{run_suffix}"
+    )
+    case = replace(
+        case,
+        trace_path=prepare_trace(
+            case.trace_path,
+            out_dir=trace_dir,
+            trace_type=case.trace_type,
+            expected_sha256=case.trace_sha256,
+        ),
+    )
     run = open_cell(case, out_dir=out_dir)
     _active = run
+    previous_handlers = {}
     try:
-        _run_cell(run)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, interrupted)
+        _run_cell(run, replay_validator=replay_validator)
     finally:
         _active = None
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     return run.out
 
 
-def _run_cell(run: RouterPolicyStack) -> None:
+def _run_cell(run: RouterPolicyStack, *, replay_validator: ReplayValidator) -> None:
     case = run.case
     settle = float(os.environ.get("AGENTX_PORT_SETTLE_SEC", "2"))
     if settle > 0:
@@ -630,25 +728,7 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
     try:
         try:
             preflight_router_bin(case.router_bin)
-            for i in range(case.worker_count):
-                release_worker_port_holders(run.port_holders, i, case.worker_count)
-                _release_kv_port_holders(run, i)
-                worker_cmd = engine_command(run, i)
-                worker_log = run.out / f"engine{i}.log"
-                Path(str(worker_log) + ".command.json").write_text(
-                    json.dumps(worker_cmd, indent=2), encoding="utf-8"
-                )
-                run.stack.append(
-                    launch_worker(
-                        worker_cmd,
-                        label=f"engine{i}",
-                        env=run.env | {"CUDA_VISIBLE_DEVICES": run.gpus[i]},
-                        ready_url=f"http://127.0.0.1:{ports['http'][i]}/health",
-                        timeout=1800,
-                        log_prefix="router_policy",
-                        log_path=worker_log,
-                    )
-                )
+            start_workers(run)
             _require_resolved_kv_events(run)
             print(f"ENGINES_READY {time.monotonic() - started:.0f}s", flush=True)
             release_router_port_holders(run.port_holders, case.worker_count)
@@ -769,17 +849,19 @@ raise SystemExit(main(["vllm", *sys.argv[1:]]))
             replay.wait(timeout=120)
         except subprocess.TimeoutExpired:
             graceful_stop(replay, 30, process_group=True, kill_grace=15)
-        snapshot(run, run.out / "after")
+        snapshot_errors = snapshot(run, run.out / "after", strict=False)
         replay_rc = replay.returncode
         if replay_rc not in (0, None):
             print(f"REPLAY exit code {replay_rc}", flush=True)
         cleanup(run)
         write_calibration(
             run,
+            replay_validator=replay_validator,
             result_dir=result,
             replay_rc=replay_rc,
             wall_seconds=time.monotonic() - started,
             stalled=stalled,
+            snapshot_errors=snapshot_errors,
         )
     finally:
         cleanup(run)

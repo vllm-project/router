@@ -1,5 +1,5 @@
 {
-  "id": "cache_aware",
+  "id": "pd_merge_kv_aware_affinity",
   "runtime": {
     "model": "Qwen/Qwen3-4B-Instruct-2507",
     "trace_path": "tests/python/e2e/perf/router_policy/data/tracelab-ci-uniform-28.jsonl",
@@ -8,7 +8,7 @@
   },
   "benchmark_params": {
     "task-num": 8,
-    "max-concurrency": [8, 16, 32],
+    "max-concurrency": [8],
     "gap_scale": 1.0,
     "max_inflight": 1,
     "task_stagger": 0
@@ -25,6 +25,7 @@
       "cpu_kv_bytes": 0,
       "dtype": "bfloat16",
       "enable_prefix_caching": true,
+      "prefix_caching_hash_algo": "sha256_cbor",
       "kv_cache_metrics": true,
       "kv_cache_metrics_sample": 0.01
     }
@@ -39,6 +40,7 @@
     "kv_penalty_external": 0.6,
     "kv_penalty_disk": 0.3,
     "worker_startup_timeout_secs": 60,
-    "policy": "cache_aware"
+    "policy": "kv_aware_aff",
+    "kv_aware_session_affinity_ttl_secs": 1800
   }
 }
