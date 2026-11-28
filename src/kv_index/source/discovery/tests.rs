@@ -2287,10 +2287,8 @@ async fn metrics_only_worker_supplies_cache_metadata() {
     let (router, _) = metrics_and_models_router(move || metrics.to_owned());
     let (worker, server) = spawn_metrics_only_worker(router).await;
 
-    let metadata = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
-        .await
-        .unwrap();
-    let info = metadata.server_info;
+    let metadata = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None).await;
+    let info = metadata.server_info.unwrap();
     let models = metadata.base_models;
     assert_eq!(info.kv_block_size, Some(16));
     assert_eq!(discovered_block_size(&info), Some(16));
@@ -2364,11 +2362,64 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
 }
 
 #[tokio::test]
+async fn invalid_metrics_geometry_still_fences_incompatible_ranks() {
+    use axum::routing::get;
+
+    let (pub0, replay0, _publisher0, _replay0) = layout_endpoints();
+    let (pub1, replay1, _publisher1, _replay1) = layout_endpoints();
+    let sources = serde_json::json!({
+        "0": {"endpoint": pub0, "replay_endpoint": replay0, "topic": "kv/geometry/0", "publisher": "zmq"},
+        "1": {"endpoint": pub1, "replay_endpoint": replay1, "topic": "kv/geometry/1", "publisher": "zmq"}
+    });
+    let metrics = Arc::new(Mutex::new(METRICS_ONLY.to_owned()));
+    let (app, requests) = metrics_and_models_router({
+        let metrics = metrics.clone();
+        move || metrics.lock().clone()
+    });
+    let app = app.route(
+        "/kv_event_sources",
+        get(move || {
+            let sources = sources.clone();
+            async move { axum::Json(sources) }
+        }),
+    );
+    let (url, server) = spawn_metrics_only_worker(app).await;
+    let _server = AbortTestServer(server);
+    let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+    assert_eq!(
+        supervisor.on_worker_added(&url).await.unwrap().ranks.len(),
+        2
+    );
+    let provider = supervisor.match_provider_for_worker(&url).unwrap();
+    let has_binding =
+        |rank| supervisor.workers_have_cache_bindings([(url.as_str(), rank)].into_iter());
+    assert!(has_binding(0) && has_binding(1));
+
+    let missing = "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256\"} 1.0\n";
+    let conflicting = concat!(
+        "vllm:cache_config_info{engine=\"0\",block_size=\"16\"} 1.0\n",
+        "vllm:cache_config_info{engine=\"1\",block_size=\"32\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+    );
+    for (report, rank1_stays_bound) in [(missing, true), (conflicting, false)] {
+        *metrics.lock() = report.to_owned();
+        let info = supervisor.on_worker_added(&url).await.unwrap();
+        assert!(info.cache_key.is_none());
+        assert!(Arc::ptr_eq(
+            &provider,
+            &supervisor.match_provider_for_worker(&url).unwrap()
+        ));
+        assert_eq!((has_binding(0), has_binding(1)), (false, rank1_stays_bound));
+    }
+    assert_eq!(requests.metrics.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
 async fn worker_without_metadata_names_every_source() {
     let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
 
     let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
         .await
+        .server_info
         .unwrap_err();
     assert!(error.contains("get_server_info"), "{error}");
     assert!(error.contains("server_info"), "{error}");

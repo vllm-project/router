@@ -499,10 +499,11 @@ pub(super) fn parse_vllm_version(version: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct WorkerMetadata {
-    pub(super) server_info: ServerInfo,
+    pub(super) server_info: Result<ServerInfo, String>,
     pub(super) base_models: Option<HashSet<String>>,
+    /// Parsed reports can remain available when cache geometry is rejected.
     pub(super) engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
@@ -517,20 +518,35 @@ pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<WorkerMetadata, String> {
+) -> WorkerMetadata {
     let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
         Ok(server_info) => {
-            return Ok(WorkerMetadata {
-                server_info,
-                ..Default::default()
-            })
+            return WorkerMetadata {
+                server_info: Ok(server_info),
+                base_models: None,
+                engine_cache_configs: None,
+            };
         }
         Err(error) => error,
     };
 
-    query_metrics_metadata(client, worker_url, api_key)
-        .await
-        .map_err(|error| format!("{control_error}; {error}"))
+    let (metadata, engine_cache_configs) =
+        match query_engine_cache_configs(client, worker_url, api_key).await {
+            Ok(engines) => (
+                query_metrics_metadata(client, worker_url, api_key, &engines).await,
+                Some(engines),
+            ),
+            Err(error) => (Err(error), None),
+        };
+    let (server_info, base_models) = match metadata {
+        Ok((info, models)) => (Ok(info), models),
+        Err(error) => (Err(format!("{control_error}; {error}")), None),
+    };
+    WorkerMetadata {
+        server_info,
+        base_models,
+        engine_cache_configs,
+    }
 }
 
 /// The control endpoints can report server aliases. A metrics scrape cannot.
@@ -623,9 +639,9 @@ async fn query_metrics_metadata(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
-) -> Result<WorkerMetadata, String> {
-    let engines = query_engine_cache_configs(client, worker_url, api_key).await?;
-    let hash_unit = metrics_meta::shared_hash_unit(&engines).map_err(|units| {
+    engines: &EngineCacheConfigs,
+) -> Result<(ServerInfo, Option<HashSet<String>>), String> {
+    let hash_unit = metrics_meta::shared_hash_unit(engines).map_err(|units| {
         format!("metrics: engines disagree on block size {units:?} — refusing to index")
     })?;
     if let Some(layout) = engines
@@ -645,11 +661,10 @@ async fn query_metrics_metadata(
         kv_block_size: hash_unit,
         ..Default::default()
     };
-    Ok(WorkerMetadata {
-        server_info: validate_worker_metadata(worker_url, "metrics", Ok(info))?,
-        base_models: models.as_ref().map(base_model_names),
-        engine_cache_configs: Some(engines),
-    })
+    Ok((
+        validate_worker_metadata(worker_url, "metrics", Ok(info))?,
+        models.as_ref().map(base_model_names),
+    ))
 }
 
 pub(super) async fn query_engine_cache_configs(

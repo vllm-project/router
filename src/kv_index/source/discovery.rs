@@ -1042,21 +1042,14 @@ async fn discover_full_attention_http_worker(
         query_worker_metadata_and_models(client, worker_url, api_key),
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
-    let (server_info, base_models, engine_cache_configs) = match server {
-        Ok(metadata) => (
-            Ok(metadata.server_info),
-            metadata.base_models,
-            metadata.engine_cache_configs,
-        ),
-        Err(error) => (Err(error), None, None),
-    };
+    let server_info = server.server_info;
     let model_id = server_info
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
     let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
-    discovery.base_models = base_models;
-    discovery.engine_cache_configs = engine_cache_configs;
+    discovery.base_models = server.base_models;
+    discovery.engine_cache_configs = server.engine_cache_configs;
     discovery
 }
 
