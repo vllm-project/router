@@ -93,7 +93,7 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "vllm_router_kv_index_request_duration_seconds",
-        "Elapsed time of a completed placement lookup in seconds"
+        "Time spent on completed placement lookups or shared prefix probes that require per-rank lookups, in seconds"
     );
     describe_counter!(
         "vllm_router_kv_index_errors_total",
@@ -713,7 +713,11 @@ impl RouterMetrics {
         let result = if hit { "hit" } else { "miss" };
         counter!("vllm_router_kv_index_requests_total", "op" => "lookup", "result" => result)
             .increment(1);
-        histogram!("vllm_router_kv_index_request_duration_seconds", "op" => "lookup")
+        Self::record_kv_index_duration("lookup", duration);
+    }
+
+    pub(crate) fn record_kv_index_duration(op: &'static str, duration: Duration) {
+        histogram!("vllm_router_kv_index_request_duration_seconds", "op" => op)
             .record(duration.as_secs_f64());
     }
 

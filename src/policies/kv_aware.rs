@@ -1675,7 +1675,6 @@ impl KvAwarePolicy {
             && lora_name.is_none()
             && credit_fallback.is_none()
         {
-            let start = Instant::now();
             prompts
                 .first()
                 .and_then(WorkerPrompts::single)
@@ -1686,7 +1685,8 @@ impl KvAwarePolicy {
                     else {
                         return false;
                     };
-                    shared.confirms_miss(tokens, &mut query_cache.hashes)
+                    let start = Instant::now();
+                    let confirmed = shared.confirms_miss(tokens, &mut query_cache.hashes)
                         && bindings.iter().zip(&prompts).all(|(binding, prompts)| {
                             binding
                                 .shared_prefix
@@ -1695,13 +1695,22 @@ impl KvAwarePolicy {
                                 && prompts
                                     .single()
                                     .is_some_and(|ids| std::ptr::eq(tokens, ids) || tokens == ids)
-                        })
+                        });
+                    let elapsed = start.elapsed();
+                    if confirmed {
+                        crate::metrics::RouterMetrics::record_kv_index_lookup(false, elapsed);
+                    } else {
+                        crate::metrics::RouterMetrics::record_kv_index_duration(
+                            "shared_prefix_probe_fallback",
+                            elapsed,
+                        );
+                    }
+                    confirmed
                 })
-                .map(|tokens| (tokens, start.elapsed()))
         } else {
             None
         };
-        if let Some((tokens, elapsed)) = shared_miss {
+        if let Some(tokens) = shared_miss {
             let size = bindings.len();
             let mut count = 0;
             let mut hash_failed = 0;
@@ -1712,7 +1721,6 @@ impl KvAwarePolicy {
                         u64::from(binding.matches.hash_contract_failed(binding.target.dp_rank));
                 }
             }
-            crate::metrics::RouterMetrics::record_kv_index_lookup(false, elapsed);
             crate::metrics::RouterMetrics::record_kv_index_misses(true, hash_failed);
             crate::metrics::RouterMetrics::record_kv_index_misses(false, count - hash_failed);
             lookups.record_count("miss", count);
@@ -2525,6 +2533,25 @@ mod tests {
             );
             provider
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let metrics = recorder.handle();
+        let assert_samples = |lookups, fallback_probes| {
+            let text = metrics.render();
+            for (op, count) in [
+                ("lookup", lookups),
+                ("shared_prefix_probe_fallback", fallback_probes),
+            ] {
+                let prefix =
+                    format!(r#"vllm_router_kv_index_request_duration_seconds_count{{op="{op}"}} "#);
+                let actual: u64 = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&prefix))
+                    .map(|value| value.parse().unwrap())
+                    .unwrap_or(0);
+                assert_eq!(actual, count, "op={op}");
+            }
+        };
         let first = register(workers[0].as_ref(), &domain);
         let second = register(workers[1].as_ref(), &domain);
         let tokens = [42; 33];
@@ -2548,9 +2575,11 @@ mod tests {
         assert!(plan(&inputs).grouped.iter().all(Vec::is_empty));
         assert_eq!(first.1.load(Ordering::Relaxed), 0);
         assert_eq!(second.1.load(Ordering::Relaxed), 0);
+        assert_samples(1, 0);
 
         warm_full(&second.0, 0, &tokens[..32]);
         assert!(!plan(&inputs).grouped[1].is_empty());
+        assert_samples(3, 1);
 
         let mut different = inputs.clone();
         different.insert(
@@ -2558,6 +2587,7 @@ mod tests {
             Arc::from([vec![7; tokens.len()]]),
         );
         assert!(!plan(&different).grouped[1].is_empty());
+        assert_samples(5, 2);
 
         // A separate index can have the same policy key and still hold
         // different pages. A miss on the first index must not mask this hit.
@@ -2569,6 +2599,7 @@ mod tests {
         let plan = plan(&inputs);
         assert!(plan.grouped[0].is_empty());
         assert!(!plan.grouped[1].is_empty());
+        assert_samples(7, 3);
     }
 
     #[test]
