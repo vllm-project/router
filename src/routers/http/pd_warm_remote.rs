@@ -1,6 +1,10 @@
 //! Explicitly gated, exact-token NIXL multi-turn orchestration.
 //! Metadata is engine-owned and single-use. Neither leases nor cost estimates grant capacity.
-use super::{dp_utils, pd_program_adapter::PdProgramRuntime, program_adapter::ProgramCompletion};
+use super::{
+    dp_utils,
+    pd_program_adapter::{self, PdProgramRuntime},
+    program_adapter::ProgramCompletion,
+};
 use crate::config::types::PdProgramSchedulingConfig;
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
@@ -620,13 +624,42 @@ async fn local_prefix(
 /// Fully separate from native PD: unsupported exact-token/capability requests use
 /// the native two-stage path.
 ///
-/// `None` hands the turn back to the caller *unconsumed*: the caller then
-/// dispatches the prefill it already selected. Every `None` exit therefore has
-/// to stay above `claim()`, `pd_load.admit_bound()` and
-/// `runtime.reserve_prefill()`; an early `None` after any of those points would
-/// let the caller claim, charge and reserve twice for one turn. This is checked
-/// by `cold_fallback_consumes_one_prefill_selection_per_turn` only indirectly
-/// (`round_robin` alternation), so keep the exits grouped at the top.
+fn prefill_target_is_live(
+    runtime: &PdProgramRuntime,
+    prefill_id: &str,
+    prefill_worker: &Arc<dyn Worker>,
+) -> bool {
+    runtime
+        .worker_registry
+        .get_prefill_workers()
+        .iter()
+        .any(|worker| {
+            Arc::ptr_eq(worker, prefill_worker)
+                && worker.is_available()
+                && pd_program_adapter::worker_target(worker).id == prefill_id
+        })
+}
+
+enum ExecuteError {
+    Reselect,
+    Failed(String),
+}
+
+impl From<String> for ExecuteError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&str> for ExecuteError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+/// Returns `None` if this protocol declines the turn or if the prefill worker becomes
+/// unavailable before prefill dispatch (after dropping any held admission/permit so the
+/// caller can perform its bounded re-selection); `Some(result)` once dispatch commits.
 ///
 /// `prefills` carries the target and the worker it charges together: both are
 /// derived from `policy_prefill`, so a caller cannot pass a target whose
@@ -645,6 +678,7 @@ pub(super) async fn execute(
     policy_prefill: usize,
     pd_load: &Arc<super::pd_types::PdLoadManager>,
     decode_worker: Arc<dyn Worker>,
+    prefill_deadline: &mut Option<Instant>,
 ) -> Option<Result<(Response, Option<PdResponseContext>), String>> {
     // Discovery lacks a registration incarnation fence for this protocol.
     if runtime.discovery {
@@ -677,6 +711,10 @@ pub(super) async fn execute(
             return None;
         }
     };
+    if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
+        warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+        return None;
+    }
     let identity = request_identity(request);
     // Without warm reads or local reuse there is no consumer for a candidate;
     // claiming one would only consume it and inflate the claim counters.
@@ -816,6 +854,10 @@ pub(super) async fn execute(
             }
         }
     }
+    if route != PdPath::LocalAppend && !prefill_target_is_live(runtime, &p.id, prefill_worker) {
+        warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+        return None;
+    }
     let event_revision = warm_remote.revision_for(d);
     let started = Instant::now();
     // Charge the same native P/D accounting the native two-stage path uses so
@@ -824,23 +866,42 @@ pub(super) async fn execute(
     // admit_bound charges PdLoadManager and attaches the workers itself, so
     // do not attach again: finish/Drop decrement exactly once.
     let attempt = pd_load.admit_bound(prefill_worker.clone(), decode_worker);
-    let result = async {
+    let result: Result<TurnResult, ExecuteError> = async {
         let d_params = if route == PdPath::LocalAppend {
             attempt.finish_prefill();
             json!({"do_remote_decode":false,"do_remote_prefill":false,"pd_local_max_miss_tokens":warm_remote.config.local_execution_budget_tokens,"pd_local_max_running_requests":local_running_limit,"pd_local_max_local_prefills":warm_remote.config.max_local_requests_per_target})
         } else {
-            let permit = runtime
-                .reserve_prefill(&p.id)
-                .await
-                .map_err(|_| "P capacity timeout")?;
+            let deadline =
+                *prefill_deadline.get_or_insert_with(|| runtime.prefill_wait_deadline());
+            let permit = match runtime.reserve_prefill_until(&p.id, deadline).await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
+                        warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                        return Err(ExecuteError::Reselect);
+                    }
+                    return Err(ExecuteError::Failed("P capacity timeout".into()));
+                }
+            };
+            if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
+                warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                return Err(ExecuteError::Reselect);
+            }
+            let current_pe = warm_remote
+                .identify(client, p, headers, topology_revision)
+                .await;
+            if !prefill_target_is_live(runtime, &p.id, prefill_worker) {
+                warm_remote.invalidate_target(&p.base_url, p.dp_rank);
+                return Err(ExecuteError::Reselect);
+            }
             if runtime.worker_registry.revision() != topology_revision
-                || warm_remote
-                    .identify(client, p, headers, topology_revision)
-                    .await?
-                    != pe
+                || current_pe.as_ref().ok() != Some(&pe)
             {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
-                return Err("P epoch changed after capacity wait".into());
+                return Err(match current_pe {
+                    Err(err) => err.into(),
+                    Ok(_) => ExecuteError::Failed("P epoch changed after capacity wait".into()),
+                });
             }
             let warm = candidate.as_ref().filter(|c| {
                 route == PdPath::WarmRemote
@@ -907,7 +968,7 @@ pub(super) async fn execute(
                 }
                 Err(PrefillError::Failed(error)) => {
                     RouterMetrics::record_pd_prefill_error(&p.base_url);
-                    return Err(error);
+                    return Err(ExecuteError::Failed(error));
                 }
             };
             if value
@@ -916,7 +977,9 @@ pub(super) async fn execute(
                 != Some(pe.instance_epoch.as_str())
             {
                 warm_remote.invalidate_target(&p.base_url, p.dp_rank);
-                return Err("P response instance epoch mismatch".into());
+                return Err(ExecuteError::Failed(
+                    "P response instance epoch mismatch".into(),
+                ));
             }
             if let Some(f) = value.pointer("/kv_transfer_params/pd_feedback") {
                 let external = f
@@ -944,7 +1007,9 @@ pub(super) async fn execute(
             || warm_remote.identify(client, d, headers, topology_revision).await? != de
         {
             warm_remote.invalidate_target(&d.base_url, d.dp_rank);
-            return Err("D epoch changed before dispatch".into());
+            return Err(ExecuteError::Failed(
+                "D epoch changed before dispatch".into(),
+            ));
         }
         let mut dr = request.clone();
         dr["kv_transfer_params"] = d_params;
@@ -1011,7 +1076,7 @@ pub(super) async fn execute(
             // settles the Program turn as failed without publishing candidates.
             Some(Ok((response, None)))
         }
-        Err(error) if route == PdPath::LocalAppend => {
+        Err(ExecuteError::Failed(error)) if route == PdPath::LocalAppend => {
             drop(local_permit);
             dispatch = match completion.restart_pd_attempt() {
                 Some(d) => d,
@@ -1137,7 +1202,11 @@ pub(super) async fn execute(
                 }
             }))
         }
-        Err(e) => Some(Err(e)),
+        Err(ExecuteError::Reselect) => {
+            drop(attempt);
+            None
+        }
+        Err(ExecuteError::Failed(e)) => Some(Err(e)),
     }
 }
 

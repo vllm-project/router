@@ -15,7 +15,7 @@ use std::sync::{
 };
 use vllm_router_rs::{
     config::{ConfigValidator, PolicyConfig, RouterConfig, RoutingMode},
-    core::Worker,
+    core::{BasicWorker, Worker, WorkerType},
     policies::{LoadBalancingPolicy, PolicyFactory, RequestHeaders},
     protocols::spec::{CompletionRequest, GenerationRequest},
     routers::{http::vllm_pd_router::VllmPDRouter, RouterTrait},
@@ -23,6 +23,8 @@ use vllm_router_rs::{
 };
 /// What a [`RecordingPrefill`] saw: request text and headers per call.
 type RecordedCalls = Arc<Mutex<Vec<(Option<String>, Option<RequestHeaders>)>>>;
+type CapabilityHook = Arc<dyn Fn() -> Option<StatusCode> + Send + Sync>;
+type CompletionGate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 #[derive(Clone)]
 struct StateData {
@@ -33,11 +35,13 @@ struct StateData {
     partial: bool,
     fail_local: Arc<AtomicBool>,
     capability_probes: Arc<AtomicU64>,
+    on_capability_probe: Arc<Mutex<Option<CapabilityHook>>>,
     reject_status: Arc<AtomicU64>,
     large_text: Arc<AtomicUsize>,
     metrics_kv_milli: Arc<AtomicU64>,
     metrics_running: Arc<AtomicU64>,
     auth_gate: Arc<AtomicBool>,
+    prefill_gate: CompletionGate,
 }
 struct Engine {
     url: String,
@@ -58,11 +62,13 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         partial,
         fail_local: Arc::new(AtomicBool::new(false)),
         capability_probes: Arc::new(AtomicU64::new(0)),
+        on_capability_probe: Arc::new(Mutex::new(None)),
         reject_status: Arc::new(AtomicU64::new(0)),
         large_text: Arc::new(AtomicUsize::new(0)),
         metrics_kv_milli: Arc::new(AtomicU64::new(0)),
         metrics_running: Arc::new(AtomicU64::new(0)),
         auth_gate: Arc::new(AtomicBool::new(false)),
+        prefill_gate: Arc::new(Mutex::new(None)),
     };
     let app=Router::new().route("/health",get(||async{"ok"}))
         .route("/get_server_info",get(||async{Json(json!({"model_id":"test","data_parallel_size":1}))}))
@@ -74,6 +80,10 @@ async fn engine(p: bool, fail_warm: bool, partial: bool) -> Engine {
         }))
         .route("/pd_capabilities",get(|State(s):State<StateData>,headers:HeaderMap|async move{
             s.capability_probes.fetch_add(1,Ordering::SeqCst);
+            let hook = s.on_capability_probe.lock().unwrap().clone();
+            if let Some(status) = hook.and_then(|f| f()) {
+                return (status, "probe failed").into_response();
+            }
             if s.auth_gate.load(Ordering::SeqCst)
                 && headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) != Some("Bearer op-key")
             {
@@ -95,6 +105,11 @@ async fn generate(
     Json(r): Json<Value>,
 ) -> axum::response::Response {
     s.calls.lock().unwrap().push(r.clone());
+    let gate = s.prefill_gate.lock().unwrap().take();
+    if let Some((entered, release)) = gate {
+        entered.notify_one();
+        release.notified().await;
+    }
     if r.pointer("/kv_transfer_params/pd_probe_only") == Some(&json!(true)) {
         return Json(json!({"choices":[],"usage":{"prompt_tokens":r["prompt"].as_array().unwrap().len(),"completion_tokens":0},"kv_transfer_params":{"pd_probe":true,"pd_instance_epoch":s.epoch.load(Ordering::SeqCst).to_string(),"pd_feedback":{"local_cached_tokens":6}}})).into_response();
     }
@@ -204,6 +219,38 @@ async fn router_with_custom_prefill_policy(
     router_with_selection(&ctx, select, prefill_urls, d).await
 }
 
+async fn router_with_registry_and_policy(
+    prefills: &[&Engine],
+    d: &Engine,
+    select: Arc<dyn LoadBalancingPolicy>,
+    local: bool,
+    pd_extra: serde_json::Value,
+) -> (VllmPDRouter, Arc<vllm_router_rs::core::WorkerRegistry>) {
+    router_with_registry_policy_and_queue_timeout(prefills, d, select, local, pd_extra, 2.0).await
+}
+
+async fn router_with_registry_policy_and_queue_timeout(
+    prefills: &[&Engine],
+    d: &Engine,
+    select: Arc<dyn LoadBalancingPolicy>,
+    local: bool,
+    pd_extra: serde_json::Value,
+    queue_timeout_seconds: f64,
+) -> (VllmPDRouter, Arc<vllm_router_rs::core::WorkerRegistry>) {
+    let (cfg, prefill_urls) = warm_router_config_with_queue_timeout(
+        prefills,
+        d,
+        &PolicyConfig::RoundRobin,
+        local,
+        pd_extra,
+        queue_timeout_seconds,
+    );
+    let ctx = Arc::new(AppContext::new(cfg, reqwest::Client::new(), 64, None, vec![]).unwrap());
+    let registry = ctx.worker_registry.clone();
+    let router = router_with_selection(&ctx, select, prefill_urls, d).await;
+    (router, registry)
+}
+
 async fn router_with_selection(
     ctx: &Arc<AppContext>,
     select: Arc<dyn LoadBalancingPolicy>,
@@ -230,6 +277,17 @@ fn warm_router_config(
     local: bool,
     pd_extra: serde_json::Value,
 ) -> (RouterConfig, Vec<(String, Option<u16>)>) {
+    warm_router_config_with_queue_timeout(prefills, d, policy, local, pd_extra, 2.0)
+}
+
+fn warm_router_config_with_queue_timeout(
+    prefills: &[&Engine],
+    d: &Engine,
+    policy: &PolicyConfig,
+    local: bool,
+    pd_extra: serde_json::Value,
+    queue_timeout_seconds: f64,
+) -> (RouterConfig, Vec<(String, Option<u16>)>) {
     let prefill_urls = prefills
         .iter()
         .map(|p| (p.url.clone(), None))
@@ -252,7 +310,8 @@ fn warm_router_config(
             target.insert(key.clone(), value.clone());
         }
     }
-    cfg.program_scheduling=Some(serde_json::from_value(json!({"token_capacity_per_dp_rank":100000,"enable_batch_gain_admission":false,"decode_buffer_tokens":4,"metrics_interval_seconds":0.02,"queue_timeout_seconds":2,"force_resume_timeout_seconds":1,"pd":pd})).unwrap());
+    let force_resume_timeout_seconds = queue_timeout_seconds.min(1.0);
+    cfg.program_scheduling=Some(serde_json::from_value(json!({"token_capacity_per_dp_rank":100000,"enable_batch_gain_admission":false,"decode_buffer_tokens":4,"metrics_interval_seconds":0.02,"queue_timeout_seconds":queue_timeout_seconds,"force_resume_timeout_seconds":force_resume_timeout_seconds,"pd":pd})).unwrap());
     if local {
         let pd = &mut cfg.program_scheduling.as_mut().unwrap().pd;
         pd.local_append = true;
@@ -749,16 +808,50 @@ struct RecordingPrefill {
     needs_text: bool,
     needs_cache_key: bool,
     needs_headers: bool,
+    rotate: bool,
+    picks: Option<Vec<usize>>,
     calls: RecordedCalls,
     counter: AtomicUsize,
 }
 
 impl RecordingPrefill {
     fn new(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Self::with_rotation(needs_text, needs_cache_key, needs_headers, true)
+    }
+
+    fn pinned_first(needs_text: bool, needs_cache_key: bool, needs_headers: bool) -> Arc<Self> {
+        Self::with_rotation(needs_text, needs_cache_key, needs_headers, false)
+    }
+
+    fn scripted(
+        needs_text: bool,
+        needs_cache_key: bool,
+        needs_headers: bool,
+        picks: Vec<usize>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             needs_text,
             needs_cache_key,
             needs_headers,
+            rotate: false,
+            picks: Some(picks),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            counter: AtomicUsize::new(0),
+        })
+    }
+
+    fn with_rotation(
+        needs_text: bool,
+        needs_cache_key: bool,
+        needs_headers: bool,
+        rotate: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            needs_text,
+            needs_cache_key,
+            needs_headers,
+            rotate,
+            picks: None,
             calls: Arc::new(Mutex::new(Vec::new())),
             counter: AtomicUsize::new(0),
         })
@@ -780,7 +873,13 @@ impl LoadBalancingPolicy for RecordingPrefill {
             .lock()
             .unwrap()
             .push((request_text.map(str::to_string), headers.cloned()));
-        Some(self.counter.fetch_add(1, Ordering::SeqCst) % workers.len())
+        let pos = self.counter.fetch_add(1, Ordering::SeqCst);
+        let index = match &self.picks {
+            Some(picks) => picks.get(pos).copied().unwrap_or(0) % workers.len(),
+            None if self.rotate => pos % workers.len(),
+            None => 0,
+        };
+        Some(index)
     }
 
     fn name(&self) -> &'static str {
@@ -913,4 +1012,749 @@ async fn selection_uses_the_cache_routing_key_when_requested() {
         calls[0].1.is_none(),
         "headers were not requested but were attached"
     );
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_removed_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-race"));
+    let body = completion_body("race-removed", &[31, 32, 33], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected cold fallback re-selection to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(
+        calls[1]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-race")
+    );
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_becomes_unhealthy_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        let worker = reg.get_by_url(&p0_url).expect("prefill worker registered");
+        worker.set_healthy(false);
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-unhealthy"),
+    );
+    let body = completion_body("race-unhealthy", &[34, 35, 36], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected cold fallback re-selection to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn cold_fallback_returns_503_when_last_prefill_leaves_during_warm_probe() {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(false, false, false);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        Some(StatusCode::SERVICE_UNAVAILABLE)
+    }));
+
+    let body = completion_body("race-last", &[41, 42, 43], true, false);
+    let (status, _, resp_body) = send_completion(&r, None, body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    let body_text = String::from_utf8_lossy(&resp_body);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected early no-feasible 503 before reserve_prefill, got: {body_text}"
+    );
+}
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_is_removed_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        None
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-race-200"));
+    let body = completion_body("race-removed-200", &[44, 45, 46], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected re-selection after 200 probe race to succeed, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_becomes_unhealthy_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0, &p1], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0_url);
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        let worker = reg.get_by_url(&p0_url).expect("prefill worker registered");
+        worker.set_healthy(false);
+        None
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-unhealthy-200"),
+    );
+    let body = completion_body("race-unhealthy-200", &[47, 48, 49], true, false);
+    let (status, _, resp_body) = send_completion(&r, Some(&headers), body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected re-selection when P turned unhealthy with 200 probe, got body: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial + bounded re-selection: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn warm_probe_200_returns_no_feasible_when_last_prefill_leaves_during_probe() {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(false, false, false);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let reg = registry.clone();
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        assert!(reg.remove_by_url(&p0_url).is_some());
+        None
+    }));
+
+    let body = completion_body("race-last-200", &[51, 52, 53], true, false);
+    let (status, _, resp_body) = send_completion(&r, None, body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert!(p0.state.calls.lock().unwrap().is_empty());
+    let body_text = String::from_utf8_lossy(&resp_body);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected early no-feasible 503 instead of stale epoch error, got: {body_text}"
+    );
+}
+
+async fn wait_for_worker_load(worker: &dyn Worker, expected: usize, at_least: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let current = worker.load();
+            if if at_least {
+                current >= expected
+            } else {
+                current == expected
+            } {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for worker load");
+}
+
+async fn run_capacity_wait_circuit_breaker_race(
+    prefills: &[&Engine],
+    policy: Arc<RecordingPrefill>,
+    headers: Option<HeaderMap>,
+) -> (StatusCode, Vec<u8>) {
+    let p0 = prefills[0];
+    let d = engine(false, false, false).await;
+    let (r, registry) = router_with_registry_and_policy(
+        prefills,
+        &d,
+        policy,
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry
+        .get_by_url(&p0.url)
+        .expect("prefill worker registered");
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0.url);
+    let rev_before = registry.revision();
+
+    // Populate warm capability cache for p0 and d before taking the capacity slot.
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("cb-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let r1 = Arc::clone(&r);
+    let req1 = tokio::spawn(async move {
+        send_completion(
+            &r1,
+            None,
+            completion_body("cb-hold", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("timed out waiting for req1 to enter prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let r2 = Arc::clone(&r);
+    let req2 = tokio::spawn(async move {
+        send_completion(
+            &r2,
+            headers.as_ref(),
+            completion_body("cb-wait", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    // Allow req2 to park on reserve_prefill before tripping p0's circuit breaker.
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    p0_worker.circuit_breaker().force_open();
+    assert!(!p0_worker.is_available());
+    assert_eq!(registry.revision(), rev_before);
+
+    release.notify_one();
+    let (status1, _, body1) = req1.await.unwrap();
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "holding request failed: {}",
+        String::from_utf8_lossy(&body1)
+    );
+    let (status2, _, body2) = req2.await.unwrap();
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    (status2, body2)
+}
+
+#[tokio::test]
+async fn capacity_wait_reselects_when_prefill_circuit_breaker_opens() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(true, false, true);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-session-id", HeaderValue::from_static("session-cb-wait"));
+
+    let (status2, body2) =
+        run_capacity_wait_circuit_breaker_race(&[&p0, &p1], policy.clone(), Some(headers)).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "expected reselection after circuit breaker opened during capacity wait, got: {}",
+        String::from_utf8_lossy(&body2)
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "expected warmup + hold + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[2], calls[3]);
+    assert_eq!(
+        calls[3]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-cb-wait")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_returns_no_feasible_when_last_prefill_circuit_breaker_opens() {
+    let p0 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(false, false, false);
+
+    let (status2, body2) = run_capacity_wait_circuit_breaker_race(&[&p0], policy, None).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    let body_text = String::from_utf8_lossy(&body2);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected no-feasible 503 after last prefill tripped circuit breaker during wait, got: {body_text}"
+    );
+}
+
+async fn run_capacity_wait_timeout_liveness_race(
+    prefills: &[&Engine],
+    policy: Arc<RecordingPrefill>,
+    headers: Option<HeaderMap>,
+    queue_timeout_seconds: f64,
+) -> (StatusCode, Vec<u8>) {
+    let p0 = prefills[0];
+    let d = engine(false, false, false).await;
+    let (r, registry) = router_with_registry_policy_and_queue_timeout(
+        prefills,
+        &d,
+        policy,
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+        queue_timeout_seconds,
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry
+        .get_by_url(&p0.url)
+        .expect("prefill worker registered");
+    assert_eq!(registry.get_prefill_workers()[0].url(), p0.url);
+
+    // Populate warm capability cache for p0 and d before taking the capacity slot.
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("timeout-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let r1 = Arc::clone(&r);
+    let req1 = tokio::spawn(async move {
+        send_completion(
+            &r1,
+            None,
+            completion_body("timeout-hold", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("timed out waiting for req1 to enter prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let r2 = Arc::clone(&r);
+    let req2 = tokio::spawn(async move {
+        send_completion(
+            &r2,
+            headers.as_ref(),
+            completion_body("timeout-wait", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    // Allow req2 to park on reserve_prefill before tripping p0 while req1 keeps holding the slot.
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    p0_worker.circuit_breaker().force_open();
+    assert!(!p0_worker.is_available());
+
+    let (status2, _, body2) = req2.await.unwrap();
+    release.notify_one();
+    let (status1, _, body1) = req1.await.unwrap();
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "holding request failed: {}",
+        String::from_utf8_lossy(&body1)
+    );
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    (status2, body2)
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_reselects_when_prefill_leaves_while_slot_held() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(true, false, true);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-timeout-wait"),
+    );
+
+    let (status2, body2) =
+        run_capacity_wait_timeout_liveness_race(&[&p0, &p1], policy.clone(), Some(headers), 0.25)
+            .await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "expected reselection after timeout when prefill left while slot stayed held, got: {}",
+        String::from_utf8_lossy(&body2)
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        4,
+        "expected warmup + hold + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[2], calls[3]);
+    assert_eq!(
+        calls[3]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-timeout-wait")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_reselect_preserves_overall_deadline_when_sibling_saturated() {
+    let p0 = engine(true, false, false).await;
+    let p1 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::scripted(true, false, true, vec![0, 1, 0, 0, 0]);
+    let (r, registry) = router_with_registry_policy_and_queue_timeout(
+        &[&p0, &p1],
+        &d,
+        policy.clone(),
+        false,
+        json!({"max_prefill_requests_per_target": 1}),
+        0.4,
+    )
+    .await;
+    let r = Arc::new(r);
+    let p0_worker = registry.get_by_url(&p0.url).expect("p0 worker registered");
+    let p1_worker = registry.get_by_url(&p1.url).expect("p1 worker registered");
+
+    let (warm_status, _, warm_body) = send_completion(
+        &r,
+        None,
+        completion_body("timeout-deadline-warm", &[10, 11, 12], true, false),
+    )
+    .await;
+    assert_eq!(
+        warm_status,
+        StatusCode::OK,
+        "warmup turn failed: {}",
+        String::from_utf8_lossy(&warm_body)
+    );
+    wait_for_worker_load(p0_worker.as_ref(), 0, false).await;
+
+    let p1_entered = Arc::new(tokio::sync::Notify::new());
+    let p1_release = Arc::new(tokio::sync::Notify::new());
+    *p1.state.prefill_gate.lock().unwrap() = Some((p1_entered.clone(), p1_release.clone()));
+    let r_p1 = Arc::clone(&r);
+    let req_p1 = tokio::spawn(async move {
+        send_completion(
+            &r_p1,
+            None,
+            completion_body("timeout-hold-p1", &[20, 21, 22], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), p1_entered.notified())
+        .await
+        .expect("timed out waiting for req_p1 to enter p1 prefill gate");
+    assert_eq!(p1_worker.load(), 1);
+
+    let p0_entered = Arc::new(tokio::sync::Notify::new());
+    let p0_release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((p0_entered.clone(), p0_release.clone()));
+    let r_p0 = Arc::clone(&r);
+    let req_p0 = tokio::spawn(async move {
+        send_completion(
+            &r_p0,
+            None,
+            completion_body("timeout-hold-p0", &[25, 26, 27], true, false),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), p0_entered.notified())
+        .await
+        .expect("timed out waiting for req_p0 to enter p0 prefill gate");
+    assert_eq!(p0_worker.load(), 1);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-timeout-deadline"),
+    );
+    let started = std::time::Instant::now();
+    let r_wait = Arc::clone(&r);
+    let req_wait = tokio::spawn(async move {
+        send_completion(
+            &r_wait,
+            Some(&headers),
+            completion_body("timeout-wait-saturated", &[30, 31, 32], true, false),
+        )
+        .await
+    });
+    wait_for_worker_load(p0_worker.as_ref(), 2, true).await;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    p0_worker.circuit_breaker().force_open();
+
+    let (status_wait, _, body_wait) = req_wait.await.unwrap();
+    let elapsed = started.elapsed();
+    p0_release.notify_one();
+    p1_release.notify_one();
+    assert_eq!(req_p0.await.unwrap().0, StatusCode::OK);
+    assert_eq!(req_p1.await.unwrap().0, StatusCode::OK);
+
+    assert_eq!(
+        status_wait,
+        StatusCode::TOO_MANY_REQUESTS,
+        "expected queue timeout 429 on saturated sibling after reselection, got: {}",
+        String::from_utf8_lossy(&body_wait)
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(350)
+            && elapsed < std::time::Duration::from_millis(650),
+        "expected single 0.4s overall queue timeout across reselection, elapsed={elapsed:?}"
+    );
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    assert_eq!(p1.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        5,
+        "expected warmup + hold_p1 + hold_p0 + wait + reselect calls: {calls:?}"
+    );
+    assert_eq!(calls[3], calls[4]);
+    assert_eq!(
+        calls[4]
+            .1
+            .as_ref()
+            .and_then(|h| h.get("x-session-id"))
+            .map(String::as_str),
+        Some("session-timeout-deadline")
+    );
+}
+
+#[tokio::test]
+async fn capacity_wait_timeout_returns_no_feasible_when_last_prefill_leaves_while_slot_held() {
+    let p0 = engine(true, false, false).await;
+    let policy = RecordingPrefill::pinned_first(false, false, false);
+
+    let (status2, body2) =
+        run_capacity_wait_timeout_liveness_race(&[&p0], policy, None, 0.25).await;
+    assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 2);
+    let body_text = String::from_utf8_lossy(&body2);
+    assert!(
+        body_text.contains("No feasible registered P/D pair"),
+        "expected no-feasible 503 after last prefill left during timeout wait, got: {body_text}"
+    );
+}
+
+async fn run_same_url_incarnation_replacement_test(
+    remove_first: bool,
+    probe_status: Option<StatusCode>,
+) {
+    let p0 = engine(true, false, false).await;
+    let d = engine(false, false, false).await;
+    let policy = RecordingPrefill::new(true, false, true);
+    let (r, registry) =
+        router_with_registry_and_policy(&[&p0], &d, policy.clone(), false, json!({})).await;
+    let p0_url = p0.url.clone();
+    let retired = registry.get_by_url(&p0_url).expect("p0 worker registered");
+    let replacement: Arc<dyn Worker> = Arc::new(
+        BasicWorker::new(
+            p0_url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        )
+        .with_labels(std::collections::HashMap::from([(
+            "incarnation".to_string(),
+            "replacement".to_string(),
+        )])),
+    );
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *p0.state.prefill_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let reg = registry.clone();
+    let rep_for_hook = Arc::clone(&replacement);
+    let url_for_hook = p0_url.clone();
+    let replaced = Arc::new(AtomicBool::new(false));
+    *p0.state.on_capability_probe.lock().unwrap() = Some(Arc::new(move || {
+        if !replaced.swap(true, Ordering::SeqCst) {
+            if remove_first {
+                assert!(reg.remove_by_url(&url_for_hook).is_some());
+            }
+            reg.register(Arc::clone(&rep_for_hook));
+        }
+        probe_status
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_static("session-incarnation"),
+    );
+    let r = Arc::new(r);
+    let r_req = Arc::clone(&r);
+    let body = completion_body("incarnation-replace", &[41, 42, 43], true, false);
+    let req = tokio::spawn(async move { send_completion(&r_req, Some(&headers), body).await });
+
+    let entered_wait =
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified()).await;
+    if entered_wait.is_err() {
+        release.notify_one();
+        let (status, _, resp_body) = req.await.unwrap();
+        panic!(
+            "request did not reach prefill dispatch; status={status}, body={}",
+            String::from_utf8_lossy(&resp_body)
+        );
+    }
+
+    let retired_load = retired.load();
+    let replacement_load = replacement.load();
+    release.notify_one();
+
+    let (status, _, resp_body) = req.await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected same-URL replacement to succeed after re-selection, got: {}",
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert_eq!(retired_load, 0, "cold dispatch charged the retired worker");
+    assert_eq!(
+        replacement_load, 1,
+        "cold dispatch did not charge the replacement worker"
+    );
+    assert_eq!(replacement.load(), 0);
+    assert_eq!(p0.state.capability_probes.load(Ordering::SeqCst), 1);
+    assert_eq!(p0.state.calls.lock().unwrap().len(), 1);
+    let calls = policy.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected initial selection + re-selection on incarnation change: {calls:?}"
+    );
+    assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_replaced_at_same_url_during_warm_probe() {
+    run_same_url_incarnation_replacement_test(true, Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+}
+
+#[tokio::test]
+async fn cold_fallback_reselects_when_prefill_is_overwritten_in_place_at_same_url() {
+    run_same_url_incarnation_replacement_test(false, Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+}
+
+#[tokio::test]
+async fn warm_probe_200_reselects_when_prefill_is_replaced_at_same_url_during_probe() {
+    run_same_url_incarnation_replacement_test(true, None).await;
 }

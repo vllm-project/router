@@ -27,7 +27,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
@@ -302,9 +302,14 @@ impl PdProgramRuntime {
         )))
     }
 
-    pub async fn reserve_prefill(
+    pub(super) fn prefill_wait_deadline(&self) -> Instant {
+        Instant::now() + self.queue_timeout
+    }
+
+    pub(super) async fn reserve_prefill_until(
         &self,
         worker_id: &str,
+        deadline: Instant,
     ) -> Result<OwnedSemaphorePermit, ScheduleError> {
         let gate = self
             .prefill_gates
@@ -312,10 +317,27 @@ impl PdProgramRuntime {
             .entry(worker_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.prefill_limit)))
             .clone();
-        tokio::time::timeout(self.queue_timeout, gate.acquire_owned())
+        match gate.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(ScheduleError::NoTargets),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ScheduleError::QueueTimeout);
+        }
+        tokio::time::timeout(remaining, gate.acquire_owned())
             .await
             .map_err(|_| ScheduleError::QueueTimeout)?
             .map_err(|_| ScheduleError::NoTargets)
+    }
+
+    pub async fn reserve_prefill(
+        &self,
+        worker_id: &str,
+    ) -> Result<OwnedSemaphorePermit, ScheduleError> {
+        self.reserve_prefill_until(worker_id, self.prefill_wait_deadline())
+            .await
     }
 }
 
