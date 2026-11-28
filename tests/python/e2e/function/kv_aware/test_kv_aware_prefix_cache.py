@@ -17,7 +17,7 @@ from tests.python.e2e.function.kv_aware.config import (
     kv_aware_request_log_poll_sec,
     kv_aware_reuse_rounds,
 )
-from tests.python.e2e.function.kv_aware.dataset import (
+from tests.python.e2e.function.kv_aware.request_builder import (
     lane_prefix,
     lane_prime_user,
     lane_reuse_user,

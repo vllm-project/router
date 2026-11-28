@@ -174,6 +174,24 @@ def kv_scenario(kv_workers, kv_st_runtime, kv_tokenizer, router_manager):
 
 
 @pytest.mark.integration
+def test_kv_aware_routes_distinct_prefixes_to_cache_holders(kv_scenario):
+    st = kv_scenario()
+    a, b = st.workers
+    prefix_a = " ".join(f"t{i}" for i in range(16))
+    prefix_b = " ".join(f"t{i}" for i in range(16, 32))
+
+    st.publish_applied(a, [a.store(st.tokens(f"{prefix_a} t32")[:16])])
+    st.publish_applied(b, [b.store(st.tokens(f"{prefix_b} t32")[:16])])
+
+    # Both probes change the final token and run on the same HTTP session.
+    reuse_a = f"{prefix_a} t33"
+    reuse_b = f"{prefix_b} t33"
+    for _ in range(5):
+        assert st.choose(reuse_b) is b
+        assert st.choose(reuse_a) is a
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "invalidation", ["remove", "clear", "gap", "restart", "malformed"]
 )

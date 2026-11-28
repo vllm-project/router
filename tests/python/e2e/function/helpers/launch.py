@@ -1,16 +1,21 @@
-"""Launch vllm-router and vllm-rs workers for tests/python/e2e/function (no vllm.test import)."""
+"""Launch vllm-router and workers for the functional E2E tests."""
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -88,26 +93,89 @@ def find_available_port() -> int:
 
 
 def find_distinct_available_ports(count: int) -> list[int]:
-    """Return ``count`` unique ephemeral ports on 127.0.0.1 (hold until allocated)."""
+    """Find free ports; delayed binders must keep ``reserve_available_ports`` open."""
+    with reserve_available_ports(count) as ports:
+        return ports
+
+
+def _port_candidates() -> list[int]:
+    # Engine listeners and outgoing connections use bind(0) during model loading.
+    # Keep delayed ZMQ listeners out of that automatically allocated range.
+    low, high = 32768, 65535
+    if sys.platform == "linux":
+        try:
+            values = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+            start, end = map(int, values)
+            if 0 < start <= end <= 65535:
+                low, high = start, end
+        except (OSError, ValueError):
+            pass
+    ports = [port for port in range(10000, 65536) if not low <= port <= high]
+    random.SystemRandom().shuffle(ports)
+    return ports
+
+
+def _try_port_lease(directory: Path, port: int):
+    """Keep an OS file lock until the test stack stops, including process crashes."""
+    lease = (directory / f"{port}.lock").open("a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            if lease.tell() == 0:
+                lease.write(b"\0")
+                lease.flush()
+            lease.seek(0)
+            msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        lease.close()
+        if error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return None
+        raise
+    return lease
+
+
+@contextmanager
+def reserve_available_ports(count: int):
+    """Lease random free TCP ports across cooperating E2E processes.
+
+    Probe all IPv4 interfaces, matching ZMQ's wildcard bind. File locks let
+    workers bind later without another test choosing their unbound ports.
+    They do not occupy TCP sockets, and the OS releases them on process exit.
+    """
     if count < 1:
         raise ValueError("count must be >= 1")
+    directory = Path(tempfile.gettempdir()) / "vllm-router-e2e-ports"
+    directory.mkdir(exist_ok=True)
     ports: list[int] = []
-    sockets: list[socket.socket] = []
-    try:
-        while len(ports) < count:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-            if port not in ports:
-                ports.append(port)
-                sockets.append(s)
-            else:
-                s.close()
-        return ports
-    finally:
-        for s in sockets:
-            s.close()
+    with ExitStack() as leases:
+        for port in _port_candidates():
+            lease = _try_port_lease(directory, port)
+            if lease is None:
+                continue
+            leases.enter_context(lease)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    if sys.platform == "win32":
+                        probe.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                        )
+                    probe.bind(("0.0.0.0", port))
+            except OSError as error:
+                lease.close()
+                if error.errno in (errno.EADDRINUSE, errno.EACCES):
+                    continue
+                raise
+            ports.append(port)
+            if len(ports) == count:
+                break
+        if len(ports) != count:
+            raise RuntimeError(f"Could not reserve {count} free E2E TCP ports")
+        yield ports
 
 
 def _parse_url(base_url: str) -> tuple[str, str]:
@@ -144,10 +212,14 @@ def wait_worker_health(
     raise TimeoutError(f"Worker failed to become healthy in time: {health_url}")
 
 
-def wait_router_health(base_url: str, timeout: float) -> None:
+def wait_router_health(
+    base_url: str, timeout: float, proc: subprocess.Popen | None = None
+) -> None:
     start = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start < timeout:
+            if proc is not None and (code := proc.poll()) is not None:
+                raise TimeoutError(f"Router exited with code {code}: {base_url}")
             try:
                 r = session.get(f"{base_url}/health", timeout=5)
                 if r.status_code == 200:
@@ -185,6 +257,7 @@ def kv_events_config_argv(
     replay_port: int | None = None,
     endpoint_bind: str = "*",
     replay_host: str = "127.0.0.1",
+    topic: str | None = None,
 ) -> list[str]:
     """``--kv-events-config`` JSON. Replay is included only when ``replay_port`` is set."""
     payload: dict[str, object] = {
@@ -195,7 +268,40 @@ def kv_events_config_argv(
     }
     if replay_port is not None:
         payload["replay_endpoint"] = f"tcp://{replay_host}:{replay_port}"
+    if topic is not None:
+        payload["topic"] = topic
     return ["--kv-events-config", json.dumps(payload, separators=(",", ":"))]
+
+
+def _cuda_visible_devices(gpu_ids: int | list[int]) -> str:
+    if isinstance(gpu_ids, int):
+        return str(gpu_ids)
+    return ",".join(map(str, gpu_ids))
+
+
+def popen_launch_vllm_http_worker(
+    executable: str,
+    model: str,
+    base_url: str,
+    *,
+    gpu_id: int | list[int],
+    hash_seed: str,
+    extra_argv: list[str],
+    log_file: TextIO,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    """Launch an HTTP worker that publishes full KV block hashes."""
+    host, port = _parse_url(base_url)
+    env = {
+        **os.environ,
+        **(extra_env or {}),
+        "CUDA_VISIBLE_DEVICES": _cuda_visible_devices(gpu_id),
+        "PYTHONHASHSEED": hash_seed,
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
+        "VLLM_USE_RUST_FRONTEND": "0",
+    }
+    cmd = [executable, "serve", model, "--host", host, "--port", port, *extra_argv]
+    return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
 
 
 def resolve_worker_serve_launch(
@@ -227,30 +333,39 @@ def popen_launch_vllm_rs_grpc_worker(
     host: str = "127.0.0.1",
     http_port: int,
     grpc_port: int,
-    base_gpu_id: int = 0,
+    base_gpu_id: int | list[int] = 0,
     kv_events_zmq_port: int | None = None,
     kv_events_replay_port: int | None = None,
+    kv_events_topic: str | None = None,
     extra_argv: list[str] | None = None,
     endpoint_bind: str = "*",
     replay_host: str = "127.0.0.1",
     prefer_vllm_serve: bool = False,
     capture_output: bool = False,
+    hash_seed: str | None = None,
+    log_file: TextIO | None = None,
+    extra_env: dict[str, str | None] | None = None,
 ) -> subprocess.Popen:
     """``vllm-rs serve`` with HTTP + ``--grpc-port``.
 
     KV-event flags are appended only when ``kv_events_zmq_port`` is set.
     ``--grpc-port`` is passed only on this ``vllm-rs`` path.
 
-    When ``capture_output`` is true, stdout/stderr are merged into a PIPE for
-    ``SubprocessLogPump`` (do not pass a custom stdout object).
+    Set ``hash_seed`` to publish full, reproducible KV hashes. Stdout and
+    stderr go to ``log_file`` or, with ``capture_output``, a log pump PIPE.
+    Values of ``None`` in ``extra_env`` remove inherited variables.
     """
     kind, prefix = resolve_worker_serve_launch(prefer_vllm_serve=prefer_vllm_serve)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(base_gpu_id)
+    env = {
+        key: value
+        for key, value in {**os.environ, **(extra_env or {})}.items()
+        if value is not None
+    }
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(base_gpu_id)
     # HIP and CUDA index the agent list already filtered by ROCR. Keep an
     # inherited ROCR mask intact, but align HIP with the narrowed CUDA index.
     if "HIP_VISIBLE_DEVICES" in env:
-        env["HIP_VISIBLE_DEVICES"] = str(base_gpu_id)
+        env["HIP_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"]
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None:
         # The router discovers one full-attention group with the default hash root.
@@ -265,6 +380,7 @@ def popen_launch_vllm_rs_grpc_worker(
                 replay_port=kv_events_replay_port,
                 endpoint_bind=endpoint_bind,
                 replay_host=replay_host,
+                topic=kv_events_topic,
             ),
         ]
     cmd = [
@@ -278,6 +394,9 @@ def popen_launch_vllm_rs_grpc_worker(
         str(grpc_port),
         *serve_tail,
     ]
+    if hash_seed is not None:
+        env["PYTHONHASHSEED"] = hash_seed
+        env["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] = "0"
     zmq_note = f" kv_events_zmq={kv_events_zmq_port}" if kv_events_zmq_port else ""
     replay_note = (
         f" kv_events_replay={kv_events_replay_port}"
@@ -298,6 +417,9 @@ def popen_launch_vllm_rs_grpc_worker(
         popen_kw["encoding"] = "utf-8"
         popen_kw["errors"] = "replace"
         popen_kw["bufsize"] = 1
+    elif log_file is not None:
+        popen_kw["stdout"] = log_file
+        popen_kw["stderr"] = subprocess.STDOUT
     return subprocess.Popen(cmd, **popen_kw)
 
 
@@ -312,6 +434,9 @@ def popen_launch_router_only(
     router_temperature: float | None = None,
     worker_urls: list[str] | None = None,
     router_model: str | None = None,
+    extra_argv: list[str] | None = None,
+    log_level: str | None = None,
+    log_file: TextIO | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
     prom_port = find_available_port()
@@ -347,19 +472,25 @@ def popen_launch_router_only(
         "--prometheus-host",
         "127.0.0.1",
     ]
-    env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    if extra_argv:
+        cmd.extend(extra_argv)
+    if log_level is None:
+        env.setdefault("RUST_LOG", "vllm_router_rs=info")
+    else:
+        env["RUST_LOG"] = f"vllm_router_rs={log_level}"
     env.setdefault("VLLM_ROUTER_STAGES", "1")
-    # Inherit stdio so ``pytest -s`` shows router tracing (same as vllm-rs workers).
+    # With no log file, inherit stdio so pytest -s shows router tracing.
     print(f"[e2e] starting router {base_url} policy={policy!r}", flush=True)
     print(f"[e2e] router cmd: {cmd!r}", flush=True)
-    proc = subprocess.Popen(cmd, env=env)
+    output = {"stdout": log_file, "stderr": subprocess.STDOUT} if log_file else {}
+    proc = subprocess.Popen(cmd, env=env, **output)
     try:
-        wait_router_health(base_url, timeout)
+        wait_router_health(base_url, timeout, proc)
     except TimeoutError as exc:
-        if proc.poll() is None:
-            proc.kill()
+        terminate_process(proc)
+        log_location = str(log_file.name) if log_file else "this terminal"
         raise TimeoutError(
-            f"{exc}\nrouter cmd: {cmd!r}\n(router logs were streamed to this terminal)"
+            f"{exc}\nrouter cmd: {cmd!r}\n(router logs: {log_location})"
         ) from exc
     return proc
 

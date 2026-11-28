@@ -1,7 +1,8 @@
-"""Model and prompt constants for kv_aware functional e2e.
+"""Case settings and prompt constants for kv_aware functional e2e.
 
-Workers: **``vllm-rs serve``** with ``grpc://`` URLs (see ``scripts/backend``).
-``vllm serve`` does not accept ``--grpc-port`` (``docs/backend/grpc.md``).
+The dual-lane case uses ``vllm-rs serve`` with gRPC. The hybrid case covers
+both ``vllm serve`` with HTTP and ``vllm-rs serve`` with gRPC. Default worker
+settings live in ``cases/``.
 
 Optional environment (see also ``function/helpers/launch.py``):
 
@@ -11,11 +12,15 @@ Optional environment (see also ``function/helpers/launch.py``):
 - Model for workers + router (HF id or local dir), first match wins:
   ``KV_AWARE_E2E_MODEL``, ``MODEL``, ``VLLM_ROUTER_MODEL``, ``MODEL_DIR``;
   default ``Qwen/Qwen3-0.6B`` (see ``kv_aware_e2e_model()``).
+- ``KV_AWARE_HYBRID_MODEL``: optional local Qwen3.5-4B checkpoint.
+- ``KV_AWARE_HYBRID_QWEN3_8_27B_MODEL``: optional local Qwen3.8-27B checkpoint.
+  Each hybrid case declares its local checkpoint variable in
+  ``cases/hybrid_model/*.json``.
 - ``KV_AWARE_USE_VLLM_SERVE``: ``0`` (default) use ``vllm-rs serve``.
   ``1`` is rejected: ``vllm serve`` cannot be a ``grpc://`` worker.
 - Worker serve extras (shell-split, first set wins):
   ``KV_AWARE_WORKER_SERVE_EXTRA``, ``VLLM_SERVE_EXTRA``, ``VLLM_RS_SERVE_EXTRA``;
-  default ``--enable-prefix-caching`` when all unset.
+  defaults to the worker arguments in ``cases/qwen3_0_6b.json`` when all unset.
 - ``KV_AWARE_KV_EVENTS``: ``1`` (default) append ``--kv-events-config`` per worker; ``0`` to disable.
 - ``KV_AWARE_KV_EVENTS_REPLAY``: ``1`` (default) add ``replay_endpoint`` per worker (DEALER replay).
 - ``KV_AWARE_KV_EVENTS_ENDPOINT_BIND``: PUB bind in JSON ``endpoint`` (default ``*`` → ``tcp://*:port``).
@@ -25,12 +30,12 @@ Optional environment (see also ``function/helpers/launch.py``):
 - Worker logs: subprocess PIPE → log file + stderr echo when ``pytest -s`` unless
   ``KV_AWARE_WORKER_LOG_QUIET=1`` (file-only under ``[e2e] worker logs: ...``).
 
-Worker GPUs (two worker serve processes):
+Worker GPUs:
 
-- If ``CUDA_VISIBLE_DEVICES`` is set (e.g. ``0,1,2,3`` or ``2,3,4,5``), worker A/B
-  use the **first two entries** in that list (physical ids).
-- If unset, query the machine via ``nvidia-smi`` and use physical ``0`` and ``1``
-  (requires at least two GPUs on the host).
+- Use GPU IDs from ``CUDA_VISIBLE_DEVICES``, or query ``nvidia-smi`` when unset.
+- The dual-lane case uses two workers with one GPU each. Hybrid merge cases
+  may use one worker; 1P1D uses two. Each worker gets a distinct GPU slice
+  based on its tensor parallel size.
 
 Routing scenario (``test_kv_aware_*`` under ``kv_aware/``):
 
@@ -45,12 +50,26 @@ contract, two-worker prime, index settle, then **first B reuse before any A reus
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
+from pathlib import Path
+from typing import Any
 
-# Default when no model env is set (see ``kv_aware_e2e_model()``).
-KV_AWARE_E2E_MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
+
+def load_kv_aware_case(name: str) -> dict[str, Any]:
+    path = Path(__file__).with_name("cases") / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_hybrid_kv_aware_cases() -> dict[str, dict[str, Any]]:
+    """Load complete hybrid scenarios keyed by filename."""
+    directory = Path(__file__).with_name("cases") / "hybrid_model"
+    paths = sorted(directory.glob("*.json"))
+    if not paths:
+        raise ValueError(f"No hybrid KV-aware cases found in {directory}")
+    return {path.stem: json.loads(path.read_text(encoding="utf-8")) for path in paths}
 
 
 def kv_aware_e2e_model() -> str:
@@ -59,7 +78,7 @@ def kv_aware_e2e_model() -> str:
         raw = os.environ.get(key, "").strip()
         if raw:
             return raw
-    return KV_AWARE_E2E_MODEL_DEFAULT
+    return load_kv_aware_case("qwen3_0_6b")["model"]
 
 
 # Independent long prefixes so two lanes do not share KV block hashes.
@@ -130,7 +149,7 @@ def worker_serve_extra_argv() -> list[str]:
         raw = os.environ.get(key, "").strip()
         if raw:
             return shlex.split(raw)
-    return ["--enable-prefix-caching"]
+    return load_kv_aware_case("qwen3_0_6b")["worker_args"]
 
 
 def _parse_cuda_visible_device_list(raw: str) -> list[int]:
@@ -156,25 +175,24 @@ def _machine_physical_gpu_indices() -> list[int]:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
             "CUDA_VISIBLE_DEVICES is unset and nvidia-smi failed; "
-            "set CUDA_VISIBLE_DEVICES to at least two GPU ids"
+            "set CUDA_VISIBLE_DEVICES to the available GPU ids"
         ) from exc
     indices = [int(line.strip()) for line in out.splitlines() if line.strip()]
-    if len(indices) < 2:
+    if not indices:
         raise RuntimeError(
-            f"kv_aware e2e needs at least two GPUs; nvidia-smi reported {indices!r}"
+            f"kv_aware e2e needs at least one GPU; nvidia-smi reported {indices!r}"
         )
     return indices
 
 
 def kv_aware_gpu_pool() -> list[int]:
-    """Ordered physical GPU ids available for picking worker A/B."""
+    """Ordered physical GPU ids available for assigning workers."""
     raw = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw is not None and raw.strip():
         pool = _parse_cuda_visible_device_list(raw.strip())
-        if len(pool) < 2:
+        if not pool:
             raise RuntimeError(
-                f"CUDA_VISIBLE_DEVICES={raw!r} lists fewer than two GPUs; "
-                "kv_aware e2e needs two worker GPUs"
+                f"CUDA_VISIBLE_DEVICES={raw!r} does not list any GPU ids"
             )
         return pool
     return _machine_physical_gpu_indices()
@@ -183,4 +201,6 @@ def kv_aware_gpu_pool() -> list[int]:
 def kv_aware_worker_gpu_ids() -> tuple[int, int]:
     """Physical GPU indices for worker A and worker B (first two in the pool)."""
     pool = kv_aware_gpu_pool()
+    if len(pool) < 2:
+        raise RuntimeError("The dual-lane case requires at least two GPUs")
     return pool[0], pool[1]

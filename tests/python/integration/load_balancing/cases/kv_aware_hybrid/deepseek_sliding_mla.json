@@ -1,0 +1,14 @@
+{
+  "rank": {
+    "hash_block_size": 4,
+    "partial_hash_hits": false,
+    "speculative_tokens": 0,
+    "groups": [
+      {"kind": "sliding_window_mla", "block_size": 16, "sliding_window": 16},
+      {"kind": "sliding_window_mla", "block_size": 16, "sliding_window": 32},
+      {"kind": "mla_attention", "block_size": 16, "cache_role": "sparse", "tokens_per_state": "4"},
+      {"kind": "scratch", "block_size": 4, "tokens_per_state": "1"}
+    ]
+  },
+  "expected": {"whole": 32, "short": 16, "rival": 20, "partial": 16, "partial_worker": "b"}
+}

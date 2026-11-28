@@ -21,8 +21,11 @@ pytestmark = [pytest.mark.ready, pytest.mark.cpu]
         ("4,5", None),
     ],
 )
-@pytest.mark.parametrize("gpu_id", [0, 1])
-def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id):
+@pytest.mark.parametrize(
+    "gpu_id,expected",
+    [(0, "0"), (1, "1"), pytest.param([0, 1], "0,1", id="tensor-parallel")],
+)
+def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id, expected):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     if hip_mask is None:
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
@@ -46,11 +49,11 @@ def test_worker_gpu_masks(monkeypatch, hip_mask, rocr_mask, gpu_id):
     )
 
     child_env = popen.call_args.kwargs["env"]
-    assert child_env["CUDA_VISIBLE_DEVICES"] == str(gpu_id)
+    assert child_env["CUDA_VISIBLE_DEVICES"] == expected
     if hip_mask is None:
         assert "HIP_VISIBLE_DEVICES" not in child_env
     else:
-        assert child_env["HIP_VISIBLE_DEVICES"] == str(gpu_id)
+        assert child_env["HIP_VISIBLE_DEVICES"] == expected
     if rocr_mask is None:
         assert "ROCR_VISIBLE_DEVICES" not in child_env
     else:
