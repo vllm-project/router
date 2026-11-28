@@ -287,6 +287,8 @@ Exactness covers only the input IDs sent to the Engine. Future output length, th
 
 `auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; the generic schema uses `x-session-id`. Recognized schemas are not mixed.
 
+Header-only Codex traffic is mapped into workflow classification automatically: `workflow_profile_id=codex`, `spawn_reason`/`agent_role` from `x-openai-subagent` or `x-codex-turn-metadata.request_kind`, and `expected_resume` from terminal kinds such as compaction. Parent lineage may also use `x-codex-parent-thread-id`. Claude/generic header schemas stay identity-only. Canonical `agentic_context` and `agent_hint` still take precedence when present.
+
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 
 ## Resume ordering and capacity

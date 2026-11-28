@@ -147,6 +147,25 @@ seat. It does not reserve physical vLLM KV. To make a retained seat useful:
 - verify actual cached prompt tokens, because physical eviction can still
   remove a logically retained prefix.
 
+## Codex header compatibility
+
+When `program_scheduling_enable_key` is `auto`, the Router matches one known
+Header schema (Claude Code, Codex/OpenCode, or generic `x-session-id`) and
+never mixes them. Codex/OpenCode also maps native stage headers into workflow
+prediction fields without a client shim:
+
+| Prediction field | Codex source |
+| --- | --- |
+| `workflow_profile_id` | fixed `codex` |
+| `profile_version` | `x-codex-version` or `version`, else `1` |
+| `spawn_reason` | `x-openai-subagent`, else `x-codex-turn-metadata.request_kind`, else `turn` |
+| `agent_role` | subagent stage when `x-openai-subagent` is present, else `lead` |
+| `expected_resume` | `false` for terminal kinds (`compaction` / `memory` / `prewarm` / `compact`), otherwise `true` |
+| `parent_program_id` | derived from `x-codex-parent-thread-id` when present |
+
+Claude Code and generic `x-session-id` keep identity-only defaults. Canonical
+`vllm_xargs.agentic_context` still wins when present.
+
 ## Router rollout
 
 Enable Program scheduling with the canonical opt-in contract and start workflow

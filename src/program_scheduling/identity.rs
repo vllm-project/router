@@ -204,6 +204,11 @@ impl ProgramIdentity {
                             .then(|| scoped_program_id(&identity.placement_key, Some("lead")))
                     });
             identity.blocks_parent = !identity.expected_resume;
+            // Codex carries extra stage headers; map them into workflow fields
+            // after the shared lead/subagent defaults above.
+            if let Some(headers) = headers {
+                apply_codex_workflow_fields(&mut identity, headers)?;
+            }
         }
         if identity.blocks_parent && identity.parent_program_id.is_none() {
             return Err(ScheduleError::InvalidIdentity(match source {
@@ -396,6 +401,69 @@ fn consistent_hash_request_key(headers: Option<&HeaderMap>, request: Option<&Jso
     }
     let request_text = request.and_then(|request| serde_json::to_string(request).ok());
     hash_key::extract_hash_key(request_text.as_deref(), None)
+}
+
+/// Map native Codex stage headers into workflow prediction fields.
+///
+/// No-ops unless this request already resolved to the Codex `session-id`
+/// schema, so Claude/generic header traffic is unchanged.
+fn apply_codex_workflow_fields(
+    identity: &mut ProgramIdentity,
+    headers: &HeaderMap,
+) -> Result<(), ScheduleError> {
+    use crate::request_identity::{
+        CODEX_SUBAGENT_HEADER, CODEX_TURN_METADATA_HEADER, CODEX_VERSION_HEADER,
+    };
+
+    let Some(session_id) = read_nonempty_header(headers, CODEX_SESSION_HEADER)? else {
+        return Ok(());
+    };
+    if identity.session_id.as_deref() != Some(session_id.as_str()) {
+        return Ok(());
+    }
+
+    let subagent = read_nonempty_header(headers, CODEX_SUBAGENT_HEADER)?;
+    let turn_metadata = read_nonempty_header(headers, CODEX_TURN_METADATA_HEADER)?;
+    let request_kind = turn_metadata
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("request_kind")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        });
+    // Prefer Codex-specific version so a gateway-supplied generic `version`
+    // cannot displace the fitted-profile key.
+    let version = read_nonempty_header(headers, CODEX_VERSION_HEADER)?
+        .or(read_nonempty_header(headers, "version")?);
+
+    identity.workflow_profile_id = Some("codex".to_string());
+    identity.profile_version = Some(version.unwrap_or_else(|| "1".to_string()));
+
+    let stage = subagent
+        .clone()
+        .or(request_kind.clone())
+        .unwrap_or_else(|| "turn".to_string());
+    identity.spawn_reason = Some(stage.clone());
+    // Sticky Codex sessions use a non-`lead` thread-id as agent_id; treat the
+    // main worker as lead unless a subagent stage header is present.
+    identity.agent_role = Some(if subagent.is_some() {
+        stage
+    } else {
+        "lead".to_string()
+    });
+
+    let terminal_kind = matches!(
+        request_kind.as_deref(),
+        Some("compaction" | "memory" | "prewarm")
+    ) || matches!(
+        subagent.as_deref(),
+        Some("compact" | "memory_consolidation")
+    );
+    identity.expected_resume = !terminal_kind;
+    identity.blocks_parent = false;
+    Ok(())
 }
 
 fn apply_canonical_scheduling(
@@ -613,7 +681,10 @@ mod tests {
         assert_eq!(identity.program_id(), "session-a:worker");
         assert_eq!(identity.parent_program_id(), Some("session-a:lead"));
         assert_eq!(identity.placement_hash_key(), "header:session-id:session-a");
-        assert!(!identity.expected_resume());
+        assert_eq!(identity.workflow_profile_id(), Some("codex"));
+        assert_eq!(identity.agent_role(), Some("lead"));
+        assert_eq!(identity.spawn_reason(), Some("turn"));
+        assert!(identity.expected_resume());
 
         let mut claude_headers = HeaderMap::new();
         claude_headers.insert(CLAUDE_SESSION_HEADER, "session-c".parse().unwrap());
@@ -641,6 +712,80 @@ mod tests {
             "header:x-session-id:session-d"
         );
         assert!(identity.expected_resume());
+    }
+
+    #[test]
+    fn codex_native_headers_map_workflow_fields() {
+        use crate::request_identity::{
+            CODEX_SUBAGENT_HEADER, CODEX_TURN_METADATA_HEADER, CODEX_VERSION_HEADER,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CODEX_SESSION_HEADER, "session-a".parse().unwrap());
+        headers.insert(CODEX_THREAD_HEADER, "worker".parse().unwrap());
+        headers.insert(CODEX_SUBAGENT_HEADER, "review".parse().unwrap());
+        headers.insert(
+            CODEX_TURN_METADATA_HEADER,
+            r#"{"request_kind":"turn"}"#.parse().unwrap(),
+        );
+        headers.insert(CODEX_VERSION_HEADER, "0.42.0".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&headers), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.workflow_profile_id(), Some("codex"));
+        assert_eq!(identity.profile_version(), Some("0.42.0"));
+        assert_eq!(identity.spawn_reason(), Some("review"));
+        assert_eq!(identity.agent_role(), Some("review"));
+        assert!(identity.expected_resume());
+        assert!(!identity.blocks_parent());
+
+        // Main Codex turns (no subagent header) classify as lead/turn and resume.
+        let mut lead = HeaderMap::new();
+        lead.insert(CODEX_SESSION_HEADER, "session-b".parse().unwrap());
+        lead.insert(CODEX_THREAD_HEADER, "worker".parse().unwrap());
+        lead.insert(
+            CODEX_TURN_METADATA_HEADER,
+            r#"{"request_kind":"turn"}"#.parse().unwrap(),
+        );
+        let identity = ProgramIdentity::from_request(Some(&lead), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.workflow_profile_id(), Some("codex"));
+        assert_eq!(identity.agent_role(), Some("lead"));
+        assert_eq!(identity.spawn_reason(), Some("turn"));
+        assert!(identity.expected_resume());
+
+        // Terminal kinds mark no expected resume so predictors observe no_return.
+        let mut compact = HeaderMap::new();
+        compact.insert(CODEX_SESSION_HEADER, "session-c".parse().unwrap());
+        compact.insert(CODEX_THREAD_HEADER, "worker".parse().unwrap());
+        compact.insert(CODEX_SUBAGENT_HEADER, "compact".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&compact), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.spawn_reason(), Some("compact"));
+        assert!(!identity.expected_resume());
+
+        // Prefer x-codex-version when a conflicting generic version is present.
+        let mut both = HeaderMap::new();
+        both.insert(CODEX_SESSION_HEADER, "session-d".parse().unwrap());
+        both.insert(CODEX_THREAD_HEADER, "worker".parse().unwrap());
+        both.insert(CODEX_VERSION_HEADER, "0.42.0".parse().unwrap());
+        both.insert("version", "gateway-1".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&both), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.profile_version(), Some("0.42.0"));
+
+        // Non-Codex header schemas are left alone.
+        let mut claude = HeaderMap::new();
+        claude.insert(CLAUDE_SESSION_HEADER, "session-c".parse().unwrap());
+        claude.insert(CLAUDE_AGENT_HEADER, "researcher".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&claude), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.workflow_profile_id(), None);
+        assert_eq!(identity.agent_role(), Some("subagent"));
     }
 
     #[test]
