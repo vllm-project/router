@@ -94,6 +94,15 @@ mod test_pd_routing {
 
     #[tokio::test]
     async fn http_pd_bypass_only_redispatches_after_tagged_refusal() {
+        verify_http_bypass_refusal(false).await;
+    }
+
+    #[tokio::test]
+    async fn http_pd_bypass_refusal_readmits_through_discovery() {
+        verify_http_bypass_refusal(true).await;
+    }
+
+    async fn verify_http_bypass_refusal(discovery: bool) {
         use crate::kv_fixture::{KvPublisher, TOPIC};
         use axum::{
             body::Body,
@@ -207,10 +216,23 @@ mod test_pd_routing {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let discovery_address = discovery.then(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .to_string()
+        });
         let config = RouterConfig {
             mode: RoutingMode::VllmPrefillDecode {
-                prefill_urls: vec![(format!("{base}/p"), None)],
-                decode_urls: vec![format!("{base}/d")],
+                prefill_urls: (!discovery)
+                    .then(|| (format!("{base}/p"), None))
+                    .into_iter()
+                    .collect(),
+                decode_urls: (!discovery)
+                    .then(|| format!("{base}/d"))
+                    .into_iter()
+                    .collect(),
                 prefill_policy: Some(PolicyConfig::RoundRobin),
                 decode_policy: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
@@ -219,7 +241,7 @@ mod test_pd_routing {
                     kv_penalty_disk: 0.4,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                discovery_address: discovery_address.clone(),
             },
             kv_connector: KvConnector::Nixl,
             worker_startup_timeout_secs: 5,
@@ -254,16 +276,35 @@ mod test_pd_routing {
             vec![],
             false,
         );
+        let _registration_socket = discovery_address.map(|address| {
+            let zmq_context = zmq::Context::new();
+            let dealer = zmq_context.socket(zmq::DEALER).unwrap();
+            dealer.set_linger(0).unwrap();
+            dealer.connect(&format!("tcp://{address}")).unwrap();
+            for (role, suffix) in [("P", "p"), ("D", "d")] {
+                let registration = json!({
+                    "type": role,
+                    "http_address": format!("{base}/{suffix}"),
+                    "zmq_address": format!("tcp://{role}:1"),
+                });
+                dealer
+                    .send(rmp_serde::to_vec_named(&registration).unwrap(), 0)
+                    .unwrap();
+            }
+            dealer
+        });
         let prompt: Vec<u32> = (0..33).collect();
         publisher.restore(&prompt[..32], 16).await;
         let request = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 8});
-        let direct = json!({"do_remote_prefill": false, "do_remote_decode": false, "max_local_prefill_tokens": 2048});
+        let direct = json!({"do_remote_prefill": false, "do_remote_decode": false, "max_local_prefill_tokens": 2047});
 
-        for (result, status, splits) in [
+        let cases = [
             (Refusal::Tagged, StatusCode::OK, true),
             (Refusal::Untagged, StatusCode::UNPROCESSABLE_ENTITY, false),
             (Refusal::NoResponse, StatusCode::GATEWAY_TIMEOUT, false),
-        ] {
+        ];
+        let cases = if discovery { &cases[..1] } else { &cases[..] };
+        for &(result, status, splits) in cases {
             *refusal.lock().unwrap() = result;
             let request = Request::post("/v1/completions")
                 .header(header::CONTENT_TYPE, "application/json")

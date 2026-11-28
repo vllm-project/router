@@ -15,7 +15,7 @@ use crate::policies::{
 use axum::http::HeaderMap;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 const REFRESH_TICK: Duration = Duration::from_secs(1);
 
 type StagePool<'a> = (&'a [Arc<dyn Worker>], Option<&'a dyn KvAwareOps>);
+type DiscoveredDecodes = dyn Fn() -> Vec<Arc<dyn Worker>> + Send + Sync;
 
 #[derive(PartialEq, Eq)]
 struct TargetRegistration {
@@ -35,6 +36,7 @@ pub(super) struct PdKvState {
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<WorkerRegistry>>,
+    discovered_decodes: OnceLock<Box<DiscoveredDecodes>>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     // Serializes updates to the target bindings in both policies.
@@ -124,6 +126,7 @@ impl PdKvState {
             api_key: None,
             supervisor,
             registry: None,
+            discovered_decodes: OnceLock::new(),
             prefill_policy: None,
             decode_policy: None,
             targets: Mutex::new(HashMap::new()),
@@ -174,6 +177,13 @@ impl PdKvState {
         });
     }
 
+    pub(super) fn track_discovered_decodes(
+        &self,
+        snapshot: impl Fn() -> Vec<Arc<dyn Worker>> + Send + Sync + 'static,
+    ) {
+        self.discovered_decodes.get_or_init(|| Box::new(snapshot));
+    }
+
     async fn bind_refresh(&self) {
         let Some(registry) = &self.registry else {
             return;
@@ -181,7 +191,10 @@ impl PdKvState {
         let prefill_policy = self.prefill_policy.as_deref().and_then(kv_aware_ops);
         let decode_policy = self.decode_policy.as_deref().and_then(kv_aware_ops);
         let prefill = registry.get_prefill_workers();
-        let decode = registry.get_decode_workers();
+        let decode = match self.discovered_decodes.get() {
+            Some(snapshot) => snapshot(),
+            None => registry.get_decode_workers(),
+        };
         self.bind_pools([
             (prefill.as_slice(), prefill_policy),
             (decode.as_slice(), decode_policy),
@@ -220,7 +233,18 @@ impl PdKvState {
 
         let mut targets = self.targets.lock().await;
         // A source probe may outlive the worker it started for.
+        let discovered = self.discovered_decodes.get().map(|snapshot| {
+            snapshot()
+                .into_iter()
+                .map(|worker| worker.url().to_owned())
+                .collect::<HashSet<_>>()
+        });
         let is_current = |worker: &Arc<dyn Worker>| {
+            if let Some(discovered) = &discovered {
+                if worker.worker_type() == crate::core::WorkerType::Decode {
+                    return discovered.contains(worker.url());
+                }
+            }
             self.registry.as_ref().is_none_or(|registry| {
                 registry
                     .get_by_url(worker.url())
@@ -230,8 +254,9 @@ impl PdKvState {
         targets.retain(|url, target| {
             let (workers, policy) = pools[usize::from(target.decode)];
             if let Some(policy) = policy {
-                let still_registered = match &self.registry {
-                    Some(registry) => registry.get_by_url(url).is_some_and(|worker| {
+                let still_registered = match (target.decode, &discovered, &self.registry) {
+                    (true, Some(discovered), _) => discovered.contains(url),
+                    (_, _, Some(registry)) => registry.get_by_url(url).is_some_and(|worker| {
                         if target.decode {
                             worker.worker_type() == crate::core::WorkerType::Decode
                         } else {
@@ -241,7 +266,7 @@ impl PdKvState {
                             )
                         }
                     }),
-                    None => workers.iter().any(|worker| worker.url() == url),
+                    (_, _, None) => workers.iter().any(|worker| worker.url() == url),
                 };
                 if still_registered {
                     return true;

@@ -925,7 +925,7 @@ async fn grpc_pd_prefill_bypass_uses_verified_decode_kv_and_retries_typed_refusa
         Some(json!({
             "do_remote_prefill": false,
             "do_remote_decode": false,
-            "max_local_prefill_tokens": 8,
+            "max_local_prefill_tokens": 7,
         }))
     );
 

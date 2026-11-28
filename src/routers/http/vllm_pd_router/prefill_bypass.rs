@@ -4,6 +4,8 @@ use crate::backend::preprocess::http_cache_read_fallback;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const DEFAULT_LOCAL_PREFILL_LIMIT: usize = 2048;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PdPrefillBypassPolicy {
@@ -51,7 +53,7 @@ impl Default for PdPrefillBypassConfig {
 
 impl PdPrefillBypassConfig {
     fn token_limit(self) -> usize {
-        self.max_tokens.unwrap_or(2048)
+        self.max_tokens.unwrap_or(DEFAULT_LOCAL_PREFILL_LIMIT)
     }
 }
 
@@ -98,7 +100,8 @@ impl PrefillBypass {
     }
 
     pub(in crate::routers::http) fn transfer_params(&self) -> Value {
-        local_params(self.config.token_limit())
+        // The worker's maximum is inclusive. The router's threshold is exclusive.
+        local_params(self.config.token_limit() - 1)
     }
 
     /// Check the caller's verified local KV and load observed at dispatch.
@@ -136,7 +139,14 @@ fn eligible_request(path: &str, request: &Value) -> bool {
                 .get(key)
                 .is_some_and(|value| !value.is_null() && value.as_u64() != Some(1))
         })
-        || request.get("use_beam_search").and_then(Value::as_bool) == Some(true)
+        || ["use_beam_search", "echo"]
+            .iter()
+            .any(|key| request.get(key).and_then(Value::as_bool) == Some(true))
+        || ["logprobs", "top_logprobs"].iter().any(|key| {
+            request
+                .get(key)
+                .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
+        })
     {
         return false;
     }
@@ -147,15 +157,19 @@ fn eligible_request(path: &str, request: &Value) -> bool {
             .is_some_and(|messages| {
                 !messages.is_empty()
                     && messages.iter().all(|message| {
-                        message.get("content").is_some_and(|content| {
-                            content.is_string()
-                                || content.as_array().is_some_and(|parts| {
-                                    !parts.is_empty()
-                                        && parts.iter().all(|part| {
-                                            part.get("type").and_then(Value::as_str) == Some("text")
-                                        })
-                                })
-                        })
+                        ["tool_calls", "function_call"]
+                            .iter()
+                            .all(|key| message.get(key).is_none_or(Value::is_null))
+                            && message.get("content").is_some_and(|content| {
+                                content.is_string()
+                                    || content.as_array().is_some_and(|parts| {
+                                        !parts.is_empty()
+                                            && parts.iter().all(|part| {
+                                                part.get("type").and_then(Value::as_str)
+                                                    == Some("text")
+                                            })
+                                    })
+                            })
                     })
             }),
         "/v1/completions" => request.get("prompt").is_some_and(|prompt| {
@@ -211,7 +225,7 @@ mod tests {
         assert!(PrefillBypass::from_config(config).unwrap().is_none());
         config.enabled = true;
         let bypass = PrefillBypass::from_config(config).unwrap().unwrap();
-        assert_eq!(bypass.transfer_params()[LIMIT_FIELD], 2048);
+        assert_eq!(bypass.transfer_params()[LIMIT_FIELD], 2047);
         let mut estimate = PrefillEstimate {
             prompt_tokens: 10_000,
             remaining_tokens: 2047,
@@ -289,12 +303,28 @@ mod tests {
         assert!(PrefillBypass::eligible_request("/v1/completions", &request));
         for request in [
             serde_json::json!({"prompt":"text","n":2}),
+            serde_json::json!({"prompt":"text","echo":true}),
+            serde_json::json!({"prompt":"text","logprobs":0}),
             serde_json::json!({"prompt":["a","b"]}),
             serde_json::json!({"prompt":"text","kv_transfer_params":{}}),
             serde_json::json!({"prompt":"text","prompt_embeds":[]}),
         ] {
             assert!(!PrefillBypass::eligible_request(
                 "/v1/completions",
+                &request
+            ));
+        }
+        assert!(PrefillBypass::eligible_request(
+            "/v1/completions",
+            &serde_json::json!({"prompt":"text","echo":false,"logprobs":null})
+        ));
+        for request in [
+            serde_json::json!({"messages":[{"content":"text"}],"logprobs":true}),
+            serde_json::json!({"messages":[{"content":"text"}],"top_logprobs":1}),
+            serde_json::json!({"messages":[{"role":"assistant","content":"text","tool_calls":[{"id":"call"}]}]}),
+        ] {
+            assert!(!PrefillBypass::eligible_request(
+                "/v1/chat/completions",
                 &request
             ));
         }

@@ -23,7 +23,7 @@ use super::prefill_bypass::{
 };
 use super::{
     grpc_decode_outcome, own_grpc_decode, record_grpc_decode_stream_failure, response_with_body,
-    DecodeCommitInput, DecodePoolSource, VllmPDRouter, NAMED_LORA_FIELD,
+    DecodeCommitInput, DecodePoolSource, ServiceType, VllmPDRouter, NAMED_LORA_FIELD,
 };
 use crate::backend::{EngineFrontend, PreparedRequest};
 use crate::config::{KvConnector, PolicyConfig, RouterConfig};
@@ -121,7 +121,24 @@ impl VllmPDRouter {
     fn set_prefill_bypass(&self, feature: PrefillBypass) -> Result<(), String> {
         self.prefill_bypass
             .set(feature)
-            .map_err(|_| "prefill bypass is already configured".to_string())
+            .map_err(|_| "prefill bypass is already configured".to_string())?;
+        if self.use_discovery {
+            if let Some(state) = &self.pd_router.kv_state {
+                let registry = self.service_registry.clone();
+                let connector = self.kv_connector;
+                let dp_size = self.intra_node_data_parallel_size;
+                state.track_discovered_decodes(move || {
+                    Self::expand_discovery_candidates(
+                        registry.get_instance_snapshots(ServiceType::Decode),
+                        ServiceType::Decode,
+                        connector,
+                        dp_size,
+                    )
+                    .unwrap_or_default()
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn try_http_prefill_bypass(

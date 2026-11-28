@@ -424,6 +424,7 @@ impl GrpcEngineBackend {
                         format!("grpc GenerateStream: {}", status.message()),
                     )
                         .into_response();
+                    // Preserve the pre-stream status and metadata for the P/D bypass refusal check.
                     response.extensions_mut().insert(status);
                     return response;
                 }

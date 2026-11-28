@@ -1136,16 +1136,30 @@ impl VllmPDRouter {
         instances: Vec<(String, String, Option<usize>)>,
         service_type: ServiceType,
     ) -> Result<Vec<Arc<dyn Worker>>, String> {
+        Self::expand_discovery_candidates(
+            instances,
+            service_type,
+            self.kv_connector,
+            self.intra_node_data_parallel_size,
+        )
+    }
+
+    fn expand_discovery_candidates(
+        instances: Vec<(String, String, Option<usize>)>,
+        service_type: ServiceType,
+        kv_connector: KvConnector,
+        intra_node_data_parallel_size: usize,
+    ) -> Result<Vec<Arc<dyn Worker>>, String> {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (address, _, registered_dp_size) in instances {
             let (base, _) = dp_utils::parse_worker_url(&address);
-            let dp_size = match self.kv_connector {
+            let dp_size = match kv_connector {
                 // Respect an explicit registration, including an explicit
                 // single-rank size. Preserve the legacy single-rank MoRI-IO default.
                 KvConnector::MoriIO => registered_dp_size.unwrap_or(1).max(1),
                 _ => registered_dp_size
                     .unwrap_or(1)
-                    .max(self.intra_node_data_parallel_size)
+                    .max(intra_node_data_parallel_size)
                     .max(1),
             };
             let ranks = dp_utils::expand_dp_ranks(&address, dp_size)?;
