@@ -3,15 +3,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::lifecycle::{SourceAction, WorkerLifecycle, WorkerRegistration, CONTROL_TIMEOUT};
-use super::probe::{fetch_kv_event_sources, fetch_native_sources, worker_serves_base_model};
+use super::metrics_meta::{reported_prefix_hash, EngineCacheConfigs};
+use super::probe::{probe_bound_sources, worker_serves_base_model, WorkerDescriptor};
 use super::{
-    events_enabled, resolve_endpoint, split_worker_rank, worker_host, KvEventSourceEntry,
-    KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
+    canonical_source_rank, events_enabled, resolve_endpoint, split_worker_rank, worker_host,
+    KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, SourcesProbe, WorkerDiscovery,
 };
 use crate::core::{worker::UNLABELED_WORKER_MODEL_ID, Worker};
+use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::CacheCapabilities;
 
 impl KvIndexSupervisor {
@@ -230,20 +231,17 @@ impl KvIndexSupervisor {
         let probes: Vec<_> = stream::iter(refresh.into_iter().map(
             |(base, lifecycle, owner)| async move {
                 let connector = self.pd_connector.filter(|_| prefill_bases.contains(&base));
-                let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
-                let probe = tokio::time::timeout_at(
-                    deadline,
+                let probe = tokio::time::timeout(
+                    CONTROL_TIMEOUT,
                     self.probe_registration(
                         &base,
                         plain_only.contains(&base),
                         connector,
                         &lifecycle,
-                        deadline,
                     ),
                 )
                 .await
-                .ok()
-                .and_then(Result::ok);
+                .ok();
                 (base, lifecycle, owner, connector, probe)
             },
         ))
@@ -260,11 +258,19 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action =
-                lifecycle.observe_descriptor(probe.as_ref().map(|probe| &probe.descriptor));
+            let configs = probe
+                .as_ref()
+                .and_then(|probe| probe.worker.engine_cache_configs.as_ref());
+            if let Some(configs) = configs {
+                self.fence_installed_hashes(&base, &lifecycle, configs);
+            }
+            let descriptor = probe
+                .as_ref()
+                .and_then(|probe| probe.descriptor.as_ref().ok());
+            let action = lifecycle.observe_descriptor(&base, descriptor, configs);
             match action {
                 SourceAction::Keep => {
-                    if let Some(probe) = probe {
+                    if let Some(probe) = probe.filter(|probe| probe.descriptor.is_ok()) {
                         lifecycle.state.lock().base_models =
                             probe.worker.base_models.unwrap_or_default();
                     }
@@ -281,6 +287,7 @@ impl KvIndexSupervisor {
                         owner,
                         Some(lifecycle.clone()),
                         connector,
+                        true,
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
                         self.installed.retire_if_current(&base, &lifecycle);
@@ -312,44 +319,123 @@ pub(super) enum StaticHybridMatch {
     Unavailable(SourcesProbe),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BoundSource {
     pub(super) endpoint: String,
     pub(super) replay_endpoint: Option<String>,
     pub(super) topic: String,
 }
 
-/// The publisher endpoints a worker's hybrid subscribers are attached to, by
-/// rank. Used to notice a publisher that moved while keeping its identity.
+impl From<&EventSource> for BoundSource {
+    fn from(source: &EventSource) -> Self {
+        Self {
+            endpoint: source.pub_endpoint.clone(),
+            replay_endpoint: source.replay_endpoint.clone(),
+            topic: source.topic.clone(),
+        }
+    }
+}
+
+/// Publisher identities by rank, including publishers fenced before subscription.
 pub(super) type BoundSources = HashMap<u32, BoundSource>;
 
-/// Check that the bound publishers and their reported layout are unchanged.
-/// A default layout has no worker report. Its hash and block size are checked
-/// in the publisher's event stream, bound to the topic for this boot.
-pub(super) async fn native_sources_match(
-    client: &reqwest::Client,
-    worker: &str,
-    api_key: Option<&str>,
-    expected: Option<&CacheCapabilities>,
-    bound: &BoundSources,
-) -> StaticHybridMatch {
-    let timeout = Duration::from_secs(2);
-    let observed = tokio::time::timeout(
-        timeout,
-        fetch_native_sources(client, worker, api_key, timeout),
-    )
-    .await;
-    let Ok((Ok(sources), Ok(layout))) = observed else {
-        return StaticHybridMatch::Unavailable(SourcesProbe::Failed);
+pub(super) fn is_fenced_source(key: &str, fenced: impl FnOnce(u32) -> bool) -> bool {
+    canonical_source_rank(key).is_some_and(fenced)
+}
+
+pub(super) fn runtime_hash_mismatch(
+    configs: Option<&EngineCacheConfigs>,
+    capability: &CacheCapabilities,
+    worker_url: &str,
+    rank: u32,
+) -> bool {
+    let reported = configs.and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
+    let Some((expected, reported)) = capability
+        .rank_capability(rank)
+        .and_then(|contract| contract.reported_hash_mismatch(reported))
+    else {
+        return false;
     };
-    let Some(host) = worker_host(worker) else {
+    tracing::warn!(
+        worker_url,
+        rank,
+        reported,
+        expected,
+        "KV credit disabled for incompatible worker prefix hash algorithm"
+    );
+    true
+}
+
+/// Check the surviving publisher set against the same source snapshot.
+pub(super) fn observed_sources_match(
+    worker: &str,
+    bound: &BoundSources,
+    fences: &BoundSources,
+    expected: Option<&CacheCapabilities>,
+    observed: &Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe>,
+) -> StaticHybridMatch {
+    let (sources, layout) = match observed {
+        Ok(snapshot) => snapshot,
+        Err(probe) => return StaticHybridMatch::Unavailable(*probe),
+    };
+    let Some(host) = worker_host(split_worker_rank(worker).0) else {
         return StaticHybridMatch::Differs;
     };
-    if layout.as_ref() == expected && bound_sources_match(&host, bound, &sources) {
+    let active = bound.iter().filter(|(rank, _)| !fences.contains_key(rank));
+    if layouts_match(expected, layout.as_ref(), fences)
+        && bound_sources_match(&host, active.map(|(&rank, source)| (rank, source)), sources)
+    {
         StaticHybridMatch::Matches
     } else {
         StaticHybridMatch::Differs
     }
+}
+
+fn layouts_match(
+    expected: Option<&CacheCapabilities>,
+    observed: Option<&CacheCapabilities>,
+    fences: &BoundSources,
+) -> bool {
+    match (expected, observed) {
+        (Some(expected), Some(observed)) => {
+            let retained = |rank| !fences.contains_key(&rank);
+            expected.schema_version == observed.schema_version
+                && expected.adapters == observed.adapters
+                && expected
+                    .ranks
+                    .iter()
+                    .filter(|rank| retained(rank.rank))
+                    .eq(observed.ranks.iter().filter(|rank| retained(rank.rank)))
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The recorded identity stays fenced even when cache metrics are unavailable.
+/// A replacement without a hash report proceeds through normal admission and
+/// event validation.
+pub(super) fn has_new_publisher(
+    worker: &str,
+    fences: &BoundSources,
+    descriptor: &WorkerDescriptor,
+    configs: Option<&EngineCacheConfigs>,
+) -> bool {
+    let Some((sources, capability)) = descriptor.sources().zip(descriptor.layout()) else {
+        return false;
+    };
+    worker_host(split_worker_rank(worker).0).is_some_and(|host| {
+        capability.ranks.iter().any(|entry| {
+            let rank = entry.rank;
+            sources.get(&rank.to_string()).is_some_and(|source| {
+                events_enabled(source)
+                    && fences
+                        .get(&rank)
+                        .is_none_or(|installed| bound_source_moved(&host, installed, source))
+                    && !runtime_hash_mismatch(configs, capability, worker, rank)
+            })
+        })
+    })
 }
 
 /// Whether a probe result keeps the provider alive. A transient failure is not
@@ -378,36 +464,17 @@ pub(super) async fn static_hybrid_sources_match(
     worker_url: &str,
     api_key: Option<&str>,
     discovery: &WorkerDiscovery,
-    bound: Option<&BoundSources>,
 ) -> StaticHybridMatch {
-    // A rank-pinned worker URL (`base@1`) still queries the engine's HTTP
-    // control plane on the base URL.
-    let (http_url, _) = split_worker_rank(worker_url);
-    // Revalidate with the same probe (gRPC or HTTP) discovery used.
-    let observed = match tokio::time::timeout(
-        Duration::from_secs(2),
-        fetch_kv_event_sources(client, http_url, api_key),
-    )
-    .await
-    {
-        Ok(Ok(sources)) => sources,
-        Ok(Err(unavailable)) => return StaticHybridMatch::Unavailable(unavailable.probe),
-        Err(_) => return StaticHybridMatch::Unavailable(SourcesProbe::Failed),
+    let observed = match probe_bound_sources(client, worker_url, api_key, true).await {
+        Ok((sources, _)) => sources,
+        Err(probe) => return StaticHybridMatch::Unavailable(probe),
     };
-    let Some(host) = worker_host(http_url) else {
+    let Some(host) = worker_host(split_worker_rank(worker_url).0) else {
         return StaticHybridMatch::Differs;
     };
-    if let Some(bound) = bound {
-        return if bound_sources_match(&host, bound, &observed) {
-            StaticHybridMatch::Matches
-        } else {
-            StaticHybridMatch::Differs
-        };
-    }
     let Ok(expected) = &discovery.sources else {
         return StaticHybridMatch::Differs;
     };
-    // Layout-only sources are verified against their bound publishers above.
     // A rank-pinned declaration only compares the rank it supplies.
     let matches = !expected.is_empty()
         && expected.iter().all(|(rank, expected)| {
@@ -428,17 +495,16 @@ pub(super) async fn static_hybrid_sources_match(
     }
 }
 
-fn bound_sources_match(
+fn bound_sources_match<'a>(
     host: &str,
-    bound: &BoundSources,
-    sources: &super::KvEventSourcesResponse,
+    mut bound: impl Iterator<Item = (u32, &'a BoundSource)>,
+    sources: &KvEventSourcesResponse,
 ) -> bool {
-    !bound.is_empty()
-        && bound.iter().all(|(rank, installed)| {
-            sources
-                .get(&rank.to_string())
-                .is_some_and(|actual| !bound_source_moved(host, installed, actual))
-        })
+    bound.all(|(rank, installed)| {
+        sources
+            .get(&rank.to_string())
+            .is_some_and(|actual| !bound_source_moved(host, installed, actual))
+    })
 }
 
 /// Whether the engine's current answer for one rank no longer matches the

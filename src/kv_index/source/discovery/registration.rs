@@ -1,7 +1,7 @@
 //! Admit and install one worker and its event sources.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 use super::lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
 use super::metrics_meta::reported_prefix_hash;
 use super::probe::{layout_model, server_instance_id, worker_descriptor};
+use super::reconcile::{runtime_hash_mismatch, BoundSource, BoundSources};
 use super::{
     discovered_block_size, event_source_label, event_sources_for_worker, metadata_source_label,
     CacheKey, KvIndexSupervisor, LiveSource, ServerInfo, SourcesProbe, WorkerDiscovery,
@@ -31,7 +32,7 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed, None, None)
+        self.install_observed_worker(worker_url, discovery, observed, None, None, false)
     }
 
     pub(super) fn install_observed_worker(
@@ -41,6 +42,7 @@ impl KvIndexSupervisor {
         observed: Option<Arc<AtomicBool>>,
         expected_lifecycle: Option<Arc<WorkerLifecycle>>,
         connector: Option<KvConnector>,
+        preserve_hash_fences: bool,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok().map(|mut descriptor| {
             descriptor.connector = connector;
@@ -171,27 +173,30 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
+        let previous =
+            expected_lifecycle.or_else(|| self.lifecycles.lock().get(worker_url).cloned());
+        let previous_fences = previous
+            .as_ref()
+            .map_or_else(BoundSources::new, |previous| {
+                previous.state.lock().hash_fences.clone()
+            });
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
-        let mut incompatible_ranks = 0;
+        let mut hash_fences = previous_fences.clone();
+        let mut rejected_hash = 0;
+        let configs = discovery.engine_cache_configs.as_ref();
         event_sources.retain(|source| {
             let rank = source.dp_rank;
-            let reported = discovery
-                .engine_cache_configs
-                .as_ref()
-                .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
-            if let Some((expected, reported)) = capability
-                .rank_capability(rank)
-                .and_then(|contract| contract.reported_hash_mismatch(reported))
-            {
-                warn!(
-                    worker_url,
-                    rank,
-                    expected,
-                    reported,
-                    "KV credit disabled for incompatible worker prefix hash algorithm"
-                );
-                incompatible_ranks += 1;
+            let identity = BoundSource::from(source);
+            // Explicit registration may revalidate a fenced publisher with a reported hash.
+            let still_fenced = hash_fences.get(&rank) == Some(&identity)
+                && (preserve_hash_fences
+                    || configs
+                        .and_then(|configs| reported_prefix_hash(configs, worker_url, rank))
+                        .is_none());
+            if still_fenced || runtime_hash_mismatch(configs, &capability, worker_url, rank) {
+                hash_fences.insert(rank, identity);
+                rejected_hash += 1;
                 return false;
             }
             match capability
@@ -199,6 +204,7 @@ impl KvIndexSupervisor {
                 .and_then(|binding| binding.with_tail_proof_limit(server_info.vllm_version))
             {
                 Ok(binding) => {
+                    hash_fences.remove(&rank);
                     let binding = if assumed_plain_full {
                         binding.require_root_proof()
                     } else {
@@ -225,7 +231,7 @@ impl KvIndexSupervisor {
                 }
             }
         });
-        let load_only = reported_ranks != 0 && incompatible_ranks == reported_ranks;
+        let load_only = reported_ranks != 0 && rejected_hash == reported_ranks;
         if bindings.is_empty() && !load_only {
             return Err("no KV event rank has a verified layout".into());
         }
@@ -247,12 +253,12 @@ impl KvIndexSupervisor {
             (None, None) => true,
             _ => false,
         };
-        let lifecycle_unchanged = expected_lifecycle.as_ref().is_none_or(|observed| {
-            self.lifecycles
-                .lock()
-                .get(worker_url)
-                .is_some_and(|current| Arc::ptr_eq(observed, current))
-        });
+        let lifecycle_unchanged = match (previous.as_ref(), self.lifecycles.lock().get(worker_url))
+        {
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+            (None, None) => true,
+            _ => false,
+        };
         if !unchanged || !lifecycle_unchanged {
             return Err("KV worker was registered while discovery was pending".into());
         }
@@ -297,8 +303,16 @@ impl KvIndexSupervisor {
             }
         }
         // Publish the new registration while holding the source-owner lock.
-        let active = Arc::new(AtomicBool::new(!load_only));
-        let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), !load_only, descriptor));
+        let active = Arc::new(AtomicBool::new(true));
+        let lifecycle = Arc::new(WorkerLifecycle::new(active.clone(), true, descriptor));
+        lifecycle.state.lock().hash_fences = hash_fences;
+        if let Some(previous) = &previous {
+            let state = previous.state.lock();
+            if state.hash_fences != previous_fences {
+                return Err("KV publisher eligibility changed while discovery was pending".into());
+            }
+            previous.active.store(false, Ordering::Release);
+        }
         if let Some(previous) = workers.remove(worker_url) {
             self.installed.retire_worker(previous);
         }
@@ -308,16 +322,15 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ..Default::default()
             };
-            // Preserve model eligibility even though this registration has no cache key.
             let mut base_models = discovery.base_models.unwrap_or_default();
             base_models.insert(model_id);
             base_models.extend(server_info.served_model_aliases);
             self.publish_registration(worker_url, lifecycle, &info, Some(base_models));
             info!(
                 worker_url,
-                incompatible_ranks,
+                rejected_hash,
                 recovery = "restart vLLM with --prefix-caching-hash-algo sha256_cbor, then re-add the worker or restart Router",
-                "KV registration is load-only because every rank reported an incompatible prefix hash"
+                "KV registration is load-only after incompatible prefix hash reports for every rank"
             );
             return Ok(info);
         }
@@ -377,6 +390,10 @@ impl KvIndexSupervisor {
         let provider = Arc::new(LayoutWorkerProvider {
             indexes,
             lifecycle: lifecycle.clone(),
+            bound: targets
+                .iter()
+                .map(|(source, _)| (source.dp_rank, source.into()))
+                .collect(),
         });
         self.monitor_hybrid_source(
             &provider,

@@ -27,9 +27,12 @@ mod registration;
 
 pub(crate) use lifecycle::CONTROL_TIMEOUT;
 use lifecycle::{LayoutWorkerProvider, WorkerLifecycle};
+use metrics_meta::reported_prefix_hash;
 use metrics_meta::EngineCacheConfigs;
 use observer::WorkerObservation;
-use reconcile::{static_hybrid_sources_match, StaticHybridMatch};
+use reconcile::{
+    bound_source_moved, is_fenced_source, static_hybrid_sources_match, StaticHybridMatch,
+};
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) use probe::worker_serves_base_model;
@@ -466,13 +469,14 @@ impl KvIndexSupervisor {
             observed,
             Some(lifecycle.clone()),
             None,
+            false,
         );
         if !installation
             .as_ref()
             .is_ok_and(|info| info.cache_key.is_some())
         {
             if let Some(hashes) = hashes {
-                self.fence_failed_registration(worker_url, &lifecycle, &hashes);
+                self.fence_installed_hashes(worker_url, &lifecycle, &hashes);
             }
         }
         Ok((installation?, models))
@@ -480,8 +484,8 @@ impl KvIndexSupervisor {
 
     /// Discover worker metadata and available hashes for a new registration.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
-        let mut discovery = self.discover_for_role(worker_url, None).await;
-        self.probe_admission_hashes(worker_url, &mut discovery, None)
+        let mut discovery = self.discover_for_role(worker_url, None, false).await;
+        self.probe_admission_hashes(worker_url, &mut discovery)
             .await;
         discovery
     }
@@ -490,6 +494,7 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         prefill_connector: Option<KvConnector>,
+        observe_runtime: bool,
     ) -> WorkerDiscovery {
         let static_source = if self.http_pd {
             self.static_pd_sources
@@ -503,15 +508,25 @@ impl KvIndexSupervisor {
         };
         let mut discovery = match static_source {
             Some(discovery) if layout_only(&discovery) => {
-                self.discover_declared_layout(worker_url, discovery).await
+                self.discover_declared_layout(worker_url, discovery, observe_runtime)
+                    .await
             }
             Some(mut discovery) => {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                if let Err((probe, reason)) =
-                    self.verify_static_source(worker_url, &discovery).await
-                {
+                let (verification, configs) = tokio::join!(
+                    self.verify_static_source(worker_url, &discovery),
+                    probe::probe_engine_cache_configs(
+                        &self.client,
+                        worker_url,
+                        self.api_key.as_deref(),
+                        (observe_runtime && discovery.hybrid.is_some())
+                            .then_some(lifecycle::OPTIONAL_METADATA_BUDGET),
+                    ),
+                );
+                discovery.engine_cache_configs = configs;
+                if let Err((probe, reason)) = verification {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
                         detail: reason.into(),
@@ -522,11 +537,17 @@ impl KvIndexSupervisor {
                 discovery
             }
             None => {
+                let lifecycle = if observe_runtime {
+                    self.lifecycles.lock().get(worker_url).cloned()
+                } else {
+                    None
+                };
                 let mut discovery = discover_worker(
                     &self.client,
                     worker_url,
                     self.http_pd || self.full_attention_http,
                     self.api_key.as_deref(),
+                    lifecycle.as_deref(),
                 )
                 .await;
                 if discovery.assumed_plain_full
@@ -619,12 +640,20 @@ impl KvIndexSupervisor {
         &self,
         worker_url: &str,
         mut discovery: WorkerDiscovery,
+        observe_runtime: bool,
     ) -> WorkerDiscovery {
         let (base, _) = split_worker_rank(worker_url);
         let api_key = self.api_key.as_deref();
         let grpc = crate::backend::is_grpc_url(base);
-        let (sources, (model, base_models)) =
-            tokio::join!(fetch_kv_event_sources(&self.client, base, api_key), async {
+        let requires_hash_size = discovery.hybrid.as_ref().is_some_and(|layout| {
+            layout
+                .ranks
+                .iter()
+                .any(|rank| rank.hash_block_size.is_none())
+        });
+        let (sources, (model, base_models), configs) = tokio::join!(
+            fetch_kv_event_sources(&self.client, base, api_key),
+            async {
                 if let Some(model) = discovery
                     .model_id
                     .as_ref()
@@ -650,8 +679,17 @@ impl KvIndexSupervisor {
                         Some(base_model_names(&models)),
                     )
                 }
-            },);
+            },
+            probe::probe_engine_cache_configs(
+                &self.client,
+                base,
+                api_key,
+                (observe_runtime && !requires_hash_size)
+                    .then_some(lifecycle::OPTIONAL_METADATA_BUDGET),
+            ),
+        );
         discovery.base_models = base_models;
+        discovery.engine_cache_configs = configs;
         let Ok(sources) = sources else {
             discovery.sources = sources;
             return discovery;
@@ -680,11 +718,7 @@ impl KvIndexSupervisor {
         }
         discovery.model_id = Ok(Some(model.clone()));
         if let Some(layout) = &mut discovery.hybrid {
-            if layout
-                .ranks
-                .iter()
-                .any(|rank| rank.hash_block_size.is_none())
-            {
+            if requires_hash_size {
                 let engines = match tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     probe::query_engine_cache_configs(&self.client, base, api_key),
@@ -756,7 +790,6 @@ impl KvIndexSupervisor {
             worker_url,
             self.api_key.as_deref(),
             discovery,
-            None,
         )
         .await
         {
@@ -860,6 +893,7 @@ async fn discover_worker(
     worker_url: &str,
     http_pd: bool,
     api_key: Option<&str>,
+    lifecycle: Option<&WorkerLifecycle>,
 ) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
@@ -886,7 +920,7 @@ async fn discover_worker(
             .flat_map(|id| id.iter().cloned())
             .collect();
         let mut discovery =
-            native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+            native_worker_discovery(worker_url, server_info, sources, model_id, layout, None);
         discovery.base_models = Some(base_models);
         return discovery;
     }
@@ -904,7 +938,7 @@ async fn discover_worker(
             engine_cache_configs: None,
         };
     }
-    discover_full_attention_http_worker(client, worker_url, api_key).await
+    discover_full_attention_http_worker(client, worker_url, api_key, lifecycle).await
 }
 
 /// Split a pinned data-parallel rank, as in `http://host:8000@3`.
@@ -1002,6 +1036,12 @@ fn layout_only(discovery: &WorkerDiscovery) -> bool {
     discovery.hybrid.is_some() && discovery.sources.as_ref().is_ok_and(HashMap::is_empty)
 }
 
+fn canonical_source_rank(key: &str) -> Option<u32> {
+    key.parse::<u32>()
+        .ok()
+        .filter(|rank| key == rank.to_string())
+}
+
 /// The layout names the publisher topic each rank must use. A discovered
 /// publisher that advertises another topic belongs to a different boot, so
 /// subscribing to it would index the wrong stream.
@@ -1037,9 +1077,10 @@ async fn discover_full_attention_http_worker(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    lifecycle: Option<&WorkerLifecycle>,
 ) -> WorkerDiscovery {
     let (server, (sources, layout)) = tokio::join!(
-        query_worker_metadata_and_models(client, worker_url, api_key),
+        query_worker_metadata_and_models(client, worker_url, api_key, lifecycle.is_some()),
         fetch_native_sources(client, worker_url, api_key, CONTROL_TIMEOUT),
     );
     let server_info = server.server_info;
@@ -1047,7 +1088,14 @@ async fn discover_full_attention_http_worker(
         .as_ref()
         .map(|info| Some(server_model_id(info).unwrap_or_else(|| worker_url.to_string())))
         .map_err(Clone::clone);
-    let mut discovery = native_worker_discovery(worker_url, server_info, sources, model_id, layout);
+    let mut discovery = native_worker_discovery(
+        worker_url,
+        server_info,
+        sources,
+        model_id,
+        layout,
+        lifecycle.map(|entry| (entry, server.engine_cache_configs.as_ref())),
+    );
     discovery.base_models = server.base_models;
     discovery.engine_cache_configs = server.engine_cache_configs;
     discovery
@@ -1059,10 +1107,41 @@ fn native_worker_discovery(
     sources: Result<KvEventSourcesResponse, SourcesUnavailable>,
     model_id: Result<Option<String>, String>,
     layout: Result<Option<CacheCapabilities>, String>,
+    runtime: Option<(&WorkerLifecycle, Option<&EngineCacheConfigs>)>,
 ) -> WorkerDiscovery {
     let (hybrid, assumed_plain_full) = match (&server_info, &sources, &model_id, layout) {
         (Ok(info), Ok(sources), Ok(Some(model)), Ok(Some(layout))) => {
-            match validate_native_publishers(&layout, sources, info, model) {
+            let state = runtime.map(|(entry, configs)| (entry.state.lock(), configs));
+            let host = worker_host(split_worker_rank(worker_url).0);
+            let fenced = |rank| {
+                let Some((state, configs)) = &state else {
+                    return false;
+                };
+                // The observed source may have changed before its layout row.
+                if state
+                    .descriptor
+                    .as_ref()
+                    .and_then(probe::WorkerDescriptor::layout)
+                    .zip(*configs)
+                    .is_some_and(|(layout, configs)| {
+                        let reported = reported_prefix_hash(configs, worker_url, rank);
+                        layout.rank_capability(rank).is_some_and(|contract| {
+                            contract.reported_hash_mismatch(reported).is_some()
+                        })
+                    })
+                {
+                    return true;
+                }
+                state.hash_fences.get(&rank).is_some_and(|fence| {
+                    sources.get(&rank.to_string()).is_none_or(|source| {
+                        !events_enabled(source)
+                            || host
+                                .as_ref()
+                                .is_some_and(|host| !bound_source_moved(host, fence, source))
+                    })
+                })
+            };
+            match validate_native_publishers(&layout, sources, info, model, fenced) {
                 Ok(()) => {
                     info!(worker_url, "using the worker's discovered KV cache layout");
                     (Some(layout), false)
@@ -1127,9 +1206,18 @@ fn validate_native_publishers(
     sources: &KvEventSourcesResponse,
     info: &ServerInfo,
     model: &str,
+    fenced: impl Fn(u32) -> bool + Copy,
 ) -> Result<(), String> {
-    let active = sources.iter().filter(|(_, source)| events_enabled(source));
-    if active.clone().count() != layout.ranks.len() {
+    let active = sources
+        .iter()
+        .filter(|(key, source)| events_enabled(source) && !is_fenced_source(key, fenced));
+    if active.clone().count()
+        != layout
+            .ranks
+            .iter()
+            .filter(|rank| !fenced(rank.rank))
+            .count()
+    {
         return Err(
             "the reported layouts and enabled event sources have different rank counts".into(),
         );
@@ -1139,11 +1227,8 @@ fn validate_native_publishers(
     let mut topics = HashSet::new();
     for (key, source) in active {
         let rejected = |reason| format!("DP rank {key}: {reason}");
-        let rank = key
-            .parse::<u32>()
-            .ok()
-            .filter(|rank| key == &rank.to_string())
-            .ok_or_else(|| rejected("invalid event source rank"))?;
+        let rank =
+            canonical_source_rank(key).ok_or_else(|| rejected("invalid event source rank"))?;
         if !topics.insert(source.topic.as_str()) {
             return Err(rejected("event topic is shared by multiple ranks"));
         }
@@ -1178,9 +1263,8 @@ fn synthesize_plain_full_layout(
         .iter()
         .filter(|(_, source)| events_enabled(source))
         .map(|(key, source)| {
-            let rank = key.parse::<u32>().ok()?;
-            if key != &rank.to_string()
-                || source.topic.is_empty()
+            let rank = canonical_source_rank(key)?;
+            if source.topic.is_empty()
                 || source.replay_endpoint.as_deref().is_none_or(str::is_empty)
             {
                 return None;

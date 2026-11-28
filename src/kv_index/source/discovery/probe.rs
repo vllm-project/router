@@ -4,13 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::Instant;
 use tonic::client::Grpc;
 use tonic_prost::ProstCodec;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::lifecycle::{WorkerLifecycle, OPTIONAL_METADATA_BUDGET};
 use super::metrics_meta::EngineCacheConfigs;
+use super::reconcile::{is_fenced_source, BoundSources};
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
@@ -22,11 +22,11 @@ use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
 
 pub(super) struct RegistrationProbe {
-    pub(super) descriptor: WorkerDescriptor,
+    pub(super) descriptor: Result<WorkerDescriptor, String>,
     pub(super) worker: WorkerDiscovery,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct WorkerDescriptor {
     server_info: ServerInfo,
     sources: Option<KvEventSourcesResponse>,
@@ -39,6 +39,32 @@ pub(super) struct WorkerDescriptor {
 impl WorkerDescriptor {
     pub(super) fn layout(&self) -> Option<&CacheCapabilities> {
         self.hybrid.as_ref()
+    }
+
+    pub(super) fn sources(&self) -> Option<&KvEventSourcesResponse> {
+        self.sources.as_ref()
+    }
+
+    pub(super) fn matches_unfenced(&self, other: &Self, fences: &BoundSources) -> bool {
+        if self == other {
+            return true;
+        }
+        if fences.is_empty() {
+            return false;
+        }
+        // Compare a filtered copy on the slow refresh path. Keep the original
+        // publisher identities available for registration.
+        let view = |mut descriptor: Self| {
+            let fenced = |rank| fences.contains_key(&rank);
+            if let Some(sources) = &mut descriptor.sources {
+                sources.retain(|rank, _| !is_fenced_source(rank, fenced));
+            }
+            if let Some(layout) = &mut descriptor.hybrid {
+                layout.ranks.retain(|rank| !fenced(rank.rank));
+            }
+            descriptor
+        };
+        view(self.clone()) == view(other.clone())
     }
 
     pub(super) fn has_nonplain_layout(&self) -> bool {
@@ -72,9 +98,8 @@ impl KvIndexSupervisor {
         plain_only: bool,
         connector: Option<crate::config::KvConnector>,
         lifecycle: &WorkerLifecycle,
-        deadline: Instant,
-    ) -> Result<RegistrationProbe, String> {
-        let mut worker = self.discover_for_role(base, connector).await;
+    ) -> RegistrationProbe {
+        let mut worker = self.discover_for_role(base, connector, true).await;
         if plain_only
             && worker
                 .hybrid
@@ -87,13 +112,19 @@ impl KvIndexSupervisor {
             );
             worker.hybrid = None;
         }
-        let mut descriptor = worker_descriptor(&worker)?;
+        let mut result = worker_descriptor(&worker);
+        let Ok(descriptor) = &mut result else {
+            return RegistrationProbe {
+                descriptor: result,
+                worker,
+            };
+        };
         descriptor.connector = connector;
         if worker.base_models.is_none() {
             let cached = {
                 let state = lifecycle.state.lock();
                 (state.info.is_some()
-                    && state.descriptor.as_ref() == Some(&descriptor)
+                    && state.descriptor.as_ref() == Some(descriptor)
                     && (descriptor
                         .server_info
                         .instance_id
@@ -112,42 +143,25 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
-            self.probe_admission_hashes(base, &mut worker, Some(deadline))
-                .await;
+        RegistrationProbe {
+            descriptor: result,
+            worker,
         }
-        Ok(RegistrationProbe { descriptor, worker })
     }
 
     pub(super) async fn probe_admission_hashes(
         &self,
         worker_url: &str,
         worker: &mut WorkerDiscovery,
-        deadline: Option<Instant>,
     ) {
-        let (base, _) = split_worker_rank(worker_url);
-        if !needs_admission_hashes(base, worker) {
-            return;
-        }
-        // Leave enough time for the optional scrape inside the refresh deadline.
-        if deadline.is_some_and(|deadline| {
-            deadline.saturating_duration_since(Instant::now()) <= OPTIONAL_METADATA_BUDGET
-        }) {
-            debug!(
+        if needs_admission_hashes(worker_url, worker) {
+            worker.engine_cache_configs = probe_engine_cache_configs(
+                &self.client,
                 worker_url,
-                "Skipping KV hash probe because the refresh budget is exhausted"
-            );
-            return;
-        }
-        match tokio::time::timeout(
-            OPTIONAL_METADATA_BUDGET,
-            query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
-        )
-        .await
-        {
-            Ok(Ok(configs)) => worker.engine_cache_configs = Some(configs),
-            Ok(Err(error)) => debug!(worker_url, %error, "Optional KV hash probe failed"),
-            Err(_) => debug!(worker_url, "Optional KV hash probe timed out"),
+                self.api_key.as_deref(),
+                Some(OPTIONAL_METADATA_BUDGET),
+            )
+            .await;
         }
     }
 }
@@ -315,6 +329,32 @@ pub(super) async fn fetch_kv_event_sources(
         probe: SourcesProbe::Failed,
         detail: format!("kv_event_sources {url} parse: {error}"),
     })
+}
+
+/// Fetch the source snapshot before deciding which ranks are still bound.
+pub(super) async fn probe_bound_sources(
+    client: &reqwest::Client,
+    worker: &str,
+    api_key: Option<&str>,
+    static_source: bool,
+) -> Result<(KvEventSourcesResponse, Option<CacheCapabilities>), SourcesProbe> {
+    let (base, _) = split_worker_rank(worker);
+    let timeout = Duration::from_secs(2);
+    tokio::time::timeout(timeout, async {
+        if static_source {
+            return fetch_kv_event_sources(client, base, api_key)
+                .await
+                .map(|sources| (sources, None))
+                .map_err(|unavailable| unavailable.probe);
+        }
+        let (sources, layout) = fetch_native_sources(client, base, api_key, timeout).await;
+        Ok((
+            sources.map_err(|_| SourcesProbe::Failed)?,
+            layout.map_err(|_| SourcesProbe::Failed)?,
+        ))
+    })
+    .await
+    .unwrap_or(Err(SourcesProbe::Failed))
 }
 
 /// Read the source list and its automatically published cache contract.
@@ -507,37 +547,46 @@ pub(super) struct WorkerMetadata {
     pub(super) engine_cache_configs: Option<EngineCacheConfigs>,
 }
 
-/// Worker cache metadata, tried in the order a deployment is likely to answer it:
-/// the multi-backend control contract, the engine config endpoint, then the
-/// always-on `/metrics` scrape.
-///
-/// Every source is optional; the error names what each one said, so an operator
-/// can tell a missing endpoint from an endpoint that answered without a block
-/// size.
+/// Prefer control metadata, with metrics as the fallback. For hash validation,
+/// start a bounded optional scrape alongside control and reuse a successful
+/// result if control metadata is unavailable.
 pub(super) async fn query_worker_metadata_and_models(
     client: &reqwest::Client,
     worker_url: &str,
     api_key: Option<&str>,
+    check_runtime_hash: bool,
 ) -> WorkerMetadata {
-    let control_error = match query_worker_control_metadata(client, worker_url, api_key).await {
+    let (control, metrics) = tokio::join!(
+        query_worker_control_metadata(client, worker_url, api_key),
+        probe_engine_cache_configs(
+            client,
+            worker_url,
+            api_key,
+            check_runtime_hash.then_some(OPTIONAL_METADATA_BUDGET),
+        ),
+    );
+    let control_error = match control {
         Ok(server_info) => {
             return WorkerMetadata {
                 server_info: Ok(server_info),
                 base_models: None,
-                engine_cache_configs: None,
+                engine_cache_configs: metrics,
             };
         }
         Err(error) => error,
     };
 
-    let (metadata, engine_cache_configs) =
-        match query_engine_cache_configs(client, worker_url, api_key).await {
-            Ok(engines) => (
-                query_metrics_metadata(client, worker_url, api_key, &engines).await,
-                Some(engines),
-            ),
-            Err(error) => (Err(error), None),
-        };
+    let engines = match metrics {
+        Some(engines) => Ok(engines),
+        None => query_engine_cache_configs(client, worker_url, api_key).await,
+    };
+    let (metadata, engine_cache_configs) = match engines {
+        Ok(engines) => (
+            query_metrics_metadata(client, worker_url, api_key, &engines).await,
+            Some(engines),
+        ),
+        Err(error) => (Err(error), None),
+    };
     let (server_info, base_models) = match metadata {
         Ok((info, models)) => (Ok(info), models),
         Err(error) => (Err(format!("{control_error}; {error}")), None),
@@ -687,6 +736,29 @@ pub(super) async fn query_engine_cache_configs(
         return Err("metrics: no vllm:cache_config_info series".to_string());
     }
     Ok(engines)
+}
+
+pub(super) async fn probe_engine_cache_configs(
+    client: &reqwest::Client,
+    worker_url: &str,
+    api_key: Option<&str>,
+    budget: Option<Duration>,
+) -> Option<EngineCacheConfigs> {
+    let budget = budget?;
+    let (worker_url, _) = split_worker_rank(worker_url);
+    if crate::backend::is_grpc_url(worker_url) {
+        return None;
+    }
+    let configs = tokio::time::timeout(
+        budget,
+        query_engine_cache_configs(client, worker_url, api_key),
+    )
+    .await
+    .unwrap_or_else(|_| Err(format!("metrics probe timed out after {budget:?}")));
+    if let Err(error) = &configs {
+        tracing::debug!(worker_url, %error, "optional worker cache metrics unavailable");
+    }
+    configs.ok()
 }
 
 pub(super) async fn query_model_list(
