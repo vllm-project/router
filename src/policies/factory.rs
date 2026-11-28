@@ -2,8 +2,8 @@
 
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LeastLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -71,6 +71,7 @@ impl PolicyFactory {
                 Arc::new(ConsistentHashPolicy::new())
             }
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::LeastLoad => Arc::new(LeastLoadPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -87,6 +88,7 @@ impl PolicyFactory {
             "sticky_least_loaded" | "stickyleastloaded" => {
                 Some(Arc::new(StickyLeastLoadedPolicy::new()))
             }
+            "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "rendezvous_hash" | "rendezvoushash" => Some(Arc::new(RendezvousHashPolicy::new())),
             _ => None,
         }

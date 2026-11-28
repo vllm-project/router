@@ -100,14 +100,16 @@ and the Rust OpenAI backend use different configuration paths. See
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
-| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD prefill policy; unset inherits `--policy`. |
-| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD decode policy; unset inherits `--policy`. |
+| `--policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load, rendezvous_hash` | `cache_aware` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load` | `cache_aware` | Request-level routing policy; also the fallback for both PD stages. |
+| `--prefill-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load` | `unset` | PD prefill policy; unset inherits `--policy`. |
+| `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, least_load` | `unset` | PD decode policy; unset inherits `--policy`. |
 | `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | KV-aware selection temperature for regular routing and PD prefill; zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
 | `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | Transfer credit for an authorized external KV source. Worker events alone cannot establish shared-pool residency. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
+| `--session-affinity` | `off, hard` | `off` | — | — | Hard pin in front of a stateless policy. `off` leaves current launch lines unchanged. |
+| `--session-affinity-ttl-secs` | `u64` | `7200` | — | — | Idle seconds before a hard session pin is forgotten (1–31536000). |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
 | `--balance-abs-threshold` | `usize` | `64` | `integer` | `64` | Cache-aware load balancing absolute threshold; used together with the relative threshold. |
 | `--balance-rel-threshold` | `f32` | `1.5` | `float` | `1.5` | Cache-aware load balancing relative threshold; used together with the absolute threshold. |

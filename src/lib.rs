@@ -20,6 +20,7 @@ pub mod request_identity;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
+pub mod session_affinity;
 mod token_estimator;
 pub mod tokenizer;
 pub mod tree;
@@ -36,6 +37,7 @@ pub enum PolicyType {
     PowerOfTwo,
     ConsistentHash,
     StickyLeastLoaded,
+    LeastLoad,
 }
 
 #[pyclass]
@@ -162,6 +164,7 @@ impl Router {
                     virtual_nodes: 160, // Default value
                 },
                 PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
+                PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad,
             }
         };
 
@@ -277,6 +280,8 @@ impl Router {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
+            session_affinity: config::SessionAffinityMode::Off,
+            session_affinity_ttl_secs: 7200,
             health_check: config::HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,

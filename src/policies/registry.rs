@@ -6,8 +6,8 @@
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, CostParams, KvAffinityTable,
-    KvAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy, RendezvousHashPolicy,
-    RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
+    KvAwarePolicy, LeastLoadPolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
+    RendezvousHashPolicy, RoundRobinPolicy, StickyLeastLoadedPolicy, TransferCredits,
 };
 use crate::config::types::PolicyConfig;
 use std::collections::HashMap;
@@ -36,6 +36,9 @@ pub struct PolicyRegistry {
     /// Affinity table shared by every KV-aware policy this registry creates,
     /// bounding affinity state across models.
     kv_affinity_table: Arc<KvAffinityTable>,
+
+    /// Hard session pin for stateless policies. Off until the CLI turns it on.
+    session_affinity: Arc<crate::session_affinity::SessionAffinity>,
 }
 
 impl PolicyRegistry {
@@ -60,7 +63,30 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
+            session_affinity: Arc::new(crate::session_affinity::SessionAffinity::off()),
         }
+    }
+
+    /// Turn on the hard session pin. Policies that already pin keep their own map.
+    pub fn with_session_affinity(
+        mut self,
+        affinity: Arc<crate::session_affinity::SessionAffinity>,
+    ) -> Self {
+        if affinity.is_enabled()
+            && !crate::session_affinity::SessionAffinity::applies(self.default_policy.name())
+        {
+            warn!(
+                policy = self.default_policy.name(),
+                "session affinity is off for this policy; it keeps its own placement"
+            );
+            return self;
+        }
+        self.session_affinity = affinity;
+        self
+    }
+
+    pub fn session_affinity(&self) -> Arc<crate::session_affinity::SessionAffinity> {
+        Arc::clone(&self.session_affinity)
     }
 
     /// Called when a worker is added
@@ -201,6 +227,7 @@ impl PolicyRegistry {
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "consistent_hash" => Arc::new(ConsistentHashPolicy::new()),
             "sticky_least_loaded" => Arc::new(StickyLeastLoadedPolicy::new()),
+            "least_load" => Arc::new(LeastLoadPolicy::new()),
             "rendezvous_hash" => Arc::new(RendezvousHashPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
@@ -255,6 +282,7 @@ impl PolicyRegistry {
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::ConsistentHash { .. } => Arc::new(ConsistentHashPolicy::new()),
             PolicyConfig::StickyLeastLoaded => Arc::new(StickyLeastLoadedPolicy::new()),
+            PolicyConfig::LeastLoad => Arc::new(LeastLoadPolicy::new()),
             PolicyConfig::RendezvousHash => Arc::new(RendezvousHashPolicy::new()),
         }
     }
@@ -281,6 +309,7 @@ impl PolicyRegistry {
     /// prefill/decode policies (for PD mode), since we don't know which policy
     /// instance is tracking the session.
     pub fn finish_session(&self, session_id: &str) {
+        self.session_affinity.finish_session(session_id);
         self.default_policy.finish_session(session_id);
 
         {

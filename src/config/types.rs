@@ -9,6 +9,19 @@ use crate::program_scheduling::{
     ProgramResumeOrder, ProgramSchedulingEnableKey, TokenCountMode,
 };
 
+/// Hard session pin in front of `--policy`. `off` is the current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAffinityMode {
+    #[default]
+    Off,
+    Hard,
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    7200
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -87,6 +100,12 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Hard pin in front of a stateless `--policy`. Off leaves current launch lines unchanged.
+    #[serde(default)]
+    pub session_affinity: SessionAffinityMode,
+    /// Idle seconds for [`SessionAffinityMode::Hard`]. Ignored while the mode is off.
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1174,6 +1193,10 @@ pub enum PolicyConfig {
     #[serde(rename = "sticky_least_loaded")]
     StickyLeastLoaded,
 
+    /// Fewest in-flight requests. Does not pin a session.
+    #[serde(rename = "least_load")]
+    LeastLoad,
+
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
 }
@@ -1188,6 +1211,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
+            PolicyConfig::LeastLoad => "least_load",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
@@ -1420,6 +1444,8 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            session_affinity: SessionAffinityMode::Off,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -2322,6 +2348,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            session_affinity: SessionAffinityMode::Off,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2394,6 +2422,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            session_affinity: SessionAffinityMode::Off,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2462,6 +2492,8 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            session_affinity: SessionAffinityMode::Off,
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

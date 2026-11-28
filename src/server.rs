@@ -79,12 +79,20 @@ impl AppContext {
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
+        let policy_registry = PolicyRegistry::new_with_affinity_ttl(
             router_config.policy.clone(),
             router_config
                 .kv_aware_session_affinity_ttl_secs
                 .map(std::time::Duration::from_secs),
-        ));
+        );
+        let policy_registry = Arc::new(match router_config.session_affinity {
+            crate::config::SessionAffinityMode::Hard => policy_registry.with_session_affinity(
+                Arc::new(crate::session_affinity::SessionAffinity::hard(
+                    router_config.session_affinity_ttl_secs,
+                )),
+            ),
+            crate::config::SessionAffinityMode::Off => policy_registry,
+        });
 
         let router_manager = None;
 
