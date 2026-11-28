@@ -33,12 +33,12 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PromptHashes};
 use crate::routers::{header_utils, RouterTrait};
 
-pub(crate) fn validate_prefill_bypass(
+pub(crate) fn prepare_prefill_bypass(
     config: PdPrefillBypassConfig,
     router: &RouterConfig,
-) -> Result<(), String> {
-    config.validate()?;
-    if config.is_enabled()
+) -> Result<Option<PrefillBypass>, String> {
+    let feature = PrefillBypass::from_config(config)?;
+    if feature.is_some()
         && (!router.mode.is_pd_mode()
             || router.kv_connector != KvConnector::Nixl
             || !matches!(
@@ -48,21 +48,21 @@ pub(crate) fn validate_prefill_bypass(
     {
         return Err("prefill bypass requires vLLM P/D with NIXL and kv_aware Decode".into());
     }
-    Ok(())
+    Ok(feature)
 }
 
 pub(crate) fn install_prefill_bypass(
     router: &dyn RouterTrait,
-    config: PdPrefillBypassConfig,
+    feature: Option<PrefillBypass>,
 ) -> Result<(), String> {
-    if !config.is_enabled() {
+    let Some(feature) = feature else {
         return Ok(());
-    }
+    };
     router
         .as_any()
         .downcast_ref::<VllmPDRouter>()
         .ok_or_else(|| "prefill bypass requires a vLLM P/D router".to_string())?
-        .configure_prefill_bypass(config)
+        .set_prefill_bypass(feature)
 }
 
 type LiveDecode<'a> =
@@ -112,13 +112,16 @@ tokio::task_local! {
 impl VllmPDRouter {
     /// Install the optional policy before the router serves requests.
     pub fn configure_prefill_bypass(&self, config: PdPrefillBypassConfig) -> Result<(), String> {
-        config.validate()?;
-        if let Some(feature) = PrefillBypass::enabled(config) {
-            self.prefill_bypass
-                .set(feature)
-                .map_err(|_| "prefill bypass is already configured".to_string())?;
+        if let Some(feature) = PrefillBypass::from_config(config)? {
+            self.set_prefill_bypass(feature)?;
         }
         Ok(())
+    }
+
+    fn set_prefill_bypass(&self, feature: PrefillBypass) -> Result<(), String> {
+        self.prefill_bypass
+            .set(feature)
+            .map_err(|_| "prefill bypass is already configured".to_string())
     }
 
     pub(super) async fn try_http_prefill_bypass(
@@ -574,10 +577,11 @@ mod tests {
                 decode: decision.clone(),
             })
         };
-        let bypass = PrefillBypass::enabled(PdPrefillBypassConfig {
+        let bypass = PrefillBypass::from_config(PdPrefillBypassConfig {
             enabled: true,
             ..Default::default()
         })
+        .unwrap()
         .unwrap();
         let estimate = PrefillEstimate {
             prompt_tokens: 8,

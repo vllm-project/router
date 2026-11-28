@@ -971,9 +971,9 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::routers::http::vllm_pd_router::{install_prefill_bypass, validate_prefill_bypass};
+    use crate::routers::http::vllm_pd_router::{install_prefill_bypass, prepare_prefill_bypass};
 
-    validate_prefill_bypass(config.pd_prefill_bypass, &config.router_config)?;
+    let prefill_bypass = prepare_prefill_bypass(config.pd_prefill_bypass, &config.router_config)?;
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)
@@ -1106,7 +1106,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             {
                 Ok(http_pd) => {
-                    install_prefill_bypass(http_pd.as_ref(), config.pd_prefill_bypass)?;
+                    install_prefill_bypass(http_pd.as_ref(), prefill_bypass)?;
                     info!("Created HTTP vLLM PD router");
                     router_manager
                         .register_router(RouterId::new("http-pd".to_string()), Arc::from(http_pd));
@@ -1128,7 +1128,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             info!("Single router mode (enable_igw=false)");
             // Create single router with the context
             let router = RouterFactory::create_router(&app_context).await?;
-            install_prefill_bypass(router.as_ref(), config.pd_prefill_bypass)?;
+            install_prefill_bypass(router.as_ref(), prefill_bypass)?;
             (Arc::from(router), None)
         };
 

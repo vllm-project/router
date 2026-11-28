@@ -53,23 +53,6 @@ impl PdPrefillBypassConfig {
     fn token_limit(self) -> usize {
         self.max_tokens.unwrap_or(2048)
     }
-
-    pub(in crate::routers::http) fn is_enabled(self) -> bool {
-        (self.enabled || self.max_tokens.is_some()) && self.token_limit() > 0
-    }
-
-    pub(in crate::routers::http) fn validate(self) -> Result<(), String> {
-        if !(0.0 < self.max_ratio && self.max_ratio <= 1.0) {
-            return Err("pd-prefill-bypass-max-ratio must be in (0, 1]".into());
-        }
-        if self.is_enabled()
-            && self.policy.uses_prefill_load()
-            && self.p_busy_requests.unwrap_or(0) == 0
-        {
-            return Err("the prefill bypass load policy requires a positive pd-prefill-bypass-p-busy-requests".into());
-        }
-        Ok(())
-    }
 }
 
 /// Estimated prompt and remaining work, based on verified Decode-local KV.
@@ -82,13 +65,21 @@ pub(in crate::routers::http) struct PrefillEstimate {
 /// Prefill bypass policy and worker contract. Admission, worker liveness and
 /// stream ownership belong to the dispatch adapter.
 #[derive(Debug)]
-pub(in crate::routers::http) struct PrefillBypass {
+pub(crate) struct PrefillBypass {
     config: PdPrefillBypassConfig,
 }
 
 impl PrefillBypass {
-    pub(in crate::routers::http) fn enabled(config: PdPrefillBypassConfig) -> Option<Self> {
-        config.is_enabled().then_some(Self { config })
+    pub(super) fn from_config(config: PdPrefillBypassConfig) -> Result<Option<Self>, String> {
+        let enabled = (config.enabled || config.max_tokens.is_some()) && config.token_limit() > 0;
+        if !(0.0 < config.max_ratio && config.max_ratio <= 1.0) {
+            return Err("pd-prefill-bypass-max-ratio must be in (0, 1]".into());
+        }
+        if enabled && config.policy.uses_prefill_load() && config.p_busy_requests.unwrap_or(0) == 0
+        {
+            return Err("the prefill bypass load policy requires a positive pd-prefill-bypass-p-busy-requests".into());
+        }
+        Ok(enabled.then_some(Self { config }))
     }
 
     pub(in crate::routers::http) fn needs_prefill_load(&self) -> bool {
@@ -217,10 +208,9 @@ mod tests {
     #[test]
     fn opt_in_defaults_require_both_suffix_thresholds() {
         let mut config = PdPrefillBypassConfig::default();
-        assert!(PrefillBypass::enabled(config).is_none());
+        assert!(PrefillBypass::from_config(config).unwrap().is_none());
         config.enabled = true;
-        assert!(PrefillBypass::enabled(config).is_some());
-        let bypass = PrefillBypass::enabled(config).unwrap();
+        let bypass = PrefillBypass::from_config(config).unwrap().unwrap();
         assert_eq!(bypass.transfer_params()[LIMIT_FIELD], 2048);
         let mut estimate = PrefillEstimate {
             prompt_tokens: 10_000,
@@ -236,7 +226,28 @@ mod tests {
         estimate.remaining_tokens = 700;
         assert!(!bypass.allows(estimate, true, None));
         config.max_tokens = Some(0);
-        assert!(PrefillBypass::enabled(config).is_none());
+        assert!(PrefillBypass::from_config(config).unwrap().is_none());
+    }
+
+    #[test]
+    fn validates_configuration_before_installation() {
+        let config = PdPrefillBypassConfig {
+            max_ratio: 0.0,
+            ..Default::default()
+        };
+        assert!(PrefillBypass::from_config(config).is_err());
+
+        let config = PdPrefillBypassConfig {
+            policy: PdPrefillBypassPolicy::BusyPrefill,
+            max_tokens: Some(8),
+            ..Default::default()
+        };
+        assert!(PrefillBypass::from_config(config).is_err());
+        let configured = PdPrefillBypassConfig {
+            p_busy_requests: Some(1),
+            ..config
+        };
+        assert!(PrefillBypass::from_config(configured).unwrap().is_some());
     }
 
     #[test]
@@ -269,7 +280,7 @@ mod tests {
         estimate.remaining_tokens = estimate.prompt_tokens;
         assert!(!PrefillBypass { config }.allows(estimate, true, Some(4)));
         config.max_tokens = Some(0);
-        assert!(PrefillBypass::enabled(config).is_none());
+        assert!(PrefillBypass::from_config(config).unwrap().is_none());
     }
 
     #[test]

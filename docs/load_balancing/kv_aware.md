@@ -186,7 +186,7 @@ active Decode requests in the Router. Its estimated uncached prompt tokens must
 be below the configured token limit for every policy.
 
 The hook runs before Prefill dispatch. A typed refusal releases the attempt
-and reruns normal P/D admission once.
+and reruns normal P/D admission once inside the current API request.
 
 See [Prefill/decode CLI options](../cli_reference.md#prefilldecode-disaggregation)
 for the available flags and defaults.
@@ -198,9 +198,9 @@ must enforce that limit against the actual cache hit. A worker that declines
 must return HTTP 422 or an initial gRPC `FAILED_PRECONDITION`, with
 `x-vllm-error-code: local_prefill_limit_exceeded`. Only this refusal triggers a
 fresh P/D attempt. Workers without the capability continue on the usual P/D
-path. The Router counter `vllm_router_pd_prefill_bypass_total` labels attempts
-as `accepted`, `refused`, or `failed`. Prefill request metrics still count
-actual calls to Prefill workers.
+path. The Router counter `vllm_router_pd_prefill_bypass_total` counts direct
+Decode dispatches by result (`accepted`, `refused`, or `failed`). Requests
+that fall through during eligibility checks use the usual P/D metrics.
 
 ## Layout files
 

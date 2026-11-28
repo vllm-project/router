@@ -44,7 +44,7 @@ mod native_prefill_bypass;
 pub(super) mod prefill_bypass;
 
 use native_prefill_bypass::SelectedPair;
-pub(crate) use native_prefill_bypass::{install_prefill_bypass, validate_prefill_bypass};
+pub(crate) use native_prefill_bypass::{install_prefill_bypass, prepare_prefill_bypass};
 use prefill_bypass::PrefillBypass;
 pub use prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
 

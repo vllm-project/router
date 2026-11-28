@@ -731,21 +731,28 @@ impl CliArgs {
 
     fn prefill_bypass_config(
         &self,
-    ) -> vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig {
+    ) -> ConfigResult<vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig> {
         use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig;
 
-        PdPrefillBypassConfig {
+        let policy =
+            ValueEnum::from_str(&self.pd_prefill_bypass_policy, false).map_err(|reason| {
+                ConfigError::InvalidValue {
+                    field: "pd-prefill-bypass-policy".to_string(),
+                    value: self.pd_prefill_bypass_policy.clone(),
+                    reason,
+                }
+            })?;
+        Ok(PdPrefillBypassConfig {
             enabled: self.pd_prefill_bypass,
             max_tokens: self.pd_prefill_bypass_max_tokens,
             max_ratio: self.pd_prefill_bypass_max_ratio,
-            policy: clap::ValueEnum::from_str(&self.pd_prefill_bypass_policy, false)
-                .expect("Prefill bypass policy validated by clap"),
+            policy,
             p_busy_requests: self.pd_prefill_bypass_p_busy_requests,
-        }
+        })
     }
 
     /// Create ServerConfig from CLI args and RouterConfig
-    fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
+    fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(ServiceDiscoveryConfig {
@@ -770,8 +777,8 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        ServerConfig {
-            pd_prefill_bypass: self.prefill_bypass_config(),
+        Ok(ServerConfig {
+            pd_prefill_bypass: self.prefill_bypass_config()?,
             host: self.host.clone(),
             port: self.port,
             router_config,
@@ -803,7 +810,7 @@ impl CliArgs {
             } else {
                 None
             },
-        }
+        })
     }
 }
 
@@ -876,7 +883,7 @@ Provide --worker-urls or PD flags as usual.",
         "DEBUG: CLI host: {}, port: {}",
         cli_args.host, cli_args.port
     );
-    let server_config = cli_args.to_server_config(router_config);
+    let server_config = cli_args.to_server_config(router_config)?;
     println!(
         "DEBUG: ServerConfig created successfully - host: {}, port: {}",
         server_config.host, server_config.port
@@ -1065,7 +1072,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.policy, "kv_aware");
-        let bypass = args.prefill_bypass_config();
+        let bypass = args.prefill_bypass_config().unwrap();
         assert_eq!(bypass.max_tokens, Some(256));
         assert_eq!(bypass.max_ratio, 0.25);
         assert_eq!(
@@ -1075,7 +1082,8 @@ mod tests {
         assert_eq!(bypass.p_busy_requests, Some(4));
         let defaults = CliArgs::try_parse_from(["vllm-router", "--pd-prefill-bypass"])
             .unwrap()
-            .prefill_bypass_config();
+            .prefill_bypass_config()
+            .unwrap();
         assert!(defaults.enabled);
         assert_eq!(defaults.max_tokens, None);
         assert_eq!(defaults.max_ratio, 0.7);
