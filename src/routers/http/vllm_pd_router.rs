@@ -7,7 +7,8 @@ use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{
-    error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext, StagePricing,
+    error_chain, PDRouterError, PdAttempt, PdEndpoint, PdPrefillInput, PdRequestContext,
+    StagePricing,
 };
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
@@ -41,7 +42,6 @@ use uuid::Uuid;
 
 mod native_prefill_bypass;
 pub(crate) use native_prefill_bypass::validate_prefill_bypass;
-mod prefill_bypass_wiring;
 use native_prefill_bypass::SplitDispatch;
 
 pub use super::prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
@@ -133,9 +133,6 @@ pub struct VllmPDRouter {
     /// Tokenizer and tonic clients for `grpc://` prefill and decode pools.
     grpc_frontend: crate::backend::EngineFrontend,
 }
-
-/// An optional admission check under the same lock as Decode commitment.
-type DecodeCommitGuard<'a> = dyn Fn(&super::pd_types::Loads, &dyn Worker) -> bool + Sync + 'a;
 
 /// Everything the deferred decode commitment needs at dispatch time.
 ///
@@ -257,6 +254,22 @@ fn prefill_pins_commitment(
         .and_then(Value::as_str)
         .is_some_and(|mode| mode == "push");
     reported_push || cached_identity
+}
+
+fn cache_aware_prefill_tokens(
+    inputs: Option<&HashMap<String, PdPrefillInput>>,
+) -> WorkerTokenInputs {
+    inputs
+        .into_iter()
+        .flat_map(|inputs| inputs.iter())
+        .filter(|(_, input)| input.image.is_none())
+        .filter_map(|(base, input)| {
+            input
+                .prompts
+                .as_ref()
+                .map(|prompts| (base.clone(), prompts.clone()))
+        })
+        .collect()
 }
 
 /// Buffer budget for stage responses. Oversized Decode bodies are streamed;
@@ -591,7 +604,7 @@ impl VllmPDRouter {
                 MORIIO_TRANSFER_PREFIX,
                 Uuid::new_v4().simple()
             )),
-            KvConnector::Nixl => None,
+            KvConnector::Nixl | KvConnector::MooncakeV2 => None,
         }
     }
 
@@ -663,7 +676,7 @@ impl VllmPDRouter {
                     }))
                 }
             }
-            KvConnector::Nixl => Ok(json!({
+            KvConnector::Nixl | KvConnector::MooncakeV2 => Ok(json!({
                 "do_remote_decode": true,
                 "do_remote_prefill": false,
                 "remote_engine_id": serde_json::Value::Null,
@@ -741,6 +754,7 @@ impl VllmPDRouter {
                     Some(params)
                 }
             }
+            KvConnector::MooncakeV2 => prefill_response_json?.get("kv_transfer_params").cloned(),
             KvConnector::Nixl => {
                 if let Some(json) = prefill_response_json {
                     let kvt = json.get("kv_transfer_params")?;
@@ -756,6 +770,57 @@ impl VllmPDRouter {
                 Some(Self::build_nixl_push_decode_params(&identity, request_id?))
             }
         }
+    }
+
+    fn missing_mooncake_v2_handoff(&self, prefill_response: &Value) -> bool {
+        self.kv_connector == KvConnector::MooncakeV2
+            && !prefill_response
+                .get("kv_transfer_params")
+                .is_some_and(Self::valid_mooncake_v2_handoff)
+    }
+
+    fn invalid_mooncake_v2_handoff(prefill: &str, path: &str, started: Instant) -> Response {
+        const MESSAGE: &str = "Prefill returned no valid Mooncake V2 KV handoff";
+        warn!(prefill_url = prefill, path, "{MESSAGE}");
+        RouterMetrics::record_pd_prefill_error(prefill);
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, started.elapsed());
+        (StatusCode::BAD_GATEWAY, MESSAGE).into_response()
+    }
+
+    fn valid_mooncake_v2_handoff(params: &Value) -> bool {
+        let Some(groups) = params["remote_block_ids"].as_array() else {
+            return false;
+        };
+        let valid_groups = groups.iter().all(|group| {
+            group
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().all(Value::is_u64))
+        });
+        let has_peer_identity = ["remote_engine_id", "remote_request_id", "remote_host"]
+            .into_iter()
+            .all(|field| {
+                params[field]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
+        let valid_port = params["remote_port"]
+            .as_u64()
+            .is_some_and(|port| (1..=u64::from(u16::MAX)).contains(&port));
+        // Decode only renews a lease when Prefill supplies remote blocks.
+        let valid_lease = groups
+            .iter()
+            .all(|group| group.as_array().is_some_and(Vec::is_empty))
+            || params["remote_kv_lease_duration"]
+                .as_u64()
+                .is_some_and(|seconds| seconds >= 6);
+
+        params["do_remote_prefill"].as_bool() == Some(true)
+            && valid_groups
+            && has_peer_identity
+            && valid_port
+            && params["remote_num_prompt_tokens"].is_u64()
+            && valid_lease
     }
 
     /// Build kv_transfer_params for the decode request (Mooncake only).
@@ -1281,17 +1346,11 @@ impl VllmPDRouter {
             .get("cache_salt")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
-        let prefill_tokens: WorkerTokenInputs = prefill_inputs
-            .iter()
-            .filter(|_| prefill_policy.name() == "cache_aware")
-            .flat_map(|inputs| inputs.iter())
-            .filter_map(|(base, input)| {
-                input
-                    .prompts
-                    .as_ref()
-                    .map(|prompts| (base.clone(), prompts.clone()))
-            })
-            .collect();
+        let prefill_tokens = cache_aware_prefill_tokens(
+            prefill_inputs
+                .as_ref()
+                .filter(|_| prefill_policy.name() == "cache_aware"),
+        );
         let decode_tokens = decode_inputs.unwrap_or_default();
         let [prefill_cache, decode_cache] = [
             (prefill_policy.as_ref(), prefill_workers, &prefill_tokens),
@@ -1360,7 +1419,7 @@ impl VllmPDRouter {
                             .is_none()
                     })
             }
-            KvConnector::Mooncake => true,
+            KvConnector::Mooncake | KvConnector::MooncakeV2 => true,
             KvConnector::MoriIO => false,
         }
     }
@@ -1420,7 +1479,6 @@ impl VllmPDRouter {
         request: &Value,
         headers: Option<&HeaderMap>,
         pin_to_provisional: bool,
-        guard: Option<&DecodeCommitGuard<'_>>,
     ) -> Result<Arc<dyn Worker>, (StatusCode, String)> {
         let decode_policy = self.policy_registry.get_decode_policy();
         // Rebuild the candidates: a worker removed while Prefill ran still
@@ -1455,7 +1513,7 @@ impl VllmPDRouter {
                     )
                     .await
                 {
-                    tokens.extend(new_tokens);
+                    tokens.merge(new_tokens);
                 }
                 // The pool can change while that await runs: re-read it and
                 // reapply the same health/model/pin filters used above.
@@ -1516,11 +1574,6 @@ impl VllmPDRouter {
             // Keep the source guards until the deferred Decode commit finishes.
             let mut validated = None;
             self.pd_router.pd_load.commit_decode(attempt, |loads| {
-                if let Some(accept) = guard {
-                    if !accept(loads, candidates.first()?.as_ref()) {
-                        return None;
-                    }
-                }
                 let context = PdRequestContext {
                     decode_pricing: context
                         .decode_pricing
@@ -1536,9 +1589,7 @@ impl VllmPDRouter {
             })
         };
         let Some(decision) = committed else {
-            if guard.is_none() {
-                RouterMetrics::record_pd_decode_commit("empty");
-            }
+            RouterMetrics::record_pd_decode_commit("empty");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No eligible decode worker at dispatch".to_owned(),
@@ -2425,6 +2476,12 @@ impl VllmPDRouter {
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        if self.kv_connector == KvConnector::MooncakeV2 && path == "/v1/responses" {
+            // vLLM Responses exposes stop controls but no min_tokens.
+            prefill_request["ignore_eos"] = json!(true);
+            prefill_request["stop"] = json!([]);
+            prefill_request["stop_token_ids"] = json!([]);
+        }
 
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
@@ -2547,6 +2604,14 @@ impl VllmPDRouter {
             }
         };
 
+        if self.missing_mooncake_v2_handoff(&prefill_response_json) {
+            return Ok(Self::invalid_mooncake_v2_handoff(
+                &prefill_base_url,
+                path,
+                start_time,
+            ));
+        }
+
         if self.epd.is_some()
             && !matches!(self.kv_connector, KvConnector::Mooncake)
             && !matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write))
@@ -2577,7 +2642,7 @@ impl VllmPDRouter {
             // output; without EPD the two are the same value.
             let request = commit_scoring_body(client_request.as_ref(), &original_request);
             match self
-                .select_and_commit_decode(&attempt, commit, request, headers, pinned, None)
+                .select_and_commit_decode(&attempt, commit, request, headers, pinned)
                 .await
             {
                 Ok(worker) => decode_worker = worker,
@@ -2799,6 +2864,10 @@ impl VllmPDRouter {
             Some(kv) => json!({ "kv_transfer_params": kv }),
             None => json!({}),
         };
+        if self.missing_mooncake_v2_handoff(&prefill_response_json) {
+            attempt.release();
+            return Self::invalid_mooncake_v2_handoff(&prefill_base_url, path, start_time);
+        }
 
         // Prefill is done, so the decode pool can be read live. The committed
         // worker replaces the admission-time pick for dispatch and metrics;
@@ -2811,7 +2880,7 @@ impl VllmPDRouter {
                     Some(&prefill_response_json),
                 );
                 match self
-                    .select_and_commit_decode(attempt, input, request, headers, pinned, None)
+                    .select_and_commit_decode(attempt, input, request, headers, pinned)
                     .await
                 {
                     Ok(worker) => worker,
@@ -2988,7 +3057,7 @@ impl VllmPDRouter {
                 .get_nixl_push_identity(prefill_worker.base_url(), prefill_worker.dp_rank())
                 .is_some(),
             KvConnector::MoriIO => self.moriio_transfer_mode() == Some(MoriIOTransferMode::Write),
-            KvConnector::Mooncake => false,
+            KvConnector::Mooncake | KvConnector::MooncakeV2 => false,
         };
         if !concurrent {
             return None;
@@ -4374,6 +4443,7 @@ mod tests {
                 Some(Arc::new(crate::policies::KvAwarePolicy::default())),
                 None,
                 false,
+                true,
                 true,
             )
             .await,
@@ -7292,6 +7362,66 @@ mod tests {
         assert_eq!(connector, KvConnector::Nixl);
     }
 
+    #[tokio::test]
+    async fn mooncake_v2_forwards_the_prefill_handoff() {
+        let mut router = test_vllm_pd_router().await;
+        router.kv_connector = KvConnector::MooncakeV2;
+        let params = router
+            .build_prefill_kv_transfer_params(None, None, None, None)
+            .unwrap();
+        assert_eq!(params["do_remote_decode"], true);
+        assert_eq!(params["do_remote_prefill"], false);
+
+        let worker = BasicWorker::new(
+            "http://prefill".into(),
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let handoff = json!({
+            "do_remote_prefill": true,
+            "remote_block_ids": [[], [0, 1]],
+            "remote_engine_id": "prefill",
+            "remote_request_id": "request",
+            "remote_host": "127.0.0.1",
+            "remote_port": 9000,
+            "remote_num_prompt_tokens": 65,
+            "remote_kv_lease_duration": 120,
+            "last_token_id": 42
+        });
+        let response = json!({"kv_transfer_params": handoff});
+        assert!(!router.missing_mooncake_v2_handoff(&response));
+        let params = router.build_decode_kv_transfer_params(&worker, Some(&response), None, None);
+        assert_eq!(params.as_ref(), response.get("kv_transfer_params"));
+        for (field, invalid_value) in [
+            ("do_remote_prefill", json!(false)),
+            ("remote_block_ids", json!([0, 1])),
+            ("remote_block_ids", json!([["0"]])),
+            ("remote_engine_id", json!("")),
+            ("remote_request_id", json!(1)),
+            ("remote_host", json!(" ")),
+            ("remote_port", json!(0)),
+            ("remote_port", json!(65536)),
+            ("remote_num_prompt_tokens", json!(-1)),
+            ("remote_kv_lease_duration", json!(5)),
+        ] {
+            let mut invalid = response.clone();
+            invalid["kv_transfer_params"][field] = Value::Null;
+            assert!(router.missing_mooncake_v2_handoff(&invalid), "null {field}");
+            invalid["kv_transfer_params"][field] = invalid_value;
+            assert!(
+                router.missing_mooncake_v2_handoff(&invalid),
+                "invalid {field}: {}",
+                invalid["kv_transfer_params"][field]
+            );
+        }
+
+        let mut no_transfer = response;
+        no_transfer["kv_transfer_params"]["remote_block_ids"] = json!([[], []]);
+        no_transfer["kv_transfer_params"]["remote_kv_lease_duration"] = Value::Null;
+        assert!(!router.missing_mooncake_v2_handoff(&no_transfer));
+    }
+
     // --- MoRI-IO WRITE mode parameter tests ---
 
     fn moriio_write_prefill_params(
@@ -7383,6 +7513,122 @@ mod tests {
                 "model": "test", "input": "hi", "stream": true,
             })).await,
         }
+    }
+
+    #[tokio::test]
+    async fn pd_requests_image_hashes_without_tensors_and_disables_rendering_for_epd() {
+        let url = spawn_test_server(axum::Router::new().route(
+            "/v1/chat/completions/render",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["mm_payload"], "none");
+                assert_eq!(
+                    body["messages"][0]["content"][0]["image_url"]["url"],
+                    "image"
+                );
+                axum::Json(json!({
+                    "token_ids": [1, 2, 3],
+                    "features": {
+                        "mm_hashes":{"image":["a".repeat(64)]},
+                        "mm_placeholders":{"image":[{"offset":1,"length":1}]}
+                    }
+                }))
+            }),
+        ))
+        .await;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let body = json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"image"}}
+        ]}]});
+        for epd in [false, true] {
+            let config = crate::config::RouterConfig {
+                epd: epd.then(|| crate::config::EpdConfig {
+                    encoder_urls: vec!["http://encoder".into()],
+                    consumer_zmq_addrs: HashMap::new(),
+                }),
+                ..Default::default()
+            };
+            let ctx = Arc::new(
+                crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                    .unwrap(),
+            );
+            let policy: Arc<dyn LoadBalancingPolicy> =
+                Arc::new(crate::policies::KvAwarePolicy::default());
+            ctx.policy_registry.set_prefill_policy(policy.clone());
+            let router = PdRouterBase::new(vec![], vec![], &ctx).await.unwrap();
+            let (inputs, _, _) = router
+                .kv_state
+                .as_ref()
+                .unwrap()
+                .prepare_stages(
+                    std::slice::from_ref(&worker),
+                    &policy,
+                    &[],
+                    &policy,
+                    &body,
+                    "/v1/chat/completions",
+                    None,
+                    None,
+                    true,
+                )
+                .await;
+            assert_eq!(inputs[&url].image.is_some(), !epd);
+            assert!(cache_aware_prefill_tokens(Some(&inputs)).is_empty());
+            if epd {
+                assert_eq!(inputs[&url].fallback_reason, Some("multimodal_input"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_mooncake_v2_handoff_returns_bad_gateway_without_decode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let prefill_url = spawn_test_server(
+            axum::Router::new()
+                .route(
+                    "/v1/responses",
+                    axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                        assert_eq!(body["ignore_eos"], true);
+                        assert_eq!(body["stop"], json!([]));
+                        assert_eq!(body["stop_token_ids"], json!([]));
+                        axum::Json(json!({"kv_transfer_params": {"do_remote_prefill": true}}))
+                    }),
+                )
+                .fallback(|| async { axum::Json(json!({})) }),
+        )
+        .await;
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let calls = decode_calls.clone();
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let mut router = test_vllm_pd_router().await;
+        router.kv_connector = KvConnector::MooncakeV2;
+        router.pd_router.worker_registry.register(prefill);
+        router.pd_router.worker_registry.register(decode.clone());
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            let response = dispatch_reservation_test_request(&router, path).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{path}");
+            assert_eq!(decode.load(), 0);
+        }
+        assert_eq!(decode_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

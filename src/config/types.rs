@@ -1013,6 +1013,10 @@ pub enum KvConnector {
     #[serde(rename = "mooncake")]
     #[value(name = "mooncake")]
     Mooncake,
+    /// Ascend MooncakeConnectorV2, with handoff metadata in the Prefill response.
+    #[serde(rename = "mooncake-v2")]
+    #[value(name = "mooncake-v2")]
+    MooncakeV2,
     /// MoRI-IO KV transfer
     #[serde(rename = "moriio")]
     #[value(name = "moriio")]

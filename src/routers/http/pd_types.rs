@@ -170,6 +170,7 @@ pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
 #[derive(Debug, Clone)]
 pub struct PdPrefillInput {
     pub prompts: Option<Arc<[Vec<u32>]>>,
+    pub(crate) image: Option<crate::kv_index::request_hash::ImagePrefix>,
     pub allow_credit: bool,
     pub fallback_reason: Option<&'static str>,
 }
@@ -701,10 +702,6 @@ impl PdAttempt {
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
-    pub(super) fn prefill_endpoint(&self) -> &PdEndpoint {
-        &self.0.prefill
-    }
-
     /// Inspect both stage loads while the selected Decode admission is still pending.
     pub(super) fn check_reserved_decode(
         &self,

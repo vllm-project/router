@@ -1,7 +1,7 @@
 //! Adapt index lookups to the routing policy.
 
 use crate::kv_index::layout::align_down;
-use crate::kv_index::request_hash::{BlockKeyGenerator, SequenceHash};
+use crate::kv_index::request_hash::{BlockKeyGenerator, ImagePrefix, SequenceHash};
 use crate::kv_index::source::binding::{PlacementSnapshot, SourceLease};
 use crate::kv_index::storage::source_transaction::StreamControl;
 use crate::kv_index::storage::{GroupPages, PageQuery, SourceReadGuard};
@@ -43,8 +43,11 @@ pub trait TieredMatchProvider: Send + Sync {
         block_size: u32,
         lora_name: Option<&str>,
         dp_rank: u32,
-        _cache: &mut RequestHashCache<'a>,
+        cache: &mut RequestHashCache<'a>,
     ) -> Vec<TierMatch> {
+        if cache.images.contains_key(&PromptKey(tokens)) {
+            return Vec::new();
+        }
         self.matches(tokens, block_size, lora_name, dp_rank)
     }
 
@@ -304,6 +307,7 @@ pub struct RequestHashCache<'a> {
     pub(crate) stop_at_gap: bool,
     /// NIXL Decode counts resident pages even when rebuilding the sliding window.
     pub(crate) count_replay_pages: bool,
+    images: HashMap<PromptKey<'a>, (&'a ImagePrefix, Vec<PreparedChain>), RandomState>,
     seen: HashMap<PromptKey<'a>, usize, RandomState>,
     prompts: HashMap<&'a [u32], usize, RandomState>,
     prepared: Vec<(&'a [u32], Vec<PreparedChain>)>,
@@ -322,6 +326,16 @@ impl<'a> RequestHashCache<'a> {
             single_target: true,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn register_image(&mut self, tokens: &'a [u32], image: &'a ImagePrefix) {
+        self.images
+            .entry(PromptKey(tokens))
+            .or_insert((image, Vec::new()));
+    }
+
+    pub(crate) fn has_images(&self) -> bool {
+        !self.images.is_empty()
     }
 
     fn prompt_slot(&mut self, tokens: &'a [u32]) -> usize {
@@ -349,8 +363,13 @@ impl<'a> RequestHashCache<'a> {
     }
 
     pub(crate) fn canonical_prompt(&mut self, tokens: &'a [u32]) -> &'a [u32] {
-        let slot = self.prompt_slot(tokens);
-        self.prepared[slot].0
+        // Equal token IDs can reference different images.
+        if self.images.contains_key(&PromptKey(tokens)) {
+            tokens
+        } else {
+            let slot = self.prompt_slot(tokens);
+            self.prepared[slot].0
+        }
     }
 
     pub(in crate::kv_index) fn pages(
@@ -386,8 +405,15 @@ impl<'a> RequestHashCache<'a> {
         adapter: Option<(&str, &str)>,
         domain_index: &Arc<KvBlockIndexer>,
     ) -> (&[SequenceHash], &mut GroupPages) {
-        let slot = self.prompt_slot(tokens);
-        let (tokens, chains) = &mut self.prepared[slot];
+        let prompt = PromptKey(tokens);
+        let (tokens, image, chains) = if self.images.contains_key(&prompt) {
+            let (image, chains) = self.images.get_mut(&prompt).unwrap();
+            (tokens, Some(*image), chains)
+        } else {
+            let slot = self.prompt_slot(tokens);
+            let (tokens, chains) = &mut self.prepared[slot];
+            (*tokens, None, chains)
+        };
         let index = chains.iter().position(|chain| {
             chain.generator == *generator
                 && chain
@@ -397,9 +423,13 @@ impl<'a> RequestHashCache<'a> {
                     == adapter
         });
         let index = index.unwrap_or_else(|| {
-            let hashes = match adapter {
-                Some((name, path)) => generator.generate_block_keys_for_adapter(tokens, name, path),
-                None => generator.generate_block_keys(tokens),
+            let hashes = match (adapter, image) {
+                (Some(_), Some(_)) => Vec::new(),
+                (Some((name, path)), None) => {
+                    generator.generate_block_keys_for_adapter(tokens, name, path)
+                }
+                (None, Some(image)) => generator.generate_block_keys_for_image(tokens, image),
+                (None, None) => generator.generate_block_keys(tokens),
             };
             chains.push(PreparedChain {
                 generator: generator.clone(),
@@ -428,6 +458,70 @@ impl<'a> RequestHashCache<'a> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_prefix_matches_native_events_without_aliasing_equal_token_ids() {
+        // Independent vLLM sha256_cbor goldens for image positions 60 and -4.
+        check_image_prefix(
+            "",
+            crate::kv_index::source::test_support::TEST_IMAGE_BLOCK_HASHES,
+        );
+        check_image_prefix(
+            "content:",
+            [
+                "6521a2f6cff15637a5767844512eb22531d85a1834d4ad81fa398c5d601895f7",
+                "8e23a619de5fe86153b8ed771642bd6ad6e326a11ff920a45c889d9617411d76",
+            ],
+        );
+    }
+
+    fn check_image_prefix(namespace: &str, block_hashes: [&str; 2]) {
+        use crate::kv_index::source::test_support::{
+            event_batch, full_binding, image_store, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::wire::KVEvent;
+
+        let hash = format!("{namespace}{TEST_IMAGE_HASH}");
+        let same_image = ImagePrefix::new(&hash, 60, 8, 129).unwrap();
+        let other_hash = format!("{namespace}{}", "a".repeat(64));
+        let other_image = ImagePrefix::new(&other_hash, 60, 8, 129).unwrap();
+        let tokens: Vec<u32> = (0..129).collect();
+        let identical_ids = tokens.clone();
+        let text_ids = tokens.clone();
+        let store = image_store(&hash, block_hashes);
+        let binding = full_binding(
+            crate::kv_index::RoutableTarget {
+                instance_id: "image-worker".into(),
+                dp_rank: 0,
+            },
+            64,
+        );
+        binding.begin_empty(0);
+        binding
+            .apply_batch(0, &event_batch(vec![KVEvent::BlockStored(store)]))
+            .unwrap();
+        for (seq, identity) in ["uuid:client-image", &other_hash].into_iter().enumerate() {
+            let invalid = image_store(identity, block_hashes);
+            binding
+                .apply_batch(
+                    seq as u64 + 1,
+                    &event_batch(vec![KVEvent::BlockStored(invalid)]),
+                )
+                .unwrap();
+        }
+        let mut cache = RequestHashCache::default();
+        cache.register_image(&tokens, &same_image);
+        cache.register_image(&identical_ids, &other_image);
+        let hits = binding.matches_with_cache(&tokens, 64, None, 0, &mut cache);
+        assert_eq!(hits[0].segments, [(0, 2)]);
+        assert!(binding
+            .matches_with_cache(&identical_ids, 64, None, 0, &mut cache)
+            .is_empty());
+        assert!(binding
+            .matches_with_cache(&text_ids, 64, None, 0, &mut cache)
+            .is_empty());
+    }
+
     #[test]
     fn ranks_hash_with_their_own_units_when_scored_at_a_common_unit() {
         use crate::kv_index::source::test_support::{full_binding, warm_full};

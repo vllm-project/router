@@ -1265,6 +1265,38 @@ fn salted_events_leave_replay_open_for_the_unsalted_chain() {
 }
 
 #[test]
+fn salted_image_events_preserve_unrelated_prefix_credit() {
+    use crate::kv_index::source::test_support::{
+        full_binding, full_store, warm_full, TEST_IMAGE_HASH,
+    };
+    use rmpv::Value;
+
+    let index = full_binding(target(), 16);
+    let warm: Vec<_> = (100..133).collect();
+    index.begin_empty(0);
+    warm_full(&index, 0, &warm[..32]);
+    assert_eq!(index.reusable_tokens(&warm, usize::MAX), 32);
+
+    let image = Value::Array(vec![TEST_IMAGE_HASH.into(), 0.into()]);
+    let salt = Value::from("private-request");
+    let tokens: Vec<_> = (0..33).collect();
+    for (seq, keys) in [
+        vec![Value::Array(vec![image.clone(), salt.clone()]), Value::Nil],
+        vec![Value::Array(vec![salt]), Value::Array(vec![image])],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut store = full_store(&tokens[..32], 16, None);
+        store.extra_keys = Some(keys);
+        let batch = event_batch(vec![KVEvent::BlockStored(store)]);
+        assert_eq!(index.apply_batch(seq as u64 + 1, &batch), Ok(()));
+        assert_eq!(index.reusable_tokens(&warm, usize::MAX), 32);
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+    }
+}
+
+#[test]
 fn declared_adapter_store_does_not_hide_layout_errors() {
     for error in ["group", "kind", "locality", "block size", "token packing"] {
         let index = fresh_index(16).with_adapters(vec![("lora1".into(), "/adapters/lora1".into())]);

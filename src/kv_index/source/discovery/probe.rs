@@ -622,6 +622,14 @@ pub(super) async fn query_server_info_json(
     {
         Some("MooncakeHybridConnector" | "MooncakeConnectorV1") => Some(true),
         Some("MooncakeConnector") => Some(false),
+        Some("MooncakeConnectorV2") => config
+            .pointer("/model_config/hf_config")
+            .and_then(serde_json::Value::as_object)
+            .map(|config| {
+                config
+                    .get("compress_ratios")
+                    .is_some_and(|value| value.is_array() || value.is_object())
+            }),
         _ => None,
     };
     Ok(ServerInfo {
