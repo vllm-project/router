@@ -1507,6 +1507,7 @@ impl KvAwarePolicy {
             if tokens.is_empty() {
                 return Vec::new();
             }
+            let start = binding.cache_key.as_ref().map(|_| Instant::now());
             let evidence_start = hashes.placement.as_ref().map(Vec::len);
             let mut hits = binding.matches.matches_with_cache(
                 tokens,
@@ -1524,6 +1525,18 @@ impl KvAwarePolicy {
                     .unwrap_or_default();
                 // Each lookup must prove its own hits before they enter the memo.
                 hits.retain(|hit| evidence.iter().any(|proof| proof.target() == &hit.target));
+            }
+            if let Some(start) = start {
+                crate::metrics::RouterMetrics::record_kv_index_lookup(
+                    !hits.is_empty(),
+                    start.elapsed(),
+                );
+                if hits.is_empty() {
+                    crate::metrics::RouterMetrics::record_kv_index_misses(
+                        binding.matches.hash_contract_failed(binding.target.dp_rank),
+                        1,
+                    );
+                }
             }
             lookups.record(if hit_count != hits.len() {
                 "unevidenced"
@@ -1956,7 +1969,8 @@ impl KvAwarePolicy {
                     else {
                         return false;
                     };
-                    shared.confirms_miss(tokens, &mut query_cache.hashes)
+                    let start = Instant::now();
+                    let confirmed = shared.confirms_miss(tokens, &mut query_cache.hashes)
                         && bindings.iter().zip(&prompts).all(|(binding, prompts)| {
                             binding
                                 .shared_prefix
@@ -1965,20 +1979,35 @@ impl KvAwarePolicy {
                                 && prompts
                                     .single()
                                     .is_some_and(|ids| std::ptr::eq(tokens, ids) || tokens == ids)
-                        })
+                        });
+                    let elapsed = start.elapsed();
+                    if confirmed {
+                        crate::metrics::RouterMetrics::record_kv_index_lookup(false, elapsed);
+                    } else {
+                        crate::metrics::RouterMetrics::record_kv_index_duration(
+                            "shared_prefix_probe_fallback",
+                            elapsed,
+                        );
+                    }
+                    confirmed
                 })
         } else {
             None
         };
         if let Some(tokens) = shared_miss {
             let size = bindings.len();
-            let count = input.eligibility.map_or(size, |_| {
-                healthy
-                    .iter()
-                    .filter(|&&i| input.allows_credit(i, workers.len()))
-                    .count()
-            });
-            lookups.record_count("miss", count as u64);
+            let mut count = 0;
+            let mut hash_failed = 0;
+            for (binding, &worker_index) in bindings.iter().zip(&healthy) {
+                if input.allows_credit(worker_index, workers.len()) {
+                    count += 1;
+                    hash_failed +=
+                        u64::from(binding.matches.hash_contract_failed(binding.target.dp_rank));
+                }
+            }
+            crate::metrics::RouterMetrics::record_kv_index_misses(true, hash_failed);
+            crate::metrics::RouterMetrics::record_kv_index_misses(false, count - hash_failed);
+            lookups.record_count("miss", count);
             return Some(SelectionPlan {
                 healthy,
                 bindings,
@@ -2737,6 +2766,25 @@ mod tests {
             );
             provider
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let metrics = recorder.handle();
+        let assert_samples = |lookups, fallback_probes| {
+            let text = metrics.render();
+            for (op, count) in [
+                ("lookup", lookups),
+                ("shared_prefix_probe_fallback", fallback_probes),
+            ] {
+                let prefix =
+                    format!(r#"vllm_router_kv_index_request_duration_seconds_count{{op="{op}"}} "#);
+                let actual: u64 = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&prefix))
+                    .map(|value| value.parse().unwrap())
+                    .unwrap_or(0);
+                assert_eq!(actual, count, "op={op}");
+            }
+        };
         let first = register(workers[0].as_ref(), &domain);
         let second = register(workers[1].as_ref(), &domain);
         let tokens = [42; 33];
@@ -2761,9 +2809,11 @@ mod tests {
         assert!(plan(&inputs).grouped.iter().all(Vec::is_empty));
         assert_eq!(first.1.load(Ordering::Relaxed), 0);
         assert_eq!(second.1.load(Ordering::Relaxed), 0);
+        assert_samples(1, 0);
 
         warm_full(&second.0, 0, &tokens[..32]);
         assert!(!plan(&inputs).grouped[1].is_empty());
+        assert_samples(3, 1);
 
         let mut different = inputs.clone();
         different.insert(
@@ -2771,6 +2821,7 @@ mod tests {
             Arc::from([vec![7; tokens.len()]]),
         );
         assert!(!plan(&different).grouped[1].is_empty());
+        assert_samples(5, 2);
 
         // A separate index can have the same policy key and still hold
         // different pages. A miss on the first index must not mask this hit.
@@ -2782,6 +2833,93 @@ mod tests {
         let plan = plan(&inputs);
         assert!(plan.grouped[0].is_empty());
         assert!(!plan.grouped[1].is_empty());
+        assert_samples(7, 3);
+    }
+
+    #[test]
+    fn lookup_reports_only_the_rank_with_a_rejected_hash_contract() {
+        use crate::kv_index::{wire::ExternalBlockHash, SourceError};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let metrics = recorder.handle();
+        let policy = KvAwarePolicy::default();
+        let domain = Arc::new(crate::kv_index::KvBlockIndexer::new());
+        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let indexes: Vec<_> = workers
+            .iter()
+            .map(|w| {
+                let target = target(w.url(), 0);
+                let index =
+                    Arc::new(full_binding(target.clone(), 16).with_shared_index(domain.clone()));
+                index.begin_empty(0);
+                policy.register_target_with_cache_identity(
+                    w.url(),
+                    target,
+                    CacheKey {
+                        model: "m".into(),
+                        block_size: 16,
+                    },
+                    index.clone(),
+                );
+                index
+            })
+            .collect();
+        let tokens = [42; 33];
+        let mut bad = full_store(&tokens[..16], 16, None);
+        bad.block_hashes[0] = ExternalBlockHash::Int(7);
+        assert_eq!(
+            indexes[0].apply_batch(0, &event_batch(vec![KVEvent::BlockStored(bad)])),
+            Err(SourceError::IntBlockHashes)
+        );
+        let lookup = |workers: &[Arc<dyn Worker>]| {
+            policy
+                .prepare_selection(
+                    workers,
+                    QualifiedKvInput {
+                        tokens: KvRequestTokens::Shared(Some(&tokens)),
+                        eligibility: None,
+                    },
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap()
+                .grouped
+        };
+        // One shared query, with different evidence at the two ranks.
+        assert!(lookup(&workers).iter().all(Vec::is_empty));
+        // One direct query against the affected rank.
+        assert!(lookup(&workers[..1])[0].is_empty());
+        let text = metrics.render();
+        for line in [
+            r#"vllm_router_kv_index_requests_total{op="lookup",result="miss"} 2"#,
+            r#"vllm_router_kv_index_miss_reason_total{reason="hash_mismatch"} 2"#,
+            r#"vllm_router_kv_index_miss_reason_total{reason="no_match"} 1"#,
+            r#"vllm_router_kv_index_errors_total{kind="hash_contract"} 1"#,
+            r#"vllm_router_kv_index_request_duration_seconds_count{op="lookup"} 2"#,
+        ] {
+            assert!(
+                text.lines().any(|seen| seen == line),
+                "missing {line} in {text}"
+            );
+        }
+        assert!(!text.contains(r#"vllm_router_kv_index_requests_total{op="lookup",result="hit"}"#));
+        // A replay boundary alone cannot establish the publisher's hash representation.
+        indexes[0].begin_empty(0);
+        assert!(lookup(&workers[..1])[0].is_empty());
+        warm_full(&indexes[0], 0, &tokens[..32]);
+        assert!(!lookup(&workers[..1])[0].is_empty());
+        assert!(!indexes[0].hash_contract_failed(0));
+        let text = metrics.render();
+        assert!(
+            text.contains(r#"vllm_router_kv_index_miss_reason_total{reason="hash_mismatch"} 3"#)
+        );
+        assert!(text.contains(r#"vllm_router_kv_index_requests_total{op="lookup",result="hit"} 1"#));
     }
 
     #[test]
@@ -4824,10 +4962,17 @@ mod tests {
             });
             let rendered = recorder.handle().render();
             let unevidenced = "vllm_router_kv_placement_lookups_total{result=\"unevidenced\"}";
+            let indexed_hits = r#"vllm_router_kv_index_requests_total{op="lookup",result="hit"}"#;
+            let indexed_misses =
+                r#"vllm_router_kv_index_requests_total{op="lookup",result="miss"}"#;
             if reserve_prefill {
                 assert!(rendered.contains(&format!("{unevidenced} 1")));
+                assert!(rendered.contains(&format!("{indexed_hits} 1")));
+                assert!(rendered.contains(&format!("{indexed_misses} 1")));
             } else {
                 assert!(!rendered.contains(unevidenced));
+                assert!(rendered.contains(&format!("{indexed_hits} 2")));
+                assert!(!rendered.contains(indexed_misses));
             }
             assert_eq!(receipt.new_prefill_tokens, expected);
             assert_eq!(receipt.slot.is_some(), reserve_prefill);

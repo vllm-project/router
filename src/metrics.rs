@@ -75,6 +75,14 @@ pub fn init_metrics() {
     );
 
     // Policy metrics
+    describe_gauge!(
+        "vllm_router_kv_index_sources",
+        "Registered worker/rank KV event sources by observed index visibility"
+    );
+    describe_gauge!(
+        "vllm_router_kv_index_ranks",
+        "Registered KV index ranks by routing role"
+    );
     describe_counter!(
         "vllm_router_kv_routing_inputs_total",
         "KV-aware token preparation by transport and result"
@@ -83,6 +91,31 @@ pub fn init_metrics() {
         "vllm_router_kv_placement_lookups_total",
         "KV-aware placement lookups and reasons for skipping them"
     );
+    describe_counter!(
+        "vllm_router_kv_events_total",
+        "Indexed KV events by event type and admission outcome"
+    );
+    describe_counter!(
+        "vllm_router_kv_index_requests_total",
+        "Completed placement lookups; a shared negative lookup is one operation"
+    );
+    describe_histogram!(
+        "vllm_router_kv_index_request_duration_seconds",
+        "Time spent on completed placement lookups or shared prefix probes that require per-rank lookups, in seconds"
+    );
+    describe_counter!(
+        "vllm_router_kv_index_errors_total",
+        "Confirmed KV index errors by kind"
+    );
+    describe_counter!(
+        "vllm_router_kv_index_miss_reason_total",
+        "Empty placement results by reason; a shared lookup accounts for each eligible rank"
+    );
+    describe_counter!(
+        "vllm_router_kv_event_warnings_total",
+        "KV event ingestion warnings by bounded kind"
+    );
+    describe_gauge!("vllm_router_kv_source_last_event_age_seconds", "Seconds since the last live KV frame, or since subscription if none has arrived; NaN for inactive slots");
     describe_counter!(
         "vllm_router_kv_source_recovery_events_total",
         "KV event source recovery events by mode and reason"
@@ -682,6 +715,42 @@ impl RouterMetrics {
 
     pub fn record_kv_placement_lookup(result: &'static str) {
         kv_placement_lookup_counter(result).increment(1);
+    }
+
+    pub(crate) fn record_kv_index_lookup(hit: bool, duration: Duration) {
+        let result = if hit { "hit" } else { "miss" };
+        counter!("vllm_router_kv_index_requests_total", "op" => "lookup", "result" => result)
+            .increment(1);
+        Self::record_kv_index_duration("lookup", duration);
+    }
+
+    pub(crate) fn record_kv_index_duration(op: &'static str, duration: Duration) {
+        histogram!("vllm_router_kv_index_request_duration_seconds", "op" => op)
+            .record(duration.as_secs_f64());
+    }
+
+    pub(crate) fn record_kv_index_misses(hash_failed: bool, count: u64) {
+        if count > 0 {
+            let reason = if hash_failed {
+                "hash_mismatch"
+            } else {
+                "no_match"
+            };
+            counter!("vllm_router_kv_index_miss_reason_total", "reason" => reason).increment(count);
+        }
+    }
+
+    pub(crate) fn record_kv_hash_contract_error() {
+        counter!("vllm_router_kv_index_errors_total", "kind" => "hash_contract").increment(1);
+    }
+
+    pub(crate) fn record_kv_event_warning(kind: &'static str, count: u64) {
+        counter!("vllm_router_kv_event_warnings_total", "kind" => kind).increment(count);
+    }
+
+    pub(crate) fn record_kv_events(event_type: &'static str, status: &'static str, count: u64) {
+        counter!("vllm_router_kv_events_total", "event_type" => event_type, "status" => status)
+            .increment(count);
     }
 
     pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {

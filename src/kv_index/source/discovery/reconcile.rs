@@ -158,10 +158,15 @@ impl KvIndexSupervisor {
             self.on_worker_removed(&base);
         }
         let refresh: Vec<_> = {
-            let workers = self.installed.workers.lock();
+            let mut workers = self.installed.workers.lock();
             bases
                 .iter()
                 .filter_map(|base| {
+                    if let Some(worker) = workers.get_mut(base) {
+                        worker
+                            .coverage
+                            .set_role(self.rank_role(base, Some(prefill_bases)));
+                    }
                     let missing = !self.lifecycles.lock().contains_key(base);
                     let lifecycle = self.lifecycle_for_worker(base);
                     (missing || lifecycle.refresh_due()).then(|| {
@@ -174,7 +179,7 @@ impl KvIndexSupervisor {
                 })
                 .collect()
         };
-        self.refresh_registrations(refresh, plain_only, prefill_bases)
+        self.refresh_registrations(refresh, plain_only, Some(prefill_bases))
             .await;
         self.worker_registrations()
     }
@@ -210,7 +215,7 @@ impl KvIndexSupervisor {
                 .collect()
         };
         let changed = self
-            .refresh_registrations(refresh, &HashSet::new(), &HashSet::new())
+            .refresh_registrations(refresh, &HashSet::new(), None)
             .await;
         if changed.is_empty() {
             return HashMap::new();
@@ -224,12 +229,14 @@ impl KvIndexSupervisor {
         &self,
         refresh: Vec<(String, Arc<WorkerLifecycle>, Option<Arc<AtomicBool>>)>,
         plain_only: &HashSet<String>,
-        prefill_bases: &HashSet<String>,
+        prefill_bases: Option<&HashSet<String>>,
     ) -> HashSet<String> {
         use futures_util::{stream, StreamExt};
         let probes: Vec<_> = stream::iter(refresh.into_iter().map(
             |(base, lifecycle, owner)| async move {
-                let connector = self.pd_connector.filter(|_| prefill_bases.contains(&base));
+                let connector = self
+                    .pd_connector
+                    .filter(|_| prefill_bases.is_some_and(|pool| pool.contains(&base)));
                 let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
                 let probe = tokio::time::timeout_at(
                     deadline,
@@ -281,6 +288,7 @@ impl KvIndexSupervisor {
                         owner,
                         Some(lifecycle.clone()),
                         connector,
+                        self.rank_role(&base, prefill_bases),
                     );
                     if !installation.is_ok_and(|info| info.cache_key.is_some()) {
                         self.installed.retire_if_current(&base, &lifecycle);

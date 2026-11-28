@@ -199,6 +199,185 @@ fn target(name: &str) -> RoutableTarget {
     }
 }
 
+#[test]
+fn warnings_count_committed_events_and_preserve_device_replica_counts() {
+    use crate::kv_index::source::test_support::event_batch;
+    use crate::kv_index::SourceError;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mut index = full_binding(target("warning-worker"), BLOCK_SIZE);
+    index.max_entries = 1;
+    index.begin_empty(0);
+    let gpu = store_prompt();
+    let mut host = gpu.clone();
+    host.medium = Some("CPU".into());
+    let missing = full_store(&[6, 7, 8, 9], BLOCK_SIZE, None);
+    let store = |event| KVEvent::BlockStored(event);
+    let remove_gpu = || gpu_remove(Some(0), gpu.block_hashes.clone());
+    let remove_unknown = || {
+        gpu_remove(
+            Some(0),
+            [missing.block_hashes.clone(), missing.block_hashes.clone()].concat(),
+        )
+    };
+
+    // A removal with no matching owner and another with no matching tier.
+    index
+        .apply_batch(
+            0,
+            &event_batch(vec![remove_unknown(), store(host.clone()), remove_gpu()]),
+        )
+        .unwrap();
+    index
+        .apply_batch(
+            1,
+            &event_batch(vec![
+                store(host.clone()),
+                store(gpu.clone()),
+                store(gpu.clone()),
+                remove_gpu(),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(credit(&index), 4);
+    index
+        .apply_batch(2, &event_batch(vec![remove_gpu(), remove_gpu()]))
+        .unwrap();
+
+    // Reject the entire batch after a duplicate; the pending duplicate warning is discarded.
+    assert_eq!(
+        index.apply_batch(3, &event_batch(vec![store(host), store(missing)])),
+        Err(SourceError::Capacity)
+    );
+    index.begin_empty(5);
+    assert_eq!(
+        index.apply_batch(6, &event_batch(vec![])),
+        Err(SourceError::Sequence)
+    );
+    index.begin_empty(5);
+    assert_eq!(
+        index.apply_batch(4, &event_batch(vec![])),
+        Err(SourceError::Sequence)
+    );
+
+    let text = recorder.handle().render();
+    let mut warnings: Vec<_> = text
+        .lines()
+        .filter(|s| s.starts_with("vllm_router_kv_event_warnings_total{"))
+        .collect();
+    warnings.sort_unstable();
+    assert_eq!(
+        warnings,
+        [
+            "vllm_router_kv_event_warnings_total{kind=\"capacity_exhausted\"} 1",
+            "vllm_router_kv_event_warnings_total{kind=\"duplicate_store\"} 1",
+            "vllm_router_kv_event_warnings_total{kind=\"stale_sequence\"} 1",
+            "vllm_router_kv_event_warnings_total{kind=\"unknown_remove\"} 3",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn verified_replay_overlap_does_not_raise_a_stale_sequence_warning() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("live-warning"), BLOCK_SIZE));
+    let _handle = tcp.start(index.clone(), None);
+    let store = batch_payload(&[KVEvent::BlockStored(store_prompt())]);
+    let empty = batch_payload(&[]);
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[(0, &store), (1, &empty)]);
+    wait_until(|| credit(&index) == 4).await;
+    tcp.live(1, &empty);
+    tcp.live(2, &empty);
+    wait_until(|| next_seq(&index) == Some(3)).await;
+    assert!(!recorder.handle().render().contains("stale_sequence"));
+    tcp.live(2, &empty);
+    wait_until(|| {
+        recorder
+            .handle()
+            .render()
+            .contains("vllm_router_kv_event_warnings_total{kind=\"stale_sequence\"} 1")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn replay_gap_remove_rejection_and_quiet_publisher_have_distinct_metrics() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = recorder.handle();
+    let tcp = TcpReplay::new();
+    let index = Arc::new(full_binding(target("scrape-worker"), BLOCK_SIZE));
+    let (tx, mut signals) = mpsc::channel(8);
+    let _subscriber = tcp.start(index.clone(), Some(tx));
+    tcp.subscribed().await;
+    tcp.history(&tcp.request(0).await, &[]);
+
+    // Removal arrives before its store. Then skip sequence 1 on the live socket.
+    let store = store_prompt();
+    tcp.live(
+        0,
+        &batch_payload(&[gpu_remove(Some(0), store.block_hashes.clone())]),
+    );
+    wait_until(|| next_seq(&index) == Some(1)).await;
+    tcp.live(2, &batch_payload(&[]));
+    assert!(matches!(
+        signal(&mut signals).await,
+        IngestionSignal::Gap {
+            from_seq: 1,
+            to_seq: 1,
+            ..
+        }
+    ));
+    let gap = tcp.request(1).await;
+    tcp.history(
+        &gap,
+        &[(1, &batch_payload(&[KVEvent::BlockStored(store.clone())]))],
+    );
+    wait_until(|| credit(&index) == 4 && next_seq(&index) == Some(3)).await;
+
+    let mut invalid = store;
+    invalid.block_hashes.clear();
+    tcp.live(3, &batch_payload(&[KVEvent::BlockStored(invalid)]));
+    wait_until(|| metrics.render().contains(r#"status="invalid_block"} 1"#)).await;
+    assert_eq!(credit(&index), 0);
+    // Keep XPUB connected and stop sending. The rejected live frame was the last arrival.
+    wait_until(|| {
+        metrics
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("vllm_router_kv_source_last_event_age_seconds{"))
+            .any(|line| {
+                line.split_ascii_whitespace()
+                    .last()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .is_some_and(|age| age >= 1.0)
+            })
+    })
+    .await;
+    let text = metrics.render();
+    let mut events: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            line.starts_with("vllm_router_kv_events_total{")
+                || line.starts_with("vllm_router_kv_event_warnings_total{")
+        })
+        .collect();
+    events.sort_unstable();
+    assert_eq!(
+        events,
+        [
+            r#"vllm_router_kv_event_warnings_total{kind="unknown_remove"} 1"#,
+            r#"vllm_router_kv_events_total{event_type="removed",status="ok"} 1"#,
+            r#"vllm_router_kv_events_total{event_type="stored",status="invalid_block"} 1"#,
+            r#"vllm_router_kv_events_total{event_type="stored",status="ok"} 1"#,
+        ]
+    );
+}
+
 #[tokio::test]
 async fn emit_drops_when_full_and_records_loss() {
     let (tx, mut rx) = mpsc::channel(1);

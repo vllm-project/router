@@ -263,6 +263,19 @@ pub(super) struct LayoutWorkerProvider {
 }
 
 impl LayoutWorkerProvider {
+    pub(super) fn visible_rank_count(&self) -> usize {
+        if !self.lifecycle.trusted(&self.lifecycle.state.lock()) {
+            return 0;
+        }
+        self.indexes
+            .values()
+            .filter(|rank| {
+                rank.control.generation() != 0
+                    && rank.binding.as_ref().is_none_or(|lease| lease.is_active())
+            })
+            .count()
+    }
+
     fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
         let mut state = self.lifecycle.state.lock();
         let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
@@ -309,6 +322,12 @@ impl LayoutWorkerProvider {
 }
 
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
+    fn hash_contract_failed(&self, rank: u32) -> bool {
+        self.indexes
+            .get(&rank)
+            .is_some_and(|index| index.hash_contract_failed(rank))
+    }
+
     fn shared_prefix_lookup(&self, rank: u32) -> Option<crate::kv_index::SharedPrefixLookup> {
         self.indexes.get(&rank)?.shared_prefix_lookup(rank)
     }
@@ -430,6 +449,15 @@ impl KvIndexSupervisor {
                 }
                 if provider.lifecycle.expire_if_needed() {
                     invalidate(&handles);
+                }
+                if let Some(installed) = installed.upgrade() {
+                    let mut workers = installed.workers.lock();
+                    if let Some(subs) = workers
+                        .get_mut(&worker)
+                        .filter(|subs| Arc::ptr_eq(&subs.provider, &provider))
+                    {
+                        subs.coverage.refresh(&provider);
+                    }
                 }
                 let outcome = if let Some(config) = &static_config {
                     static_hybrid_sources_match(

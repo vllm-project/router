@@ -213,6 +213,9 @@ impl Subscriber {
                         return None;
                     }
                     if seq != next {
+                        if seq < next {
+                            RouterMetrics::record_kv_event_warning("stale_sequence", 1);
+                        }
                         warn!(%topic, seq, expected = next, "KV replay sequence gap");
                         return None;
                     }
@@ -265,7 +268,9 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
     let hwm = source.hwm;
     let can_replay = subscriber.binding.is_some();
 
-    tokio::spawn(async move {
+    let age = Arc::new(super::liveness::SourceAge::new(&source_id, dp_rank));
+    let live_age = Arc::clone(&age);
+    let run = async move {
         let mut failures = 0u32;
         loop {
             if is_shutdown(&mut shutdown_rx) || !subscriber.active() {
@@ -413,6 +418,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                             &mut sub,
                             &mut pending_live,
                             topic.as_bytes(),
+                            &live_age,
                         )
                         .await
                         {
@@ -525,7 +531,7 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 let (through, overlap, restart_from) = 'live_batch: {
                     let received = pending_live
                         .pop()
-                        .map_or_else(|| sub.socket().recv_multipart(zmq::DONTWAIT), Ok);
+                        .map_or_else(|| live_age.recv(sub.socket(), topic.as_bytes()), Ok);
                     match received {
                         Ok(mut frames) => {
                             let seq = match live_sequence(&frames, topic.as_bytes()) {
@@ -570,6 +576,10 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                                 bootstrap = false;
                                 replay_socket = None;
                                 continue 'live;
+                            }
+                            // Verified replay overlap was consumed above; zero can start a new incarnation.
+                            if seq > 0 && seq <= last_seq {
+                                RouterMetrics::record_kv_event_warning("stale_sequence", 1);
                             }
                             // Sequence zero outside the verified replay overlap
                             // can belong to a new publisher lifetime.
@@ -716,6 +726,12 @@ fn spawn_subscriber(subscriber: Subscriber, ctx: Arc<zmq::Context>) -> Subscribe
                 _ = tokio::time::sleep(delay) => {},
                 _ = shutdown_rx.recv() => return,
             }
+        }
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = run => {},
+            _ = age.report() => {},
         }
     });
 

@@ -189,7 +189,7 @@ impl IndexBatch<'_> {
         hashes: &[SequenceHash],
         incremental: bool,
         max_entries: usize,
-    ) -> Result<(), PageWriteError> {
+    ) -> Result<PageWriteOutcome, PageWriteError> {
         self.check_target(&owner.target());
         self.index.hash_pages.store(
             self.active_pages,
@@ -209,7 +209,7 @@ impl IndexBatch<'_> {
         tier: StorageTier,
         hashes: &[SequenceHash],
         incremental: bool,
-    ) -> Result<(), PageWriteError> {
+    ) -> Result<PageWriteOutcome, PageWriteError> {
         self.check_target(&owner.target());
         self.write.mark_removal();
         self.index
@@ -221,6 +221,8 @@ impl IndexBatch<'_> {
 #[derive(Default)]
 pub(crate) struct StreamControl {
     visible_generation: AtomicU64,
+    /// Diagnostic evidence for this subscription. Replay retries alone do not disprove it.
+    pub(in crate::kv_index) hash_contract_failed: std::sync::atomic::AtomicBool,
 }
 
 impl StreamControl {
@@ -312,6 +314,9 @@ impl StreamState {
     }
 
     pub(crate) fn begin_lease(&mut self) -> u64 {
+        self.control
+            .hash_contract_failed
+            .store(false, Ordering::Relaxed);
         self.lease_id = next_generation();
         self.rejection_reported = false;
         self.lease_id

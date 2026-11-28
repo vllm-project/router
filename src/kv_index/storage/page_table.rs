@@ -10,7 +10,8 @@ use hashbrown::hash_map::EntryRef;
 use parking_lot::RwLock;
 
 use super::{
-    page_tag, records::Residency, Fast, KvBlockIndexer, PageQuery, PageWriteError, SourceVersion,
+    page_tag, records::Residency, Fast, KvBlockIndexer, PageQuery, PageWriteError,
+    PageWriteOutcome, SourceVersion,
 };
 use crate::kv_index::request_hash::SequenceHash;
 use crate::kv_index::types::{ResidencyOwner, RoutableTarget, StorageTier, TierBits};
@@ -536,7 +537,7 @@ fn observe(
     non_device_tiers: &mut usize,
     tier: StorageTier,
     incremental: bool,
-) -> Result<(), PageWriteError> {
+) -> Result<PageWriteOutcome, PageWriteError> {
     if let Some(holder) = holders.get_mut(owner.id) {
         let fact = &mut holder.residency;
         let new_non_device = tier != StorageTier::Device && !fact.tiers.contains(tier);
@@ -545,6 +546,9 @@ fn observe(
         }
         if new_non_device {
             *non_device_tiers += 1;
+        }
+        if !incremental && !new_non_device {
+            return Ok(PageWriteOutcome::DuplicateStore);
         }
     } else {
         let mut residency = Residency::default();
@@ -559,29 +563,30 @@ fn observe(
             residency,
         });
     }
-    Ok(())
+    Ok(PageWriteOutcome::Applied)
 }
 
+/// None means no copy at this tier; Some(true) means the membership can be erased.
 fn withdraw(
     holders: &mut Holders,
     owner_id: u64,
     non_device_tiers: &mut usize,
     tier: StorageTier,
     incremental: bool,
-) -> bool {
-    let Some(holder) = holders.get_mut(owner_id) else {
-        return false;
-    };
-    let fact = &mut holder.residency;
+) -> Option<bool> {
+    let fact = &mut holders.get_mut(owner_id)?.residency;
+    if !fact.tiers.contains(tier) {
+        return None;
+    }
     let removed = fact.withdraw(tier, incremental);
     if tier != StorageTier::Device && removed {
         *non_device_tiers -= 1;
     }
     if fact.tiers.0 != 0 {
-        return false;
+        return Some(false);
     }
     holders.remove(owner_id);
-    true
+    Some(true)
 }
 
 impl PageTable {
@@ -610,12 +615,12 @@ impl PageTable {
         hashes: &[SequenceHash],
         incremental: bool,
         max_entries: usize,
-    ) -> Result<(), PageWriteError> {
+    ) -> Result<PageWriteOutcome, PageWriteError> {
         if incremental != (tier == StorageTier::Device) {
             return Err(PageWriteError::InvalidResidencyMode);
         }
         if hashes.is_empty() {
-            return Ok(());
+            return Ok(PageWriteOutcome::Applied);
         }
         // The source gate keeps memberships stable until the whole store is applied.
         let check_capacity = |count: usize, keys: Option<&Pages>| {
@@ -688,12 +693,15 @@ impl PageTable {
                 incremental,
             )
         };
+        let mut outcome = PageWriteOutcome::Applied;
         for &hash in hashes {
             let page = PageKey::new(group, hash);
             match keys.entry_ref(&page) {
                 EntryRef::Occupied(member) => {
                     // This source keeps the row attached while its write gate is held.
-                    observe_page(member.key())?;
+                    if observe_page(member.key())? == PageWriteOutcome::DuplicateStore {
+                        outcome = PageWriteOutcome::DuplicateStore;
+                    }
                 }
                 EntryRef::Vacant(member) => {
                     // Hold the directory entry until both the row and its membership exist.
@@ -708,7 +716,7 @@ impl PageTable {
                 }
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     pub(super) fn remove(
@@ -719,27 +727,37 @@ impl PageTable {
         tier: StorageTier,
         hashes: &[SequenceHash],
         incremental: bool,
-    ) -> Result<(), PageWriteError> {
+    ) -> Result<PageWriteOutcome, PageWriteError> {
         if incremental != (tier == StorageTier::Device) {
             return Err(PageWriteError::InvalidResidencyMode);
         }
         let Some(pages) = active.get_mut(owner) else {
-            return Ok(());
+            return Ok(if hashes.is_empty() {
+                PageWriteOutcome::Applied
+            } else {
+                PageWriteOutcome::UnknownRemove
+            });
         };
+        let mut outcome = PageWriteOutcome::Applied;
         let id = pages.owner.id;
         for &hash in hashes {
             // Remove carries the raw hash but no adapter name. Only namespaces
             // sharing this exact page need to be visited.
             let page = PageKey::new(group, hash);
+            let mut found = false;
             self.remove_row_if(&page, |row| {
                 for scope in row.scopes_mut() {
-                    if !withdraw(
+                    let Some(erase_membership) = withdraw(
                         &mut scope.holders,
                         id,
                         &mut pages.non_device_tiers,
                         tier,
                         incremental,
-                    ) {
+                    ) else {
+                        continue;
+                    };
+                    found = true;
+                    if !erase_membership {
                         continue;
                     }
                     pages.page_count -= 1;
@@ -756,11 +774,14 @@ impl PageTable {
                 }
                 row.prune()
             });
+            if !found {
+                outcome = PageWriteOutcome::UnknownRemove;
+            }
         }
         if pages.base.is_empty() && pages.named.is_empty() {
             active.remove(owner);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     pub(super) fn clear_owner(&self, active: &mut ActivePages, owner: &ResidencyOwner) {

@@ -888,6 +888,12 @@ async fn exercise_static_hybrid(pd: bool) {
     use crate::policies::{KvAwareOps, KvAwarePolicy};
     use axum::{routing::get, Json, Router};
 
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = recorder.handle();
+    let visible = || gauge_value(&metrics, "sources", "state", "visible");
+    let unavailable = || gauge_value(&metrics, "sources", "state", "unavailable");
+
     let group = |idx, kind, spec, mode| {
         serde_json::json!({
             "group_idx":idx, "kind":kind, "spec_type":spec, "block_size":528,
@@ -973,6 +979,7 @@ async fn exercise_static_hybrid(pd: bool) {
     publisher.bind("inproc://hybrid-discovery-pub").unwrap();
     replay.bind("inproc://hybrid-discovery-replay").unwrap();
     let info = supervisor.on_worker_added(&worker_url).await.unwrap();
+    assert_eq!((visible(), unavailable()), (0, 1));
     let provider = supervisor.match_provider_for_worker(&worker_url).unwrap();
     boundary_subscription(&publisher, "hybrid/epoch-1", false).await;
     let payload = crate::kv_index::source::binding::tests::qwen35_payload();
@@ -1007,6 +1014,7 @@ async fn exercise_static_hybrid(pd: bool) {
         .unwrap()
         .provider
         .clone();
+    wait_for(|| visible() == 1 && unavailable() == 0).await;
     fail_probe.store(true, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(5), async {
         while failed_probes.load(Ordering::Acquire) == 0 {
@@ -1024,6 +1032,7 @@ async fn exercise_static_hybrid(pd: bool) {
     .await
     .unwrap();
     assert!(hybrid.lifecycle.active.load(Ordering::Acquire));
+    wait_for(|| visible() == 0 && unavailable() == 1).await;
     assert!(provider.matches(&prompt, 528, None, 0).is_empty());
     if pd {
         let revision = supervisor.worker_registrations()[&worker_url].revision;
@@ -1092,6 +1101,9 @@ async fn exercise_static_hybrid(pd: bool) {
     })
     .await
     .unwrap();
+    wait_for(|| visible() == 1 && unavailable() == 0).await;
+    let role = if pd { "decode" } else { "regular" };
+    assert_eq!(gauge_value(&metrics, "ranks", "role", role), 1);
     sources.write().await["0"]["topic"] = serde_json::json!("hybrid/epoch-2");
     tokio::time::timeout(Duration::from_secs(5), async {
         while !provider.matches(&prompt, 528, None, 0).is_empty() {
@@ -1101,7 +1113,25 @@ async fn exercise_static_hybrid(pd: bool) {
     .await
     .unwrap();
     supervisor.shutdown();
+    assert_eq!((visible(), unavailable()), (0, 0));
+    assert_eq!(gauge_value(&metrics, "ranks", "role", role), 0);
     server.abort();
+}
+
+fn gauge_value(
+    metrics: &metrics_exporter_prometheus::PrometheusHandle,
+    metric: &str,
+    label: &str,
+    value: &str,
+) -> usize {
+    let key = format!("vllm_router_kv_index_{metric}{{{label}=\"{value}\"}} ");
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&key))
+        .unwrap_or_else(|| panic!("missing series {key}"))
+        .parse()
+        .unwrap()
 }
 
 fn declared_full_worker(
@@ -1233,6 +1263,10 @@ async fn source_group_rejects_duplicate_normalized_ranks_without_mutation() {
 
 #[tokio::test]
 async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = recorder.handle();
+    let ranks = || gauge_value(&metrics, "ranks", "role", "regular");
     let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
     let (second_endpoint, second_replay_endpoint, _second_publisher, _second_replay) =
         layout_endpoints();
@@ -1256,6 +1290,7 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
         .unwrap();
 
     let provider = supervisor.match_provider_for_worker(worker).unwrap();
+    assert_eq!(ranks(), 2);
     let active = supervisor.installed.workers.lock()[worker].active.clone();
     boundary_subscription(&publisher, "kv", true).await;
     finish_empty_startup_replay(&replay).await;
@@ -1272,6 +1307,7 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
         "kv",
     );
     let error = supervisor.install_worker(worker, conflicting).unwrap_err();
+    assert_eq!(ranks(), 2);
     assert!(error.contains("live KV streams") || error.contains("KV replay endpoints"));
     assert!(active.load(Ordering::Acquire));
     assert!(hit());
@@ -1280,7 +1316,46 @@ async fn failed_readd_preserves_the_active_binding_and_success_fences_it() {
     assert!(!active.load(Ordering::Acquire));
     assert!(!hit());
     assert!(supervisor.match_provider_for_worker(neighbor).is_some());
+    assert_eq!(ranks(), 2);
+    supervisor.on_worker_removed(worker);
+    supervisor.on_worker_removed(worker);
+    assert_eq!(ranks(), 1);
     supervisor.shutdown();
+    assert_eq!(ranks(), 0);
+}
+
+#[tokio::test]
+async fn index_coverage_follows_pd_pool_roles_for_each_rank() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let metrics = recorder.handle();
+    let ranks = |role| gauge_value(&metrics, "ranks", "role", role);
+    let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
+    let worker = "http://worker:8000";
+    let mut first = declared_full_worker("model", "id", 0, "inproc://p0", "inproc://r0", "kv");
+    let second = declared_full_worker("model", "id", 1, "inproc://p1", "inproc://r1", "kv");
+    first
+        .hybrid
+        .as_mut()
+        .unwrap()
+        .ranks
+        .extend(second.hybrid.unwrap().ranks);
+    first
+        .sources
+        .as_mut()
+        .unwrap()
+        .extend(second.sources.unwrap());
+    supervisor.install_worker(worker, first).unwrap();
+    assert_eq!(ranks("unassigned"), 2);
+    let pool = HashSet::from([worker.to_owned()]);
+    let empty = HashSet::new();
+    supervisor.refresh_workers(&pool, &empty, &pool).await;
+    supervisor.refresh_workers(&pool, &empty, &pool).await;
+    assert_eq!((ranks("unassigned"), ranks("prefill")), (0, 2));
+    supervisor.refresh_workers(&pool, &empty, &empty).await;
+    assert_eq!((ranks("prefill"), ranks("decode")), (0, 2));
+    supervisor.shutdown();
+    assert_eq!(ranks("decode"), 0);
 }
 
 #[tokio::test]
@@ -2059,11 +2134,13 @@ async fn pinned_static_admission_and_fencing_use_the_single_local_engine_report(
     live_frame(publisher, topic.as_bytes(), 0, &payload);
     let hit = || !provider.matches(&prompt, 16, None, 1).is_empty();
     wait_for(&hit).await;
+    assert_eq!(provider.visible_rank_count(), 1);
 
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let (reports, _) = metrics_meta::parse_cache_config_info(&incompatible);
     supervisor.fence_failed_registration(&url, &provider.lifecycle, &reports);
     assert!(!hit());
+    assert_eq!(provider.visible_rank_count(), 0);
     let registration = &supervisor.worker_registrations()[&url];
     assert!(registration.info.as_ref().unwrap().ranks.is_empty());
     assert!(!supervisor.workers_have_cache_bindings([(url.as_str(), 1)].into_iter()));

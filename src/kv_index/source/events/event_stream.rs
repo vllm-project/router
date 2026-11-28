@@ -278,6 +278,10 @@ impl EventStream {
                     Self::check(state, lease)?;
                     self.index.reset_stream(state, tx, None, false);
                     state.lease_id = 0;
+                    self.index
+                        .control
+                        .hash_contract_failed
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     Ok(())
                 },
             )
@@ -414,6 +418,143 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_distinguishes_a_quiet_publisher_from_a_rejected_live_event() {
+        use crate::kv_index::source::test_support::{event_payload, full_binding, full_store};
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // This runtime and its subscriber tasks share the local recorder's thread.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let metrics = recorder.handle();
+        let age = || {
+            metrics
+                .render()
+                .lines()
+                .find(|line| line.starts_with("vllm_router_kv_source_last_event_age_seconds{"))
+                .and_then(|line| line.split_whitespace().last()?.parse::<f64>().ok())
+                .unwrap()
+        };
+        let ctx = Arc::new(zmq::Context::new());
+        let publisher = ctx.socket(zmq::XPUB).unwrap();
+        let replay = ctx.socket(zmq::ROUTER).unwrap();
+        publisher.set_linger(0).unwrap();
+        replay.set_linger(0).unwrap();
+        publisher.bind("inproc://kv-metrics-live").unwrap();
+        replay.bind("inproc://kv-metrics-replay").unwrap();
+        let index = Arc::new(full_binding(
+            RoutableTarget {
+                instance_id: Arc::from("worker"),
+                dp_rank: 0,
+            },
+            16,
+        ));
+        let source = EventSource {
+            source: Arc::from("worker"),
+            dp_rank: 0,
+            pub_endpoint: "inproc://kv-metrics-live".into(),
+            replay_endpoint: Some("inproc://kv-metrics-replay".into()),
+            topic: "epoch".into(),
+            hwm: None,
+        };
+        let handle = spawn_zmq(source, Arc::new(EventStream::new(index.clone())), ctx).unwrap();
+        assert_eq!(recv(&publisher).await[0], b"\x01epoch");
+        let request = recv(&replay).await;
+        let tokens: Vec<_> = (0..17).collect();
+        let store = full_store(&tokens[..16], 16, None);
+        let good = event_payload(1.0, &[KVEvent::BlockStored(store.clone())], Some(0));
+
+        // Keep PUB connected and silent; catch up only through the replay channel.
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while age() < 1.5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let quiet_age = age();
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    b"epoch",
+                    &0_i64.to_be_bytes(),
+                    &good,
+                ],
+                0,
+            )
+            .unwrap();
+        // Sample a new gauge tick after the replay, not the stale value from
+        // before it. Replaying a Store must not make the SUB publisher younger.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !metrics.render().contains("status=\"ok\"") || age() == quiet_age {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(age() > quiet_age);
+
+        // First event is valid but the unsupported group rejects the entire live batch.
+        let mut invalid = store.clone();
+        invalid.group_idx = Some(99);
+        let bad = event_payload(
+            2.0,
+            &[KVEvent::BlockStored(store), KVEvent::BlockStored(invalid)],
+            Some(0),
+        );
+        publisher
+            .send_multipart([b"epoch".as_slice(), &1_i64.to_be_bytes(), &bad], 0)
+            .unwrap();
+        // The live frame is seen even while the subscriber is catching up.
+        // It reaches admission only after we send the replay end marker.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while age() >= 1.5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!metrics.render().contains("unsupported_group"));
+        replay
+            .send_multipart(
+                [
+                    request[0].as_slice(),
+                    &[],
+                    &[],
+                    &(-1_i64).to_be_bytes(),
+                    &[],
+                ],
+                0,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let text = metrics.render();
+                if text.contains("status=\"unsupported_group\"") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let text = metrics.render();
+        for status in ["ok", "unsupported_group"] {
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with("vllm_router_kv_events_total{")
+                        && l.contains("event_type=\"stored\"")
+                        && l.contains(&format!("status=\"{status}\""))
+                        && l.ends_with(" 1")),
+                "{text}"
+            );
+        }
+        assert_eq!(index.reusable_tokens(&tokens, usize::MAX), 0);
+        drop(handle);
     }
 
     #[tokio::test]

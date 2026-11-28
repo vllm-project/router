@@ -48,6 +48,12 @@ pub trait TieredMatchProvider: Send + Sync {
         self.matches(tokens, block_size, lora_name, dp_rank)
     }
 
+    /// Whether this rank's publisher has demonstrated an incompatible hash contract.
+    #[doc(hidden)]
+    fn hash_contract_failed(&self, _rank: u32) -> bool {
+        false
+    }
+
     /// Group restore evidence belongs to one target; dense lookups cover all targets.
     fn target_scoped(&self) -> bool {
         false
@@ -174,6 +180,14 @@ impl PlacementEvidence {
 }
 
 impl crate::policies::TieredMatchProvider for SourceBinding {
+    fn hash_contract_failed(&self, rank: u32) -> bool {
+        rank == self.target.dp_rank
+            && self
+                .control
+                .hash_contract_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn shared_prefix_lookup(&self, rank: u32) -> Option<SharedPrefixLookup> {
         (rank == self.target.dp_rank
             && self.plain_attention_match()
