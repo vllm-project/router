@@ -36,6 +36,7 @@ pub enum PolicyType {
     PowerOfTwo,
     ConsistentHash,
     StickyLeastLoaded,
+    LeastLoad,
 }
 
 #[pyclass]
@@ -162,6 +163,7 @@ impl Router {
                     virtual_nodes: 160, // Default value
                 },
                 PolicyType::StickyLeastLoaded => ConfigPolicyConfig::StickyLeastLoaded,
+                PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad,
             }
         };
 

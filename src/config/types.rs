@@ -1174,6 +1174,10 @@ pub enum PolicyConfig {
     #[serde(rename = "sticky_least_loaded")]
     StickyLeastLoaded,
 
+    /// Fewest in-flight requests. Does not pin a session.
+    #[serde(rename = "least_load")]
+    LeastLoad,
+
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
 }
@@ -1188,6 +1192,7 @@ impl PolicyConfig {
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::ConsistentHash { .. } => "consistent_hash",
             PolicyConfig::StickyLeastLoaded => "sticky_least_loaded",
+            PolicyConfig::LeastLoad => "least_load",
             PolicyConfig::RendezvousHash => "rendezvous_hash",
         }
     }
