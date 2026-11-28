@@ -1,9 +1,8 @@
 use crate::core::Worker;
-use crate::policies::{AffinityKey, AffinityRecord, RequestHeaders};
+use crate::policies::AffinityRecord;
 use axum::body::Body;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Custom error type for PD router operations
@@ -43,45 +42,11 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
     chain.join(" caused by: ")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PdEndpoint {
-    pub http_url: String,
-    pub dp_rank: Option<usize>,
-}
-
-impl PdEndpoint {
-    pub(super) fn for_worker(worker: &dyn Worker) -> Self {
-        Self {
-            http_url: worker.base_url().to_owned(),
-            dp_rank: worker.dp_rank(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum Stage {
-    Prefill,
-    Decode,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PdLoadSample {
-    pub prefill_requests: usize,
-    pub active_prefill_tokens: u64,
-    pub unknown_prefill_requests: usize,
-    pub pending_decode_requests: usize,
-    pub active_decode_requests: usize,
-    /// Logical context tokens of Decode requests admitted but not yet
-    /// dispatched. Their KV is not on the engine yet, so they are waiting work.
-    pub pending_decode_tokens: u64,
-    /// Logical context tokens of Decode requests already dispatched. Each
-    /// sequence contributes its full prompt length; shared physical prefix
-    /// blocks still count once per request: sequences share one copy.
-    pub active_decode_tokens: u64,
-    /// Admitted Decode requests whose prompt length the Router does not know.
-    /// Any candidate holding one is compared by request counts.
-    pub unknown_decode_requests: usize,
-}
+// Keep the existing HTTP type paths for callers of the load manager.
+pub(crate) use crate::policies::pd::{Loads, Stage};
+pub use crate::policies::pd::{
+    PdEndpoint, PdLoadSample, PdPrefillInput, PdRequestContext, PdSelection, StageDecision,
+};
 
 impl PdLoadSample {
     fn publish(self, stage: Stage, endpoint: &PdEndpoint) {
@@ -132,26 +97,6 @@ impl PdLoadSample {
         }
     }
 
-    pub(super) fn occupancy(self, stage: Stage) -> usize {
-        match stage {
-            Stage::Prefill => self.prefill_requests,
-            Stage::Decode => self.pending_decode_requests + self.active_decode_requests,
-        }
-    }
-
-    /// The unit Decode ranks by, when it can be known.
-    ///
-    /// `None` as soon as one admitted request on this endpoint has an unknown
-    /// prompt length: mixing a known token figure with an unknown one would
-    /// compare different units across the pool, and request counts are the
-    /// documented fallback.
-    pub(super) fn decode_tokens(self) -> Option<u64> {
-        (self.unknown_decode_requests == 0).then(|| {
-            self.pending_decode_tokens
-                .saturating_add(self.active_decode_tokens)
-        })
-    }
-
     fn idle(self) -> bool {
         self.prefill_requests == 0
             && self.active_prefill_tokens == 0
@@ -161,76 +106,11 @@ impl PdLoadSample {
     }
 }
 
-pub(super) type Loads = HashMap<(Stage, PdEndpoint), PdLoadSample>;
-
-/// Backend-effective tokens prepared outside the admission transaction.
-#[derive(Debug, Clone)]
-pub struct PdPrefillInput {
-    pub prompts: Option<Arc<[Vec<u32>]>>,
-    /// Per-rank placement snapshot.
-    /// Hashing and index queries are completed before the admission lock.
-    pub work_by_rank: HashMap<Option<usize>, crate::policies::PrefillWorkEstimate>,
-    pub allow_credit: bool,
-    pub fallback_reason: Option<&'static str>,
-}
-
-/// Token inputs are keyed by the P base URL: each backend renders its own
-/// effective input, so different tokenizer/template configurations never mix.
-#[derive(Clone)]
-pub struct PdRequestContext<'a> {
-    pub worker_pairs: Option<&'a HashSet<(PdEndpoint, PdEndpoint)>>,
-    pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
-    pub model_id: Option<&'a str>,
-    pub legacy_policy_input: Option<&'a str>,
-    pub(crate) prefill_cache: Option<&'a crate::policies::PreparedCacheSelection>,
-    pub(crate) decode_cache: Option<&'a crate::policies::PreparedCacheSelection>,
-    pub headers: Option<&'a RequestHeaders>,
-    /// Stable session identity for the optional kv_aware decode binding.
-    /// Resolved at request entry, only when the affinity switch is on;
-    /// `None` selects per request on both stages.
-    pub affinity_key: Option<AffinityKey>,
-    /// Borrowed LoRA name from the request; used for Decode binding only with an eligible affinity key.
-    pub lora_name: Option<&'a str>,
-    /// Request cache salt scoping the binding digest.
-    pub cache_salt: Option<&'a str>,
-    /// Marginal Decode context per candidate, keyed by worker URL, priced
-    /// immediately before Decode is selected. `None` keeps Decode on full
-    /// context tokens, or on request counts when those are unknown too.
-    pub decode_context: Option<&'a HashMap<String, u64>>,
-    pub route: &'a str,
-    /// True when this admission is a health probe: it takes a pair but starts
-    /// no sequence, so it must not reserve Decode occupancy.
-    pub probe: bool,
-}
-
 /// Prompt tokens a Prefill decision established, including credited prefix.
 fn prompt_tokens(prefill: &StageDecision) -> Option<u64> {
     prefill
         .new_prefill_tokens
         .map(|new| new.saturating_add(prefill.credited_prefix_tokens.unwrap_or(0)))
-}
-
-#[derive(Debug, Clone)]
-pub struct StageDecision {
-    pub fallback_reason: Option<&'static str>,
-    pub credited_prefix_tokens: Option<u64>,
-    pub worker_index: usize,
-    pub endpoint: PdEndpoint,
-    pub score: Option<f64>,
-    /// Immutable token work charged to this attempt after KV credit.
-    pub new_prefill_tokens: Option<u64>,
-    /// How session affinity shaped this stage's choice: bind / sticky_hit /
-    /// no_session / capacity_bypass, set only while the switch is on.
-    pub affinity_outcome: Option<&'static str>,
-    /// Held binding reference for this stage's decision; the admission
-    /// attempt releases it on cleanup.
-    pub affinity: Option<Arc<AffinityRecord>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PdSelection {
-    pub prefill: StageDecision,
-    pub decode: StageDecision,
 }
 
 #[derive(Debug, Default)]

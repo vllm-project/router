@@ -314,12 +314,12 @@ impl ProgramRouter {
     }
 
     pub(crate) fn uses_kv_binding(&self) -> bool {
-        self.admission.config.binding_strategy == super::ProgramBindingStrategy::KvAware
+        self.admission.config.binding_strategy.uses_kv_index()
     }
 
     /// Whether initial Program binding needs the request text for prefix affinity.
     pub fn uses_cache_aware_binding(&self) -> bool {
-        self.admission.config.binding_strategy == super::ProgramBindingStrategy::CacheAware
+        self.admission.config.binding_strategy.needs_routing_text()
     }
 }
 

@@ -94,9 +94,7 @@ impl ConfiguredKvSources {
         } = policy
         {
             **static_kv_event_sources = std::mem::take(&mut self.regular);
-        } else if let Some(program) = program.filter(|p| {
-            p.binding_strategy == crate::program_scheduling::ProgramBindingStrategy::KvAware
-        }) {
+        } else if let Some(program) = program.filter(|p| p.binding_strategy.uses_kv_index()) {
             program.binding_kv_sources = std::mem::take(&mut self.regular);
         } else {
             return Err(ConfigError::IncompatibleConfig {

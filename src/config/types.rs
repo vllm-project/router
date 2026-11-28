@@ -1109,7 +1109,7 @@ impl RoutingMode {
     pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
             RoutingMode::VllmPrefillDecode { prefill_policy, .. } => {
-                prefill_policy.as_ref().unwrap_or(main_policy)
+                crate::policies::effective_stage_policy(main_policy, prefill_policy.as_ref())
             }
             _ => main_policy,
         }
@@ -1120,7 +1120,7 @@ impl RoutingMode {
     pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
         match self {
             RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
-                decode_policy.as_ref().unwrap_or(main_policy)
+                crate::policies::effective_stage_policy(main_policy, decode_policy.as_ref())
             }
             _ => main_policy,
         }
@@ -1455,7 +1455,7 @@ impl RouterConfig {
     pub(crate) fn uses_program_kv_binding(&self) -> bool {
         self.program_scheduling
             .as_ref()
-            .is_some_and(|program| program.binding_strategy == ProgramBindingStrategy::KvAware)
+            .is_some_and(|program| program.binding_strategy.uses_kv_index())
     }
 
     /// Program dispatch may score local P/D indexes. The cross-turn remote-read

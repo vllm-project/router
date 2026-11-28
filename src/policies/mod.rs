@@ -9,16 +9,19 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+pub(crate) mod binding;
 mod cache_aware;
 mod consistent_hash;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;
+pub(crate) mod pd;
 mod power_of_two;
 mod random;
 mod registry;
 mod rendezvous_hash;
 mod round_robin;
+pub(crate) mod selection;
 mod sticky_least_loaded;
 
 pub use cache_aware::PreparedCacheSelection;
@@ -41,6 +44,13 @@ pub use registry::PolicyRegistry;
 pub use rendezvous_hash::RendezvousHashPolicy;
 pub use round_robin::RoundRobinPolicy;
 pub use sticky_least_loaded::StickyLeastLoadedPolicy;
+
+pub(crate) fn effective_stage_policy<'a>(
+    main: &'a crate::config::PolicyConfig,
+    stage: Option<&'a crate::config::PolicyConfig>,
+) -> &'a crate::config::PolicyConfig {
+    stage.unwrap_or(main)
+}
 
 /// HTTP headers passed to policies for routing decisions
 /// Key is lowercase header name, value is header value

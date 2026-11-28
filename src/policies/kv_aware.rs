@@ -4452,10 +4452,12 @@ mod tests {
         first.release_ref();
         assert!(!second.is_expired(Instant::now() + ttl * 2));
 
-        let released_at = Instant::now();
+        let earliest_deadline = Instant::now() + ttl;
         second.release_ref();
-        assert!(!second.is_expired(released_at + ttl));
+        let latest_deadline = Instant::now() + ttl;
         let deadline = second.state.lock().idle_deadline.unwrap();
+        assert!((earliest_deadline..=latest_deadline).contains(&deadline));
+        assert!(!second.is_expired(deadline - Duration::from_nanos(1)));
         assert!(second.is_expired(deadline));
         second.state.lock().idle_deadline = Some(Instant::now() - ttl);
         assert!(table.acquire(&digest).is_none());

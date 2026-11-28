@@ -23,8 +23,8 @@
 | 谁持有 | 持有什么 | 何时取得、何时释放 |
 | --- | --- | --- |
 | `AdmissionService`（复用 `ProgramScheduler`） | 每代的请求 FIFO、当前 D 放置和放置版本、每个 D rank 的逻辑 Program 数与 token 占用、暂停/恢复及 TTL | 登记仅排队。成功提交时写入放置和占用，续轮只核算本轮增量。释放、暂停、迁移和已提交但未派发的取消都由同一把调度锁处理。每个 PD Program 同时至多一轮在途。 |
-| Router 和绑定策略 | Router 持有请求视图；策略持有轮询游标、文本亲和等算法状态 | 首绑或失效重绑才评分；成功提交后按票据幂等确认。拓扑移除和实际放置按池有序通知。 |
-| PD Router 的 prefill 策略与许可管理器 | 当轮 P、稳定的 P 许可键、该键共用的并发信号量 | 选 P 后等待许可；开始 P 请求前持有，消费完 P 响应体、出错或取消时归还。discovery 展开多个 DP rank 时沿用注册项对应的许可键。 |
+| Router 和 `policies::binding` | Router 持有请求视图，绑定策略持有轮询游标、文本亲和等算法状态 | 首绑或失效重绑才评分；成功提交后按票据幂等确认。拓扑移除和实际放置按池有序通知。 |
+| `policies::pd` 和 PD Router 的许可管理器 | 策略推荐当轮 P，许可管理器持有稳定的 P 许可键和该键共用的并发信号量 | 选 P 后等待许可；开始 P 请求前持有，消费完 P 响应体、出错或取消时归还。discovery 展开多个 DP rank 时沿用注册项对应的许可键。 |
 | PD 发送端与 `PdLoadManager` | 实际 P/D 的一次执行负载回执 `PdAttempt` | 两端和许可就绪后，固定目标发送为本轮记一笔。选 P 时有可靠估算的请求按预计新增工作量记 P 负载，其余按未知大小记一笔。P body 结束释放 P 负载；D 从 pending 转 active，终态或 Drop 释放。原生负载策略也能看到这些请求。 |
 | warm runtime 与引擎 | Router 保存可独占认领的候选及其来源；引擎持有物理 KV、租期和读取反馈 | 上一轮完整成功且证据齐全时可发布；下一轮独占认领，读前重验。执行负载、D 逻辑席位、KV 源租期各有自己的结束条件。 |
 
@@ -38,8 +38,9 @@
 sequenceDiagram
     participant R as PD Router
     participant A as AdmissionService
-    participant B as D 绑定策略
-    participant P as P 策略与许可管理器
+    participant B as policies 中的 D 绑定策略
+    participant P as policies 中的 P 策略
+    participant G as P 许可管理器
     participant H as PD 发送端
     R->>A: register_attempt(identity, pool, demand, deadline, hints)
     A-->>R: FIFO handle h
@@ -55,13 +56,14 @@ sequenceDiagram
     alt P 的有效策略为 kv_aware
         R->>P: 给出兼容 P 名单、本轮 token 和可选历史源快照
         Note over R,P: 读各 P 的 KV 事件索引和负载，估算本地命中及热读可额外省下的计算
-        P-->>R: 所选 P0、许可键、预计新增工作量和评分依据
+        P-->>R: 推荐 P0
+        R->>R: 关联 P0 的许可键和本轮工作量估算
     else 使用其他 P 策略
         R->>P: 用原请求的路由键或 headers 调用配置的策略
-        P-->>R: 所选 P0 和许可键
+        P-->>R: 推荐 P0
     end
-    R->>P: reserve_prefill(许可键, 原截止时间)
-    P-->>R: P0 的 permit
+    R->>G: reserve_prefill(P0 的许可键, 原截止时间)
+    G-->>R: P0 的 permit
     alt 配置允许且所选路径值得尝试热读
         R->>R: 独占认领并在读前复核历史前缀、源实例和租期
         Note over R,H: 通过则用 WarmRemote；验证失败则用 ColdRemote
@@ -146,6 +148,24 @@ HTTP 集成测试使用两个模拟 D 和独立的 KV 事件发布端。一组�
 首轮拿到 D 的派发凭证后，Router 查每台合格 P 上与本轮输入连续匹配的设备 KV 块，算出本轮还要做的工作，加上该 P 已接下的 token 工作量。续轮重新比较 P。配置了静态、双向 NIXL 和反馈协议，且请求是精确 token ID 的 completions 时，Router 还会估算历史 D 能补上多少。默认至少多省一个 token 才计收益，部署可通过 `pd.warm_min_extra_tokens` 提高门槛。配置了时间校准表且命中表项时，还会比较传输与冷算时间。设置门槛的单位是 token。
 
 选定 P 后，Router 沿用本轮剩余排队时间申请该 P 的并发许可。命中估算随发送前的最新索引更新。源失效或热读失败时，冷路径沿用这台 P，在同一份回执上更正工作量。测试用 400 个输入 token 复现了第 5.2 节的两个选择，并核对热读撤回后 P、D 计数都能归零。
+
+### 5.4 混布和 PD 分离共用的策略层
+
+`src/policies` 负责回答“这几个候选里推荐谁”。配置仍然分两层，`binding_strategy` 管一个 Program 第一次落在哪台机器，`policy` 和 P、D 各自的覆盖项管请求级选点。两层可以各选各的算法。
+
+| 场景 | 什么时候挑、按哪个配置挑 |
+| --- | --- |
+| 混布普通请求 | 挑一台同时跑 P 和 D 的 worker。优先用模型在注册表中的策略，否则用主 `policy`。结构化和透传请求都经 `select_regular`，沿用 KV、cache aware 和其他策略各自的输入与回退。 |
+| 原生 PD 请求 | P 用 `prefill_policy`，D 用 `decode_policy`。某侧未配置就继承主 `policy`。原有连接器和策略允许延后选 D 时，发送前再按最新负载确定 D。 |
+| 混布 Program 首绑或失效重绑 | `binding_strategy` 为 Program 选择整台 worker。启用 HTTP 会话 KV 评分时，按合格 worker 的 KV 证据和执行负载推荐。有效续轮跟随已有绑定。 |
+| PD Program 首绑或失效重绑 | `binding_strategy` 选择 D rank。HTTP 的 `kv_aware` 路径先取调度器给的合格名单。只有一个候选就直接推荐，有多个则比较每台已记账的 token 加本轮预计新增的 token。只要一台缺少可比估算，整组改用请求数和已记账 Program 数中较大的值比较。其他绑定策略沿用各自的绑定流程。 |
+| PD Program 每一轮 | 取得 D 的派发凭证后，按本轮 P 策略挑与该 D 兼容的 P。KV aware 比较 P 已接的 token 工作量加本轮还需计算的部分，可计入通过检查的热读收益。某台工作量未知时整组按 P 的请求数比较。其他 P 策略继续使用原有请求文本、头和 worker 负载。 |
+
+以两个 D、两个 P 为例。配置 `binding_strategy: kv_aware`、`--prefill-policy round_robin`。新会话首轮，两台 D 都容得下，策略比较后推荐 D1。调度器在锁内复核并给 D1 记账，随后 P 轮询挑到 P0。第二轮只要 D1 绑定有效，调度器检查 D1 能否容纳新增内容；放行后，P 轮询可以挑到 P1。若希望 P 也参考缓存，把 `--prefill-policy` 改为 `kv_aware` 即可。
+
+Router 准备各 worker 的输入、KV 事件证据和可用的热读估算。策略层据此打分并处理证据不足时的负载回退。准入、队列、票据复核及容量记账仍由调度器负责，P 许可和实际传输由 PD Router 执行。选 P 时估出的热读收益要在实际读取前重新验证。
+
+实现入口见 [策略注册表](../../src/policies/registry.rs)、[混布请求选择](../../src/policies/selection.rs)、[Program 绑定策略](../../src/policies/binding.rs)、[原生 PD 阶段选择](../../src/policies/pd/mod.rs) 和 [PD Program 的 D、P 选择](../../src/policies/pd/program.rs)。
 
 ## 6. 失败和重试契约
 

@@ -66,73 +66,34 @@ impl crate::program_scheduling::SessionRankScorer for ProgramDecodeKvRequest<'_>
         candidates: &[crate::program_scheduling::ProgramBindingCandidate],
     ) -> Result<Option<String>, crate::program_scheduling::ScheduleError> {
         let model = self.body.get("model").and_then(Value::as_str);
-        let mut ranks = Vec::new();
-        let mut workers = Vec::new();
-        for rank in candidates {
-            if let Some(worker) = self
-                .router
-                .program_decode_worker(&rank.target_id)
-                .filter(|worker| super::pd_router::model_eligible(worker.as_ref(), model))
-            {
-                ranks.push(rank);
-                workers.push(worker);
-            }
-        }
-        if workers.is_empty() {
-            return Ok(None);
-        }
-        if let [only] = ranks.as_slice() {
-            RouterMetrics::record_prefix_routing_decision(
-                "kv_aware",
-                "program_decode",
-                "single_candidate",
-            );
-            return Ok(Some(only.target_id.clone()));
-        }
+        let eligible: Vec<_> = candidates
+            .iter()
+            .filter_map(|rank| {
+                let worker = self.router.program_decode_worker(&rank.target_id)?;
+                crate::policies::pd::model_eligible(worker.as_ref(), model)
+                    .then_some((rank, worker))
+            })
+            .collect();
         let state = self.router.pd_router.kv_state.as_ref();
         let kv = state.and_then(|state| kv_aware_ops(state.decode_policy.as_deref()?));
-        let prices = if let (Some(state), Some(kv)) = (state, kv) {
+        let prices = async {
+            let state = state?;
+            let workers: Vec<_> = eligible
+                .iter()
+                .map(|(_, worker)| Arc::clone(worker))
+                .collect();
             state
                 .price_decode_workers(
                     &workers,
-                    kv,
+                    kv?,
                     &super::router::session_render_body(self.body, true),
                     self.path,
                     self.headers,
                     None,
                 )
                 .await
-        } else {
-            None
         };
-        // The admission snapshot and the marginal context are both in tokens.
-        // When any price is unavailable, compare the whole set in counts.
-        let additional: Option<Vec<_>> = prices.as_ref().and_then(|prices| {
-            workers
-                .iter()
-                .map(|worker| prices.get(worker.url()).copied())
-                .collect()
-        });
-        let (loads, additional, outcome) = if let Some(additional) = additional {
-            let projected = ranks
-                .iter()
-                .zip(&additional)
-                .map(|(rank, new)| (rank.accounted_tokens as usize).saturating_add(*new as usize))
-                .collect::<Vec<_>>();
-            (projected, additional, "prefix_cost")
-        } else {
-            let loads = workers
-                .iter()
-                .zip(&ranks)
-                .map(|(w, r)| w.load().max(r.accounted_programs))
-                .collect();
-            (loads, vec![0; workers.len()], "load_fallback")
-        };
-        let picked = kv
-            .and_then(|kv| kv.pick_decode(&loads, &additional))
-            .or_else(|| (0..loads.len()).min_by_key(|&i| loads[i]));
-        RouterMetrics::record_prefix_routing_decision("kv_aware", "program_decode", outcome);
-        Ok(picked.map(|index| ranks[index].target_id.clone()))
+        Ok(crate::policies::pd::recommend_program_decode(&eligible, kv, prices).await)
     }
 }
 
@@ -1296,7 +1257,7 @@ impl VllmPDRouter {
             .iter()
             .filter(|worker| {
                 worker.is_available()
-                    && super::pd_router::model_eligible(
+                    && crate::policies::pd::model_eligible(
                         worker.as_ref(),
                         request.get("model").and_then(Value::as_str),
                     )
@@ -1469,7 +1430,7 @@ impl VllmPDRouter {
         pin: Option<&PdEndpoint>,
     ) {
         candidates.retain(|worker| {
-            worker.is_available() && super::pd_router::model_eligible(worker.as_ref(), model_id)
+            worker.is_available() && crate::policies::pd::model_eligible(worker.as_ref(), model_id)
         });
         if let Some(pin) = pin {
             candidates.retain(|worker| &PdEndpoint::for_worker(worker.as_ref()) == pin);
@@ -1585,7 +1546,7 @@ impl VllmPDRouter {
             probe: false,
         };
         let committed = self.pd_router.pd_load.commit_decode(attempt, |loads| {
-            super::pd_router::select_decode_stage(
+            crate::policies::pd::select_decode_stage(
                 loads,
                 &candidates,
                 decode_policy.as_ref(),
@@ -1919,7 +1880,7 @@ impl VllmPDRouter {
         let model = request.get("model").and_then(Value::as_str);
         prefill_candidates.retain(|(_, p)| {
             p.is_available()
-                && super::pd_router::model_eligible(p.as_ref(), model)
+                && crate::policies::pd::model_eligible(p.as_ref(), model)
                 && pairs.as_ref().is_none_or(|set| {
                     set.contains(&(PdEndpoint::for_worker(p.as_ref()), d_endpoint.clone()))
                 })
@@ -1943,71 +1904,22 @@ impl VllmPDRouter {
         } else {
             HashMap::new()
         };
-        let index = if kv.is_some() {
-            let remote_miss = if let Some(warm) = warm {
-                warm.prefill_remote_misses(
-                    runtime,
-                    &self.pd_router.client,
-                    headers,
-                    completion.dispatch(),
-                    &pd_program_adapter::worker_target(decode_worker),
-                    request,
-                    path,
-                    &workers,
-                    &inputs,
-                )
-                .await
-            } else {
-                HashMap::new()
-            };
-            let context = PdRequestContext {
-                worker_pairs: None,
-                prefill_inputs: Some(&inputs),
-                model_id: model,
-                legacy_policy_input: None,
-                prefill_cache: None,
-                decode_cache: None,
-                headers: None,
-                affinity_key: None,
-                lora_name: None,
-                cache_salt: None,
-                decode_context: None,
-                route: path,
-                probe: false,
-            };
-            super::pd_router::select_program_kv_prefill(
-                &self.pd_router.pd_load.snapshot(),
+        let remote_miss = if let (Some(_), Some(warm)) = (kv, warm) {
+            warm.prefill_remote_misses(
+                runtime,
+                &self.pd_router.client,
+                headers,
+                completion.dispatch(),
+                &pd_program_adapter::worker_target(decode_worker),
+                request,
+                path,
                 &workers,
-                policy.as_ref(),
-                &context,
-                &remote_miss,
+                &inputs,
             )
-            .map(|decision| decision.worker_index)
+            .await
         } else {
-            self.select_program_prefill_index(&workers, request, path, headers)
+            HashMap::new()
         };
-        let index = index.ok_or_else(|| "No feasible registered P/D pair".to_owned())?;
-        let (permit_key, worker) = prefill_candidates.swap_remove(index);
-        let input = inputs.remove(worker.base_url());
-        Ok(ProgramPrefillSelection {
-            permit_key,
-            worker,
-            input,
-        })
-    }
-
-    /// Legacy P policies consume their original text and header inputs.
-    fn select_program_prefill_index(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request: &Value,
-        path: &str,
-        headers: Option<&HeaderMap>,
-    ) -> Option<usize> {
-        if workers.is_empty() {
-            return None;
-        }
-        let policy = self.policy_registry.get_prefill_policy();
         let request_text = if policy.needs_cache_routing_key() {
             Some(crate::protocols::spec::cache_routing::for_route(
                 request, path,
@@ -2020,13 +1932,36 @@ impl VllmPDRouter {
         let policy_headers = policy
             .needs_headers()
             .then(|| header_utils::to_policy_headers(headers).unwrap_or_default());
-        // Both callers index the worker slice with this value. A policy that
-        // returns an out-of-range index is a policy bug, but it must degrade to
-        // the same "no feasible P" 503 as an empty pool instead of panicking the
-        // request task.
-        policy
-            .select_worker_with_headers(workers, request_text.as_deref(), policy_headers.as_ref())
-            .filter(|index| *index < workers.len())
+        let context = PdRequestContext {
+            worker_pairs: None,
+            prefill_inputs: Some(&inputs),
+            model_id: model,
+            legacy_policy_input: request_text.as_deref(),
+            prefill_cache: None,
+            decode_cache: None,
+            headers: policy_headers.as_ref(),
+            affinity_key: None,
+            lora_name: None,
+            cache_salt: None,
+            decode_context: None,
+            route: path,
+            probe: false,
+        };
+        let index = crate::policies::pd::select_program_prefill(
+            || self.pd_router.pd_load.snapshot(),
+            &workers,
+            policy.as_ref(),
+            &context,
+            &remote_miss,
+        );
+        let index = index.ok_or_else(|| "No feasible registered P/D pair".to_owned())?;
+        let (permit_key, worker) = prefill_candidates.swap_remove(index);
+        let input = inputs.remove(worker.base_url());
+        Ok(ProgramPrefillSelection {
+            permit_key,
+            worker,
+            input,
+        })
     }
 
     /// Recheck the bound endpoints after a capacity wait: an expired
@@ -8082,6 +8017,15 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_failures_release_only_owned_reservation() {
+        // Own the failing endpoint: close each accepted TCP connection without
+        // sending an HTTP response, regardless of local services or proxies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_url = format!("http://{}", listener.local_addr().unwrap());
+        let broken_server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         for path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
             for mode in [
                 "prefill_http",
@@ -8091,7 +8035,7 @@ mod tests {
                 "decode_timeout",
             ] {
                 let prefill_url = if mode == "prefill_transport" {
-                    "http://127.0.0.1:1".to_string()
+                    broken_url.clone()
                 } else if mode == "prefill_http" {
                     spawn_test_server(
                         axum::Router::new()
@@ -8106,7 +8050,7 @@ mod tests {
                     .await
                 };
                 let decode_url = if mode == "decode_transport" {
-                    "http://127.0.0.1:1".to_string()
+                    broken_url.clone()
                 } else if mode == "decode_timeout" {
                     spawn_test_server(
                         axum::Router::new()
@@ -8130,6 +8074,7 @@ mod tests {
                     Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
                 let mut router = test_vllm_pd_router().await;
                 router.http_client = reqwest::Client::builder()
+                    .no_proxy()
                     .timeout(std::time::Duration::from_millis(200))
                     .build()
                     .unwrap();
@@ -8163,5 +8108,6 @@ mod tests {
                 decode.decrement_load();
             }
         }
+        broken_server.abort();
     }
 }

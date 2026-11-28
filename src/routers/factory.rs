@@ -5,7 +5,6 @@ use super::{
     RouterTrait,
 };
 use crate::config::{PolicyConfig, RoutingMode};
-use crate::policies::PolicyFactory;
 use crate::server::AppContext;
 use std::sync::Arc;
 
@@ -66,22 +65,11 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        // Both stages inherit the main policy unless they have a stage override.
-        // Build both policies against the registry-owned affinity table so the
-        // router-level kv_aware session-affinity TTL applies to the PD path too.
-        let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
-        let prefill_policy = PolicyFactory::create_from_config(
-            prefill_policy_config.unwrap_or(main_policy_config),
-            Some(&kv_affinity_table),
+        ctx.policy_registry.configure_pd(
+            main_policy_config,
+            prefill_policy_config,
+            decode_policy_config,
         );
-        let decode_policy = PolicyFactory::create_from_config(
-            decode_policy_config.unwrap_or(main_policy_config),
-            Some(&kv_affinity_table),
-        );
-
-        // Set the prefill and decode policies in the registry
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
 
         // Create vLLM PD router with both static URLs and service discovery support
         if discovery_address.is_some() {
