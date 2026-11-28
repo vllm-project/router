@@ -493,6 +493,7 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
+        // Automatic readmission applies only to a single worker rank, rank 0.
         let reported = discovery
             .engine_cache_configs
             .as_ref()
@@ -648,9 +649,7 @@ impl KvIndexSupervisor {
 
     async fn probe_static_vllm_instance(&self, worker_url: &str, discovery: &mut WorkerDiscovery) {
         if !self.tracks_vllm_instance(worker_url, discovery)
-            || self
-                .resolved_static_source(worker_url)
-                .is_none_or(|source| layout_only(&source))
+            || self.resolved_static_source(worker_url).is_none()
         {
             return;
         }

@@ -2323,7 +2323,7 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
     let compatible = Some("sha256_cbor");
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let invalid = "tcp://127.0.0.1:invalid";
-    for static_source in [false, true] {
+    for (static_source, layout_only) in [(false, false), (true, false), (true, true)] {
         let boot = Arc::new(Mutex::new((
             "initial",
             if static_source {
@@ -2356,8 +2356,12 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
         if static_source {
             let (endpoint, replay, _, _) = &worker.sockets[0];
             let config = StaticKvEventSources {
-                endpoints: vec![endpoint.clone()],
-                replay_endpoints: Some(vec![replay.clone()]),
+                endpoints: if layout_only {
+                    Vec::new()
+                } else {
+                    vec![endpoint.clone()]
+                },
+                replay_endpoints: (!layout_only).then(|| vec![replay.clone()]),
                 topic: "kv/admission/0".into(),
                 block_size: 16,
                 model: "mock-model".into(),
@@ -2372,6 +2376,13 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
         let initial = supervisor.on_worker_added(url).await.unwrap();
         assert_eq!(initial.ranks.is_empty(), static_source);
         let old = supervisor.lifecycle_for_worker(url);
+        if static_source {
+            assert_eq!(
+                old.state.lock().fenced_vllm_instance_id.as_deref(),
+                Some("initial"),
+                "static worker must record the fenced instance (layout_only={layout_only})"
+            );
+        }
         let refresh = || async {
             old.state.lock().checked = None;
             supervisor.refresh_discovered_workers().await

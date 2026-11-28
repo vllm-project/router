@@ -569,7 +569,8 @@ async fn query_worker_control_metadata(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<ServerInfo, String> {
-    // 1. Multi-backend control metadata. Absent from stock vLLM.
+    // 1. Multi-backend control metadata. Native vLLM restart evidence comes
+    // from /server_info, which this path does not query on success.
     let first_error = match validate_worker_metadata(
         worker_url,
         "get_server_info",
