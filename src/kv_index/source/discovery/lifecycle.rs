@@ -241,6 +241,18 @@ pub(super) struct LayoutWorkerProvider {
     pub(super) lifecycle: Arc<WorkerLifecycle>,
 }
 
+impl LayoutWorkerProvider {
+    pub(super) fn visible_rank_count(&self) -> usize {
+        if !self.lifecycle.trusted(&self.lifecycle.state.lock()) {
+            return 0;
+        }
+        self.indexes
+            .values()
+            .filter(|rank| rank.control.generation() != 0)
+            .count()
+    }
+}
+
 impl crate::policies::TieredMatchProvider for LayoutWorkerProvider {
     fn hash_contract_failed(&self, rank: u32) -> bool {
         self.indexes
@@ -366,6 +378,15 @@ impl KvIndexSupervisor {
                 }
                 if provider.lifecycle.expire_if_needed() {
                     invalidate(&handles);
+                }
+                if let Some(installed) = installed.upgrade() {
+                    let mut workers = installed.workers.lock();
+                    if let Some(subs) = workers
+                        .get_mut(&worker)
+                        .filter(|subs| Arc::ptr_eq(&subs.provider, &provider))
+                    {
+                        subs.coverage.refresh(&provider);
+                    }
                 }
                 let outcome = if let Some(config) = &static_config {
                     static_hybrid_sources_match(

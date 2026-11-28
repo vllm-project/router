@@ -19,6 +19,7 @@ use crate::kv_index::EventSubscriberHandle;
 use crate::kv_index::{CacheCapabilities, GroupCapability, RankCapability};
 use crate::kv_index::{IngestionSignal, SourceId};
 
+mod coverage;
 mod lifecycle;
 mod observer;
 mod probe;
@@ -193,6 +194,7 @@ pub(crate) struct SourcesUnavailable {
 
 /// Per-worker subscriber state retained for removal-time cleanup.
 struct WorkerSubs {
+    coverage: coverage::IndexCoverage,
     active: Arc<AtomicBool>,
     key: CacheKey,
     source_id: SourceId,
@@ -254,6 +256,15 @@ impl std::fmt::Debug for KvIndexSupervisor {
 }
 
 impl KvIndexSupervisor {
+    fn rank_role(&self, worker: &str, prefill_bases: Option<&HashSet<String>>) -> &'static str {
+        match (self.http_pd, prefill_bases) {
+            (false, _) => "regular",
+            (true, None) => "unassigned",
+            (true, Some(pool)) if pool.contains(worker) => "prefill",
+            (true, Some(_)) => "decode",
+        }
+    }
+
     /// Observe event continuity without decoding cache identities.
     pub(crate) fn new_observer(client: reqwest::Client) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::indexed(client);
@@ -453,8 +464,14 @@ impl KvIndexSupervisor {
         };
         let discovery = self.discover(worker_url).await;
         let models = discovery.base_models.clone();
-        let info =
-            self.install_observed_worker(worker_url, discovery, observed, Some(lifecycle), None)?;
+        let info = self.install_observed_worker(
+            worker_url,
+            discovery,
+            observed,
+            Some(lifecycle),
+            None,
+            self.rank_role(worker_url, None),
+        )?;
         Ok((info, models))
     }
 

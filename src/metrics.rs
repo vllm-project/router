@@ -75,6 +75,14 @@ pub fn init_metrics() {
     );
 
     // Policy metrics
+    describe_gauge!(
+        "vllm_router_kv_index_sources",
+        "Registered worker/rank KV event sources by observed index visibility"
+    );
+    describe_gauge!(
+        "vllm_router_kv_index_ranks",
+        "Registered KV index ranks by routing role"
+    );
     describe_counter!(
         "vllm_router_kv_routing_inputs_total",
         "KV-aware token preparation by transport and result"

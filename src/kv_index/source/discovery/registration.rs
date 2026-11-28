@@ -31,7 +31,14 @@ impl KvIndexSupervisor {
             .lock()
             .get(worker_url)
             .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed, None, None)
+        self.install_observed_worker(
+            worker_url,
+            discovery,
+            observed,
+            None,
+            None,
+            self.rank_role(worker_url, None),
+        )
     }
 
     pub(super) fn install_observed_worker(
@@ -41,6 +48,7 @@ impl KvIndexSupervisor {
         observed: Option<Arc<AtomicBool>>,
         expected_lifecycle: Option<Arc<WorkerLifecycle>>,
         connector: Option<KvConnector>,
+        role: &'static str,
     ) -> Result<WorkerKvInfo, String> {
         let descriptor = worker_descriptor(&discovery).ok().map(|mut descriptor| {
             descriptor.connector = connector;
@@ -352,6 +360,7 @@ impl KvIndexSupervisor {
         workers.insert(
             worker_url.to_string(),
             WorkerSubs {
+                coverage: super::coverage::IndexCoverage::new(role, &provider),
                 active,
                 key: key.clone(),
                 source_id,
