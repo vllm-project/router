@@ -1260,7 +1260,7 @@ mod tests {
                                 panic!("survivor lost shared pages")
                             };
                             assert!(pages.iter().all(|group| group.get(0).is_some()));
-                            assert!(index.source_version_is_current(&version));
+                            assert!(version.is_current());
                         } else {
                             assert!(matches!(matched, Some(PageMatch::Miss)));
                         }

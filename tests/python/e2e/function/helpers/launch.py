@@ -362,6 +362,10 @@ def popen_launch_vllm_rs_grpc_worker(
         if value is not None
     }
     env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices(base_gpu_id)
+    # HIP and CUDA index the agent list already filtered by ROCR. Keep an
+    # inherited ROCR mask intact, but align HIP with the narrowed CUDA index.
+    if "HIP_VISIBLE_DEVICES" in env:
+        env["HIP_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"]
     serve_tail = list(extra_argv or [])
     if kv_events_zmq_port is not None:
         # The router discovers one full-attention group with the default hash root.
