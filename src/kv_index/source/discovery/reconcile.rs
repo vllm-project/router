@@ -189,7 +189,7 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
-                    if lifecycle.vllm_restart_probe_due() {
+                    if lifecycle.fenced_readmission_due() {
                         return true;
                     }
                     lifecycle.layout_rebind_due()
@@ -263,22 +263,29 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let descriptor = probe.as_ref().and_then(|probe| probe.descriptor.as_ref());
+            let descriptor = probe.as_ref().map(|probe| &probe.descriptor);
             let metadata = probe
                 .as_ref()
                 .and_then(|probe| probe.worker.server_info.as_ref().ok());
             let action = lifecycle.observe_descriptor(descriptor, metadata);
             match action {
                 SourceAction::Keep => {
-                    if let Some(probe) = probe.filter(|probe| probe.descriptor.is_some()) {
-                        lifecycle.state.lock().base_models =
-                            probe.worker.base_models.unwrap_or_default();
+                    if let Some(probe) = probe {
+                        let mut state = lifecycle.state.lock();
+                        if state.fenced_vllm_instance_id.is_none() {
+                            state.base_models = probe.worker.base_models.unwrap_or_default();
+                        }
                     }
                 }
                 SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");
-                    lifecycle.state.lock().base_models =
-                        probe.worker.base_models.clone().unwrap_or_default();
+                    {
+                        let mut state = lifecycle.state.lock();
+                        if state.fenced_vllm_instance_id.is_none() {
+                            state.base_models =
+                                probe.worker.base_models.clone().unwrap_or_default();
+                        }
+                    }
                     // Both owner and control-record identities are compared under
                     // the publication lock; an old probe cannot resurrect a source.
                     let installation = self.install_observed_worker(

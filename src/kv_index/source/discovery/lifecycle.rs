@@ -49,6 +49,7 @@ pub(super) struct LifecycleState {
     pub(super) info: Option<WorkerKvInfo>,
     pub(super) base_models: HashSet<String>,
     pub(super) descriptor: Option<WorkerDescriptor>,
+    pub(super) fenced_vllm_instance_id: Option<String>,
     // None schedules immediate descriptor discovery after a layout change.
     pub(super) checked: Option<Instant>,
     pub(super) probe_failures: u8,
@@ -57,8 +58,17 @@ pub(super) struct LifecycleState {
 }
 
 impl LifecycleState {
-    fn vllm_instance_id(&self) -> Option<&str> {
-        self.descriptor.as_ref()?.vllm_instance_id()
+    pub(super) fn reported_vllm_restart(&self, metadata: Option<&ServerInfo>) -> bool {
+        self.fenced_vllm_instance_id
+            .as_deref()
+            .zip(metadata)
+            .is_some_and(|(fenced, info)| {
+                info.prefix_caching_hash_algo.is_some()
+                    && info
+                        .vllm_instance_id
+                        .as_deref()
+                        .is_some_and(|id| id != fenced)
+            })
     }
 }
 
@@ -84,6 +94,7 @@ impl WorkerLifecycle {
                 info: None,
                 base_models: HashSet::new(),
                 descriptor,
+                fenced_vllm_instance_id: None,
                 checked: Some(Instant::now()),
                 probe_failures: 0,
                 trusted: true,
@@ -170,9 +181,12 @@ impl WorkerLifecycle {
         })
     }
 
-    pub(super) fn vllm_restart_probe_due(&self) -> bool {
-        let has_instance_id = self.state.lock().vllm_instance_id().is_some();
-        has_instance_id && self.refresh_due()
+    pub(super) fn fenced_readmission_due(&self) -> bool {
+        let state = self.state.lock();
+        state.fenced_vllm_instance_id.is_some()
+            && state
+                .checked
+                .is_none_or(|checked| checked.elapsed() >= REFRESH_INTERVAL)
     }
 
     pub(super) fn layout_rebind_due(&self) -> bool {
@@ -180,7 +194,8 @@ impl WorkerLifecycle {
             return false;
         }
         let state = self.state.lock();
-        !state.trusted
+        state.fenced_vllm_instance_id.is_none()
+            && !state.trusted
             && state
                 .checked
                 .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
@@ -193,10 +208,7 @@ impl WorkerLifecycle {
     ) -> bool {
         state.info.is_some()
             && state.descriptor.as_ref() == Some(descriptor)
-            && (!self.layout
-                || self.trusted(state)
-                // The layout monitor owns transient recovery for this same boot.
-                || (state.vllm_instance_id().is_some() && self.active.load(Ordering::Acquire)))
+            && (!self.layout || self.trusted(state))
     }
 
     /// Descriptor probes run every 30s; three failures retire an installed owner.
@@ -207,28 +219,13 @@ impl WorkerLifecycle {
     ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
-        if let Some(old) = state.vllm_instance_id() {
-            let Some(info) = metadata.filter(|info| info.vllm_instance_id.is_some()) else {
-                // An optional probe failure does not identify a new instance.
-                return SourceAction::Keep;
+        if state.fenced_vllm_instance_id.is_some() {
+            // Keep the load-only registration until admission publishes a replacement.
+            return if descriptor.is_some() && state.reported_vllm_restart(metadata) {
+                SourceAction::Rebuild
+            } else {
+                SourceAction::Keep
             };
-            if info.vllm_instance_id.as_deref() != Some(old) {
-                self.stop_layout(&mut state);
-                state.checked = Some(Instant::now());
-                return if descriptor.is_some() && info.prefix_caching_hash_algo.is_some() {
-                    SourceAction::Rebuild
-                } else {
-                    SourceAction::Stop
-                };
-            }
-            // Descriptor changes within a fenced boot cannot restore KV credit.
-            if state
-                .info
-                .as_ref()
-                .is_some_and(|info| info.ranks.is_empty())
-            {
-                return SourceAction::Keep;
-            }
         }
         match descriptor {
             Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
@@ -280,6 +277,10 @@ impl WorkerLifecycle {
             state.checked = None;
         }
         state.trusted = false;
+        // An in-flight layout probe may finish after the last rank was fenced.
+        if state.fenced_vllm_instance_id.is_some() {
+            return;
+        }
         state.base_models.clear();
         if state.info.take().is_some() {
             state.revision = crate::kv_index::next_owner_incarnation();
@@ -304,10 +305,15 @@ pub(super) struct LayoutWorkerProvider {
 }
 
 impl LayoutWorkerProvider {
-    fn fence_runtime_hashes(&self, worker: &str, configs: &EngineCacheConfigs) {
+    fn fence_runtime_hashes(
+        &self,
+        worker: &str,
+        configs: &EngineCacheConfigs,
+        vllm_instance_id: Option<String>,
+    ) -> bool {
         let mut state = self.lifecycle.state.lock();
         let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
-            return;
+            return false;
         };
         let mut fenced = Vec::new();
         for (&rank, index) in &self.indexes {
@@ -331,6 +337,7 @@ impl LayoutWorkerProvider {
             lease.fence_hash();
             fenced.push((rank, index, lease));
         }
+        let mut retire = false;
         if let Some(info) = &mut state.info {
             info.ranks
                 .retain(|rank| !fenced.iter().any(|(fenced, _, _)| fenced == rank));
@@ -339,6 +346,11 @@ impl LayoutWorkerProvider {
                     worker,
                     "No KV ranks remain after failed worker re-registration"
                 );
+                if vllm_instance_id.is_some() {
+                    info.cache_key = None;
+                    state.fenced_vllm_instance_id = vllm_instance_id;
+                    retire = true;
+                }
             }
         }
         drop(state);
@@ -346,6 +358,7 @@ impl LayoutWorkerProvider {
             let _guard = lease.gate.lock();
             index.invalidate();
         }
+        retire
     }
 }
 
@@ -403,13 +416,17 @@ impl KvIndexSupervisor {
         worker_url: &str,
         observed: &Arc<WorkerLifecycle>,
         configs: &EngineCacheConfigs,
+        vllm_instance_id: Option<String>,
     ) {
-        let workers = self.installed.workers.lock();
-        if let Some(previous) = workers
-            .get(worker_url)
-            .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
-        {
-            previous.provider.fence_runtime_hashes(worker_url, configs);
+        let mut workers = self.installed.workers.lock();
+        if workers.get(worker_url).is_some_and(|previous| {
+            Arc::ptr_eq(&previous.provider.lifecycle, observed)
+                && previous
+                    .provider
+                    .fence_runtime_hashes(worker_url, configs, vllm_instance_id)
+        }) {
+            self.installed
+                .retire_worker(workers.remove(worker_url).unwrap());
         }
     }
 

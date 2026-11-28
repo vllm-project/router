@@ -22,7 +22,7 @@ use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
 
 pub(super) struct RegistrationProbe {
-    pub(super) descriptor: Option<WorkerDescriptor>,
+    pub(super) descriptor: WorkerDescriptor,
     pub(super) worker: WorkerDiscovery,
 }
 
@@ -41,10 +41,6 @@ impl WorkerDescriptor {
         self.hybrid.as_ref()
     }
 
-    pub(super) fn vllm_instance_id(&self) -> Option<&str> {
-        self.server_info.vllm_instance_id.as_deref()
-    }
-
     pub(super) fn has_nonplain_layout(&self) -> bool {
         self.hybrid
             .as_ref()
@@ -54,7 +50,8 @@ impl WorkerDescriptor {
 
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
     let mut server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
-    // Hash reports affect admission, not descriptor identity.
+    // Native restart evidence is used only to re-admit a fenced registration.
+    server_info.vllm_instance_id = None;
     server_info.prefix_caching_hash_algo = None;
     let sources = match &worker.sources {
         Ok(sources) => Some(sources.clone()),
@@ -81,6 +78,10 @@ impl KvIndexSupervisor {
         deadline: Instant,
     ) -> Result<RegistrationProbe, String> {
         let mut worker = self.discover_for_role(base, connector).await;
+        let fenced = lifecycle.state.lock().fenced_vllm_instance_id.is_some();
+        if fenced {
+            self.probe_static_vllm_instance(base, &mut worker).await;
+        }
         if plain_only
             && worker
                 .hybrid
@@ -93,22 +94,7 @@ impl KvIndexSupervisor {
             );
             worker.hybrid = None;
         }
-        let mut descriptor = match worker_descriptor(&worker) {
-            Ok(descriptor) => descriptor,
-            // The restart can invalidate old credit even if sources are unavailable.
-            Err(_)
-                if worker
-                    .server_info
-                    .as_ref()
-                    .is_ok_and(|info| info.vllm_instance_id.is_some()) =>
-            {
-                return Ok(RegistrationProbe {
-                    descriptor: None,
-                    worker,
-                })
-            }
-            Err(error) => return Err(error),
-        };
+        let mut descriptor = worker_descriptor(&worker)?;
         descriptor.connector = connector;
         if worker.base_models.is_none() {
             let cached = {
@@ -133,14 +119,19 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
+        let needs_admission = {
+            let state = lifecycle.state.lock();
+            if state.fenced_vllm_instance_id.is_some() {
+                state.reported_vllm_restart(worker.server_info.as_ref().ok())
+            } else {
+                !lifecycle.keeps_descriptor(&state, &descriptor)
+            }
+        };
+        if needs_admission {
             self.probe_admission_hashes(base, &mut worker, Some(deadline))
                 .await;
         }
-        Ok(RegistrationProbe {
-            descriptor: Some(descriptor),
-            worker,
-        })
+        Ok(RegistrationProbe { descriptor, worker })
     }
 
     pub(super) async fn probe_admission_hashes(

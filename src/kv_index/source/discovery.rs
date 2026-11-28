@@ -466,6 +466,11 @@ impl KvIndexSupervisor {
         let hashes = observed
             .as_ref()
             .and_then(|_| discovery.engine_cache_configs.clone());
+        let vllm_instance_id = discovery
+            .server_info
+            .as_ref()
+            .ok()
+            .and_then(|info| info.vllm_instance_id.clone());
         let installation = self.install_observed_worker(
             worker_url,
             discovery,
@@ -478,7 +483,7 @@ impl KvIndexSupervisor {
             .is_ok_and(|info| info.cache_key.is_some())
         {
             if let Some(hashes) = hashes {
-                self.fence_failed_registration(worker_url, &lifecycle, &hashes);
+                self.fence_failed_registration(worker_url, &lifecycle, &hashes, vllm_instance_id);
             }
         }
         Ok((installation?, models))
@@ -489,6 +494,20 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
+        if let Some(rank) = discovery
+            .hybrid
+            .as_ref()
+            .and_then(|layout| layout.rank_capability(0))
+        {
+            let reported = discovery
+                .engine_cache_configs
+                .as_ref()
+                .and_then(|configs| metrics_meta::reported_prefix_hash(configs, worker_url, 0));
+            if rank.reported_hash_mismatch(reported).is_some() {
+                self.probe_static_vllm_instance(worker_url, &mut discovery)
+                    .await;
+            }
+        }
         discovery
     }
 
@@ -515,28 +534,9 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                let (verified, native) =
-                    tokio::join!(self.verify_static_source(worker_url, &discovery), async {
-                        if !self.tracks_vllm_instance(worker_url, &discovery) {
-                            return None;
-                        }
-                        tokio::time::timeout(
-                            CONTROL_TIMEOUT,
-                            probe::query_server_info_json(
-                                &self.client,
-                                worker_url,
-                                self.api_key.as_deref(),
-                            ),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                    });
-                if let (Ok(info), Some(native)) = (&mut discovery.server_info, native) {
-                    info.vllm_instance_id = native.vllm_instance_id;
-                    info.prefix_caching_hash_algo = native.prefix_caching_hash_algo;
-                }
-                if let Err((probe, reason)) = verified {
+                if let Err((probe, reason)) =
+                    self.verify_static_source(worker_url, &discovery).await
+                {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
                         detail: reason.into(),
@@ -648,6 +648,27 @@ impl KvIndexSupervisor {
         discovery
     }
 
+    async fn probe_static_vllm_instance(&self, worker_url: &str, discovery: &mut WorkerDiscovery) {
+        if !self.tracks_vllm_instance(worker_url, discovery)
+            || !self
+                .resolved_static_source(worker_url)
+                .is_some_and(|source| !layout_only(&source))
+        {
+            return;
+        }
+        if let (Ok(info), Ok(Ok(native))) = (
+            &mut discovery.server_info,
+            tokio::time::timeout(
+                CONTROL_TIMEOUT,
+                probe::query_server_info_json(&self.client, worker_url, self.api_key.as_deref()),
+            )
+            .await,
+        ) {
+            info.vllm_instance_id = native.vllm_instance_id;
+            info.prefix_caching_hash_algo = native.prefix_caching_hash_algo;
+        }
+    }
+
     fn tracks_vllm_instance(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
         self.full_attention_http
             && !self.http_pd
@@ -656,10 +677,11 @@ impl KvIndexSupervisor {
             && discovery
                 .hybrid
                 .as_ref()
-                .is_none_or(|layout| layout.ranks.len() == 1)
-            && discovery.sources.as_ref().ok().is_none_or(|sources| {
-                sources.is_empty() || (sources.len() == 1 && sources.contains_key("0"))
-            })
+                .is_some_and(|layout| layout.ranks.len() == 1)
+            && discovery
+                .sources
+                .as_ref()
+                .is_ok_and(|sources| sources.len() == 1 && sources.contains_key("0"))
     }
 
     async fn discover_declared_layout(
