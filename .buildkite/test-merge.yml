@@ -2,6 +2,9 @@
 # pipeline.yml decides when this file is uploaded. Jobs here have no if.
 # xGMI smoke is one read mode plus a short limit.
 # RDMA smoke is SMOKE_ONLY in one direction.
+# Shared MI300X jobs acquire a host lease in the agent pre-command hook. The
+# lease wait counts against timeout_in_minutes, so keep 450 minutes: 360 for
+# the lease plus 90 for readiness and test execution.
 
 env:
   RUST_IMAGE: "rust:1.95.0-bookworm"
@@ -27,17 +30,18 @@ steps:
     steps:
       - label: "ROCm MoRI XGMI smoke (read_mode=true, short limit, 2 GPUs)"
         key: "pd-disagg-moriio-smoke-job"
-        timeout_in_minutes: 60
+        timeout_in_minutes: 450
         retry:
-          automatic:
-            - exit_status: "*"
-              limit: 1
+          automatic: false
           manual:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
         command: |
-          bash -euo pipefail <<'BASH'
+          timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+          # Bash defers this trap until its foreground command finishes,
+          # keeping timeout's kill-after active during harness cleanup.
+          trap 'exit 143' TERM
           export MORIIO_READ_MODE=true
           export LM_EVAL_LIMIT=20
           export LM_EVAL_BASELINE=0.38
@@ -58,16 +62,17 @@ steps:
   # L2: one cross-node completion (SMOKE_ONLY). Full read+write is test-nightly.yml.
   - label: ":large_purple_circle: ROCm MoRI RDMA smoke (read_mode=true, 2 nodes)"
     key: "pd-disagg-moriio-rdma-smoke"
-    timeout_in_minutes: 75
+    timeout_in_minutes: 450
     retry:
-      automatic:
-        - exit_status: "*"
-          limit: 1
+      automatic: false
       manual:
         allowed: true
         reason: "Retry transient two-node GPU or RDMA failures after inspecting both node logs"
     command: |
-      set -euo pipefail
+      timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
+      # Bash defers this trap until its foreground command finishes,
+      # keeping timeout's kill-after active during harness cleanup.
+      trap 'exit 143' TERM
 
       bash .buildkite/scripts/install_packages.sh router-bin
 
@@ -83,6 +88,7 @@ steps:
       export WORKER_FABRIC_IP=192.168.200.2
 
       bash tests/python/e2e/pd_disagg_vllm/run_moriio_rdma_accuracy_test.sh
+      BASH
     mirror_hardwares: mi300_rdma
     depends_on: "upload-merge-pipeline"
     artifact_paths:

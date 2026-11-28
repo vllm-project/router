@@ -61,6 +61,7 @@ def test_pipeline_settings_and_cleanup(
         *) return 99 ;;
       esac
     }
+    export -f bash
     """
     env = dict(os.environ, RUN_PD_LIFECYCLE=probe, TEST_SETUP_EXIT=str(setup_exit))
     env.pop("VLLM_ROCM_USE_SKINNY_GEMM", None)
