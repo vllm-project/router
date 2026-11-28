@@ -230,13 +230,15 @@ impl KvIndexSupervisor {
         let probes: Vec<_> = stream::iter(refresh.into_iter().map(
             |(base, lifecycle, owner)| async move {
                 let connector = self.pd_connector.filter(|_| prefill_bases.contains(&base));
-                let probe = tokio::time::timeout(
-                    CONTROL_TIMEOUT,
+                let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+                let probe = tokio::time::timeout_at(
+                    deadline,
                     self.probe_registration(
                         &base,
                         plain_only.contains(&base),
                         connector,
                         &lifecycle,
+                        deadline,
                     ),
                 )
                 .await
