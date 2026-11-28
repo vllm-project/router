@@ -2321,72 +2321,111 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
     use serde_json::json;
 
     let compatible = Some("sha256_cbor");
-    let boot = Arc::new(Mutex::new(("initial", compatible)));
-    let routes = Router::new().route(
-        "/server_info",
-        get({
-            let boot = boot.clone();
-            move || {
-                let (id, hash) = *boot.lock();
-                std::future::ready(Json(json!({"vllm_config": {
-                    "instance_id": id,
-                    "model_config": {"model": "mock-model"},
-                    "cache_config": {"block_size": 16, "prefix_caching_hash_algo": hash},
-                    "parallel_config": {"data_parallel_size": 1}
-                }})))
-            }
-        }),
-    );
-    let worker = HashAdmissionWorker::with_native_routes(1, METRICS_ONLY, Some(routes)).await;
-    let (supervisor, url) = (&worker.supervisor, &worker.url);
-    let initial = supervisor.on_worker_added(url).await.unwrap();
-    assert_eq!(initial.ranks, [0]);
-    let old = supervisor.lifecycle_for_worker(url);
-    let refresh = || async {
-        old.state.lock().checked = None;
-        supervisor.refresh_discovered_workers().await
-    };
-
-    *boot.lock() = ("later", compatible);
-    assert!(
-        refresh().await.is_empty(),
-        "healthy workers use transport recovery"
-    );
-
-    // Seed a full runtime fence using the instance from the failed re-registration.
-    let sources = worker.sources.lock().clone();
+    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let invalid = "tcp://127.0.0.1:invalid";
-    *boot.lock() = ("later", Some("sha256"));
-    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
-    worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
-    assert!(supervisor.on_worker_added(url).await.is_err());
-    assert!(supervisor.match_provider_for_worker(url).is_none());
-    *worker.sources.lock() = sources.clone();
+    for static_source in [false, true] {
+        let boot = Arc::new(Mutex::new((
+            "initial",
+            if static_source {
+                Some("sha256")
+            } else {
+                compatible
+            },
+        )));
+        let routes = Router::new().route(
+            "/server_info",
+            get({
+                let boot = boot.clone();
+                move || {
+                    let (id, hash) = *boot.lock();
+                    std::future::ready(Json(json!({"vllm_config": {
+                        "instance_id": id,
+                        "model_config": {"model": "mock-model"},
+                        "cache_config": {"block_size": 16, "prefix_caching_hash_algo": hash},
+                        "parallel_config": {"data_parallel_size": 1}
+                    }})))
+                }
+            }),
+        );
+        let metrics = if static_source {
+            &incompatible
+        } else {
+            METRICS_ONLY
+        };
+        let mut worker = HashAdmissionWorker::with_native_routes(1, metrics, Some(routes)).await;
+        if static_source {
+            let (endpoint, replay, _, _) = &worker.sockets[0];
+            let config = StaticKvEventSources {
+                endpoints: vec![endpoint.clone()],
+                replay_endpoints: Some(vec![replay.clone()]),
+                topic: "kv/admission/0".into(),
+                block_size: 16,
+                model: "mock-model".into(),
+                hybrid: Some(plain_full_layout("mock-model", "kv/admission/0", 16)),
+            };
+            worker.supervisor = worker
+                .supervisor
+                .with_static_sources(HashMap::from([(worker.url.clone(), config)]));
+        }
 
-    *boot.lock() = ("later", compatible);
-    *worker.metrics.lock() = METRICS_ONLY.to_owned();
-    assert!(
-        refresh().await.is_empty(),
-        "the fenced instance stays load-only"
-    );
+        let (supervisor, url) = (&worker.supervisor, &worker.url);
+        let initial = supervisor.on_worker_added(url).await.unwrap();
+        assert_eq!(initial.ranks.is_empty(), static_source);
+        let old = supervisor.lifecycle_for_worker(url);
+        let refresh = || async {
+            old.state.lock().checked = None;
+            supervisor.refresh_discovered_workers().await
+        };
 
-    *boot.lock() = ("replacement", None);
-    assert!(
-        refresh().await.is_empty(),
-        "the new instance must report its hash"
-    );
+        let sources = worker.sources.lock().clone();
+        if !static_source {
+            *boot.lock() = ("later", compatible);
+            assert!(
+                refresh().await.is_empty(),
+                "healthy workers use transport recovery"
+            );
 
-    *boot.lock() = ("replacement", compatible);
-    worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
-    assert!(refresh().await[url].provider.is_none());
-    assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(url)));
-    *worker.sources.lock() = sources;
+            *boot.lock() = ("later", Some("sha256"));
+            *worker.metrics.lock() = incompatible.clone();
+            worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
+            assert!(supervisor.on_worker_added(url).await.is_err());
+            assert!(supervisor.match_provider_for_worker(url).is_none());
+            *worker.sources.lock() = sources.clone();
+        }
 
-    let registration = &refresh().await[url];
-    let admitted = registration.info.as_ref().unwrap();
-    assert_eq!(admitted.instance_id, initial.instance_id);
-    assert_eq!(admitted.ranks, [0]);
-    assert!(registration.provider.is_some());
+        *boot.lock() = (if static_source { "initial" } else { "later" }, compatible);
+        *worker.metrics.lock() = METRICS_ONLY.to_owned();
+        assert!(
+            refresh().await.is_empty(),
+            "the fenced instance stays load-only"
+        );
+
+        *boot.lock() = ("replacement", None);
+        assert!(
+            refresh().await.is_empty(),
+            "the new instance must report its hash"
+        );
+
+        *boot.lock() = ("replacement", compatible);
+        *worker.sources.lock() = json!([]);
+        assert!(
+            refresh().await.is_empty(),
+            "the source report must be usable"
+        );
+        *worker.sources.lock() = sources.clone();
+        if !static_source {
+            worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
+            assert!(refresh().await[url].provider.is_none());
+            *worker.sources.lock() = sources;
+        }
+        assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(url)));
+
+        let registration = &refresh().await[url];
+        let admitted = registration.info.as_ref().unwrap();
+        assert_eq!(admitted.instance_id, initial.instance_id);
+        assert_eq!(admitted.ranks, [0]);
+        assert!(registration.provider.is_some());
+    }
 }
 
 #[tokio::test]
