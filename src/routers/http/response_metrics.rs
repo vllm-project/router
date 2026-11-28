@@ -355,13 +355,16 @@ impl Sse {
             }
         });
         let Some(choice) = generated.next() else {
-            // An explicitly timed token without a visible delta must not be
-            // bridged by an interval between the surrounding output events.
+            // Token evidence without a visible delta still breaks adjacency
+            // between the surrounding output events.
             if choices.iter().any(|choice| {
                 choice
                     .get("token_ids")
                     .and_then(Value::as_array)
                     .is_some_and(|ids| !ids.is_empty())
+                    || (self.route == "/v1/completions"
+                        && completion_logprob_tokens(choice)
+                            .is_some_and(|tokens| tokens.iter().any(Value::is_string)))
             }) {
                 self.last_single = None;
                 self.reset_interval = true;
@@ -384,14 +387,19 @@ fn nonempty(value: Option<&Value>) -> bool {
     value.and_then(Value::as_str).is_some_and(|s| !s.is_empty())
 }
 
+fn completion_logprob_tokens(choice: &Value) -> Option<&[Value]> {
+    choice
+        .pointer("/logprobs/tokens")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
 fn single_token(choice: &Value, route: &str) -> bool {
     if let Some(ids) = choice.get("token_ids").and_then(Value::as_array) {
         return ids.len() == 1 && ids[0].is_u64();
     }
     if route == "/v1/completions" {
-        choice
-            .pointer("/logprobs/tokens")
-            .and_then(Value::as_array)
+        completion_logprob_tokens(choice)
             .is_some_and(|tokens| tokens.len() == 1 && tokens[0].is_string())
     } else {
         // Chat logprobs for visible content or refusal, but never infer

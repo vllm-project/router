@@ -900,6 +900,58 @@ async fn pd_responses_terminal(metrics: &Metrics) {
     }
 }
 
+async fn completion_itl_respects_hidden_tokens(metrics: &Metrics) {
+    let mut worker = Worker::start().await;
+    let router = router(
+        config(RoutingMode::Regular {
+            worker_urls: vec![worker.server.url.clone()],
+        }),
+        None,
+    )
+    .await;
+    let route = ("route", COMPLETIONS);
+    let itl = |scrape: &str| sample(scrape, "itl_seconds_count", &[route]);
+    let before = itl(&metrics.scrape().await);
+    let request = post(
+        &router,
+        COMPLETIONS,
+        json!({"model":"test-model","prompt":"hello","stream":true,"logprobs":1}),
+    );
+    let tx = stream_reply(worker.call().await);
+    let mut response = request.await.unwrap().error_for_status().unwrap();
+    // Wait for each event to arrive downstream before sending the next one.
+    // They are separate body observations, without a sleep or batch ambiguity.
+    for (event, expected) in [
+        (
+            "data: {\"choices\":[{\"index\":0,\"text\":\"A\",\"logprobs\":{\"tokens\":[\"A\"]}}]}\n\n",
+            before,
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":{\"tokens\":[\"hidden\"]}}]}\n\n",
+            before,
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"text\":\"B\",\"logprobs\":{\"tokens\":[\"B\"]}}]}\n\n",
+            before,
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":{\"tokens\":[]}}]}\n\n",
+            before,
+        ),
+        (
+            "data: {\"choices\":[{\"index\":0,\"text\":\"C\",\"logprobs\":{\"tokens\":[\"C\"]}}]}\n\n",
+            before + 1.,
+        ),
+    ] {
+        send(&tx, event).await;
+        read_until(&mut response, event).await;
+        assert_eq!(itl(&metrics.scrape().await), expected, "{event}");
+    }
+    send(&tx, "data: [DONE]\n\n").await;
+    drop(tx);
+    response.bytes().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scrape_http_inference_metrics() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -909,6 +961,7 @@ async fn scrape_http_inference_metrics() {
         pd(&metrics).await;
         chat_and_responses(&metrics).await;
         pd_responses_terminal(&metrics).await;
+        completion_itl_respects_hidden_tokens(&metrics).await;
     })
     .await
     .unwrap();
