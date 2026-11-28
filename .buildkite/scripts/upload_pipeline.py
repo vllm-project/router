@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +34,13 @@ HARDWARE_PATH = BUILDKITE_DIR / "ci_mirror_hardwares.yml"
 CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
 CUDA_HF_TOKEN_EXPORT = (
     f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+)
+SHARED_GPU_DEVICE_COUNT_CHECK = (
+    "import os, sys; from pathlib import Path; "
+    'expected = int(os.environ["AMD_CI_GPU_COUNT"]); '
+    'actual = len(list(Path("/dev/dri").glob("renderD*"))); '
+    "sys.exit(0 if actual == expected else "
+    'f"shared GPU device count mismatch: expected {expected}, got {actual}")'
 )
 
 
@@ -105,7 +114,46 @@ def _prepend_hf_token_export(merged: dict[str, Any]) -> None:
         merged[key] = [CUDA_HF_TOKEN_EXPORT, existing]
 
 
-def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[Any]:
+def shared_rocm_step(
+    merged: dict[str, Any], count: int, queue: str, execution_minutes: int
+) -> None:
+    """Opt-in client of the host's GPU lease hook; never allocate in a PR script."""
+    plugins = merged.get("plugins", [])
+    if len(plugins) != 1 or set(plugins[0]) != {"docker#v5.14.0"}:
+        raise SystemExit("shared GPU admission requires the Docker v5.14.0 preset")
+    plugin = plugins[0]["docker#v5.14.0"]
+    for key in ("devices", "privileged", "ipc", "shm-size"):
+        plugin.pop(key, None)
+    environment = plugin.get("environment", [])
+    if not isinstance(environment, list) or not all(isinstance(e, str) for e in environment):
+        raise SystemExit("shared Docker environment must be a list of strings")
+    plugin["environment"] = list(dict.fromkeys([
+        *environment, "AMD_CI_GPU_LEASE_ID", "AMD_CI_GPU_COUNT",
+    ]))
+    merged["agents"] = {"queue": queue}
+    merged["env"] = {**merged.get("env", {}), "AMD_CI_GPU_COUNT": str(count)}
+    if "command" in merged and "commands" in merged:
+        raise SystemExit("shared GPU step must use command or commands, not both")
+    command_key = "commands" if "commands" in merged else "command"
+    command = merged.pop(command_key, None)
+    if isinstance(command, list) and all(isinstance(c, str) for c in command):
+        command = "\n".join(command)
+    if not isinstance(command, str) or not command.strip():
+        raise SystemExit("shared GPU step requires a non-empty command")
+    # Preserve the original execution budget separately from the six-hour
+    # shared-resource wait. The host supervisor also bounds lease lifetime.
+    merged["timeout_in_minutes"] = execution_minutes + 360 + 30  # lease wait + setup
+    merged["command"] = (
+        ': "$${AMD_CI_GPU_LEASE_ID:?shared GPU admission hook is missing}" &&\n'
+        f"python3 -c {shlex.quote(SHARED_GPU_DEVICE_COUNT_CHECK)} &&\n"
+        f"timeout --signal=TERM --kill-after=60s {execution_minutes * 60} "
+        f"bash -euo pipefail -c {shlex.quote(command)}"
+    )
+
+
+def expand_steps(
+    steps: list[Any], presets: dict[str, dict[str, Any]], *, rocm_shared: bool = False
+) -> list[Any]:
     expanded: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -114,7 +162,26 @@ def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[A
         step = dict(step)
         nested = step.get("steps")
         if isinstance(nested, list):
-            step["steps"] = expand_steps(nested, presets)
+            step["steps"] = expand_steps(nested, presets, rocm_shared=rocm_shared)
+        shared_count = step.pop("shared_gpu_count", None)
+        execution_minutes = step.pop("shared_gpu_timeout_in_minutes", None)
+        if execution_minutes is not None and (
+            type(execution_minutes) is not int
+            or execution_minutes < 1
+            or shared_count is None
+        ):
+            raise SystemExit(
+                "shared_gpu_timeout_in_minutes must be a positive integer "
+                "on a shared_gpu_count step"
+            )
+        if shared_count is not None and (
+            type(shared_count) is not int
+            or shared_count < 1
+            or "mirror_hardwares" not in step
+        ):
+            raise SystemExit(
+                "shared_gpu_count must be a positive integer on a hardware-preset step"
+            )
         if "mirror_hardwares" not in step:
             expanded.append(step)
             continue
@@ -135,20 +202,34 @@ def expand_steps(steps: list[Any], presets: dict[str, dict[str, Any]]) -> list[A
 
         merged = {key: value for key, value in step.items() if key != "mirror_hardwares"}
         merged.update(copy.deepcopy(preset))
+        shared_queue = preset.get("shared_gpu_queue")
+        merged.pop("shared_gpu_queue", None)
+        if shared_count is not None and (
+            not isinstance(shared_queue, str) or not shared_queue.strip()
+        ):
+            raise SystemExit(f"hardware preset {name!r} does not declare shared_gpu_queue")
         if CUDA_HF_TOKEN_ENV in _preset_env_names(preset):
             _prepend_hf_token_export(merged)
         if "retry" in step:
             merged["retry"] = step["retry"]
+        if rocm_shared and shared_count is not None:
+            if execution_minutes is None:
+                execution_minutes = merged.get("timeout_in_minutes", 60)
+            if type(execution_minutes) is not int or execution_minutes < 1:
+                raise SystemExit(
+                    "shared GPU execution timeout must be a positive integer"
+                )
+            shared_rocm_step(merged, shared_count, shared_queue, execution_minutes)
         expanded.append(merged)
     return expanded
 
 
-def render(pipeline_path: Path) -> str:
+def render(pipeline_path: Path, *, rocm_shared: bool = False) -> str:
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     if not isinstance(doc, dict) or not isinstance(doc.get("steps"), list):
         raise SystemExit(f"{pipeline_path} has no steps list")
     doc = dict(doc)
-    doc["steps"] = expand_steps(doc["steps"], load_presets())
+    doc["steps"] = expand_steps(doc["steps"], load_presets(), rocm_shared=rocm_shared)
     return yaml.dump(
         doc,
         Dumper=_Dumper,
@@ -168,7 +249,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Pass the expanded YAML to buildkite-agent pipeline upload",
     )
     args = parser.parse_args(argv)
-    content = render(args.pipeline)
+    if os.environ.get("ROCM_SHARED_GPUS", "0") not in ("0", "1"):
+        parser.error("ROCM_SHARED_GPUS must be 0 or 1")
+    content = render(
+        args.pipeline, rocm_shared=os.environ.get("ROCM_SHARED_GPUS") == "1"
+    )
     if not args.upload:
         sys.stdout.write(content)
         return 0

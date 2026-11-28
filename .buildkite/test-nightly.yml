@@ -350,6 +350,8 @@ steps:
             allowed: true
             reason: "Retry transient GPU-agent failures after inspecting the logs"
         mirror_hardwares: mi300_2
+        shared_gpu_count: 2
+        shared_gpu_timeout_in_minutes: 60
         command: |
           timeout --kill-after=60s 89m bash -euo pipefail <<'BASH'
           # Bash defers this trap until its foreground command finishes,
