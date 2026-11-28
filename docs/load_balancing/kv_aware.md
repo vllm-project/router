@@ -190,6 +190,11 @@ P/D admission and before Prefill dispatch. It can continue the current P/D
 attempt, return Decode's response, or release the attempt and request one fresh
 P/D admission after a typed refusal.
 
+The reusable policy takes verified Decode-local KV estimates and load facts.
+The native P/D adapter supplies these facts and owns admission, dispatch, and
+the one-time fallback. Other scheduling paths can reuse the policy and worker
+contract through their own adapters.
+
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
 | `--pd-prefill-bypass` | `flag` | `false` | `flag` | `false` | Enable Prefill bypass with the default thresholds. |

@@ -973,7 +973,10 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    config.pd_prefill_bypass.validate(&config.router_config)?;
+    crate::routers::http::vllm_pd_router::validate_prefill_bypass(
+        config.pd_prefill_bypass,
+        &config.router_config,
+    )?;
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)

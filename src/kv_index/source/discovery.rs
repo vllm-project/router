@@ -350,10 +350,7 @@ impl KvIndexSupervisor {
         self
     }
 
-    /// Resolve a worker's declared sources, folding per-rank declarations
-    /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
-    /// base URL and fans it out to its DP ranks afterwards, so a declaration
-    /// keyed by rank has to be merged here or it is never applied.
+    /// Revision of a trusted live rank that advertises local prefill support.
     pub(crate) fn local_prefill_revision(&self, base: &str, rank: u32) -> Option<u64> {
         if self.static_pd_sources.contains_key(base) {
             return None;
@@ -371,6 +368,10 @@ impl KvIndexSupervisor {
         .then_some(state.revision)
     }
 
+    /// Resolve a worker's declared sources, folding per-rank declarations
+    /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
+    /// base URL and fans it out to its DP ranks afterwards, so a declaration
+    /// keyed by rank has to be merged here or it is never applied.
     fn resolved_static_source(&self, worker_url: &str) -> Option<WorkerDiscovery> {
         let exact = self.static_sources.get(worker_url);
         if split_worker_rank(worker_url).1.is_some() {

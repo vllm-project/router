@@ -37,9 +37,12 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-mod prefill_bypass;
-use prefill_bypass::{BeforePrefill, BypassOutcome, BypassTransport, PrefillBypass};
-pub use prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
+mod native_prefill_bypass;
+pub(crate) use native_prefill_bypass::validate_prefill_bypass;
+use native_prefill_bypass::{PrefillDispatch, SplitDispatch};
+
+use super::prefill_bypass::PrefillBypass;
+pub use super::prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
 
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 type MooncakePrefillTable = HashMap<u16, HashMap<String, MooncakePrefillInfo>>;
@@ -1962,91 +1965,40 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let pool = if self.use_discovery {
-            DecodePoolSource::Discovery
-        } else {
-            DecodePoolSource::Registry
+        let dispatch =
+            native_prefill_bypass::admit_http_for_dispatch(self, &request, path, headers).await;
+        let SplitDispatch {
+            prefill,
+            decode,
+            attempt,
+            commit,
+        } = match dispatch {
+            PrefillDispatch::Split(split) => split,
+            PrefillDispatch::Respond(response) => return response,
         };
-        let mut bypass = self.prefill_bypass.as_ref();
-        loop {
-            let AdmittedPair {
-                prefill: prefill_worker,
-                decode: decode_worker,
-                admission:
-                    Admission {
-                        selection,
-                        attempt,
-                        decode_tokens,
-                        affinity_key,
-                    },
-            } = match self.admit_http_pair(pool, &request, path, headers).await {
-                Ok(pair) => pair,
-                Err(error) => {
-                    RouterMetrics::record_pd_error("server_selection");
-                    return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
-                }
-            };
-            let commit = attempt.decode_pending_commit().then(|| {
-                DecodeCommitInput::for_request(
-                    pool,
-                    selection.decode.endpoint,
-                    decode_tokens,
-                    affinity_key,
-                    &request,
-                    path,
-                    None,
-                )
-            });
-            if let Some(plugin) = bypass {
-                match plugin
-                    .before_prefill(
-                        self,
-                        BeforePrefill {
-                            request: &request,
-                            path,
-                            headers,
-                            attempt: &attempt,
-                            prefill: &prefill_worker,
-                            decode: &decode_worker,
-                            commit: commit.as_ref(),
-                            pool,
-                            transport: BypassTransport::Http,
-                        },
-                    )
-                    .await
-                {
-                    BypassOutcome::Split => {}
-                    BypassOutcome::Respond(response) => return response,
-                    BypassOutcome::ReadmitSplit => {
-                        bypass = None;
-                        continue;
-                    }
-                }
+        match self
+            .process_vllm_two_stage_request(
+                request,
+                prefill,
+                decode,
+                path,
+                headers,
+                attempt.clone(),
+                None,
+                commit.as_ref(),
+            )
+            .await
+        {
+            Ok(response) => attempt.track_response(response),
+            Err(error) => {
+                let message = if self.use_discovery {
+                    error.to_string()
+                } else {
+                    format!("Transparent proxy request failed: {error}")
+                };
+                error!(%error, "Transparent proxy request failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
             }
-            return match self
-                .process_vllm_two_stage_request(
-                    request,
-                    prefill_worker,
-                    decode_worker,
-                    path,
-                    headers,
-                    attempt.clone(),
-                    None,
-                    commit.as_ref(),
-                )
-                .await
-            {
-                Ok(response) => attempt.track_response(response),
-                Err(error) => {
-                    let message = if self.use_discovery {
-                        error.to_string()
-                    } else {
-                        format!("Transparent proxy request failed: {error}")
-                    };
-                    error!(%error, "Transparent proxy request failed");
-                    (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
-                }
-            };
         }
     }
 
@@ -2252,6 +2204,48 @@ impl VllmPDRouter {
             .await
     }
 
+    async fn admit_grpc_pair(
+        &self,
+        workers: &GrpcPdWorkers,
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        prompts: &Arc<[Vec<u32>]>,
+    ) -> Result<AdmittedPair, Box<Response>> {
+        let Some(admission) = self
+            .admit_pair_with_tokens(
+                &workers.prefill,
+                &workers.decode,
+                request,
+                path,
+                headers,
+                true,
+                Some(prompts),
+                self.decode_commit_can_defer(&workers.prefill),
+            )
+            .await
+        else {
+            RouterMetrics::record_pd_error("server_selection");
+            return Err(Box::new(
+                (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response(),
+            ));
+        };
+        let prefill = workers.prefill[admission.selection.prefill.worker_index].clone();
+        let decode = workers.decode[admission.selection.decode.worker_index].clone();
+        info!(
+            "P/D: selected prefill={} [policy:{}], decode={} [policy:{}]",
+            prefill.url(),
+            self.policy_registry.get_prefill_policy().name(),
+            decode.url(),
+            self.policy_registry.get_decode_policy().name()
+        );
+        Ok(AdmittedPair {
+            prefill,
+            decode,
+            admission,
+        })
+    }
+
     /// Shared gRPC P/D admission and dispatch for an already prepared request.
     async fn route_grpc_prepared(
         &self,
@@ -2261,104 +2255,37 @@ impl VllmPDRouter {
         prepared: crate::backend::PreparedRequest,
         workers: GrpcPdWorkers,
     ) -> Response {
-        let mut workers = workers;
-        let mut bypass = self.prefill_bypass.as_ref();
-        let router_prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
-        loop {
-            let GrpcPdWorkers {
-                prefill: prefill_workers,
-                decode: decode_workers,
-            } = &workers;
-            let Some(Admission {
-                selection,
-                attempt,
-                decode_tokens,
-                affinity_key,
-            }) = self
-                .admit_pair_with_tokens(
-                    prefill_workers,
-                    decode_workers,
-                    &request_json,
-                    path,
-                    headers,
-                    true,
-                    Some(&router_prompts),
-                    self.decode_commit_can_defer(prefill_workers),
-                )
-                .await
-            else {
-                RouterMetrics::record_pd_error("server_selection");
-                return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
-            };
-            let prefill_worker = prefill_workers[selection.prefill.worker_index].clone();
-            let decode_worker = decode_workers[selection.decode.worker_index].clone();
-            info!(
-                "P/D: selected prefill={} [policy:{}], decode={} [policy:{}]",
-                prefill_worker.url(),
-                self.policy_registry.get_prefill_policy().name(),
-                decode_worker.url(),
-                self.policy_registry.get_decode_policy().name()
-            );
-            // The gRPC handshake carries the same connector JSON as HTTP, so a
-            // connector that tolerates a late decode choice gets one here too.
-            let commit = attempt.decode_pending_commit().then(|| {
-                DecodeCommitInput::for_request(
-                    DecodePoolSource::Registry,
-                    selection.decode.endpoint.clone(),
-                    decode_tokens,
-                    affinity_key,
-                    &request_json,
-                    path,
-                    Some(router_prompts.clone()),
-                )
-            });
-            if let Some(plugin) = bypass {
-                match plugin
-                    .before_prefill(
-                        self,
-                        BeforePrefill {
-                            request: &request_json,
-                            path,
-                            headers,
-                            attempt: &attempt,
-                            prefill: &prefill_worker,
-                            decode: &decode_worker,
-                            commit: commit.as_ref(),
-                            pool: DecodePoolSource::Registry,
-                            transport: BypassTransport::Grpc {
-                                prepared: &prepared,
-                                prompts: &router_prompts,
-                            },
-                        },
-                    )
-                    .await
-                {
-                    BypassOutcome::Split => {}
-                    BypassOutcome::Respond(response) => return response,
-                    BypassOutcome::ReadmitSplit => {
-                        bypass = None;
-                        workers = match self.available_grpc_workers() {
-                            Ok(workers) => workers,
-                            Err(response) => return *response,
-                        };
-                        continue;
-                    }
-                }
-            }
-            let response = self
-                .process_grpc_two_stage(
-                    prepared,
-                    prefill_worker,
-                    decode_worker,
-                    path,
-                    &attempt,
-                    commit.as_ref(),
-                    &request_json,
-                    headers,
-                )
-                .await;
-            return attempt.track_response(response);
-        }
+        let dispatch = native_prefill_bypass::admit_grpc_for_dispatch(
+            self,
+            &request_json,
+            path,
+            headers,
+            &prepared,
+            &workers,
+        )
+        .await;
+        let SplitDispatch {
+            prefill,
+            decode,
+            attempt,
+            commit,
+        } = match dispatch {
+            PrefillDispatch::Split(split) => split,
+            PrefillDispatch::Respond(response) => return response,
+        };
+        let response = self
+            .process_grpc_two_stage(
+                prepared,
+                prefill,
+                decode,
+                path,
+                &attempt,
+                commit.as_ref(),
+                &request_json,
+                headers,
+            )
+            .await;
+        attempt.track_response(response)
     }
 
     /// Two-stage request processing for vLLM disaggregated mode

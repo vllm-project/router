@@ -11,7 +11,7 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-PREFILL_BYPASS_SOURCE = ROOT / "src/routers/http/vllm_pd_router/prefill_bypass.rs"
+PREFILL_BYPASS_SOURCE = ROOT / "src/routers/http/prefill_bypass.rs"
 
 
 def format_default(value):
