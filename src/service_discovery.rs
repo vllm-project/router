@@ -12,11 +12,108 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use rustls;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+const POD_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const POD_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+
+enum PendingRetrySlot {
+    Reserved(u64),
+    Spawned(u64, task::AbortHandle),
+}
+
+impl PendingRetrySlot {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Reserved(gen) | Self::Spawned(gen, _) => *gen,
+        }
+    }
+
+    fn abort(self) {
+        if let Self::Spawned(_, handle) = self {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingPodRetries {
+    tasks: Mutex<HashMap<String, PendingRetrySlot>>,
+    next_generation: AtomicU64,
+}
+
+impl PendingPodRetries {
+    fn reserve(&self, pod_key: &str) -> u64 {
+        let gen = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(prev) = tasks.insert(pod_key.to_string(), PendingRetrySlot::Reserved(gen)) {
+                prev.abort();
+            }
+        }
+        gen
+    }
+
+    fn attach(&self, pod_key: &str, gen: u64, handle: task::AbortHandle) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if tasks
+                .get(pod_key)
+                .is_some_and(|slot| slot.generation() == gen)
+            {
+                tasks.insert(pod_key.to_string(), PendingRetrySlot::Spawned(gen, handle));
+                return;
+            }
+        }
+        handle.abort();
+    }
+
+    fn cancel(&self, pod_key: &str) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if let Some(prev) = tasks.remove(pod_key) {
+                prev.abort();
+            }
+        }
+    }
+
+    fn is_current(&self, pod_key: &str, gen: u64) -> bool {
+        self.tasks.lock().is_ok_and(|tasks| {
+            tasks
+                .get(pod_key)
+                .is_some_and(|slot| slot.generation() == gen)
+        })
+    }
+
+    fn finish_if_current(&self, pod_key: &str, gen: u64) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            if tasks
+                .get(pod_key)
+                .is_some_and(|slot| slot.generation() == gen)
+            {
+                tasks.remove(pod_key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn pending_count(&self) -> usize {
+        self.tasks.lock().map(|tasks| tasks.len()).unwrap_or(0)
+    }
+}
+
+impl Drop for PendingPodRetries {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            for (_, slot) in tasks.drain() {
+                slot.abort();
+            }
+        }
+    }
+}
 
 /// Represents the service discovery configuration
 #[derive(Debug, Clone)]
@@ -337,12 +434,15 @@ pub async fn start_service_discovery(
             let tracked_pods_clone2 = Arc::clone(&tracked_pods);
             let router_clone = Arc::clone(&router);
             let config_clone2 = Arc::clone(&config_arc);
+            let pending_retries = Arc::new(PendingPodRetries::default());
+            let pending_retries_clone = Arc::clone(&pending_retries);
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let router_inner = Arc::clone(&router_clone);
                     let config_inner = Arc::clone(&config_clone2);
+                    let pending_retries_inner = Arc::clone(&pending_retries_clone);
 
                     async move {
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
@@ -350,21 +450,25 @@ pub async fn start_service_discovery(
                         if let Some(pod_info) = pod_info {
                             let should_include = PodInfo::should_include(&pod, &config_inner);
                             if pod.metadata.deletion_timestamp.is_some() {
-                                handle_pod_deletion(
+                                handle_pod_deletion_with_retries(
                                     &pod_info,
                                     tracked_pods_inner,
                                     router_inner,
                                     config_inner.pd_mode,
+                                    Some(pending_retries_inner.as_ref()),
                                 )
                                 .await;
                             } else {
-                                handle_pod_event(
+                                handle_pod_event_with_retries(
                                     &pod_info,
                                     tracked_pods_inner,
                                     router_inner,
                                     port,
                                     config_inner.pd_mode,
                                     should_include,
+                                    Some(pending_retries_inner),
+                                    POD_RETRY_INITIAL_DELAY,
+                                    POD_RETRY_MAX_DELAY,
                                 )
                                 .await;
                             }
@@ -403,111 +507,173 @@ pub async fn start_service_discovery(
     Ok(handle)
 }
 
-async fn handle_pod_event(
+async fn try_add_pod_once(
+    pod_info: &PodInfo,
+    tracked_pods: &Arc<Mutex<HashMap<String, TrackedPod>>>,
+    router: &Arc<dyn RouterTrait>,
+    port: u16,
+    pd_mode: bool,
+) -> Result<(), String> {
+    let worker_url = pod_info.worker_url(port);
+
+    // Atomic check-and-insert/reconcile to prevent race conditions
+    let (should_add, stale_registration) = {
+        let mut tracker = match tracked_pods.lock() {
+            Ok(tracker) => tracker,
+            Err(e) => {
+                error!("Failed to acquire tracked_pods lock: {}", e);
+                return Err(format!("Failed to acquire tracked_pods lock: {}", e));
+            }
+        };
+
+        match tracker.entry(pod_info.pod_key()) {
+            std::collections::hash_map::Entry::Occupied(mut occ) => {
+                let existing = occ.get();
+                let is_same = existing.worker_url == worker_url
+                    && existing.pod_type == pod_info.pod_type
+                    && (pod_info.uid.is_none() || existing.uid == pod_info.uid);
+
+                if is_same {
+                    (false, None) // Exact duplicate: safe no-op
+                } else {
+                    // Stale registration: pod was replaced (new IP or UID) or PD role flipped!
+                    let old = occ.insert(TrackedPod {
+                        worker_url: worker_url.clone(),
+                        pod_type: pod_info.pod_type.clone(),
+                        uid: pod_info.uid.clone(),
+                    });
+                    (true, Some(old))
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                vac.insert(TrackedPod {
+                    worker_url: worker_url.clone(),
+                    pod_type: pod_info.pod_type.clone(),
+                    uid: pod_info.uid.clone(),
+                });
+                (true, None)
+            }
+        }
+    };
+
+    if let Some(stale) = stale_registration {
+        info!(
+            "Reconciling stale pod registration for {}: evicting old URL {} (role: {:?})",
+            pod_info.name, stale.worker_url, stale.pod_type
+        );
+        remove_worker_from_router(&stale.worker_url, stale.pod_type, router, pd_mode).await;
+    }
+
+    if !should_add {
+        return Ok(());
+    }
+
+    info!(
+        "Adding pod: {} | type: {:?} | url: {}",
+        pod_info.name, pod_info.pod_type, worker_url
+    );
+
+    // Handle PD mode with specific pod types
+    let result = if pd_mode && pod_info.pod_type.is_some() {
+        use crate::routers::http::vllm_pd_router::VllmPDRouter;
+
+        if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
+            // Support --vllm-pd-disaggregation mode with K8s service discovery
+            match &pod_info.pod_type {
+                Some(PodType::Prefill) => vllm_pd_router
+                    .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Some(PodType::Decode) => vllm_pd_router
+                    .add_decode_server(worker_url.clone())
+                    .await
+                    .map_err(|e| e.to_string()),
+                Some(PodType::Regular) | None => {
+                    // Fall back to regular add_worker for regular pods
+                    router.add_worker(&worker_url).await
+                }
+            }
+        } else {
+            Err("PD mode enabled but router is not a VllmPDRouter".to_string())
+        }
+    } else {
+        // Regular mode or no pod type specified
+        router.add_worker(&worker_url).await
+    };
+
+    match result {
+        Ok(_) => {
+            debug!("Worker added: {}", worker_url);
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to add worker {} to router: {}", worker_url, e);
+            // Remove from tracking since addition failed
+            if let Ok(mut tracker) = tracked_pods.lock() {
+                tracker.remove(&pod_info.pod_key());
+            }
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_pod_event_with_retries(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
     router: Arc<dyn RouterTrait>,
     port: u16,
     pd_mode: bool,
     should_include: bool,
+    pending_retries: Option<Arc<PendingPodRetries>>,
+    retry_initial_delay: Duration,
+    retry_max_delay: Duration,
 ) {
-    let worker_url = pod_info.worker_url(port);
+    let pod_key = pod_info.pod_key();
+    if let Some(retries) = &pending_retries {
+        retries.cancel(&pod_key);
+    }
 
     // If pod is healthy and matches the selector, try to add it (with atomic check-and-insert)
     if pod_info.is_healthy() && should_include {
-        // Atomic check-and-insert/reconcile to prevent race conditions
-        let (should_add, stale_registration) = {
-            let mut tracker = match tracked_pods.lock() {
-                Ok(tracker) => tracker,
-                Err(e) => {
-                    error!("Failed to acquire tracked_pods lock: {}", e);
-                    return;
-                }
-            };
+        if try_add_pod_once(pod_info, &tracked_pods, &router, port, pd_mode)
+            .await
+            .is_err()
+        {
+            if let Some(retries) = pending_retries {
+                let gen = retries.reserve(&pod_key);
+                let retries_task = Arc::clone(&retries);
+                let retry_key = pod_key.clone();
+                let retry_pod = pod_info.clone();
+                let retry_tracked = Arc::clone(&tracked_pods);
+                let retry_router = Arc::clone(&router);
+                let initial_delay = retry_initial_delay.max(Duration::from_millis(1));
+                let max_delay = retry_max_delay.max(initial_delay);
 
-            match tracker.entry(pod_info.pod_key()) {
-                std::collections::hash_map::Entry::Occupied(mut occ) => {
-                    let existing = occ.get();
-                    let is_same = existing.worker_url == worker_url
-                        && existing.pod_type == pod_info.pod_type
-                        && (pod_info.uid.is_none() || existing.uid == pod_info.uid);
-
-                    if is_same {
-                        (false, None) // Exact duplicate: safe no-op
-                    } else {
-                        // Stale registration: pod was replaced (new IP or UID) or PD role flipped!
-                        let old = occ.insert(TrackedPod {
-                            worker_url: worker_url.clone(),
-                            pod_type: pod_info.pod_type.clone(),
-                            uid: pod_info.uid.clone(),
-                        });
-                        (true, Some(old))
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(vac) => {
-                    vac.insert(TrackedPod {
-                        worker_url: worker_url.clone(),
-                        pod_type: pod_info.pod_type.clone(),
-                        uid: pod_info.uid.clone(),
-                    });
-                    (true, None)
-                }
-            }
-        };
-
-        if let Some(stale) = stale_registration {
-            info!(
-                "Reconciling stale pod registration for {}: evicting old URL {} (role: {:?})",
-                pod_info.name, stale.worker_url, stale.pod_type
-            );
-            remove_worker_from_router(&stale.worker_url, stale.pod_type, &router, pd_mode).await;
-        }
-
-        if should_add {
-            info!(
-                "Adding pod: {} | type: {:?} | url: {}",
-                pod_info.name, pod_info.pod_type, worker_url
-            );
-
-            // Handle PD mode with specific pod types
-            let result = if pd_mode && pod_info.pod_type.is_some() {
-                use crate::routers::http::vllm_pd_router::VllmPDRouter;
-
-                if let Some(vllm_pd_router) = router.as_any().downcast_ref::<VllmPDRouter>() {
-                    // Support --vllm-pd-disaggregation mode with K8s service discovery
-                    match &pod_info.pod_type {
-                        Some(PodType::Prefill) => vllm_pd_router
-                            .add_prefill_server(worker_url.clone(), pod_info.bootstrap_port)
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Some(PodType::Decode) => vllm_pd_router
-                            .add_decode_server(worker_url.clone())
-                            .await
-                            .map_err(|e| e.to_string()),
-                        Some(PodType::Regular) | None => {
-                            // Fall back to regular add_worker for regular pods
-                            router.add_worker(&worker_url).await
+                let handle = task::spawn(async move {
+                    let mut delay = initial_delay;
+                    loop {
+                        time::sleep(delay).await;
+                        if !retries_task.is_current(&retry_key, gen) {
+                            break;
                         }
+                        if try_add_pod_once(
+                            &retry_pod,
+                            &retry_tracked,
+                            &retry_router,
+                            port,
+                            pd_mode,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            retries_task.finish_if_current(&retry_key, gen);
+                            break;
+                        }
+                        delay = delay.saturating_mul(2).min(max_delay);
                     }
-                } else {
-                    Err("PD mode enabled but router is not a VllmPDRouter".to_string())
-                }
-            } else {
-                // Regular mode or no pod type specified
-                router.add_worker(&worker_url).await
-            };
-
-            match result {
-                Ok(_) => {
-                    debug!("Worker added: {}", worker_url);
-                }
-                Err(e) => {
-                    error!("Failed to add worker {} to router: {}", worker_url, e);
-                    // Remove from tracking since addition failed
-                    if let Ok(mut tracker) = tracked_pods.lock() {
-                        tracker.remove(&pod_info.pod_key());
-                    }
-                }
+                });
+                retries.attach(&pod_key, gen, handle.abort_handle());
             }
         }
     } else {
@@ -517,13 +683,52 @@ async fn handle_pod_event(
     }
 }
 
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn handle_pod_event(
+    pod_info: &PodInfo,
+    tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
+    router: Arc<dyn RouterTrait>,
+    port: u16,
+    pd_mode: bool,
+    should_include: bool,
+) {
+    handle_pod_event_with_retries(
+        pod_info,
+        tracked_pods,
+        router,
+        port,
+        pd_mode,
+        should_include,
+        None,
+        POD_RETRY_INITIAL_DELAY,
+        POD_RETRY_MAX_DELAY,
+    )
+    .await;
+}
+
+async fn handle_pod_deletion_with_retries(
+    pod_info: &PodInfo,
+    tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
+    router: Arc<dyn RouterTrait>,
+    pd_mode: bool,
+    pending_retries: Option<&PendingPodRetries>,
+) {
+    if let Some(retries) = pending_retries {
+        retries.cancel(&pod_info.pod_key());
+    }
+    remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "deletion").await;
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashMap<String, TrackedPod>>>,
     router: Arc<dyn RouterTrait>,
     pd_mode: bool,
 ) {
-    remove_tracked_pod(pod_info, tracked_pods, router, pd_mode, "deletion").await;
+    handle_pod_deletion_with_retries(pod_info, tracked_pods, router, pd_mode, None).await;
 }
 
 async fn remove_tracked_pod(
@@ -2768,5 +2973,177 @@ mod tests {
         // 3. Stale Prefill was evicted via remove_worker_from_router.
         // Because create_test_router is not a VllmPDRouter, add fails and cleans up tracking.
         assert!(!router.get_worker_urls().contains(&worker_url));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_requeues_prefill_until_bootstrap_succeeds() {
+        use crate::config::{KvConnector, PolicyConfig, RouterConfig};
+        use crate::routers::http::vllm_pd_router::VllmPDRouter;
+        use crate::server::AppContext;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let prefill_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefill_port = prefill_listener.local_addr().unwrap().port();
+        let prefill_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = prefill_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let resp =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let bootstrap_attempts = Arc::new(AtomicUsize::new(0));
+        let bootstrap_attempts_srv = Arc::clone(&bootstrap_attempts);
+        let bootstrap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap_port = bootstrap_listener.local_addr().unwrap().port();
+        let bootstrap_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = bootstrap_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let attempt = bootstrap_attempts_srv.fetch_add(1, AtomicOrdering::SeqCst);
+                let resp = if attempt < 4 {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+                } else {
+                    let body = r#"{"0":{"engine_id":"requeue-eng-0"}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let router_config = RouterConfig {
+            kv_connector: KvConnector::Mooncake,
+            policy: PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 1,
+            worker_startup_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            AppContext::new(router_config, reqwest::Client::new(), 64, None, Vec::new()).unwrap(),
+        );
+        let pd_router = Arc::new(
+            VllmPDRouter::new(vec![], vec![], None, &app_context)
+                .await
+                .unwrap(),
+        );
+        let router_trait: Arc<dyn RouterTrait> = Arc::clone(&pd_router) as Arc<dyn RouterTrait>;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pending_retries = Arc::new(PendingPodRetries::default());
+
+        let prefill_pod = PodInfo {
+            name: "prefill-0".into(),
+            namespace: "default".into(),
+            uid: Some("uid-pf-requeue".to_string()),
+            ip: "127.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(bootstrap_port),
+        };
+        let pod_key = prefill_pod.pod_key();
+
+        handle_pod_event_with_retries(
+            &prefill_pod,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router_trait),
+            prefill_port,
+            true,
+            true,
+            Some(Arc::clone(&pending_retries)),
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        assert!(
+            !tracked_pods.lock().unwrap().contains_key(&pod_key),
+            "initial failure should roll back tracked_pods before retry succeeds"
+        );
+        assert_eq!(pending_retries.pending_count(), 1);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if pd_router.worker_registry().get_prefill_workers().len() == 1
+                && tracked_pods.lock().unwrap().contains_key(&pod_key)
+                && pending_retries.pending_count() == 0
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for prefill requeue retry (attempts={})",
+                bootstrap_attempts.load(AtomicOrdering::SeqCst)
+            );
+            time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(bootstrap_attempts.load(AtomicOrdering::SeqCst) >= 5);
+        assert!(pd_router
+            .get_mooncake_info(
+                &prefill_pod.worker_url(prefill_port),
+                Some(bootstrap_port),
+                Some(0),
+            )
+            .is_some());
+
+        prefill_task.abort();
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_deletion_cancels_pending_retry() {
+        let router = create_test_router().await;
+        let tracked_pods = Arc::new(Mutex::new(HashMap::new()));
+        let pending_retries = Arc::new(PendingPodRetries::default());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let pod_info = PodInfo {
+            name: "transient-pod".into(),
+            namespace: "default".into(),
+            uid: Some("uid-del-cancel".to_string()),
+            ip: "127.0.0.1".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+        };
+
+        handle_pod_event_with_retries(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            closed_port,
+            false,
+            true,
+            Some(Arc::clone(&pending_retries)),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+        )
+        .await;
+        assert_eq!(pending_retries.pending_count(), 1);
+
+        handle_pod_deletion_with_retries(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            false,
+            Some(pending_retries.as_ref()),
+        )
+        .await;
+        assert_eq!(pending_retries.pending_count(), 0);
+
+        time::sleep(Duration::from_millis(160)).await;
+        assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().is_empty());
     }
 }
