@@ -31,35 +31,33 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
     lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     let provider = LayoutWorkerProvider {
         indexes: HashMap::default(),
-        bound: HashMap::new(),
         lifecycle,
-    };
-    let action = |outcome| {
-        provider
-            .lifecycle
-            .observe_layout(
-                &mut provider.lifecycle.state.lock(),
-                &outcome,
-                Instant::now(),
-            )
-            .1
     };
     assert!(!provider.is_trusted());
     assert!(provider.lifecycle.expire_if_needed());
     assert!(active.load(Ordering::Acquire));
     assert_eq!(
-        action(StaticHybridMatch::Unavailable(SourcesProbe::Failed)),
+        provider
+            .lifecycle
+            .observe_layout(&StaticHybridMatch::Unavailable(SourcesProbe::Failed)),
         SourceAction::Keep
     );
     assert!(!provider.is_trusted());
-    assert_eq!(action(StaticHybridMatch::Matches), SourceAction::Recover);
+    assert_eq!(
+        provider
+            .lifecycle
+            .observe_layout(&StaticHybridMatch::Matches),
+        SourceAction::Recover
+    );
     assert!(!provider.is_trusted()); // Replay must be started before publication.
     assert!(provider.lifecycle.finish_layout_recovery(true));
     assert!(provider.is_trusted());
     provider.lifecycle.state.lock().verified_at = Instant::now() - Duration::from_secs(6);
     assert!(provider.lifecycle.expire_if_needed());
     assert_eq!(
-        action(StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
+        provider
+            .lifecycle
+            .observe_layout(&StaticHybridMatch::Unavailable(SourcesProbe::Unsupported)),
         SourceAction::Recover
     );
     let revision = {
@@ -73,7 +71,12 @@ fn hybrid_freshness_expires_recovers_and_never_reactivates_retired_worker() {
         assert!(state.info.is_none());
         assert_ne!(state.revision, revision);
     }
-    assert_eq!(action(StaticHybridMatch::Matches), SourceAction::Stop);
+    assert_eq!(
+        provider
+            .lifecycle
+            .observe_layout(&StaticHybridMatch::Matches),
+        SourceAction::Stop
+    );
     assert!(!active.load(Ordering::Acquire));
     assert!(!provider.is_trusted());
 }
@@ -84,22 +87,13 @@ fn changed_layout_rebinds_without_waiting_for_the_descriptor_interval() {
     let lifecycle = WorkerLifecycle::new(active, true, None);
     assert!(!lifecycle.layout_rebind_due());
     assert_eq!(
-        lifecycle
-            .observe_layout(
-                &mut lifecycle.state.lock(),
-                &StaticHybridMatch::Differs,
-                Instant::now()
-            )
-            .1,
+        lifecycle.observe_layout(&StaticHybridMatch::Differs),
         SourceAction::Stop
     );
     assert!(lifecycle.layout_rebind_due());
     assert!(lifecycle.refresh_due());
 
-    assert_eq!(
-        lifecycle.observe_descriptor("http://worker", None, None),
-        SourceAction::Keep
-    );
+    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
     assert!(!lifecycle.layout_rebind_due());
     assert!(!lifecycle.refresh_due());
 }
@@ -149,18 +143,23 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     let lifecycle = supervisor.lifecycle_for_worker(&worker);
-    let first = supervisor
-        .probe_registration(&worker, false, None, &lifecycle)
-        .await;
+    let probe = || {
+        supervisor.probe_registration(
+            &worker,
+            false,
+            None,
+            &lifecycle,
+            tokio::time::Instant::now() + CONTROL_TIMEOUT,
+        )
+    };
+    let first = probe().await.unwrap();
     {
         let mut state = lifecycle.state.lock();
         state.info = Some(WorkerKvInfo::default());
-        state.descriptor = Some(first.descriptor.unwrap());
+        state.descriptor = Some(first.descriptor);
         state.base_models = first.worker.base_models.unwrap();
     }
-    let repeated = supervisor
-        .probe_registration(&worker, false, None, &lifecycle)
-        .await;
+    let repeated = probe().await.unwrap();
     assert_eq!(
         repeated.worker.base_models.unwrap(),
         HashSet::from(["alias-1".into()])
@@ -168,9 +167,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     assert_eq!(requests.load(Ordering::Relaxed), 1);
 
     instance.store(2, Ordering::Relaxed);
-    let replaced = supervisor
-        .probe_registration(&worker, false, None, &lifecycle)
-        .await;
+    let replaced = probe().await.unwrap();
     assert_eq!(
         replaced.worker.base_models.unwrap(),
         HashSet::from(["alias-2".into()])
@@ -487,12 +484,12 @@ fn native_layout_rejection_identifies_the_rank_and_reason() {
         },
     )]);
     assert_eq!(
-        validate_native_publishers(&layout, &sources, &info, "model", |_| false),
+        validate_native_publishers(&layout, &sources, &info, "model"),
         Err("DP rank 0: layout hash block size differs from worker metadata".into())
     );
     sources.get_mut("0").unwrap().topic = "boot-2".into();
     assert_eq!(
-        validate_native_publishers(&layout, &sources, &info, "model", |_| false),
+        validate_native_publishers(&layout, &sources, &info, "model"),
         Err(
             "DP rank 0: layout publisher topic does not identify the observed worker instance"
                 .into()
@@ -765,14 +762,14 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
     let client = reqwest::Client::new();
     let discovery = static_worker_discovery(&worker, &config);
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &discovery).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, None).await,
         StaticHybridMatch::Matches
     );
     let mut live_only = config.clone();
     live_only.replay_endpoints = None;
     let live_only = static_worker_discovery(&worker, &live_only);
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &live_only).await,
+        static_hybrid_sources_match(&client, &worker, None, &live_only, None).await,
         StaticHybridMatch::Differs
     );
     let with_replay = sources.lock().clone();
@@ -783,13 +780,13 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
             .remove("replay_endpoint");
     }
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &live_only).await,
+        static_hybrid_sources_match(&client, &worker, None, &live_only, None).await,
         StaticHybridMatch::Matches
     );
     *sources.lock() = with_replay;
     sources.lock()["1"]["topic"] = serde_json::json!("boot-2-rank-1");
     assert_eq!(
-        static_hybrid_sources_match(&client, &worker, None, &discovery).await,
+        static_hybrid_sources_match(&client, &worker, None, &discovery, None).await,
         StaticHybridMatch::Differs
     );
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(client.clone());
@@ -800,50 +797,23 @@ async fn static_hybrid_sources_require_matching_rank_and_generation_topic() {
     assert_eq!(unavailable.probe, SourcesProbe::StaticMismatch);
     assert!(!unavailable.probe.retryable());
     assert!(super::probe::worker_descriptor(&rejected).is_ok());
-    let installed: HashMap<_, _> = (0..2)
-        .map(|rank| {
-            (
-                rank as u32,
-                BoundSource {
-                    endpoint: config.endpoints[rank].clone(),
-                    replay_endpoint: Some(config.replay_endpoints.as_ref().unwrap()[rank].clone()),
-                    topic: format!("boot-1-rank-{rank}"),
-                },
-            )
-        })
-        .collect();
-    let fences = HashMap::from([(1, installed[&1].clone())]);
-    let check_installed = || async {
-        let observed = super::probe::probe_bound_sources(&client, &worker, None, true).await;
-        super::reconcile::observed_sources_match(&worker, &installed, &fences, None, &observed)
-    };
-    let outcome = check_installed().await;
-    assert_eq!(outcome, StaticHybridMatch::Matches);
-    let lifecycle = WorkerLifecycle::new(Arc::new(AtomicBool::new(true)), true, None);
-    let now = Instant::now();
-    let observed_at = now - Duration::from_secs(2);
-    {
-        let mut state = lifecycle.state.lock();
-        state.verified_at = now - Duration::from_secs(6);
-        state.hash_fences = fences.clone();
-        assert_eq!(
-            lifecycle.observe_layout(&mut state, &outcome, observed_at),
-            (false, SourceAction::Keep)
-        );
-        assert_eq!(state.verified_at, observed_at);
-        assert!(lifecycle.trusted_at(&state, || now));
-        assert_eq!(
-            lifecycle.observe_layout(
-                &mut state,
-                &StaticHybridMatch::Unavailable(SourcesProbe::Failed),
-                now,
-            ),
-            (false, SourceAction::Keep)
-        );
-        assert_eq!(state.verified_at, observed_at);
-    }
+    let installed = HashMap::from([(
+        0,
+        BoundSource {
+            endpoint: config.endpoints[0].clone(),
+            replay_endpoint: Some(config.replay_endpoints.as_ref().unwrap()[0].clone()),
+            topic: "boot-1-rank-0".to_owned(),
+        },
+    )]);
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &discovery, Some(&installed)).await,
+        StaticHybridMatch::Matches
+    );
     sources.lock()["0"]["topic"] = serde_json::json!("boot-2-rank-0");
-    assert_eq!(check_installed().await, StaticHybridMatch::Differs);
+    assert_eq!(
+        static_hybrid_sources_match(&client, &worker, None, &discovery, Some(&installed)).await,
+        StaticHybridMatch::Differs
+    );
     task.abort();
 }
 
@@ -1644,7 +1614,7 @@ async fn nixl_prefill_discovers_mooncake_compressed_truncation() {
     let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
 
     let discovery = supervisor
-        .discover_for_role(&worker, Some(KvConnector::Nixl), None)
+        .discover_for_role(&worker, Some(KvConnector::Nixl))
         .await;
     assert!(discovery.sources.is_ok());
     assert_eq!(
@@ -1923,13 +1893,10 @@ struct MetadataRequests {
     models: std::sync::atomic::AtomicUsize,
 }
 
-fn metrics_and_models_router<F>(
-    metrics: impl Fn() -> F + Clone + Send + Sync + 'static,
-) -> (axum::Router, Arc<MetadataRequests>)
-where
-    F: std::future::Future<Output = String> + Send + 'static,
-{
-    use axum::{routing::get, Router};
+fn metrics_and_models_router(
+    metrics: impl Fn() -> String + Clone + Send + Sync + 'static,
+) -> (axum::Router, Arc<MetadataRequests>) {
+    use axum::{routing::get, Json, Router};
 
     let requests = Arc::new(MetadataRequests::default());
     let app = Router::new()
@@ -1939,7 +1906,7 @@ where
                 let requests = requests.clone();
                 move || {
                     requests.metrics.fetch_add(1, Ordering::Relaxed);
-                    metrics()
+                    std::future::ready(metrics())
                 }
             }),
         )
@@ -1949,18 +1916,16 @@ where
                 let requests = requests.clone();
                 move || {
                     requests.models.fetch_add(1, Ordering::Relaxed);
-                    mock_model_list()
+                    async {
+                        Json(serde_json::json!({"data": [
+                            {"id": "mock-model"}, {"id": "mock-alias"},
+                            {"id": "adapter", "parent": "mock-model"}
+                        ]}))
+                    }
                 }
             }),
         );
     (app, requests)
-}
-
-async fn mock_model_list() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({"data": [
-        {"id": "mock-model"}, {"id": "mock-alias"},
-        {"id": "adapter", "parent": "mock-model"}
-    ]}))
 }
 
 /// Spawn a worker that serves only what a plain `vllm serve` exposes.
@@ -1982,7 +1947,7 @@ impl Drop for AbortTestServer {
 struct HashAdmissionWorker {
     url: String,
     supervisor: KvIndexSupervisor,
-    metrics: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Mutex<String>>,
     sources: Arc<Mutex<serde_json::Value>>,
     requests: Arc<MetadataRequests>,
     _server: AbortTestServer,
@@ -1991,10 +1956,6 @@ struct HashAdmissionWorker {
 
 impl HashAdmissionWorker {
     async fn start(ranks: usize, metrics: &str) -> Self {
-        Self::start_with_routes(ranks, metrics, axum::Router::new()).await
-    }
-
-    async fn start_with_routes(ranks: usize, metrics: &str, routes: axum::Router) -> Self {
         use serde_json::json;
 
         let sockets: Vec<_> = (0..ranks).map(|_| layout_endpoints()).collect();
@@ -2013,21 +1974,13 @@ impl HashAdmissionWorker {
                 })
                 .collect(),
         )));
-        let metrics = Arc::new(Mutex::new(Some(metrics.to_owned())));
+        let metrics = Arc::new(Mutex::new(metrics.to_owned()));
         let (app, requests) = metrics_and_models_router({
             let metrics = metrics.clone();
-            move || {
-                let report = metrics.lock().clone();
-                async move {
-                    match report {
-                        Some(body) => body,
-                        None => std::future::pending().await,
-                    }
-                }
-            }
+            move || metrics.lock().clone()
         });
         let (url, server) = source_boundary_worker_with_routes(
-            app.merge(routes),
+            app,
             json!({
                 "model_id": "mock-model", "instance_id": "boot", "kv_block_size": 16,
                 "served_model_aliases": ["control-alias"]
@@ -2109,13 +2062,13 @@ async fn pinned_static_admission_and_fencing_use_the_single_local_engine_report(
 
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
     let (reports, _) = metrics_meta::parse_cache_config_info(&incompatible);
-    supervisor.fence_installed_hashes(&url, &provider.lifecycle, &reports);
+    supervisor.fence_failed_registration(&url, &provider.lifecycle, &reports);
     assert!(!hit());
     let registration = &supervisor.worker_registrations()[&url];
     assert!(registration.info.as_ref().unwrap().ranks.is_empty());
     assert!(!supervisor.workers_have_cache_bindings([(url.as_str(), 1)].into_iter()));
 
-    *worker.metrics.lock() = Some(incompatible);
+    *worker.metrics.lock() = incompatible;
     let info = supervisor.on_worker_added(&url).await.unwrap();
     assert!(info.cache_key.is_none());
     assert!(info.ranks.is_empty());
@@ -2167,7 +2120,36 @@ async fn registration_only_scrapes_hashes_for_usable_http_sources() {
     discovered.engine_cache_configs = Some(configs);
     assert!(!probe::needs_admission_hashes(url, &discovered));
 
-    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 2);
+    let lifecycle = supervisor.lifecycle_for_worker(url);
+    let probe = |budget| {
+        supervisor.probe_registration(
+            url,
+            false,
+            None,
+            &lifecycle,
+            tokio::time::Instant::now() + budget,
+        )
+    };
+    probe(CONTROL_TIMEOUT).await.unwrap();
+    let requests = || worker.requests.metrics.load(Ordering::Relaxed);
+    assert_eq!(
+        requests(),
+        2,
+        "gRPC and unchanged descriptors skip the scrape"
+    );
+
+    let sources = std::mem::replace(&mut *worker.sources.lock(), serde_json::json!([]));
+    lifecycle.state.lock().trusted = false;
+    assert!(probe(CONTROL_TIMEOUT).await.is_err());
+    assert_eq!(requests(), 2, "failed source probe");
+
+    *worker.sources.lock() = sources;
+    let without_budget = probe(Duration::ZERO).await.unwrap();
+    assert!(without_budget.worker.engine_cache_configs.is_none());
+    assert_eq!(requests(), 2, "insufficient refresh budget");
+    let with_budget = probe(CONTROL_TIMEOUT).await.unwrap();
+    assert!(with_budget.worker.engine_cache_configs.is_some());
+    assert_eq!(requests(), 3, "usable source for re-admission");
 }
 
 #[tokio::test]
@@ -2178,13 +2160,11 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     assert!(first.cache_key.is_some());
     let old = supervisor.lifecycle_for_worker(&worker.url);
 
-    *worker.metrics.lock() = Some(
-        concat!(
-            "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
-            "vllm:cache_config_info{engine=\"1\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
-        )
-        .to_owned(),
-    );
+    *worker.metrics.lock() = concat!(
+        "vllm:cache_config_info{engine=\"0\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+        "vllm:cache_config_info{engine=\"1\",prefix_caching_hash_algo=\"sha256\"} 1.0\n",
+    )
+    .to_owned();
     let (info, models) = supervisor
         .on_worker_added_with_models(&worker.url)
         .await
@@ -2193,7 +2173,7 @@ async fn load_only_registration_replaces_binding_and_preserves_model_aliases() {
     assert!(info.cache_key.is_none());
     assert!(!old.active.load(Ordering::Acquire));
     let load_only = supervisor.lifecycle_for_worker(&worker.url);
-    assert!(load_only.active.load(Ordering::Acquire));
+    assert!(!load_only.active.load(Ordering::Acquire));
     {
         let mut state = load_only.state.lock();
         state.trusted = false;
@@ -2240,7 +2220,7 @@ async fn failed_reregistration_revokes_only_the_incompatible_rank() {
     wait_for(|| hit(0) && hit(1)).await;
 
     let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
-    *worker.metrics.lock() = Some(incompatible.clone());
+    *worker.metrics.lock() = incompatible.clone();
     let sources = worker.sources.lock().clone();
     worker.sources.lock()["1"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
     let error = supervisor.on_worker_added(url).await.unwrap_err();
@@ -2250,10 +2230,10 @@ async fn failed_reregistration_revokes_only_the_incompatible_rank() {
     assert!(!supervisor.workers_have_cache_bindings([(url, 0)].into_iter()));
     assert!(supervisor.workers_have_cache_bindings([(url, 1)].into_iter()));
 
-    *worker.metrics.lock() = Some(format!(
+    *worker.metrics.lock() = format!(
         "{incompatible}{}",
         incompatible.replace("engine=\"0\"", "engine=\"1\"")
-    ));
+    );
     assert!(supervisor.on_worker_added(url).await.is_err());
     assert!(!hit(1));
     {
@@ -2263,14 +2243,11 @@ async fn failed_reregistration_revokes_only_the_incompatible_rank() {
     assert!(supervisor.match_provider_for_worker(url).is_some());
 
     *worker.sources.lock() = sources;
-    *worker.metrics.lock() = Some(format!(
-        "{METRICS_ONLY}{}",
-        METRICS_ONLY.replace("engine=\"0\"", "engine=\"1\"")
-    ));
+    *worker.metrics.lock() = METRICS_ONLY.to_owned();
     let replacement = supervisor.on_worker_added(url).await.unwrap();
     assert_eq!(replacement.ranks.len(), 2);
     let (reports, _) = metrics_meta::parse_cache_config_info(&incompatible);
-    supervisor.fence_installed_hashes(url, &previous, &reports);
+    supervisor.fence_failed_registration(url, &previous, &reports);
     assert!(supervisor.workers_have_cache_bindings([(url, 0), (url, 1)].into_iter()));
 }
 
@@ -2286,16 +2263,8 @@ async fn explicit_reregistration_restores_load_only_binding() {
         .cache_key
         .is_none());
     assert_eq!(*supervisor.first_block_size.lock(), None);
-    *worker.metrics.lock() =
-        Some(METRICS_ONLY.replace(r#"prefix_caching_hash_algo="sha256_cbor","#, ""));
-    assert!(supervisor
-        .on_worker_added(url)
-        .await
-        .unwrap()
-        .cache_key
-        .is_none());
 
-    *worker.metrics.lock() = Some(METRICS_ONLY.to_owned());
+    *worker.metrics.lock() = METRICS_ONLY.to_owned();
     supervisor.lifecycle_for_worker(url).state.lock().checked = None;
     supervisor
         .refresh_workers(
@@ -2305,21 +2274,102 @@ async fn explicit_reregistration_restores_load_only_binding() {
         )
         .await;
     assert!(supervisor.match_provider_for_worker(url).is_none());
-    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 3);
+    assert_eq!(worker.requests.metrics.load(Ordering::Relaxed), 1);
 
     assert_eq!(supervisor.on_worker_added(url).await.unwrap().ranks, [0]);
     assert_eq!(*supervisor.first_block_size.lock(), Some(16));
 }
 
 #[tokio::test]
+async fn fully_fenced_worker_rebinds_only_replacement_publishers() {
+    use crate::kv_index::{request_hash::BlockKeyGenerator, wire::ExternalBlockHash};
+
+    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    for (fenced_at_admission, replacement_rank) in [(true, 0), (false, 1)] {
+        let initial = if fenced_at_admission {
+            &incompatible
+        } else {
+            METRICS_ONLY
+        };
+        let worker = HashAdmissionWorker::start(2, initial).await;
+        let spare = worker
+            .sources
+            .lock()
+            .as_object_mut()
+            .unwrap()
+            .remove("1")
+            .unwrap();
+        let (supervisor, url) = (&worker.supervisor, &worker.url);
+        let initial_info = supervisor.on_worker_added(url).await.unwrap();
+        assert_eq!(initial_info.ranks.is_empty(), fenced_at_admission);
+        let lifecycle = supervisor.lifecycle_for_worker(url);
+        if !fenced_at_admission {
+            let original = worker.sources.lock()["0"]["replay_endpoint"].clone();
+            worker.sources.lock()["0"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
+            *worker.metrics.lock() = incompatible.clone();
+            assert!(supervisor.on_worker_added(url).await.is_err());
+            worker.sources.lock()["0"]["replay_endpoint"] = original;
+        }
+        assert!(!supervisor.workers_have_cache_bindings([(url.as_str(), 0)].into_iter()));
+        assert!(!lifecycle.layout_rebind_due());
+
+        let refresh = || async {
+            lifecycle.state.lock().checked = None;
+            supervisor.refresh_discovered_workers().await
+        };
+        *worker.metrics.lock() = METRICS_ONLY.to_owned();
+        // A descriptor change alone does not identify a replacement publisher.
+        worker.sources.lock()["0"]["hwm"] = serde_json::json!(123);
+        assert!(refresh().await.is_empty());
+
+        let topic = "kv/new";
+        if replacement_rank == 1 {
+            worker.sources.lock()["1"] = spare;
+        }
+        let rank = replacement_rank.to_string();
+        worker.sources.lock()[&rank]["topic"] = topic.into();
+        let on_rank =
+            |metrics: &str| metrics.replace("engine=\"0\"", &format!("engine=\"{rank}\""));
+        *worker.metrics.lock() = on_rank(&incompatible);
+        assert!(refresh().await.is_empty());
+        assert!(supervisor.worker_registrations()[url].info.is_some());
+
+        *worker.metrics.lock() = on_rank(METRICS_ONLY);
+        let registrations = refresh().await;
+        assert_eq!(
+            registrations[url].info.as_ref().unwrap().ranks,
+            [replacement_rank]
+        );
+        let provider = registrations[url].provider.as_ref().unwrap();
+        let (_, _, publisher, replay) = &worker.sockets[replacement_rank as usize];
+        boundary_subscription(publisher, topic, true).await;
+        finish_empty_startup_replay(replay).await;
+
+        let prompt = [7; 17];
+        let tokens = &prompt[..16];
+        let mut root = full_store(tokens, 16, None);
+        let keys = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
+        root.block_hashes[0] =
+            ExternalBlockHash::Bytes(keys.plain_root_block(tokens).unwrap().to_vec());
+        let payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(replacement_rank));
+        live_frame(publisher, topic.as_bytes(), 0, &payload);
+        wait_for(|| {
+            !provider
+                .matches(&prompt, 16, None, replacement_rank)
+                .is_empty()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
-    let (router, _) = metrics_and_models_router(move || std::future::ready(metrics.to_owned()));
+    let (router, _) = metrics_and_models_router(move || metrics.to_owned());
     let (worker, server) = spawn_metrics_only_worker(router).await;
 
-    let metadata =
-        query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, false).await;
+    let metadata = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None).await;
     let info = metadata.server_info.unwrap();
     let models = metadata.base_models;
     assert_eq!(info.kv_block_size, Some(16));
@@ -2345,11 +2395,11 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             "publisher": "zmq"
         }});
         let (router, requests) = metrics_and_models_router(move || {
-            std::future::ready(if compatible {
+            if compatible {
                 METRICS_ONLY.to_owned()
             } else {
                 METRICS_ONLY.replace("sha256_cbor", "sha256")
-            })
+            }
         });
         let router = router.route(
             "/kv_event_sources",
@@ -2359,6 +2409,7 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
             }),
         );
         let (worker, server) = spawn_metrics_only_worker(router).await;
+        let _server = AbortTestServer(server);
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
         let (info, models) = supervisor
@@ -2389,282 +2440,6 @@ async fn metrics_discovery_requires_replay_and_retains_served_aliases() {
         assert_eq!(labels["served_model_aliases"], "mock-alias,mock-model");
         assert_eq!(requests.models.load(Ordering::Relaxed), 1);
         assert_eq!(requests.metrics.load(Ordering::Relaxed), 1);
-        supervisor.shutdown();
-        server.abort();
-    }
-}
-
-fn vllm_default_root(tokens: &[u32]) -> KVEvent {
-    use crate::kv_index::{request_hash::BlockKeyGenerator, wire::ExternalBlockHash};
-
-    let mut root = full_store(tokens, 16, None);
-    let keys = BlockKeyGenerator::from_seed(16, "vllm-none-hash");
-    root.block_hashes[0] =
-        ExternalBlockHash::Bytes(keys.plain_root_block(tokens).unwrap().to_vec());
-    KVEvent::BlockStored(root)
-}
-
-#[tokio::test]
-async fn runtime_prefix_hash_is_checked_per_rank_at_discovery_and_refresh() {
-    let topics = ["kv/admission/0", "kv/admission/1", "kv/admission/2"];
-    let metrics = |first, second| {
-        format!(
-            "vllm:cache_config_info{{block_size=\"16\",engine=\"0\",prefix_caching_hash_algo=\"{first}\"}} 1.0\n\
-             vllm:cache_config_info{{block_size=\"16\",engine=\"1\",prefix_caching_hash_algo=\"{second}\"}} 1.0\n\
-             vllm:cache_config_info{{block_size=\"16\",engine=\"2\"}} 1.0\n"
-        )
-    };
-    let mut native = plain_full_layout("mock-model", topics[0], 16);
-    native.ranks = topics
-        .iter()
-        .enumerate()
-        .map(|(rank, topic)| plain_full_rank(rank as u32, "mock-model".into(), (*topic).into(), 16))
-        .collect();
-    let native = Arc::new(Mutex::new(automatic_layout(native)));
-    let worker = HashAdmissionWorker::start_with_routes(
-        3,
-        &metrics("sha256_cbor", "xxhash"),
-        axum::Router::new().route(
-            "/kv_routing_capabilities",
-            axum::routing::get({
-                let native = native.clone();
-                move || {
-                    let layout = native.lock().clone();
-                    std::future::ready(axum::Json(layout))
-                }
-            }),
-        ),
-    )
-    .await;
-    let (supervisor, _) = KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMap::new());
-    let url = &worker.url;
-    let bases = HashSet::from([url.clone()]);
-    let empty = HashSet::new();
-    let refresh = || supervisor.refresh_workers(&bases, &empty, &empty);
-    let info = refresh().await[url].info.clone().unwrap();
-    let lifecycle = supervisor.lifecycle_for_worker(url);
-    assert_eq!(
-        info.ranks.into_iter().collect::<HashSet<_>>(),
-        HashSet::from([0, 2])
-    );
-    let provider = supervisor.match_provider_for_worker(url).unwrap();
-    let revision = supervisor.worker_registrations()[url].revision;
-    let prompt = [7; 17];
-    let hits = |rank| !provider.matches(&prompt, 16, None, rank).is_empty();
-    let event = vllm_default_root(&prompt[..16]);
-    for rank in [0, 2] {
-        let (_, _, publisher, replay) = &worker.sockets[rank];
-        boundary_subscription(publisher, topics[rank], true).await;
-        finish_empty_startup_replay(replay).await;
-        let payload = event_payload(1.0, std::slice::from_ref(&event), Some(rank as u32));
-        live_frame(publisher, topics[rank].as_bytes(), 0, &payload);
-        wait_for(|| hits(rank as u32)).await;
-    }
-    let has_binding =
-        |rank| supervisor.workers_have_cache_bindings([(url.as_str(), rank)].into_iter());
-    assert!(has_binding(0) && has_binding(2));
-    assert!(!has_binding(1));
-
-    // The rank rejected at admission is outside native layout validation.
-    let verified_at = {
-        let mut state = lifecycle.state.lock();
-        state.hash_checked = Instant::now() - super::lifecycle::REFRESH_INTERVAL;
-        state.verified_at
-    };
-    let scrapes_before_layout_poll = worker.requests.metrics.load(Ordering::Relaxed);
-    native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!("kv/changed/1");
-    wait_for(|| lifecycle.state.lock().verified_at > verified_at).await;
-    assert_eq!(
-        worker.requests.metrics.load(Ordering::Relaxed),
-        scrapes_before_layout_poll
-    );
-    lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[url].revision, revision);
-    assert!(hits(2));
-
-    // Refresh can observe a new topic before the native layout reports it.
-    *worker.metrics.lock() = Some(metrics("xxhash", "sha256_cbor"));
-    worker.sources.lock()["0"]["topic"] = serde_json::json!("kv/changed/0");
-    native.lock()["ranks"][1]["publisher_topic"] = serde_json::json!(topics[1]);
-    lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[url].revision, revision);
-    assert!(!hits(0));
-    assert!(has_binding(2));
-    assert!(
-        hits(2),
-        "healthy rank lost credit during hash reconciliation"
-    );
-    assert!(
-        !has_binding(1),
-        "a rank rejected at discovery gained a binding"
-    );
-    // A failed source response still leaves the hash sample usable in this refresh.
-    *worker.metrics.lock() = Some(metrics("xxhash", "xxhash").replace(
-        "engine=\"2\"",
-        "engine=\"2\",prefix_caching_hash_algo=\"xxhash\"",
-    ));
-    *worker.sources.lock() = serde_json::json!([]);
-    lifecycle.state.lock().checked = None;
-    assert_eq!(refresh().await[url].revision, revision);
-    assert!(!has_binding(2) && !hits(2));
-    assert_eq!(lifecycle.state.lock().probe_failures, 1);
-    supervisor.shutdown();
-}
-
-#[tokio::test]
-async fn last_hash_fenced_rank_rebinds_only_to_a_new_publisher() {
-    use super::lifecycle::REFRESH_INTERVAL;
-
-    let unlabeled = METRICS_ONLY.replace(r#"prefix_caching_hash_algo="sha256_cbor","#, "");
-    for (initially_fenced, replacement_rank, replacement_report) in [
-        (false, 0, Some(METRICS_ONLY)),
-        (true, 1, Some(METRICS_ONLY)),
-        (true, 0, Some(unlabeled.as_str())),
-        (true, 0, None),
-    ] {
-        let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
-        let worker = HashAdmissionWorker::start(
-            1,
-            if initially_fenced {
-                &incompatible
-            } else {
-                METRICS_ONLY
-            },
-        )
-        .await;
-        let (supervisor, url) = (&worker.supervisor, &worker.url);
-        let info = supervisor.on_worker_added(url).await.unwrap();
-        let old = supervisor.lifecycle_for_worker(url);
-        let has_binding =
-            |rank| supervisor.workers_have_cache_bindings([(url.as_str(), rank)].into_iter());
-        if initially_fenced {
-            assert!(info.ranks.is_empty());
-        } else {
-            assert_eq!(info.ranks, [0]);
-            boundary_subscription(&worker.sockets[0].2, "kv/admission/0", true).await;
-            *worker.metrics.lock() = Some(incompatible);
-            old.state.lock().hash_checked = Instant::now() - REFRESH_INTERVAL;
-            wait_for(|| !has_binding(0)).await;
-        }
-
-        let make_refresh_due =
-            || old.state.lock().checked = Some(Instant::now() - REFRESH_INTERVAL);
-        *worker.metrics.lock() = replacement_report.map(str::to_owned);
-        old.state.lock().checked = Some(Instant::now());
-        assert!(!old.layout_rebind_due());
-
-        make_refresh_due();
-        assert!(old.layout_rebind_due());
-        assert!(supervisor.refresh_discovered_workers().await.is_empty());
-        assert!(!has_binding(0));
-
-        let (endpoint, replay_endpoint, replacement_publisher, replacement_replay) =
-            layout_endpoints();
-        *worker.sources.lock() = serde_json::json!({ (replacement_rank.to_string()): {
-            "endpoint": endpoint, "replay_endpoint": replay_endpoint,
-            "topic": "kv/new", "publisher": "zmq"
-        } });
-        let on_rank = |report: &str| {
-            report.replace(r#"engine="0""#, &format!(r#"engine="{replacement_rank}""#))
-        };
-
-        *worker.metrics.lock() = Some(on_rank(METRICS_ONLY).replace("sha256_cbor", "sha256"));
-        make_refresh_due();
-        assert!(supervisor.refresh_discovered_workers().await.is_empty());
-        assert!(!has_binding(replacement_rank));
-        assert!(old.active.load(Ordering::Acquire));
-
-        *worker.metrics.lock() = replacement_report.map(on_rank);
-        make_refresh_due();
-        let refreshed = supervisor.refresh_discovered_workers().await;
-        let provider = refreshed
-            .get(url)
-            .and_then(|registration| registration.provider.as_ref())
-            .unwrap_or_else(|| panic!("expected replacement rank {replacement_rank} to bind"));
-        assert!(has_binding(replacement_rank));
-        assert_eq!(has_binding(0), replacement_rank == 0);
-        assert!(!old.active.load(Ordering::Acquire));
-        let prompt = [7; 17];
-        let tokens = &prompt[..16];
-        let hits = || provider.matches(&prompt, 16, None, replacement_rank);
-        let payload = event_payload(1.0, &[vllm_default_root(tokens)], Some(replacement_rank));
-        let topic = b"kv/new";
-        boundary_subscription(&replacement_publisher, "kv/new", true).await;
-        finish_empty_startup_replay(&replacement_replay).await;
-        if replacement_report == Some(METRICS_ONLY) {
-            live_frame(&replacement_publisher, topic, 0, &payload);
-        } else {
-            // The numeric seed in full_payload differs from the inferred vLLM default.
-            let wrong_root = full_payload(tokens, 16, replacement_rank);
-            live_frame(&replacement_publisher, topic, 0, &wrong_root);
-            let retry = recv_frames(&replacement_replay).await;
-            assert_eq!(retry.last().unwrap(), &0_i64.to_be_bytes());
-            assert!(hits().is_empty());
-            replay_reply(&replacement_replay, &retry, topic, 0, &payload);
-            replay_reply(&replacement_replay, &retry, &[], -1, &[]);
-        }
-        wait_for(|| {
-            hits()
-                .iter()
-                .any(|hit| hit.target.dp_rank == replacement_rank && hit.segments == [(0, 1)])
-        })
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn optional_metrics_preserves_registration_and_metadata_fallback() {
-    use axum::{
-        extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
-    };
-    use std::sync::atomic::AtomicUsize;
-
-    for slow_metrics in [true, false] {
-        let scrapes = Arc::new(AtomicUsize::new(0));
-        let first_scrape = Arc::new(tokio::sync::Notify::new());
-        type Fixture = (bool, Arc<AtomicUsize>, Arc<tokio::sync::Notify>);
-        let router = Router::new()
-            .route(
-                "/get_server_info",
-                get(|State((slow, _, first)): State<Fixture>| async move {
-                    if slow {
-                        tokio::time::sleep(Duration::from_millis(2500)).await;
-                        Json(serde_json::json!({"model_id": "mock-model", "kv_block_size": 16}))
-                            .into_response()
-                    } else {
-                        first.notified().await;
-                        StatusCode::NOT_FOUND.into_response()
-                    }
-                }),
-            )
-            .route(
-                "/metrics",
-                get(|State((slow, scrapes, first)): State<Fixture>| async move {
-                    let attempt = scrapes.fetch_add(1, Ordering::Relaxed);
-                    if slow {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    } else if attempt == 0 {
-                        first.notify_one();
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                    }
-                    METRICS_ONLY.into_response()
-                }),
-            )
-            .with_state((slow_metrics, scrapes.clone(), first_scrape))
-            .route("/v1/models", get(mock_model_list));
-        let (worker, server) = spawn_metrics_only_worker(router).await;
-        let metadata = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true),
-        )
-        .await
-        .unwrap();
-        assert_eq!(metadata.server_info.unwrap().kv_block_size, Some(16));
-        assert_eq!(
-            scrapes.load(Ordering::Relaxed),
-            if slow_metrics { 1 } else { 2 }
-        );
-        server.abort();
     }
 }
 
@@ -2681,7 +2456,7 @@ async fn invalid_metrics_geometry_still_fences_incompatible_ranks() {
     let metrics = Arc::new(Mutex::new(METRICS_ONLY.to_owned()));
     let (app, requests) = metrics_and_models_router({
         let metrics = metrics.clone();
-        move || std::future::ready(metrics.lock().clone())
+        move || metrics.lock().clone()
     });
     let app = app.route(
         "/kv_event_sources",
@@ -2691,6 +2466,7 @@ async fn invalid_metrics_geometry_still_fences_incompatible_ranks() {
         }),
     );
     let (url, server) = spawn_metrics_only_worker(app).await;
+    let _server = AbortTestServer(server);
     let (supervisor, _) = KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
     assert_eq!(
         supervisor.on_worker_added(&url).await.unwrap().ranks.len(),
@@ -2717,14 +2493,13 @@ async fn invalid_metrics_geometry_still_fences_incompatible_ranks() {
         assert_eq!((has_binding(0), has_binding(1)), (false, rank1_stays_bound));
     }
     assert_eq!(requests.metrics.load(Ordering::Relaxed), 3);
-    server.abort();
 }
 
 #[tokio::test]
 async fn worker_without_metadata_names_every_source() {
     let (worker, server) = spawn_metrics_only_worker(axum::Router::new()).await;
 
-    let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None, true)
+    let error = query_worker_metadata_and_models(&reqwest::Client::new(), &worker, None)
         .await
         .server_info
         .unwrap_err();
@@ -2766,10 +2541,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             Some(descriptor("initial")),
         );
         lifecycle.state.lock().info = installed.then(WorkerKvInfo::default);
-        assert_eq!(
-            lifecycle.observe_descriptor("http://worker", signature, None),
-            expected
-        );
+        assert_eq!(lifecycle.observe_descriptor(signature), expected);
     }
     let lifecycle = WorkerLifecycle::new(
         Arc::new(AtomicBool::new(true)),
@@ -2778,16 +2550,10 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     );
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     for failures in 1..MAX_PROBE_FAILURES {
-        assert_eq!(
-            lifecycle.observe_descriptor("http://worker", None, None),
-            SourceAction::Keep
-        );
+        assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
         assert_eq!(lifecycle.state.lock().probe_failures, failures);
     }
-    assert_eq!(
-        lifecycle.observe_descriptor("http://worker", None, None),
-        SourceAction::Stop
-    );
+    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Stop);
     assert!(lifecycle.state.lock().info.is_none());
 
     let lifecycle = WorkerLifecycle::new(
@@ -2798,7 +2564,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     lifecycle.state.lock().trusted = false;
     assert_eq!(
-        lifecycle.observe_descriptor("http://worker", Some(&initial), None),
+        lifecycle.observe_descriptor(Some(&initial)),
         SourceAction::Rebuild
     );
 }
@@ -2989,13 +2755,7 @@ fn rank_credit_does_not_cross_revocation_and_empty_replay() {
         if calls == 1 {
             assert_eq!(scores[0].segments, [(0, 1)]);
             assert_eq!(
-                lifecycle
-                    .observe_layout(
-                        &mut lifecycle.state.lock(),
-                        &StaticHybridMatch::Matches,
-                        Instant::now()
-                    )
-                    .1,
+                lifecycle.observe_layout(&StaticHybridMatch::Matches),
                 SourceAction::Recover
             );
             let stream = crate::kv_index::EventStream::new(source.clone());
@@ -3056,12 +2816,7 @@ fn renewed_grants_do_not_price_pages_seen_only_after_expiry() {
                     .unwrap();
                 assert_eq!(source.control.generation(), source_generation);
                 assert_eq!(
-                    life.observe_layout(
-                        &mut life.state.lock(),
-                        &StaticHybridMatch::Matches,
-                        Instant::now()
-                    )
-                    .1,
+                    life.observe_layout(&StaticHybridMatch::Matches),
                     SourceAction::Keep
                 );
                 life.state.lock().verified_at = clock.get();
