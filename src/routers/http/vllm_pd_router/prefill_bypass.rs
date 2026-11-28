@@ -28,13 +28,15 @@ impl PdPrefillBypassPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(default)]
 pub struct PdPrefillBypassConfig {
-    /// Maximum local prefill tokens on Decode. Zero disables bypass.
+    /// Enable Prefill bypass with the default thresholds.
+    #[arg(id = "pd_prefill_bypass_enabled", long = "pd-prefill-bypass")]
+    pub enabled: bool,
+    /// Override the local prefill token limit (default 2048 when enabled). Zero disables bypass.
     #[arg(
         id = "pd_prefill_bypass_max_tokens",
-        long = "pd-prefill-bypass-max-tokens",
-        default_value_t = 0
+        long = "pd-prefill-bypass-max-tokens"
     )]
-    pub max_tokens: usize,
+    pub max_tokens: Option<usize>,
     /// Maximum fraction of the input left to prefill in the suffix check.
     #[arg(
         id = "pd_prefill_bypass_max_ratio",
@@ -61,7 +63,8 @@ pub struct PdPrefillBypassConfig {
 impl Default for PdPrefillBypassConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 0,
+            enabled: false,
+            max_tokens: None,
             max_ratio: 0.7,
             policy: PdPrefillBypassPolicy::ShortSuffix,
             p_busy_requests: None,
@@ -70,11 +73,19 @@ impl Default for PdPrefillBypassConfig {
 }
 
 impl PdPrefillBypassConfig {
+    fn token_limit(self) -> usize {
+        self.max_tokens.unwrap_or(2048)
+    }
+
+    fn is_enabled(self) -> bool {
+        (self.enabled || self.max_tokens.is_some()) && self.token_limit() > 0
+    }
+
     pub(crate) fn validate(self, config: &RouterConfig) -> Result<(), String> {
         if !(0.0 < self.max_ratio && self.max_ratio <= 1.0) {
             return Err("pd-prefill-bypass-max-ratio must be in (0, 1]".into());
         }
-        if self.max_tokens > 0 {
+        if self.is_enabled() {
             if !config.mode.is_pd_mode()
                 || config.kv_connector != KvConnector::Nixl
                 || !matches!(
@@ -140,10 +151,12 @@ impl PrefillEstimate {
     }
 
     fn allows(self, config: &PdPrefillBypassConfig, other_prefills: Option<usize>) -> bool {
-        if !self.within_limit(config.max_tokens) {
+        let limit = config.token_limit();
+        if !self.within_limit(limit) {
             return false;
         }
-        let suffix = self.remaining_tokens as f64 <= config.max_ratio * self.prompt_tokens as f64;
+        let suffix = self.remaining_tokens < limit
+            && (self.remaining_tokens as f64) < config.max_ratio * self.prompt_tokens as f64;
         let busy = config
             .p_busy_requests
             .zip(other_prefills)
@@ -295,7 +308,7 @@ pub(super) enum BypassOutcome {
 
 impl PrefillBypass {
     pub(super) fn enabled(config: PdPrefillBypassConfig) -> Option<Self> {
-        (config.max_tokens > 0).then_some(Self { config })
+        config.is_enabled().then_some(Self { config })
     }
 
     /// Runs at most once for a client request, just before Prefill dispatch.
@@ -348,7 +361,7 @@ impl PrefillBypass {
                 worker.url(),
                 prepared,
                 Uuid::new_v4().to_string(),
-                Some(local_params(self.config.max_tokens)),
+                Some(local_params(self.config.token_limit())),
             )
             .await;
         RouterMetrics::record_pd_decode_request(worker.base_url());
@@ -411,7 +424,7 @@ impl PrefillBypass {
             router_prompts,
         )
         .await?;
-        if !estimate.within_limit(self.config.max_tokens) {
+        if !estimate.within_limit(self.config.token_limit()) {
             return None;
         }
         if let Some(commit) = commit {
@@ -466,7 +479,7 @@ impl PrefillBypass {
         let start = Instant::now();
         let url = worker.endpoint_url(path);
         let mut request = request.clone();
-        request["kv_transfer_params"] = local_params(self.config.max_tokens);
+        request["kv_transfer_params"] = local_params(self.config.token_limit());
         let builder = router
             .pd_router
             .client
@@ -530,16 +543,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opt_in_defaults_require_both_suffix_thresholds() {
+        let mut config = PdPrefillBypassConfig::default();
+        assert!(PrefillBypass::enabled(config).is_none());
+        config.enabled = true;
+        assert!(PrefillBypass::enabled(config).is_some());
+        assert_eq!(config.token_limit(), 2048);
+        let mut estimate = PrefillEstimate {
+            prompt_tokens: 10_000,
+            remaining_tokens: 2047,
+            worker_revision: 1,
+        };
+        assert!(estimate.allows(&config, None));
+        estimate.remaining_tokens = 2048;
+        assert!(!estimate.allows(&config, None));
+        estimate.prompt_tokens = 1000;
+        estimate.remaining_tokens = 699;
+        assert!(estimate.allows(&config, None));
+        estimate.remaining_tokens = 700;
+        assert!(!estimate.allows(&config, None));
+        config.max_tokens = Some(0);
+        assert!(PrefillBypass::enabled(config).is_none());
+    }
+
+    #[test]
     fn policy_respects_ratio_load_and_hard_limit() {
         let mut config = PdPrefillBypassConfig {
-            max_tokens: 256,
+            max_tokens: Some(256),
             max_ratio: 0.25,
             p_busy_requests: Some(4),
             ..Default::default()
         };
         let mut estimate = PrefillEstimate {
             prompt_tokens: 400,
-            remaining_tokens: 100,
+            remaining_tokens: 99,
             worker_revision: 1,
         };
         assert!(estimate.allows(&config, None));
@@ -551,7 +588,7 @@ mod tests {
         assert!(!estimate.allows(&config, None));
         config.policy = PdPrefillBypassPolicy::ShortSuffixOrBusyPrefill;
         assert!(estimate.allows(&config, Some(4)));
-        estimate.remaining_tokens = 100;
+        estimate.remaining_tokens = 99;
         assert!(estimate.allows(&config, None));
         estimate.remaining_tokens = 256;
         assert!(estimate.allows(&config, Some(4)));
@@ -559,7 +596,7 @@ mod tests {
         assert!(!estimate.allows(&config, Some(4)));
         estimate.remaining_tokens = estimate.prompt_tokens;
         assert!(!estimate.allows(&config, Some(4)));
-        config.max_tokens = 0;
+        config.max_tokens = Some(0);
         estimate.remaining_tokens = 1;
         assert!(!estimate.allows(&config, Some(4)));
     }

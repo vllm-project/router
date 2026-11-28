@@ -389,7 +389,8 @@ impl Router {
         kv_penalty_external = 0.6,
         kv_penalty_disk = 0.3,
         kv_aware_session_affinity_ttl_secs = None,
-        pd_prefill_bypass_max_tokens = 0,
+        pd_prefill_bypass = false,
+        pd_prefill_bypass_max_tokens = None,
         pd_prefill_bypass_max_ratio = 0.7,
         pd_prefill_bypass_policy = "short_suffix".to_string(),
         pd_prefill_bypass_p_busy_requests = None,
@@ -474,7 +475,8 @@ impl Router {
         kv_penalty_external: f64,
         kv_penalty_disk: f64,
         kv_aware_session_affinity_ttl_secs: Option<u64>,
-        pd_prefill_bypass_max_tokens: usize,
+        pd_prefill_bypass: bool,
+        pd_prefill_bypass_max_tokens: Option<usize>,
         pd_prefill_bypass_max_ratio: f64,
         pd_prefill_bypass_policy: String,
         pd_prefill_bypass_p_busy_requests: Option<usize>,
@@ -514,6 +516,7 @@ impl Router {
             kv_penalty_disk,
             kv_aware_session_affinity_ttl_secs,
             pd_prefill_bypass: routers::http::vllm_pd_router::PdPrefillBypassConfig {
+                enabled: pd_prefill_bypass,
                 max_tokens: pd_prefill_bypass_max_tokens,
                 max_ratio: pd_prefill_bypass_max_ratio,
                 policy: clap::ValueEnum::from_str(&pd_prefill_bypass_policy, false)

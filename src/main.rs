@@ -1030,13 +1030,17 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.policy, "kv_aware");
-        assert_eq!(args.pd_prefill_bypass.max_tokens, 256);
+        assert_eq!(args.pd_prefill_bypass.max_tokens, Some(256));
         assert_eq!(args.pd_prefill_bypass.max_ratio, 0.25);
         assert_eq!(
             args.pd_prefill_bypass.policy,
             PdPrefillBypassPolicy::ShortSuffixOrBusyPrefill
         );
         assert_eq!(args.pd_prefill_bypass.p_busy_requests, Some(4));
+        let defaults = CliArgs::try_parse_from(["vllm-router", "--pd-prefill-bypass"]).unwrap();
+        assert!(defaults.pd_prefill_bypass.enabled);
+        assert_eq!(defaults.pd_prefill_bypass.max_tokens, None);
+        assert_eq!(defaults.pd_prefill_bypass.max_ratio, 0.7);
     }
 
     #[test]

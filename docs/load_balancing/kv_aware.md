@@ -176,21 +176,24 @@ For KV-aware Decode, add `--decode-policy kv_aware` and run the event setup on D
 
 #### Prefill bypass
 
-Opt in with `--pd-prefill-bypass-max-tokens N` (default `0`, disabled).
+Prefill bypass is off by default. Enable it with `--pd-prefill-bypass`.
+The default `short_suffix` policy requires fewer than 2,048 uncached tokens and
+less than 70% of the full prompt. Setting a positive token limit also opts in.
 For a single text prompt with `n=1`, sequential NIXL P/D can send the full
 request directly to the selected KV-aware Decode rank. The rank must advertise
 support, have verified reusable KV on device, and have no other pending or
 active Decode requests in the Router. Its estimated uncached prompt tokens must
-be at most `N` for every policy.
+be within the configured token limit for every policy.
 
-The Router installs this hook at startup when `N` is positive. It runs after
+The Router installs this hook at startup when enabled. It runs after
 P/D admission and before Prefill dispatch. It can continue the current P/D
 attempt, return Decode's response, or release the attempt and request one fresh
 P/D admission after a typed refusal.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--pd-prefill-bypass-max-tokens` | `usize` | `0` | `integer` | `0` | Maximum uncached prompt tokens on Decode. Zero disables bypass. |
+| `--pd-prefill-bypass` | `flag` | `false` | `flag` | `false` | Enable Prefill bypass with the default thresholds. |
+| `--pd-prefill-bypass-max-tokens` | `usize` | unset | `integer` | unset | Override the 2,048-token limit. A positive value opts in and zero disables bypass. |
 | `--pd-prefill-bypass-max-ratio` | `f64` | `0.7` | `float` | `0.7` | Maximum uncached fraction of the prompt, in `(0, 1]`. |
 | `--pd-prefill-bypass-policy` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | `short_suffix, busy_prefill, short_suffix_or_busy_prefill` | `short_suffix` | Check the uncached fraction, Prefill load, or either. |
 | `--pd-prefill-bypass-p-busy-requests` | `usize` | unset | `integer` | unset | Minimum number of other requests on the selected Prefill rank. Required for policies that check Prefill load. |

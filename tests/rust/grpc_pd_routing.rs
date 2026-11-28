@@ -850,7 +850,7 @@ async fn grpc_pd_prefill_bypass_uses_verified_decode_kv_and_retries_typed_refusa
     let mut ctx = create_test_context(config);
     std::sync::Arc::get_mut(&mut ctx).unwrap().pd_prefill_bypass =
         vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig {
-            max_tokens: 8,
+            max_tokens: Some(8),
             ..Default::default()
         };
     ctx.policy_registry
