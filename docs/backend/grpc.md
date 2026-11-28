@@ -46,6 +46,8 @@ token-id lower (`prepare_grpc_completion`) is shared with the gRPC P/D route,
 which reads its `token_ids` directly.
 Routing honors `session_params.session_id` like chat; without one, token-id
 prompts create no prefix-cache affinity (cache_aware balances them on load alone).
+For colocated `kv_aware` routing, the router can score prefix reuse from
+prepared token IDs and worker KV events independently of session affinity.
 
 The reply is shaped for completion clients — `text_completion` chunks and body
 with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internally.

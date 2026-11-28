@@ -95,6 +95,7 @@ async fn pd_router_with_pools(
         dp_size,
         prefill_policy,
         HashMap::new(),
+        KvConnector::Nixl,
         None,
     )
     .await
@@ -106,6 +107,7 @@ async fn pd_router_with_kv_sources(
     dp_size: usize,
     prefill_policy: PolicyConfig,
     pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    kv_connector: KvConnector,
     api_key: Option<String>,
 ) -> VllmPDRouter {
     metrics();
@@ -124,7 +126,7 @@ async fn pd_router_with_kv_sources(
         policy: PolicyConfig::RoundRobin,
         pd_kv_event_sources,
         pd_worker_pairs: Default::default(),
-        kv_connector: KvConnector::Nixl,
+        kv_connector,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
         api_key,
@@ -296,6 +298,31 @@ async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
     }
     assert!(prefill.captured().is_empty());
     assert!(decode.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_pd_mooncake_v2_rejects_missing_handoff_before_decode() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router_with_kv_sources(
+        &[&prefill],
+        &decode,
+        1,
+        PolicyConfig::RoundRobin,
+        HashMap::new(),
+        KvConnector::MooncakeV2,
+        None,
+    )
+    .await;
+    router.pin_test_token_ids(vec![1, 2, 3]);
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(prefill.captured().len(), 1);
+    assert!(decode.captured().is_empty());
+    assert_eq!(router.worker_registry().get_decode_workers()[0].load(), 0);
 }
 
 #[tokio::test]
@@ -776,6 +803,7 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
             1,
             policy,
             sources,
+            KvConnector::Nixl,
             None,
         )
         .await;
@@ -1173,6 +1201,7 @@ async fn grpc_pd_info_endpoints_use_grpc_control() {
         1,
         serde_json::from_value(json!({"type": "kv_aware"})).unwrap(),
         HashMap::new(),
+        KvConnector::Nixl,
         Some("worker-secret".into()),
     )
     .await;
@@ -1474,6 +1503,7 @@ async fn pd_router_with_api_key(
         1,
         PolicyConfig::RoundRobin,
         HashMap::new(),
+        KvConnector::Nixl,
         Some(api_key.to_string()),
     )
     .await;

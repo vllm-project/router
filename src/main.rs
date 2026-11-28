@@ -433,7 +433,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false)]
     profile: bool,
 
-    /// KV connector type for PD disaggregation (nixl or mooncake)
+    /// KV connector type for PD disaggregation
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
 }
@@ -875,6 +875,13 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_accepts_mooncake_v2() {
+        let args =
+            CliArgs::try_parse_from(["vllm-router", "--kv-connector", "mooncake-v2"]).unwrap();
+        assert_eq!(args.kv_connector, KvConnector::MooncakeV2);
+    }
 
     #[test]
     fn documented_kv_layout_examples_pass_cli_validation() {

@@ -12,6 +12,35 @@ use sha2::{Digest, Sha256};
 /// corresponding request chain for the supported `sha256_cbor` contracts.
 pub type SequenceHash = [u8; 32];
 
+/// Worker-rendered identity for a single image in a chat prompt.
+#[derive(Debug, Clone)]
+pub(crate) struct ImagePrefix {
+    hash: String,
+    offset: usize,
+    end: usize,
+}
+
+impl ImagePrefix {
+    pub(crate) fn new(hash: &str, offset: usize, length: usize, tokens: usize) -> Option<Self> {
+        let end = offset.checked_add(length)?;
+        (length != 0 && end <= tokens && is_image_hash(hash)).then(|| Self {
+            hash: hash.to_owned(),
+            offset,
+            end,
+        })
+    }
+
+    fn key(&self, start: usize, end: usize) -> Option<(&str, i64)> {
+        (start < self.end && self.offset < end)
+            .then_some((self.hash.as_str(), self.offset as i64 - start as i64))
+    }
+}
+
+pub(crate) fn is_image_hash(hash: &str) -> bool {
+    let digest = hash.strip_prefix("content:").unwrap_or(hash);
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockKeyGenerator {
     block_size: usize,
@@ -75,11 +104,30 @@ impl BlockKeyGenerator {
 
     /// Return one key per complete block followed by its required lookahead.
     pub fn generate_block_keys(&self, token_ids: &[u32]) -> Vec<SequenceHash> {
-        self.keys_after_with_extra(self.none_hash, token_ids, None)
+        self.keys_after_with_extra(self.none_hash, token_ids, None, None)
+    }
+
+    pub(crate) fn generate_block_keys_for_image(
+        &self,
+        token_ids: &[u32],
+        image: &ImagePrefix,
+    ) -> Vec<SequenceHash> {
+        if self.lookahead_tokens != 0 {
+            return Vec::new();
+        }
+        self.keys_after_with_extra(self.none_hash, token_ids, None, Some(image))
     }
 
     /// Recompute a plain first block with the same encoding as request lookup.
     pub(crate) fn plain_root_block(&self, token_ids: &[u32]) -> Option<SequenceHash> {
+        self.root_block(token_ids, &[])
+    }
+
+    pub(crate) fn root_block(
+        &self,
+        token_ids: &[u32],
+        image_keys: &[(&str, i64)],
+    ) -> Option<SequenceHash> {
         if self.lookahead_tokens != 0 {
             return None;
         }
@@ -89,6 +137,7 @@ impl BlockKeyGenerator {
             &self.none_hash,
             block,
             None,
+            image_keys,
             &[],
         ))
     }
@@ -103,7 +152,7 @@ impl BlockKeyGenerator {
         name: &str,
         path: &str,
     ) -> Vec<SequenceHash> {
-        self.keys_after_with_extra(self.none_hash, token_ids, Some((name, path)))
+        self.keys_after_with_extra(self.none_hash, token_ids, Some((name, path)), None)
     }
 
     fn keys_after_with_extra(
@@ -111,6 +160,7 @@ impl BlockKeyGenerator {
         parent: SequenceHash,
         token_ids: &[u32],
         adapter: Option<(&str, &str)>,
+        image: Option<&ImagePrefix>,
     ) -> Vec<SequenceHash> {
         let mut parent = parent;
         let mut encoded = Vec::new();
@@ -121,7 +171,15 @@ impl BlockKeyGenerator {
             .map(|(index, tokens)| {
                 let end = (index + 1) * self.block_size;
                 let lookahead = &token_ids[end..end + self.lookahead_tokens];
-                parent = hash_block(&mut encoded, &parent, tokens, adapter, lookahead);
+                let image_key = image.and_then(|image| image.key(end - self.block_size, end));
+                parent = hash_block(
+                    &mut encoded,
+                    &parent,
+                    tokens,
+                    adapter,
+                    image_key.as_slice(),
+                    lookahead,
+                );
                 parent
             })
             .collect()
@@ -133,6 +191,7 @@ fn hash_block(
     parent: &SequenceHash,
     token_ids: &[u32],
     adapter: Option<(&str, &str)>,
+    image_keys: &[(&str, i64)],
     lookahead: &[u32],
 ) -> SequenceHash {
     encoded.clear();
@@ -150,15 +209,29 @@ fn hash_block(
         // vLLM wraps the original extra keys and appends the lookahead IDs.
         encode_major(encoded, 4, 1 + lookahead.len() as u64);
     }
-    match adapter {
-        None => encoded.push(0xf6),
-        Some((name, path)) => {
-            // [["lora", name, path]]: one extra key group, one tagged tuple.
-            encode_major(encoded, 4, 1);
+    if adapter.is_none() && image_keys.is_empty() {
+        encoded.push(0xf6);
+    } else {
+        encode_major(
+            encoded,
+            4,
+            image_keys.len() as u64 + u64::from(adapter.is_some()),
+        );
+        if let Some((name, path)) = adapter {
             encode_major(encoded, 4, 3);
             encode_text(encoded, "lora");
             encode_text(encoded, name);
             encode_text(encoded, path);
+        }
+        for &(hash, offset) in image_keys {
+            encode_major(encoded, 4, 3);
+            encode_text(encoded, "mm");
+            encode_text(encoded, hash);
+            if offset < 0 {
+                encode_major(encoded, 1, (!offset) as u64);
+            } else {
+                encode_major(encoded, 0, offset as u64);
+            }
         }
     }
     for &token_id in lookahead {
@@ -260,6 +333,17 @@ mod tests {
         // Python hashlib over canonical CBOR for the vLLM 0.33 hash layout.
         let generator = BlockKeyGenerator::from_root_hash(2, std::array::from_fn(|i| i as u8));
         let lookahead = generator.clone().with_lookahead(1);
+        let image = ImagePrefix::new(
+            crate::kv_index::source::test_support::TEST_IMAGE_HASH,
+            0,
+            2,
+            5,
+        )
+        .unwrap();
+        assert!(image.key(2, 4).is_none());
+        assert!(lookahead
+            .generate_block_keys_for_image(&[1, 2, 3, 4, 5], &image)
+            .is_empty());
         let hashes = lookahead.generate_block_keys(&[1, 2, 3, 4, 5]);
         assert_eq!(
             hashes,

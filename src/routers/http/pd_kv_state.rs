@@ -42,6 +42,7 @@ pub(super) struct PdKvState {
     targets: Mutex<HashMap<String, TargetRegistration>>,
     worker_pairs: Option<HashMap<String, HashSet<String>>>,
     allow_hybrid_layouts: bool,
+    render_images: bool,
     nixl_decode_replay: bool,
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     credit_gate: Mutex<()>,
@@ -68,6 +69,7 @@ impl PdKvState {
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
         allow_hybrid_layouts: bool,
+        render_images: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources, worker_auth);
         state.worker_pairs = (!pairs.is_empty()).then(|| {
@@ -77,6 +79,7 @@ impl PdKvState {
                 .collect()
         });
         state.allow_hybrid_layouts = allow_hybrid_layouts;
+        state.render_images = render_images;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_strict_recovery(strict_recovery);
         state.supervisor.set_pd_connector(connector);
@@ -127,6 +130,7 @@ impl PdKvState {
             targets: Mutex::new(HashMap::new()),
             worker_pairs: None,
             allow_hybrid_layouts: true,
+            render_images: true,
             nixl_decode_replay: false,
             #[cfg(all(test, feature = "cpu", feature = "ready"))]
             credit_gate: Mutex::new(()),
@@ -426,6 +430,7 @@ impl PdKvState {
                     headers,
                     self.worker_auth.http_key(),
                     Duration::from_secs(1),
+                    self.render_images,
                 )
                 .await
             }
@@ -446,13 +451,14 @@ impl PdKvState {
                     allow_credit.get(&base).copied().unwrap_or(false),
                 )
             });
-            let (prompts, fallback_reason, source) = match result {
-                Ok(input) => (Some(input.prompts), fallback, input.source),
-                Err(reason) => (None, Some(reason), reason),
+            let (prompts, image, fallback_reason, source) = match result {
+                Ok(input) => (Some(input.prompts), input.image, fallback, input.source),
+                Err(reason) => (None, None, Some(reason), reason),
             };
             crate::metrics::RouterMetrics::record_kv_routing_input("pd", source);
             let input = PdPrefillInput {
                 prompts,
+                image,
                 allow_credit: fallback_reason.is_none(),
                 fallback_reason,
             };
@@ -473,11 +479,11 @@ impl PdKvState {
             .iter()
             .filter_map(|worker| {
                 let input = prepared.get(worker.base_url())?;
-                Some((
-                    worker.as_ref(),
-                    input.prompts.as_deref()?,
-                    input.allow_credit,
-                ))
+                let prompts = input.prompts.as_deref()?;
+                if let ([tokens], Some(image)) = (prompts, input.image.as_ref()) {
+                    hashes.register_image(tokens, image);
+                }
+                Some((worker.as_ref(), prompts, input.allow_credit))
             })
             .collect();
         kv.prepare_prefill_prices(&inputs, hashes)
@@ -608,6 +614,60 @@ mod kv_input_tests {
             .await;
         (inputs, prices)
     }
+
+    #[test]
+    fn prefill_prices_the_rendered_image() {
+        use crate::kv_index::request_hash::ImagePrefix;
+        use crate::kv_index::source::test_support::{
+            full_binding, warm_test_image, TEST_IMAGE_HASH,
+        };
+        use crate::kv_index::{CacheKey, RoutableTarget};
+
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://image-worker".into(),
+            WorkerType::Regular,
+        ));
+        let base = worker.base_url().to_owned();
+        let target = RoutableTarget {
+            instance_id: Arc::from(base.as_str()),
+            dp_rank: 0,
+        };
+        let binding = Arc::new(full_binding(target.clone(), 64));
+        binding.begin_empty(0);
+        warm_test_image(&binding);
+        policy.register_target_with_cache_identity(
+            &base,
+            target,
+            CacheKey {
+                model: Arc::from("m"),
+                block_size: 64,
+            },
+            binding,
+        );
+        let workers = [worker];
+        let prepared = HashMap::from([(
+            base,
+            PdPrefillInput {
+                prompts: Some(Arc::from([(0..129).collect()])),
+                image: ImagePrefix::new(TEST_IMAGE_HASH, 60, 8, 129),
+                allow_credit: true,
+                fallback_reason: None,
+            },
+        )]);
+        let prefill =
+            PdKvState::prefill_prices(&policy, &workers, &prepared, &mut PromptHashes::default())
+                .unwrap();
+        let validated = prefill.validate(&workers);
+        assert_eq!(
+            validated
+                .prefill_work(workers[0].url())
+                .unwrap()
+                .new_prefill_tokens,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn prompt_scoring_keeps_prefill_tokens_but_disables_pd_credit() {
         let state = PdKvState::new(Client::new());
@@ -1183,6 +1243,7 @@ mod kv_input_tests {
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
             false,
+            true,
             true,
         )
         .await;
