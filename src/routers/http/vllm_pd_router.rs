@@ -19,9 +19,11 @@ use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
+    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, RequestHeaders,
+    WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
+use crate::protocols::spec::GenerationRequest;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -33,7 +35,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Once, RwLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
@@ -133,13 +135,11 @@ pub struct VllmPDRouter {
 /// the pool to see removals and replacements that happened during Prefill.
 pub(super) struct DecodeCommitInput {
     pub pool: DecodePoolSource,
-    /// Admission-time provisional pick, used only for the changed counter.
+    /// Provisional target for push transfers and dispatch metrics.
     pub provisional_endpoint: PdEndpoint,
-    /// Admission-time token inputs, reused to refresh cache matches at dispatch.
-    pub decode_tokens: Option<WorkerTokenInputs>,
+    policy_inputs: DecodePolicyInputs,
     /// Prompts admission already tokenized for the policy.
     pub router_prompts: Option<Arc<[Vec<u32>]>>,
-    pub affinity_key: Option<AffinityKey>,
     pub cache_salt: Option<String>,
     pub model_id: Option<String>,
     pub route: String,
@@ -149,12 +149,10 @@ impl DecodeCommitInput {
     /// Commitment inputs for one request. The policy inputs are the ones
     /// admission resolved, so every path reads them the same way and the
     /// commitment never re-parses the headers or the body.
-    #[allow(clippy::too_many_arguments)]
     fn for_request(
         pool: DecodePoolSource,
         provisional_endpoint: PdEndpoint,
-        decode_tokens: Option<WorkerTokenInputs>,
-        affinity_key: Option<AffinityKey>,
+        policy_inputs: DecodePolicyInputs,
         request: &Value,
         route: &str,
         router_prompts: Option<Arc<[Vec<u32>]>>,
@@ -162,9 +160,8 @@ impl DecodeCommitInput {
         Self {
             pool,
             provisional_endpoint,
-            decode_tokens,
+            policy_inputs,
             router_prompts,
-            affinity_key,
             cache_salt: request
                 .get("cache_salt")
                 .and_then(Value::as_str)
@@ -180,12 +177,14 @@ impl DecodeCommitInput {
 }
 
 /// Where a deferred commitment refreshes its decode candidates from.
-#[derive(Clone, Copy)]
 pub(super) enum DecodePoolSource {
     /// Decode URLs held by the worker registry (`--decode`).
-    Registry,
+    Registry {
+        model: Option<String>,
+        require_label: bool,
+    },
     /// Decode instances published through service discovery.
-    Discovery,
+    Discovery(Option<String>),
 }
 
 /// One admitted pair. The decode handle is the provisional pickup; a deferred
@@ -201,10 +200,16 @@ struct AdmittedPair {
 struct Admission {
     selection: super::pd_types::PdSelection,
     attempt: PdAttempt,
-    decode_tokens: Option<WorkerTokenInputs>,
-    /// Resolved once at admission so the commitment does not re-read the
-    /// headers and body.
+    deferred_inputs: Option<DecodePolicyInputs>,
+}
+
+/// Policy inputs prepared at admission for a deferred Decode.
+struct DecodePolicyInputs {
+    tokens: Option<WorkerTokenInputs>,
     affinity_key: Option<AffinityKey>,
+    text: Option<String>,
+    request_body: Option<String>,
+    headers: Option<RequestHeaders>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -216,6 +221,28 @@ const MORIIO_TRANSFER_PREFIX: &str = "tx";
 /// reports success before a discovered prefill/decode pair can serve requests.
 fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
+}
+
+fn model_label(worker: &dyn Worker) -> Option<&str> {
+    worker.metadata().labels.get("model_id").map(String::as_str)
+}
+
+fn has_model_labels(workers: &[Arc<dyn Worker>]) -> bool {
+    workers
+        .iter()
+        .any(|worker| model_label(worker.as_ref()).is_some())
+}
+
+fn token_input_path<'a>(
+    path: &'a str,
+    generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
+) -> &'a str {
+    generate.map_or(path, |body| body.http_token_input_route(path))
+}
+
+/// Whether the generation limits are nested in `sampling_params`.
+fn uses_sampling_params(path: &str, typed_generate: bool) -> bool {
+    typed_generate || path == "/inference/v1/generate"
 }
 
 /// Body a deferred commitment tokenizes for a Decode that was not admitted.
@@ -1065,13 +1092,13 @@ impl VllmPDRouter {
     }
 
     /// Modify request for prefill stage (limit output to 1 token)
-    /// - For inference/v1/generate: patch sampling_params.max_tokens and sampling_params.min_tokens
+    /// - For generate endpoints: patch sampling_params.max_tokens and sampling_params.min_tokens
     /// - For /v1/responses: patch max_output_tokens (the only token-limit field for Responses API)
     /// - For other OpenAI endpoints (chat/completions): patch max_tokens, max_completion_tokens, min_tokens
     ///
     /// stream=false and stream_options removal are always applied at top level.
-    fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
-        if path.contains("inference/v1/generate") {
+    fn prepare_prefill_request(mut request: Value, path: &str, typed_generate: bool) -> Value {
+        if uses_sampling_params(path, typed_generate) {
             // Generate API: max_tokens and min_tokens are in sampling_params
             if let Some(sampling_params) = request.get_mut("sampling_params") {
                 sampling_params["max_tokens"] = json!(1);
@@ -1103,15 +1130,25 @@ impl VllmPDRouter {
     }
 
     /// Decode candidates as they stand now, from the same source admission used.
-    fn live_decode_candidates(&self, source: DecodePoolSource) -> Vec<Arc<dyn Worker>> {
+    fn live_decode_candidates(&self, source: &DecodePoolSource) -> Vec<Arc<dyn Worker>> {
         match source {
-            DecodePoolSource::Registry => self.pd_router.worker_registry.get_decode_workers(),
-            DecodePoolSource::Discovery => self
-                .discovery_candidates(
-                    self.service_registry
-                        .get_instance_snapshots(ServiceType::Decode),
-                    ServiceType::Decode,
-                )
+            DecodePoolSource::Registry {
+                model,
+                require_label,
+            } => {
+                let registry = &self.pd_router.worker_registry;
+                let mut workers = registry.get_decode_workers();
+                if let Some(model) = model.as_deref().filter(|_| {
+                    *require_label
+                        || has_model_labels(&workers)
+                        || has_model_labels(&registry.get_prefill_workers())
+                }) {
+                    workers.retain(|worker| model_label(worker.as_ref()) == Some(model));
+                }
+                workers
+            }
+            DecodePoolSource::Discovery(model) => self
+                .discovered_pool(ServiceType::Decode, model.as_deref())
                 .unwrap_or_else(|error| {
                     // A malformed registration is a configuration error that
                     // admission already reported; at commit it can only mean
@@ -1120,6 +1157,35 @@ impl VllmPDRouter {
                     Vec::new()
                 }),
         }
+    }
+
+    fn discovered_pool(
+        &self,
+        role: ServiceType,
+        model_id: Option<&str>,
+    ) -> Result<Vec<Arc<dyn Worker>>, String> {
+        let mut candidates = self.discovery_candidates(
+            self.service_registry.get_instance_snapshots(role.clone()),
+            role.clone(),
+        )?;
+        if let Some(model) = model_id {
+            let workers = self.pd_router.worker_registry.get_by_model(model);
+            let urls: HashSet<_> = workers
+                .iter()
+                .filter(|worker| {
+                    worker.is_available()
+                        && model_label(worker.as_ref()) == Some(model)
+                        && matches!(
+                            (&role, worker.worker_type()),
+                            (ServiceType::Prefill, WorkerType::Prefill { .. })
+                                | (ServiceType::Decode, WorkerType::Decode)
+                        )
+                })
+                .map(|worker| worker.base_url())
+                .collect();
+            candidates.retain(|worker| urls.contains(worker.base_url()));
+        }
+        Ok(candidates)
     }
 
     fn discovery_candidates(
@@ -1227,6 +1293,7 @@ impl VllmPDRouter {
         path: &str,
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
         defer_decode: bool,
     ) -> Option<Admission> {
         self.admit_pair_with_tokens(
@@ -1237,6 +1304,7 @@ impl VllmPDRouter {
             headers,
             forward_policy_headers,
             None,
+            generate,
             defer_decode,
         )
         .await
@@ -1254,18 +1322,33 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         forward_policy_headers: bool,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
         defer_decode: bool,
     ) -> Option<Admission> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
-            .iter()
-            .any(|policy| !policy.needs_cache_routing_key() && policy.needs_request_text())
-            .then(|| serde_json::to_string(request).ok())
+        let needs_text = |policy: &dyn LoadBalancingPolicy| {
+            if policy.needs_request_body() {
+                // Only typed generate separates token text from the JSON body.
+                generate.is_none()
+            } else {
+                !policy.needs_cache_routing_key() && policy.needs_request_text()
+            }
+        };
+        let decode_needs_text = needs_text(decode_policy.as_ref());
+        let text = (decode_needs_text || needs_text(prefill_policy.as_ref()))
+            .then(|| match generate {
+                Some(body) => Some(body.extract_text_for_routing()),
+                None => serde_json::to_string(request).ok(),
+            })
             .flatten();
+        let request_body = generate
+            .filter(|_| prefill_policy.needs_request_body() || decode_policy.needs_request_body())
+            .and_then(|_| serde_json::to_string(request).ok());
         let needs_headers = forward_policy_headers
             && (prefill_policy.needs_headers() || decode_policy.needs_headers());
         let policy_headers = header_utils::to_policy_headers(headers.filter(|_| needs_headers));
+        let input_path = token_input_path(path, generate);
         // Price only candidates that selection could actually pick. A healthy worker
         // serving another model must not deny credit to the rest of the pool; the load- and
         // rank-dependent parts of eligibility are rechecked under the selection lock.
@@ -1292,7 +1375,7 @@ impl VllmPDRouter {
                         &priceable_decode,
                         &decode_policy,
                         request,
-                        path,
+                        input_path,
                         headers,
                         router_prompts,
                         defer_decode,
@@ -1300,7 +1383,7 @@ impl VllmPDRouter {
                     self.pd_router.prepare_decode_inputs(
                         decode_workers,
                         request,
-                        path,
+                        input_path,
                         headers,
                         router_prompts,
                     ),
@@ -1317,14 +1400,14 @@ impl VllmPDRouter {
                     self.pd_router.prepare_prefill_inputs(
                         prefill_workers,
                         request,
-                        path,
+                        input_path,
                         headers,
                         router_prompts,
                     ),
                     self.pd_router.prepare_decode_inputs(
                         decode_workers,
                         request,
-                        path,
+                        input_path,
                         headers,
                         router_prompts,
                     ),
@@ -1360,6 +1443,7 @@ impl VllmPDRouter {
             prefill_inputs: prefill_inputs.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
+            request_body: request_body.as_deref(),
             prefill_cache: prefill_cache.as_ref(),
             decode_cache: decode_cache.as_deref(),
             headers: policy_headers.as_ref(),
@@ -1380,11 +1464,18 @@ impl VllmPDRouter {
             &context,
             defer_decode,
         )?;
+        // Move only the inputs Decode needs across Prefill.
+        let deferred_inputs = attempt.decode_pending_commit().then(|| DecodePolicyInputs {
+            tokens: decode_cache.map(|_| decode_tokens),
+            affinity_key,
+            text: text.filter(|_| decode_needs_text),
+            request_body: request_body.filter(|_| decode_policy.needs_request_body()),
+            headers: policy_headers.filter(|_| decode_policy.needs_headers()),
+        });
         Some(Admission {
             selection,
             attempt,
-            decode_tokens: decode_cache.map(|_| decode_tokens),
-            affinity_key,
+            deferred_inputs,
         })
     }
 
@@ -1462,8 +1553,8 @@ impl VllmPDRouter {
     /// already addressed it (push-addressed Nixl); moving it would strand the
     /// KV the Prefill just produced.
     ///
-    /// The body and headers are borrowed from the caller instead of being
-    /// carried in the input: only the cache refresh below reads them.
+    /// Cache refresh borrows the client request. Policy selection reuses
+    /// the inputs prepared at admission.
     async fn select_and_commit_decode(
         &self,
         attempt: &PdAttempt,
@@ -1476,7 +1567,7 @@ impl VllmPDRouter {
         // Rebuild the candidates: a worker removed while Prefill ran still
         // reports its last availability on the admission-time handle, and a
         // replacement registered in the meantime is invisible from it.
-        let mut candidates = self.live_decode_candidates(input.pool);
+        let mut candidates = self.live_decode_candidates(&input.pool);
         let pin = pin_to_provisional.then_some(&input.provisional_endpoint);
         // Price only what could actually be selected: an unavailable member of the live
         // pool made the whole pool refuse credit, because pricing requires every candidate
@@ -1486,7 +1577,7 @@ impl VllmPDRouter {
         // live candidate immediately before selecting against the current
         // loads. An unavailable or model-mismatched worker must not consume the
         // preparation budget while a healthy Decode is ready.
-        let mut tokens = input.decode_tokens.clone();
+        let mut tokens = input.policy_inputs.tokens.clone();
         if let Some(tokens) = tokens.as_mut() {
             let missing: Vec<_> = candidates
                 .iter()
@@ -1509,7 +1600,7 @@ impl VllmPDRouter {
                 }
                 // The pool can change while that await runs: re-read it and
                 // reapply the same health/model/pin filters used above.
-                candidates = self.live_decode_candidates(input.pool);
+                candidates = self.live_decode_candidates(&input.pool);
                 Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
             }
         }
@@ -1544,17 +1635,18 @@ impl VllmPDRouter {
         };
         // Pricing can wait on a slow backend. Re-read the pool so a removed
         // worker cannot be committed and a new one has no stale price.
-        candidates = self.live_decode_candidates(input.pool);
+        candidates = self.live_decode_candidates(&input.pool);
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
             worker_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
-            legacy_policy_input: None,
+            legacy_policy_input: input.policy_inputs.text.as_deref(),
+            request_body: input.policy_inputs.request_body.as_deref(),
             prefill_cache: None,
             decode_cache: decode_cache.as_ref(),
-            headers: None,
-            affinity_key: input.affinity_key.clone(),
+            headers: input.policy_inputs.headers.as_ref(),
+            affinity_key: input.policy_inputs.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
             prefill_pricing: None,
@@ -1796,6 +1888,7 @@ impl VllmPDRouter {
                 headers,
                 attempt.clone(),
                 Some(permit),
+                false,
                 None,
             )
             .await;
@@ -1962,17 +2055,11 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
     ) -> Result<AdmittedPair, String> {
-        let prefill_workers = self.discovery_candidates(
-            self.service_registry
-                .get_instance_snapshots(ServiceType::Prefill),
-            ServiceType::Prefill,
-        )?;
-        let decode_workers = self.discovery_candidates(
-            self.service_registry
-                .get_instance_snapshots(ServiceType::Decode),
-            ServiceType::Decode,
-        )?;
+        let prefill_workers = self.discovered_pool(ServiceType::Prefill, model_id)?;
+        let decode_workers = self.discovered_pool(ServiceType::Decode, model_id)?;
         let admission = self
             .admit_pair(
                 &prefill_workers,
@@ -1981,6 +2068,7 @@ impl VllmPDRouter {
                 path,
                 headers,
                 true,
+                generate,
                 self.decode_commit_can_defer(&prefill_workers),
             )
             .await
@@ -1999,17 +2087,21 @@ impl VllmPDRouter {
         request: Value,
         path: &str,
         headers: Option<&HeaderMap>,
+        model_id: Option<&str>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
     ) -> Response {
         let (
             prefill_worker,
             decode_worker,
             Admission {
                 attempt,
-                decode_tokens,
-                affinity_key,
+                deferred_inputs,
                 ..
             },
-        ) = match self.admit_discovered_pair(&request, path, headers).await {
+        ) = match self
+            .admit_discovered_pair(&request, path, headers, model_id, generate)
+            .await
+        {
             Ok(AdmittedPair {
                 prefill,
                 decode,
@@ -2022,14 +2114,13 @@ impl VllmPDRouter {
         };
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
-        let commit = attempt.decode_pending_commit().then(|| {
+        let commit = deferred_inputs.map(|inputs| {
             DecodeCommitInput::for_request(
-                DecodePoolSource::Discovery,
+                DecodePoolSource::Discovery(model_id.map(str::to_owned)),
                 PdEndpoint::for_worker(decode_worker.as_ref()),
-                decode_tokens,
-                affinity_key,
+                inputs,
                 &request,
-                path,
+                token_input_path(path, generate),
                 None,
             )
         });
@@ -2042,6 +2133,7 @@ impl VllmPDRouter {
                 headers,
                 attempt.clone(),
                 None,
+                generate.is_some(),
                 commit.as_ref(),
             )
             .await
@@ -2270,8 +2362,7 @@ impl VllmPDRouter {
         let Some(Admission {
             selection,
             attempt,
-            decode_tokens,
-            affinity_key,
+            deferred_inputs,
         }) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -2281,6 +2372,7 @@ impl VllmPDRouter {
                 headers,
                 true,
                 Some(&router_prompts),
+                None,
                 self.decode_commit_can_defer(&prefill_workers),
             )
             .await
@@ -2299,12 +2391,14 @@ impl VllmPDRouter {
         );
         // The gRPC handshake carries the same connector JSON as HTTP, so a
         // connector that tolerates a late decode choice gets one here too.
-        let commit = attempt.decode_pending_commit().then(|| {
+        let commit = deferred_inputs.map(|inputs| {
             DecodeCommitInput::for_request(
-                DecodePoolSource::Registry,
+                DecodePoolSource::Registry {
+                    model: None,
+                    require_label: false,
+                },
                 selection.decode.endpoint.clone(),
-                decode_tokens,
-                affinity_key,
+                inputs,
                 &request_json,
                 path,
                 Some(router_prompts),
@@ -2340,6 +2434,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
+        typed_generate: bool,
         commit: Option<&DecodeCommitInput>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
@@ -2405,6 +2500,7 @@ impl VllmPDRouter {
                     &prefill_worker,
                     &decode_worker,
                     path,
+                    typed_generate,
                 )
                 .await
             {
@@ -2449,7 +2545,8 @@ impl VllmPDRouter {
         );
 
         // Stage 1: Prepare prefill request with max_tokens=1 and kv_transfer_params
-        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        let mut prefill_request =
+            Self::prepare_prefill_request(original_request.clone(), path, typed_generate);
         if self.kv_connector == KvConnector::MooncakeV2 && path == "/v1/responses" {
             // vLLM Responses exposes stop controls but no min_tokens.
             prefill_request["ignore_eos"] = json!(true);
@@ -3025,6 +3122,7 @@ impl VllmPDRouter {
         prefill_worker: &Arc<dyn Worker>,
         decode_worker: &Arc<dyn Worker>,
         path: &str,
+        typed_generate: bool,
     ) -> Option<(Value, Value, String)> {
         let concurrent = match self.kv_connector {
             KvConnector::Nixl => self
@@ -3042,7 +3140,8 @@ impl VllmPDRouter {
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
         let decode_base_url = decode_worker.base_url().to_string();
-        let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+        let mut prefill_request =
+            Self::prepare_prefill_request(original_request.clone(), path, typed_generate);
         prefill_request["kv_transfer_params"] = self
             .build_prefill_kv_transfer_params(
                 transfer_id.as_deref(),
@@ -3580,8 +3679,25 @@ impl RouterTrait for VllmPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::InferenceGenerateRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
+        self.route_inference_generate_path(headers, body, "/inference/v1/generate", model_id)
+            .await
+    }
+
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::protocols::spec::InferenceGenerateRequest,
+        path: &str,
+        model_id: Option<&str>,
+    ) -> Response {
+        if let Some(response) = reject_full_report(
+            self.pd_router.kv_state.is_some(),
+            body.other.get("vllm_xargs"),
+        ) {
+            return response;
+        }
         let request_json = match serde_json::to_value(body) {
             Ok(json) => json,
             Err(e) => {
@@ -3592,13 +3708,8 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
-        self.route_transparent(
-            headers,
-            "/inference/v1/generate",
-            &Method::POST,
-            request_json,
-        )
-        .await
+        self.route_transparent_with_context(headers, path, request_json, model_id, Some(body))
+            .await
     }
 
     // Override OpenAI-compatible routes for vLLM two-stage processing
@@ -3822,31 +3933,57 @@ impl RouterTrait for VllmPDRouter {
                 .into_response();
         }
 
+        self.route_transparent_with_context(headers, path, body, None, None)
+            .await
+    }
+}
+
+impl VllmPDRouter {
+    async fn route_transparent_with_context(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        request_json: Value,
+        model_id: Option<&str>,
+        generate: Option<&crate::protocols::spec::InferenceGenerateRequest>,
+    ) -> Response {
         debug!(
-            "Transparent proxy: routing {} {} through P/D pipeline",
-            method, path
+            "Transparent proxy: routing POST {} through P/D pipeline",
+            path
         );
 
-        // Body is already a serde_json::Value, use it directly
-        let request_json = body;
+        // The prefill stage writes token limits into this value. Reject a value
+        // that cannot hold them before admission reserves workers. A null value
+        // gets the prefill defaults, like an omitted field.
+        if uses_sampling_params(path, generate.is_some())
+            && request_json
+                .get("sampling_params")
+                .is_some_and(|params| !params.is_object() && !params.is_null())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "sampling_params must be a JSON object",
+            )
+                .into_response();
+        }
 
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers).await
+            self.process_vllm_request(request_json, path, headers, model_id, generate)
+                .await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
-            let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
-            let prefill_workers: Vec<Arc<dyn Worker>> = all_prefill
-                .iter()
-                .filter(|w| w.is_available())
-                .cloned()
-                .collect();
-            let all_decode = self.pd_router.worker_registry.get_decode_workers();
-            let decode_workers: Vec<Arc<dyn Worker>> = all_decode
-                .iter()
-                .filter(|w| w.is_available())
-                .cloned()
-                .collect();
+            let mut prefill_workers = self.pd_router.worker_registry.get_prefill_workers();
+            let mut decode_workers = self.pd_router.worker_registry.get_decode_workers();
+            let model_scope = model_id.filter(|_| {
+                has_model_labels(&prefill_workers) || has_model_labels(&decode_workers)
+            });
+            let eligible = |worker: &Arc<dyn Worker>| {
+                worker.is_available()
+                    && model_scope.is_none_or(|model| model_label(worker.as_ref()) == Some(model))
+            };
+            prefill_workers.retain(eligible);
+            decode_workers.retain(eligible);
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
                 RouterMetrics::record_pd_error("server_selection");
@@ -3864,8 +4001,7 @@ impl RouterTrait for VllmPDRouter {
             let Admission {
                 selection,
                 attempt,
-                decode_tokens,
-                affinity_key,
+                deferred_inputs,
             } = match self
                 .admit_pair(
                     &prefill_workers,
@@ -3874,6 +4010,7 @@ impl RouterTrait for VllmPDRouter {
                     path,
                     headers,
                     true,
+                    generate,
                     self.decode_commit_can_defer(&prefill_workers),
                 )
                 .await
@@ -3893,14 +4030,16 @@ impl RouterTrait for VllmPDRouter {
 
             // Mirrors the discovery path: a deferred commitment re-selects the
             // decode target once the Prefill response is in.
-            let commit = attempt.decode_pending_commit().then(|| {
+            let commit = deferred_inputs.map(|inputs| {
                 DecodeCommitInput::for_request(
-                    DecodePoolSource::Registry,
+                    DecodePoolSource::Registry {
+                        model: model_id.map(str::to_owned),
+                        require_label: model_scope.is_some(),
+                    },
                     selection.decode.endpoint.clone(),
-                    decode_tokens,
-                    affinity_key,
+                    inputs,
                     &request_json,
-                    path,
+                    token_input_path(path, generate),
                     None,
                 )
             });
@@ -3922,6 +4061,7 @@ impl RouterTrait for VllmPDRouter {
                     headers,
                     attempt.clone(),
                     None,
+                    generate.is_some(),
                     commit.as_ref(),
                 )
                 .await
@@ -3965,6 +4105,760 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use crate::protocols::spec::{
+        ChatCompletionRequest, CompletionRequest, InferenceGenerateRequest,
+    };
+    use crate::routers::router_manager::{RouterId, RouterManager};
+
+    #[derive(Debug)]
+    struct Selection {
+        worker_urls: Vec<String>,
+        text: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingPolicy {
+        selections: std::sync::Mutex<Vec<Selection>>,
+        select_worker: bool,
+    }
+
+    impl LoadBalancingPolicy for RecordingPolicy {
+        fn select_worker_with_headers(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            request_text: Option<&str>,
+            _headers: Option<&RequestHeaders>,
+        ) -> Option<usize> {
+            self.selections.lock().unwrap().push(Selection {
+                worker_urls: workers
+                    .iter()
+                    .map(|worker| worker.url().to_owned())
+                    .collect(),
+                text: request_text.map(str::to_owned),
+            });
+            self.select_worker.then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    async fn recording_router(
+        discovery: bool,
+    ) -> (VllmPDRouter, Arc<RecordingPolicy>, Arc<RecordingPolicy>) {
+        let prefill = Arc::new(RecordingPolicy {
+            select_worker: true,
+            ..Default::default()
+        });
+        // Stop after both policy selections, before dispatching HTTP requests.
+        let decode = Arc::new(RecordingPolicy::default());
+        let policies = Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::Random));
+        policies.set_prefill_policy(prefill.clone());
+        policies.set_decode_policy(decode.clone());
+        let mut router = test_vllm_pd_router().await;
+        router.pd_router.policy_registry = policies.clone();
+        router.policy_registry = policies;
+        router.use_discovery = discovery;
+        (router, prefill, decode)
+    }
+
+    fn register_model_pair(router: &VllmPDRouter, model: &str) {
+        for (role, worker_type, service_type) in [
+            (
+                "prefill",
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                ServiceType::Prefill,
+            ),
+            ("decode", WorkerType::Decode, ServiceType::Decode),
+        ] {
+            let address = format!("{model}-{role}:8000");
+            let worker = BasicWorker::new(format!("http://{address}"), worker_type)
+                .with_labels(HashMap::from([("model_id".into(), model.into())]));
+            router.pd_router.worker_registry.register(Arc::new(worker));
+            router.service_registry.register_service(
+                address,
+                format!("zmq-{model}-{role}"),
+                service_type,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_routes_preserve_model_and_token_policy_context() {
+        for discovery in [false, true] {
+            let (router, prefill, decode) = recording_router(discovery).await;
+            register_model_pair(&router, "model-a");
+            register_model_pair(&router, "model-b");
+            let manager = RouterManager::new(
+                crate::config::RouterConfig::default(),
+                reqwest::Client::new(),
+                router.pd_router.worker_registry.clone(),
+                router.policy_registry.clone(),
+            );
+            manager.register_router(RouterId::new("http-pd".into()), Arc::new(router));
+
+            for (path, seed) in [
+                ("/inference/v1/generate", 1),
+                ("/inference/v1/generate", 2),
+                ("/custom/v1/generate", 1),
+                ("/custom/v1/generate", 2),
+            ] {
+                let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                    "model": "model-b", "token_ids": [123, 456],
+                    "sampling_params": {"seed": seed}, "request_id": format!("request-{seed}"),
+                    "prompt": format!("extension-{seed}"),
+                    "session_params": {"session_id": format!("unrelated-{seed}")}
+                }))
+                .unwrap();
+                let response = if path == "/inference/v1/generate" {
+                    manager.route_inference_generate(None, &body, None).await
+                } else {
+                    manager
+                        .route_inference_generate_path(None, &body, path, None)
+                        .await
+                };
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+
+            for (role, policy) in [("prefill", prefill), ("decode", decode)] {
+                let selections = policy.selections.lock().unwrap();
+                assert_eq!(selections.len(), 4);
+                for selection in selections.iter() {
+                    assert_eq!(
+                        selection.worker_urls,
+                        [format!("http://model-b-{role}:8000")]
+                    );
+                    assert_eq!(selection.text.as_deref(), Some("123 456"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_with_model_dispatches_to_unlabeled_static_urls() {
+        use axum::{
+            extract::Path,
+            routing::{get, post},
+            Json, Router,
+        };
+
+        let app = Router::new()
+            .route("/p/health", get(|| async { StatusCode::OK }))
+            .route("/d/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/p/{*path}",
+                post(|Path(path): Path<String>, Json(body): Json<Value>| async move {
+                    Json(json!({"kv_transfer_params": {
+                        "path": path, "model": body["model"], "max_tokens": body["sampling_params"]["max_tokens"]
+                    }}))
+                }),
+            )
+            .route(
+                "/d/{*path}",
+                post(|Path(path): Path<String>, Json(body): Json<Value>| async move {
+                    Json(json!({"path": path, "body": body}))
+                }),
+            );
+        let base = spawn_test_server(app).await;
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::RoundRobin,
+            worker_startup_timeout_secs: 3,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        let router = VllmPDRouter::new(
+            vec![(format!("{base}/p"), None)],
+            vec![format!("{base}/d")],
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let body: InferenceGenerateRequest = serde_json::from_value(json!({
+            "model": "model-a", "token_ids": [123], "sampling_params": {"max_tokens": 8}
+        }))
+        .unwrap();
+        for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+            let response = if path == "/inference/v1/generate" {
+                router
+                    .route_inference_generate(None, &body, body.model.as_deref())
+                    .await
+            } else {
+                router
+                    .route_inference_generate_path(None, &body, path, body.model.as_deref())
+                    .await
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let backend_path = path.trim_start_matches('/');
+            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded["path"], backend_path);
+            assert_eq!(decoded["body"]["model"], "model-a");
+            assert_eq!(decoded["body"]["sampling_params"]["max_tokens"], 8);
+            assert_eq!(
+                decoded["body"]["kv_transfer_params"],
+                json!({"path": backend_path, "model": "model-a", "max_tokens": 1})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_generate_rechecks_model_and_tokens_when_decode_changes_during_prefill() {
+        use crate::policies::{CacheAwareCandidate, CacheAwareConfig, CacheAwarePolicy};
+        use axum::{routing::post, Json, Router};
+
+        let path = "/skyrl/v1/generate";
+        let body: InferenceGenerateRequest = serde_json::from_value(json!({
+            "model": "model-a", "token_ids": [123, 456], "prompt": "extension"
+        }))
+        .unwrap();
+        for discovery in [false, true] {
+            for matching_label in [false, true] {
+                let mut router = test_vllm_pd_router().await;
+                router.use_discovery = discovery;
+                router.kv_connector = KvConnector::Mooncake;
+                let policy = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+                    eviction_interval_secs: 0,
+                    ..Default::default()
+                }));
+                router.policy_registry.set_decode_policy(policy.clone());
+                let decode = spawn_test_server(
+                    Router::new().route(path, post(|| async { Json(json!({})) })),
+                )
+                .await;
+                let admitted = format!("{decode}/old");
+                let labels = HashMap::from([("model_id".into(), "model-a".into())]);
+                let registry = router.pd_router.worker_registry.clone();
+                let old_id = registry.register(Arc::new(
+                    BasicWorker::new(admitted.clone(), WorkerType::Decode)
+                        .with_labels(labels.clone()),
+                ));
+                let replacement = BasicWorker::new(decode.clone(), WorkerType::Decode);
+                let replacement = Arc::new(if matching_label {
+                    replacement.with_labels(labels.clone())
+                } else {
+                    replacement
+                });
+                let prefill = spawn_test_server(Router::new().route(
+                    path,
+                    post(move || {
+                        registry.remove(&old_id).unwrap();
+                        registry.register(replacement.clone());
+                        async { Json(json!({})) }
+                    }),
+                ))
+                .await;
+                router.worker_registry().register(Arc::new(
+                    BasicWorker::new(
+                        prefill.clone(),
+                        WorkerType::Prefill {
+                            bootstrap_port: None,
+                        },
+                    )
+                    .with_labels(labels),
+                ));
+                for (url, role) in [
+                    (&prefill, ServiceType::Prefill),
+                    (&admitted, ServiceType::Decode),
+                    (&decode, ServiceType::Decode),
+                ] {
+                    router.service_registry.register_service(
+                        url.trim_start_matches("http://").to_owned(),
+                        String::new(),
+                        role,
+                    );
+                }
+
+                let response = router
+                    .route_inference_generate_path(None, &body, path, body.model.as_deref())
+                    .await;
+                if matching_label {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let placement = policy
+                        .evaluate_initial_placement(
+                            "model-a",
+                            &body.extract_cache_routing_key(),
+                            &[CacheAwareCandidate {
+                                target_id: &decode,
+                                kv_pressure: 0.0,
+                            }],
+                        )
+                        .unwrap();
+                    assert_eq!(placement.match_rate, 1.0);
+                } else {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(
+                        axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .unwrap(),
+                        "No eligible decode worker at dispatch"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_mixed_static_pool_distinguishes_explicit_model_scope() {
+        for (labeled_role, label) in [
+            (
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                "model-b",
+            ),
+            (WorkerType::Decode, "unknown"),
+        ] {
+            let (router, prefill, decode) = recording_router(false).await;
+            let registry = router.worker_registry();
+            registry.register(Arc::new(BasicWorker::new(
+                "http://prefill:8000".into(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )));
+            registry.register(Arc::new(BasicWorker::new(
+                "http://decode:8000".into(),
+                WorkerType::Decode,
+            )));
+            let labeled = Arc::new(
+                BasicWorker::new("http://labeled:8000".into(), labeled_role)
+                    .with_labels(HashMap::from([("model_id".into(), label.into())])),
+            );
+            registry.register(labeled.clone());
+            let mut body: InferenceGenerateRequest =
+                serde_json::from_value(json!({"model": label, "token_ids": [123]})).unwrap();
+            for healthy in [true, false] {
+                labeled.set_healthy(healthy);
+                let response = router
+                    .route_inference_generate(None, &body, body.model.as_deref())
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(prefill.selections.lock().unwrap().is_empty());
+                assert!(decode.selections.lock().unwrap().is_empty());
+            }
+            labeled.set_healthy(true);
+            body.model = Some("model-a".into());
+            let response = router.route_inference_generate(None, &body, None).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            for (role, policy) in [("prefill", prefill), ("decode", decode)] {
+                let selections = policy.selections.lock().unwrap();
+                assert_eq!(selections.len(), 1);
+                let urls = &selections[0].worker_urls;
+                assert!(urls.contains(&format!("http://{role}:8000")));
+                assert_eq!(
+                    urls.iter().any(|url| url == labeled.url()),
+                    label == "unknown" && role == "decode"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_uses_token_policy_context_without_model_scope() {
+        for discovery in [false, true] {
+            let (router, prefill, decode) = recording_router(discovery).await;
+            register_model_pair(&router, "model-a");
+            for seed in [1, 2] {
+                let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                    "token_ids": [123, 456], "sampling_params": {"seed": seed},
+                    "request_id": format!("request-{seed}")
+                }))
+                .unwrap();
+                let response = router
+                    .route_inference_generate_path(None, &body, "/custom/v1/generate", None)
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            for policy in [prefill, decode] {
+                let selections = policy.selections.lock().unwrap();
+                assert_eq!(selections.len(), 2);
+                assert!(selections
+                    .iter()
+                    .all(|selection| selection.text.as_deref() == Some("123 456")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_cache_admission_preserves_token_inputs() {
+        use crate::policies::{CacheAwareCandidate, CacheAwareConfig, CacheAwarePolicy};
+
+        for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+            let router = test_vllm_pd_router().await;
+            let prefill = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            }));
+            let decode = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            }));
+            router.policy_registry.set_prefill_policy(prefill.clone());
+            router.policy_registry.set_decode_policy(decode.clone());
+            register_model_pair(&router, "model-a");
+            let prefill_workers = router.pd_router.worker_registry.get_prefill_workers();
+            let decode_workers = router.pd_router.worker_registry.get_decode_workers();
+            for seed in [1, 2] {
+                let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                    "model": "model-a", "token_ids": [123, 456],
+                    "sampling_params": {"seed": seed}, "prompt": format!("extension-{seed}")
+                }))
+                .unwrap();
+                let request = serde_json::to_value(&body).unwrap();
+                let Admission {
+                    selection, attempt, ..
+                } = router
+                    .admit_pair(
+                        &prefill_workers,
+                        &decode_workers,
+                        &request,
+                        path,
+                        None,
+                        true,
+                        Some(&body),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                for (policy, worker) in [
+                    (&prefill, &prefill_workers[selection.prefill.worker_index]),
+                    (&decode, &decode_workers[selection.decode.worker_index]),
+                ] {
+                    let placement = policy
+                        .evaluate_initial_placement(
+                            "model-a",
+                            &body.extract_cache_routing_key(),
+                            &[CacheAwareCandidate {
+                                target_id: worker.url(),
+                                kv_pressure: 0.0,
+                            }],
+                        )
+                        .unwrap();
+                    assert_eq!(placement.match_rate, 1.0, "{path}");
+                }
+                attempt.release();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_admission_preserves_body_sessions_with_mixed_policies() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        for discovery in [false, true] {
+            for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+                for sticky_prefill in [false, true] {
+                    let (router, _, _) = recording_router(discovery).await;
+                    register_model_pair(&router, "model-a");
+                    let sticky = Arc::new(StickyLeastLoadedPolicy::new());
+                    let recording = Arc::new(RecordingPolicy {
+                        select_worker: true,
+                        ..Default::default()
+                    });
+                    if sticky_prefill {
+                        router.policy_registry.set_prefill_policy(sticky.clone());
+                        router.policy_registry.set_decode_policy(recording.clone());
+                    } else {
+                        router.policy_registry.set_prefill_policy(recording.clone());
+                        router.policy_registry.set_decode_policy(sticky.clone());
+                    }
+                    let prefill_workers = router.pd_router.worker_registry.get_prefill_workers();
+                    let decode_workers = router.pd_router.worker_registry.get_decode_workers();
+                    for token in [123, 456] {
+                        let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                            "model": "model-a", "token_ids": [token],
+                            "session_params": {"session_id": "multi-turn"}
+                        }))
+                        .unwrap();
+                        let request = serde_json::to_value(&body).unwrap();
+                        let attempt = if discovery {
+                            router
+                                .admit_discovered_pair(
+                                    &request,
+                                    path,
+                                    None,
+                                    Some("model-a"),
+                                    Some(&body),
+                                )
+                                .await
+                                .unwrap()
+                                .admission
+                                .attempt
+                        } else {
+                            router
+                                .admit_pair(
+                                    &prefill_workers,
+                                    &decode_workers,
+                                    &request,
+                                    path,
+                                    None,
+                                    true,
+                                    Some(&body),
+                                    false,
+                                )
+                                .await
+                                .unwrap()
+                                .attempt
+                        };
+                        assert_eq!(sticky.active_session_count(), 1, "{path}");
+                        let selections = recording.selections.lock().unwrap();
+                        assert_eq!(
+                            selections.last().unwrap().text.as_deref(),
+                            Some(token.to_string().as_str()),
+                            "{path}"
+                        );
+                        attempt.release();
+                    }
+                    sticky.finish_session("multi-turn");
+                    assert_eq!(sticky.active_session_count(), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_generate_decode_honors_body_and_header_session_pins() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        // Built-in sticky routing commits at admission. Opt in to deferral
+        // here so the session lookup runs after Prefill.
+        #[derive(Debug)]
+        struct DeferredSticky(StickyLeastLoadedPolicy);
+
+        impl LoadBalancingPolicy for DeferredSticky {
+            fn select_worker_with_headers(
+                &self,
+                workers: &[Arc<dyn Worker>],
+                text: Option<&str>,
+                headers: Option<&RequestHeaders>,
+            ) -> Option<usize> {
+                self.0.select_worker_with_headers(workers, text, headers)
+            }
+
+            fn can_redecide_at_dispatch(&self, _: bool) -> bool {
+                true
+            }
+            fn needs_request_body(&self) -> bool {
+                true
+            }
+            fn needs_headers(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &'static str {
+                "deferred_sticky"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let router = test_vllm_pd_router().await;
+        register_model_pair(&router, "model-a");
+        let registry = router.worker_registry();
+        registry.register(Arc::new(BasicWorker::new(
+            "http://decode-2:8000".into(),
+            WorkerType::Decode,
+        )));
+        let prefill = registry.get_prefill_workers();
+        let decode = registry.get_decode_workers();
+        let sticky = Arc::new(DeferredSticky(StickyLeastLoadedPolicy::new()));
+        router.policy_registry.set_decode_policy(sticky.clone());
+        // Without the pin, the worker with no active sessions wins.
+        assert_eq!(
+            sticky.select_worker(&decode[1..], Some(r#"{"session_id":"pinned"}"#)),
+            Some(0)
+        );
+
+        let path = "/skyrl/v1/generate";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "pinned".parse().unwrap());
+        for (typed, session, headers) in [
+            (true, "pinned", None),
+            (true, "other", Some(&headers)),
+            (false, "pinned", None),
+        ] {
+            let request = json!({"token_ids": [123], "session_params": {"session_id": session}});
+            let body = typed.then(|| serde_json::from_value(request.clone()).unwrap());
+            let admission = router
+                .admit_pair(
+                    &prefill,
+                    &decode,
+                    &request,
+                    path,
+                    headers,
+                    true,
+                    body.as_ref(),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(admission.attempt.decode_pending_commit());
+            assert_eq!(admission.selection.decode.worker_index, 0);
+            admission.attempt.finish_prefill();
+            let input = DecodeCommitInput::for_request(
+                DecodePoolSource::Registry {
+                    model: None,
+                    require_label: false,
+                },
+                admission.selection.decode.endpoint,
+                admission.deferred_inputs.unwrap(),
+                &request,
+                token_input_path(path, body.as_ref()),
+                None,
+            );
+            let committed = router
+                .select_and_commit_decode(&admission.attempt, &input, &request, headers, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                committed.url(),
+                decode[1].url(),
+                "typed={typed}, session={session}"
+            );
+            admission.attempt.release();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_rejects_unknown_model_in_both_pools() {
+        for discovery in [false, true] {
+            let (router, prefill, decode) = recording_router(discovery).await;
+            register_model_pair(&router, "model-a");
+            let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                "model": "unknown-model", "token_ids": [123]
+            }))
+            .unwrap();
+            let response = router
+                .route_inference_generate_path(
+                    None,
+                    &body,
+                    "/custom/v1/generate",
+                    Some("unknown-model"),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(prefill.selections.lock().unwrap().is_empty());
+            assert!(decode.selections.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_generate_discovery_requires_metadata_only_for_model_scope() {
+        for model in [None, Some("model-a")] {
+            let (router, prefill, decode) = recording_router(true).await;
+            for (role, service_type) in [
+                ("prefill", ServiceType::Prefill),
+                ("decode", ServiceType::Decode),
+            ] {
+                router.service_registry.register_service(
+                    format!("model-a-{role}:8000"),
+                    format!("zmq-{role}"),
+                    service_type,
+                );
+            }
+            let body: InferenceGenerateRequest =
+                serde_json::from_value(json!({"token_ids": [123]})).unwrap();
+            let response = router
+                .route_inference_generate_path(None, &body, "/custom/v1/generate", model)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            for policy in [prefill, decode] {
+                assert_eq!(
+                    policy.selections.lock().unwrap().len(),
+                    usize::from(model.is_none())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_rejects_non_object_sampling_params_before_admission() {
+        for discovery in [false, true] {
+            let (router, prefill, _) = recording_router(discovery).await;
+            let decode = Arc::new(RecordingPolicy {
+                select_worker: true,
+                ..Default::default()
+            });
+            router.policy_registry.set_decode_policy(decode.clone());
+            register_model_pair(&router, "model-a");
+            for path in ["/inference/v1/generate", "/custom/v1/generate"] {
+                for sampling_params in [json!("text"), json!(1), json!(true), json!([])] {
+                    let body: InferenceGenerateRequest = serde_json::from_value(json!({
+                        "token_ids": [123], "sampling_params": sampling_params
+                    }))
+                    .unwrap();
+                    let response = if path == "/inference/v1/generate" {
+                        router.route_inference_generate(None, &body, None).await
+                    } else {
+                        router
+                            .route_inference_generate_path(None, &body, path, None)
+                            .await
+                    };
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "{path}: {sampling_params}"
+                    );
+                    assert_eq!(
+                        axum::body::to_bytes(response.into_body(), 1024)
+                            .await
+                            .unwrap(),
+                        "sampling_params must be a JSON object"
+                    );
+                }
+            }
+            assert!(prefill.selections.lock().unwrap().is_empty());
+            assert!(decode.selections.lock().unwrap().is_empty());
+
+            // An explicit null keeps the prefill defaults, like an omitted field.
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(RecordingPolicy::default()));
+            let body: InferenceGenerateRequest =
+                serde_json::from_value(json!({"token_ids": [123], "sampling_params": null}))
+                    .unwrap();
+            let response = router
+                .route_inference_generate_path(None, &body, "/custom/v1/generate", None)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(prefill.selections.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_prefill_additional_generate_path_patches_sampling_params() {
+        let request = json!({
+            "token_ids": [123, 456],
+            "sampling_params": {
+                "max_tokens": 512,
+                "min_tokens": 50,
+                "temperature": 0.7
+            }
+        });
+        let result = VllmPDRouter::prepare_prefill_request(request, "/custom/v1/generate", true);
+        assert_eq!(result["sampling_params"]["max_tokens"], 1);
+        assert_eq!(result["sampling_params"]["min_tokens"], 1);
+        assert_eq!(result["sampling_params"]["temperature"], 0.7);
+        assert!(result.get("max_tokens").is_none());
+    }
+
     async fn finalize_decode_response(
         response: reqwest::Response,
         prefill: Option<&Value>,
@@ -4550,6 +5444,24 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+        let generate_req = serde_json::from_value(
+            json!({"token_ids": [1, 2, 3], "vllm_xargs": {"kv_cache_report_mode": "full"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            router
+                .route_inference_generate(None, &generate_req, None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            router
+                .route_inference_generate_path(None, &generate_req, "/custom/v1/generate", None)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             router
                 .route_transparent(None, "/custom", &Method::POST, chat.clone())
@@ -4656,6 +5568,7 @@ mod tests {
                     "/v1/completions",
                     None,
                     false,
+                    None,
                     false,
                 )
                 .await
@@ -4747,6 +5660,7 @@ mod tests {
                     "/v1/chat/completions",
                     None,
                     false,
+                    None,
                     false,
                 )
                 .await
@@ -4815,6 +5729,7 @@ mod tests {
                     "/v1/chat/completions",
                     None,
                     false,
+                    None,
                     false,
                 )
                 .await
@@ -5788,6 +6703,7 @@ mod tests {
                 "/v1/completions",
                 None,
                 false,
+                None,
                 false,
             )
             .await
@@ -5827,6 +6743,7 @@ mod tests {
                 "/v1/completions",
                 None,
                 false,
+                None,
                 false,
             )
             .await
@@ -5857,6 +6774,7 @@ mod tests {
                 "/v1/completions",
                 None,
                 false,
+                None,
                 false,
             )
             .await
@@ -5886,6 +6804,7 @@ mod tests {
                 "/v1/completions",
                 None,
                 false,
+                None,
                 false,
             )
             .await
@@ -5921,6 +6840,7 @@ mod tests {
                     "/v1/completions",
                     None,
                     false,
+                    None,
                     false,
                 )
                 .await
@@ -5967,6 +6887,7 @@ mod tests {
                 None,
                 attempt.clone(),
                 None,
+                false,
                 None,
             );
             let inspect = async {
@@ -6029,6 +6950,7 @@ mod tests {
                     "/v1/completions",
                     None,
                     false,
+                    None,
                     false,
                 )
                 .await
@@ -6383,7 +7305,7 @@ mod tests {
             for turn in 0..3 {
                 let request = json!({"model": "m", "prompt": format!("turn {turn}")});
                 let pair = router
-                    .admit_discovered_pair(&request, "/v1/completions", Some(&headers))
+                    .admit_discovered_pair(&request, "/v1/completions", Some(&headers), None, None)
                     .await
                     .expect("a P/D pair should be admitted");
                 pairs.insert((pair.prefill.url().to_owned(), pair.decode.url().to_owned()));
@@ -7263,6 +8185,25 @@ mod tests {
     // --- OpenAI-style endpoint tests (chat/completions, completions) ---
 
     #[test]
+    fn test_prefill_unregistered_paths_with_token_ids_preserve_route_limits() {
+        for path in ["/custom/proxy", "/v1/responses/response-id/cancel"] {
+            let request = json!({
+                "token_ids": [123],
+                "max_tokens": 512,
+                "max_output_tokens": 512
+            });
+            let result = VllmPDRouter::prepare_prefill_request(request, path, false);
+            let limit = if path.starts_with("/v1/responses/") {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert_eq!(result[limit], 1, "{path}");
+            assert!(result.get("sampling_params").is_none(), "{path}");
+        }
+    }
+
+    #[test]
     fn test_prefill_chat_completion_sets_max_tokens_1() {
         let request = json!({
             "model": "test",
@@ -7270,7 +8211,7 @@ mod tests {
             "max_tokens": 512,
             "stream": true
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions", false);
         assert_eq!(result["max_tokens"], 1);
         assert_eq!(result["min_tokens"], 1);
         assert_eq!(result["stream"], false);
@@ -7278,27 +8219,48 @@ mod tests {
 
     #[test]
     fn test_prefill_chat_completion_sets_max_completion_tokens_1() {
-        let request = json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 512,
-            "max_completion_tokens": 256
-        });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
-        assert_eq!(result["max_tokens"], 1);
-        assert_eq!(result["max_completion_tokens"], 1);
+        for token_ids in [None, Some(json!([123, 456]))] {
+            let mut request = json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 512,
+                "max_completion_tokens": 256
+            });
+            if let Some(token_ids) = token_ids {
+                request["token_ids"] = token_ids;
+            }
+            let request: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+            let result = VllmPDRouter::prepare_prefill_request(
+                serde_json::to_value(request).unwrap(),
+                "/v1/chat/completions",
+                false,
+            );
+            assert_eq!(result["max_tokens"], 1);
+            assert_eq!(result["max_completion_tokens"], 1);
+        }
     }
 
     #[test]
     fn test_prefill_chat_completion_clamps_min_tokens() {
-        let request = json!({
-            "model": "test",
-            "max_tokens": 512,
-            "min_tokens": 100
-        });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
-        assert_eq!(result["max_tokens"], 1);
-        assert_eq!(result["min_tokens"], 1);
+        for token_ids in [None, Some(json!([123, 456]))] {
+            let mut request = json!({
+                "model": "test",
+                "prompt": "hi",
+                "max_tokens": 512,
+                "min_tokens": 100
+            });
+            if let Some(token_ids) = token_ids {
+                request["token_ids"] = token_ids;
+            }
+            let request: CompletionRequest = serde_json::from_value(request).unwrap();
+            let result = VllmPDRouter::prepare_prefill_request(
+                serde_json::to_value(request).unwrap(),
+                "/v1/completions",
+                false,
+            );
+            assert_eq!(result["max_tokens"], 1);
+            assert_eq!(result["min_tokens"], 1);
+        }
     }
 
     #[test]
@@ -7308,7 +8270,7 @@ mod tests {
             "max_tokens": 512,
             "min_tokens": 0
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/completions", false);
         assert_eq!(result["max_tokens"], 1);
         assert_eq!(result["min_tokens"], 1);
     }
@@ -7321,7 +8283,7 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/chat/completions", false);
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
     }
@@ -7336,7 +8298,7 @@ mod tests {
             "max_output_tokens": 1024,
             "stream": true
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses", false);
         assert_eq!(result["max_output_tokens"], 1);
         // Responses API doesn't use max_tokens, so it should not be injected
         assert!(result.get("max_tokens").is_none());
@@ -7350,7 +8312,7 @@ mod tests {
             "input": "Hello",
             "stream": false
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses");
+        let result = VllmPDRouter::prepare_prefill_request(request, "/v1/responses", false);
         // For /v1/responses, max_output_tokens should always be forced to 1
         assert_eq!(result["max_output_tokens"], 1);
         // Responses API doesn't use max_tokens, so it should not be injected
@@ -7369,7 +8331,8 @@ mod tests {
                 "temperature": 0.7
             }
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         // sampling_params.max_tokens should be capped
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         // Inject min_tokens when sampling_params is present but omits it.
@@ -7389,7 +8352,8 @@ mod tests {
                 "min_tokens": 50
             }
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         assert_eq!(result["sampling_params"]["max_tokens"], 1);
         assert_eq!(result["sampling_params"]["min_tokens"], 1);
     }
@@ -7400,7 +8364,8 @@ mod tests {
         let request = json!({
             "token_ids": [123, 456],
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         // stream should still be forced to false
         assert_eq!(result["stream"], false);
         // top-level max_tokens should NOT be set (generate path)
@@ -7418,7 +8383,8 @@ mod tests {
             "stream": true,
             "stream_options": {"include_usage": true}
         });
-        let result = VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate");
+        let result =
+            VllmPDRouter::prepare_prefill_request(request, "/inference/v1/generate", false);
         assert_eq!(result["stream"], false);
         assert!(result.get("stream_options").is_none());
     }

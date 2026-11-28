@@ -82,6 +82,29 @@ vllm-router \
     --intra-node-data-parallel-size 8
 ```
 
+#### Additional Generate Paths
+
+Register extension endpoints that use the `/inference/v1/generate` request
+schema. Configured paths use typed request handling and active-load accounting.
+Regular routing also applies the configured retries and circuit breaking. PD
+routing uses the existing two-stage dispatch, which does not add coordinated
+retries or record dispatch outcomes for circuit breaking. Built-in routes keep
+their existing handlers. Workers must expose the configured paths.
+
+The built-in `/inference/v1/generate` route and configured generate paths use token IDs for cache affinity. With `sticky_least_loaded`, these routes can use a session ID from the request body. This does not change sticky routing for chat or completions. With `consistent_hash` or `rendezvous_hash`, send `x-session-id` to keep affinity across requests with different token IDs.
+
+When IGW selects workers by model, PD discovery requires a matching prefill worker and decode worker in the registry. If either role is missing, the router returns 503. A direct-URL PD pool with no model labels accepts requests with a `model` field and forwards it to the workers.
+
+Rust embedders must set `ServerConfig.extra_generate_paths`. Use an empty vector
+to keep only the built-in typed routes.
+
+```bash
+vllm-router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware \
+  --extra-generate-paths /custom/v1/generate
+```
+
 #### Optional WASM OnRequest middleware
 
 Load an independently built WASM Component plugin (see `examples/wasm_middleware/` and [RFC #236](https://github.com/vllm-project/router/issues/236)). By default it attaches only to `POST /v1/chat/completions` and fails closed on plugin errors:
@@ -95,7 +118,7 @@ Load an independently built WASM Component plugin (see `examples/wasm_middleware
     --wasm-middleware-route /v1/chat/completions
 ```
 
-Additional paths can be attached with repeated `--wasm-middleware-route` flags (must be one of the protected inference routes). Without `--wasm-middleware`, the Router does not initialize Wasmtime.
+To select which protected inference routes run the plugin, repeat `--wasm-middleware-route` for each path. This list replaces the default. To attach a custom generate route, specify the same path in `--extra-generate-paths` and `--wasm-middleware-route`. Without `--wasm-middleware`, the router does not initialize Wasmtime.
 
 v0.1 resource / fail-closed defaults on attached routes (not configurable via CLI yet):
 

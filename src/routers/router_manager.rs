@@ -700,7 +700,8 @@ impl RouterTrait for RouterManager {
         body: &InferenceGenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             if let Some(response) =
@@ -708,7 +709,37 @@ impl RouterTrait for RouterManager {
             {
                 return response;
             }
-            router.route_inference_generate(headers, body, None).await
+            router
+                .route_inference_generate(headers, body, model_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_inference_generate_path(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        path: &str,
+        _model_id: Option<&str>,
+    ) -> Response {
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            if let Some(response) =
+                self.reject_shared_full_report(router.as_ref(), body.other.get("vllm_xargs"))
+            {
+                return response;
+            }
+            router
+                .route_inference_generate_path(headers, body, path, model_id)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,

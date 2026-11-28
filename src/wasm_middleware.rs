@@ -76,8 +76,8 @@ const SENSITIVE_GUEST_HEADERS: &[&str] = &[
     "set-cookie2",
 ];
 
-/// Paths where the WASM OnRequest layer is mounted (`protected_routes`).
-/// `--wasm-middleware-route` values outside this set are rejected at startup.
+/// Built-in inference routes that support WASM OnRequest middleware.
+/// The server can also attach middleware to registered extra generate paths.
 pub const SUPPORTED_WASM_ROUTES: &[&str] = &[
     "/generate",
     "/inference/v1/generate",
@@ -139,6 +139,13 @@ impl WasmMiddlewareConfig {
     }
 
     pub fn validate(&self) -> Result<(), WasmMiddlewareError> {
+        self.validate_with_generate_paths(&[])
+    }
+
+    fn validate_with_generate_paths(
+        &self,
+        extra_generate_paths: &[String],
+    ) -> Result<(), WasmMiddlewareError> {
         if self.max_input_bytes == 0 || self.max_output_bytes == 0 {
             return Err(WasmMiddlewareError::InvalidConfig(
                 "wasm body limits must be greater than zero".into(),
@@ -164,15 +171,14 @@ impl WasmMiddlewareConfig {
                 "wasm middleware requires at least one route".into(),
             ));
         }
+        let mut supported = SUPPORTED_WASM_ROUTES.to_vec();
+        supported.extend(extra_generate_paths.iter().map(String::as_str));
         for route in &self.routes {
-            if !SUPPORTED_WASM_ROUTES
-                .iter()
-                .any(|supported| *supported == route)
-            {
+            if !supported.contains(&route.as_str()) {
                 return Err(WasmMiddlewareError::InvalidConfig(format!(
                     "unsupported wasm middleware route `{route}`; \
                      supported routes: {}",
-                    SUPPORTED_WASM_ROUTES.join(", ")
+                    supported.join(", ")
                 )));
             }
         }
@@ -274,7 +280,15 @@ pub struct WasmMiddlewareRuntime {
 
 impl WasmMiddlewareRuntime {
     pub fn load(config: WasmMiddlewareConfig) -> Result<Self, WasmMiddlewareError> {
-        config.validate()?;
+        Self::load_with_generate_paths(config, &[])
+    }
+
+    /// The server validates these extra paths before registering them.
+    pub(crate) fn load_with_generate_paths(
+        config: WasmMiddlewareConfig,
+        extra_generate_paths: &[String],
+    ) -> Result<Self, WasmMiddlewareError> {
+        config.validate_with_generate_paths(extra_generate_paths)?;
         let bytes =
             std::fs::read(&config.component_path).map_err(|source| WasmMiddlewareError::Read {
                 path: config.component_path.clone(),
@@ -885,6 +899,7 @@ mod tests {
         Router::new()
             .route("/v1/chat/completions", post(echo_headers))
             .route("/v1/completions", post(echo_headers))
+            .route("/custom/v1/generate", post(echo_headers))
             .layer(axum::middleware::from_fn_with_state(
                 WasmRouteMiddlewareState {
                     runtime,
@@ -926,6 +941,22 @@ mod tests {
         let other_body = other.into_body().collect().await.unwrap().to_bytes();
         let other_json: Value = serde_json::from_slice(&other_body).unwrap();
         assert_eq!(other_json["x-wasm-middleware"], "");
+    }
+
+    #[tokio::test]
+    async fn wasm_attaches_only_to_registered_generate_paths() {
+        let route = "/custom/v1/generate";
+        let config = WasmMiddlewareConfig::from_path(require_component_path())
+            .with_routes(vec![route.into()]);
+        assert!(matches!(
+            config.validate_with_generate_paths(&["/other".into()]),
+            Err(WasmMiddlewareError::InvalidConfig(_))
+        ));
+        let runtime = WasmMiddlewareRuntime::load_with_generate_paths(config, &[route.into()])
+            .expect("load middleware for the registered route");
+        let app = test_app(Arc::new(runtime), 1024 * 1024);
+        let response = post_json(app, route, r#"{"token_ids":[1],"note":"__wasm_reject__"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

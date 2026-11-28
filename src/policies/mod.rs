@@ -160,6 +160,11 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    /// Whether routing requires the serialized request body rather than prompt text.
+    fn needs_request_body(&self) -> bool {
+        false
+    }
+
     /// Whether request text must use the content-preserving cache routing key.
     fn needs_cache_routing_key(&self) -> bool {
         false
@@ -178,10 +183,8 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Whether the Decode decision can be re-run when the Decode request is
     /// dispatched, instead of at admission.
     ///
-    /// True only when every input the policy scores with is still valid after
-    /// a Prefill, or is carried into the commitment. Policies whose answer
-    /// depends on admission-time request text or on a per-pool counter keep
-    /// their admission decision.
+    /// Opt in only if selection can wait until Prefill finishes. The router
+    /// preserves the request text, body, and headers the policy asks for.
     ///
     /// `decode_cache_ready` reports whether the caller carries the prefix
     /// selection prepared at admission, which `cache_aware` needs to score
