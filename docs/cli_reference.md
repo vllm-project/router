@@ -76,6 +76,7 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--worker-startup-timeout-secs` | `u64` | `600` | `integer` | `600` | Time in seconds to wait for workers to become ready. |
 | `--worker-startup-check-interval` | `u64` | `30` | `integer` | `30` | Seconds between worker startup checks; also controls regular-router `power_of_two` load polling. |
 | `--intra-node-data-parallel-size` | `usize` | `1` | `integer` | `1` | DP replicas per worker URL; values greater than 1 enable DP-aware routing. |
+| `--decode-intra-node-data-parallel-size` | `usize` | `unset` | — | — | Per-side DP replicas for decode workers; `unset` keeps the engine `/metrics` self-report, `1` registers one rank-less decode worker so the engine balances decode internally. Rust CLI only for now. |
 | `--backend` | `vllm, trtllm, openai, anthropic` | `vllm` | — | — | Select the backend; `trtllm` and `anthropic` currently warn and fall back to regular routing. |
 | `--runtime` | `vllm, trtllm, openai, anthropic` | `vllm` | — | — | Alias for `--backend`, with the same choices and default. |
 | `--mini-lb` | — | — | `flag` | `false` | Use the Python debug load balancer instead of the Rust extension; it does not implement the full router feature set. |

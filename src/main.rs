@@ -259,6 +259,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1)]
     intra_node_data_parallel_size: usize,
 
+    /// Per-side override for decode workers. When set, it pins the decode expansion directly (bypassing each decode endpoint's engine-count self-report); 1 keeps decode a single rank-less worker so the engine's internal DP load balancer owns decode placement.
+    #[arg(long)]
+    decode_intra_node_data_parallel_size: Option<usize>,
+
     /// API key for worker authorization
     #[arg(long)]
     api_key: Option<String>,
@@ -663,6 +667,7 @@ impl CliArgs {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
+            decode_intra_node_data_parallel_size: self.decode_intra_node_data_parallel_size,
             api_key: self.api_key.clone(),
             api_key_validation_urls,
             discovery,

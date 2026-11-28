@@ -249,6 +249,8 @@ impl Router {
             worker_startup_timeout_secs: self.worker_startup_timeout_secs,
             worker_startup_check_interval_secs: self.worker_startup_check_interval,
             intra_node_data_parallel_size: self.intra_node_data_parallel_size,
+            // Per-side decode override is CLI-only today.
+            decode_intra_node_data_parallel_size: None,
             api_key: self.api_key.clone(),
             api_key_validation_urls: self.api_key_validation_urls.clone(),
             discovery,

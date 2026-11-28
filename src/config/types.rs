@@ -47,6 +47,11 @@ pub struct RouterConfig {
     /// Intra-node data parallel size (number of DP replicas per worker URL). When > 1, the router will create multiple worker instances per URL, one for each DP rank.
     #[serde(default = "default_intra_node_data_parallel_size")]
     pub intra_node_data_parallel_size: usize,
+    /// Per-side override for decode expansion. When set, it pins the decode
+    /// worker count directly and bypasses the per-endpoint engine-count
+    /// self-report; `Some(1)` keeps decode a single rank-less worker.
+    #[serde(default = "default_decode_intra_node_data_parallel_size")]
+    pub decode_intra_node_data_parallel_size: Option<usize>,
     /// The api key used for the authorization with the worker
     pub api_key: Option<String>,
     /// API key validation URLs (if set, incoming requests must validate against them)
@@ -130,6 +135,10 @@ fn default_history_backend() -> HistoryBackend {
 
 fn default_intra_node_data_parallel_size() -> usize {
     1
+}
+
+fn default_decode_intra_node_data_parallel_size() -> Option<usize> {
+    None
 }
 
 /// Router-level Program scheduling configuration.
@@ -1403,6 +1412,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 30,
             intra_node_data_parallel_size: 1,
+            decode_intra_node_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: None,
@@ -2301,6 +2311,7 @@ mod tests {
             worker_startup_timeout_secs: 60,
             worker_startup_check_interval_secs: 5,
             intra_node_data_parallel_size: 1,
+            decode_intra_node_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -2373,6 +2384,7 @@ mod tests {
             worker_startup_timeout_secs: 180,
             worker_startup_check_interval_secs: 15,
             intra_node_data_parallel_size: 1,
+            decode_intra_node_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
@@ -2436,6 +2448,7 @@ mod tests {
             worker_startup_timeout_secs: 600,
             worker_startup_check_interval_secs: 20,
             intra_node_data_parallel_size: 1,
+            decode_intra_node_data_parallel_size: None,
             api_key: None,
             api_key_validation_urls: vec![],
             discovery: Some(DiscoveryConfig {
