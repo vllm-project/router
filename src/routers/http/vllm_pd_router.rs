@@ -45,6 +45,7 @@ const MOONCAKE_STATIC_BOOTSTRAP_MAX_RETRIES: usize = 30;
 const MOONCAKE_DYNAMIC_BOOTSTRAP_MAX_RETRIES: usize = 4;
 const MOONCAKE_BOOTSTRAP_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const MOONCAKE_BOOTSTRAP_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+const MOONCAKE_BOOTSTRAP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Mooncake prefill bootstrap info (engine_id per dp_rank)
 #[derive(Debug, Clone)]
@@ -489,13 +490,14 @@ impl VllmPDRouter {
         bootstrap_addr: &str,
         max_retries: usize,
         initial_backoff: std::time::Duration,
+        attempt_timeout: std::time::Duration,
     ) -> Result<HashMap<usize, String>, String> {
         let url = format!("{}/query", bootstrap_addr);
         let max_retries = max_retries.max(1);
         let mut backoff = initial_backoff;
 
         for attempt in 1..=max_retries {
-            match client.get(&url).send().await {
+            match client.get(&url).timeout(attempt_timeout).send().await {
                 Ok(response) => {
                     if !response.status().is_success() {
                         if attempt == max_retries {
@@ -577,6 +579,7 @@ impl VllmPDRouter {
             bootstrap_addr,
             MOONCAKE_STATIC_BOOTSTRAP_MAX_RETRIES,
             MOONCAKE_BOOTSTRAP_INITIAL_BACKOFF,
+            MOONCAKE_BOOTSTRAP_REQUEST_TIMEOUT,
         )
         .await
     }
@@ -783,7 +786,7 @@ impl VllmPDRouter {
     }
 
     /// Read bootstrap metadata for the selected worker without holding the lock across awaits.
-    fn get_mooncake_info(
+    pub(crate) fn get_mooncake_info(
         &self,
         prefill_url: &str,
         bootstrap_port: Option<u16>,
@@ -3396,6 +3399,7 @@ impl VllmPDRouter {
                 &bootstrap_addr,
                 MOONCAKE_DYNAMIC_BOOTSTRAP_MAX_RETRIES,
                 MOONCAKE_BOOTSTRAP_INITIAL_BACKOFF,
+                MOONCAKE_BOOTSTRAP_REQUEST_TIMEOUT,
             )
             .await
             .map_err(|message| PDRouterError::NetworkError { message })?;
@@ -4782,6 +4786,41 @@ mod tests {
         assert!(router
             .get_mooncake_info(&prefill_url, Some(bootstrap_port), Some(0))
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn mooncake_bootstrap_query_times_out_per_attempt_with_long_shared_client_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let mut held_sockets = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held_sockets.push(stream);
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let bootstrap_addr = format!("http://127.0.0.1:{port}");
+        let start = std::time::Instant::now();
+        let result = VllmPDRouter::query_mooncake_bootstrap_with_retry(
+            &client,
+            &bootstrap_addr,
+            2,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        accept_task.abort();
+
+        assert!(result.is_err(), "expected stalled /query to time out");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "per-attempt timeout should bound 2 stalled attempts well below client timeout, elapsed={elapsed:?}"
+        );
     }
 
     #[tokio::test]
