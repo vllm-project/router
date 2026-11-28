@@ -1,9 +1,11 @@
 import io
+import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock
 
@@ -118,6 +120,36 @@ def test_wait_health_returns_early_when_process_exits():
 
     assert time.monotonic() - start < 5
     assert proc.returncode == 3
+
+
+class _ClosedStderr:
+    def write(self, line):
+        raise ValueError("I/O operation on closed file")
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "stderr", [_ClosedStderr(), None], ids=["closed-stderr", "no-stderr"]
+)
+def test_tee_keeps_draining_when_mirroring_fails(monkeypatch, stderr):
+    lines = [
+        "VLLM Router starting...\n",
+        "Host: 127.0.0.1:53000\n",
+        'Error: Os { code: 98, kind: AddrInUse, message: "Address already in use" }\n',
+    ]
+    monkeypatch.setattr(sys, "__stderr__", stderr)
+    tail = deque(maxlen=50)
+
+    router_manager._tee(io.StringIO("".join(lines)), tail)
+
+    assert list(tail) == lines
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="listener ownership uses /proc")
+def test_owns_listener_is_unknown_when_no_listener_is_listed():
+    assert router_manager._owns_listener(os.getpid(), find_free_port()) is None
 
 
 FAKE_ROUTER = """\
@@ -258,3 +290,29 @@ def test_start_router_ignores_health_from_port_squatter(monkeypatch, tmp_path):
         for squatter in squatters:
             squatter.shutdown()
             squatter.server_close()
+
+
+def test_start_router_closes_child_pipes(monkeypatch, tmp_path):
+    popen = subprocess.Popen
+    procs = []
+
+    def record_popen(*args, **kwargs):
+        procs.append(popen(*args, **kwargs))
+        return procs[-1]
+
+    monkeypatch.setattr(router_manager.subprocess, "Popen", record_popen)
+    manager = router_manager.RouterManager()
+    crash = _fake_router(tmp_path, "sys.exit(7)")
+    with pytest.raises(RuntimeError):
+        manager.start_router(router_bin=crash, timeout=10)
+    assert procs[-1].stdout.closed
+
+    serve = tmp_path / "serve"
+    serve.mkdir()
+    handle = manager.start_router(router_bin=_fake_router(serve, SERVE), timeout=10)
+    manager.stop_all()
+    # The reader closes the pipe once it drains to EOF after the child exits.
+    deadline = time.monotonic() + 5
+    while not handle.process.stdout.closed and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert handle.process.stdout.closed

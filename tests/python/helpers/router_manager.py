@@ -27,10 +27,20 @@ class _RouterExited(Exception):
 
 def _tee(stream, tail: Deque[str]) -> None:
     # sys.__stderr__ is fd 2, where the router wrote before its output was piped.
-    for line in stream:
-        sys.__stderr__.write(line)
-        sys.__stderr__.flush()
-        tail.append(line)
+    mirror = sys.__stderr__
+    # Close the pipe at EOF: nothing else reads or closes proc.stdout.
+    with stream:
+        for line in stream:
+            tail.append(line)
+            if mirror is None:
+                continue
+            # Best effort: this is the only reader, so a closed stderr must not
+            # stop draining the pipe or hide a bind failure from tail.
+            try:
+                mirror.write(line)
+                mirror.flush()
+            except (OSError, ValueError):
+                mirror = None
 
 
 def _owns_listener(pid: int, port: int) -> Optional[bool]:
@@ -52,6 +62,10 @@ def _owns_listener(pid: int, port: int) -> Optional[bool]:
             fields = row.split()
             if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
                 inodes.add(f"socket:[{fields[9]}]")
+    if not inodes:
+        # /health answered, so someone listens; tables that show nobody can't
+        # be trusted (e.g. a sandboxed /proc).
+        return None
     pids = [pid]
     while pids:
         p = pids.pop()
