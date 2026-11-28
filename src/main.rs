@@ -209,6 +209,21 @@ struct CliArgs {
     /// Omit to disable session affinity while keeping KV-aware routing enabled.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
     kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Enable Prefill bypass with the default thresholds.
+    #[arg(long)]
+    pd_prefill_bypass: bool,
+    /// Override the local prefill token limit (default 2048 when enabled). Zero disables bypass.
+    #[arg(long)]
+    pd_prefill_bypass_max_tokens: Option<usize>,
+    /// Maximum fraction of the input left to prefill in the suffix check.
+    #[arg(long, default_value_t = 0.7)]
+    pd_prefill_bypass_max_ratio: f64,
+    /// Policy used to decide whether to bypass Prefill.
+    #[arg(long, value_parser = ["short_suffix", "busy_prefill", "short_suffix_or_busy_prefill"], default_value = "short_suffix")]
+    pd_prefill_bypass_policy: String,
+    /// Minimum number of other Prefill requests for Prefill to be busy.
+    #[arg(long)]
+    pd_prefill_bypass_p_busy_requests: Option<usize>,
     /// Static KV event publishers for regular kv_aware workers.
     #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
     kv_event_source: Vec<String>,
@@ -714,8 +729,30 @@ impl CliArgs {
         })
     }
 
+    fn prefill_bypass_config(
+        &self,
+    ) -> ConfigResult<vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig> {
+        use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig;
+
+        let policy =
+            ValueEnum::from_str(&self.pd_prefill_bypass_policy, false).map_err(|reason| {
+                ConfigError::InvalidValue {
+                    field: "pd-prefill-bypass-policy".to_string(),
+                    value: self.pd_prefill_bypass_policy.clone(),
+                    reason,
+                }
+            })?;
+        Ok(PdPrefillBypassConfig {
+            enabled: self.pd_prefill_bypass,
+            max_tokens: self.pd_prefill_bypass_max_tokens,
+            max_ratio: self.pd_prefill_bypass_max_ratio,
+            policy,
+            p_busy_requests: self.pd_prefill_bypass_p_busy_requests,
+        })
+    }
+
     /// Create ServerConfig from CLI args and RouterConfig
-    fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
+    fn to_server_config(&self, router_config: RouterConfig) -> ConfigResult<ServerConfig> {
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
             Some(ServiceDiscoveryConfig {
@@ -740,7 +777,8 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
-        ServerConfig {
+        Ok(ServerConfig {
+            pd_prefill_bypass: self.prefill_bypass_config()?,
             host: self.host.clone(),
             port: self.port,
             router_config,
@@ -772,7 +810,7 @@ impl CliArgs {
             } else {
                 None
             },
-        }
+        })
     }
 }
 
@@ -845,7 +883,7 @@ Provide --worker-urls or PD flags as usual.",
         "DEBUG: CLI host: {}, port: {}",
         cli_args.host, cli_args.port
     );
-    let server_config = cli_args.to_server_config(router_config);
+    let server_config = cli_args.to_server_config(router_config)?;
     println!(
         "DEBUG: ServerConfig created successfully - host: {}, port: {}",
         server_config.host, server_config.port
@@ -1013,6 +1051,42 @@ mod tests {
         assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
         assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+    }
+
+    #[test]
+    fn parses_prefill_bypass_alongside_worker_policy() {
+        use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassPolicy;
+
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "kv_aware",
+            "--pd-prefill-bypass-max-tokens",
+            "256",
+            "--pd-prefill-bypass-max-ratio",
+            "0.25",
+            "--pd-prefill-bypass-policy",
+            "short_suffix_or_busy_prefill",
+            "--pd-prefill-bypass-p-busy-requests",
+            "4",
+        ])
+        .unwrap();
+        assert_eq!(args.policy, "kv_aware");
+        let bypass = args.prefill_bypass_config().unwrap();
+        assert_eq!(bypass.max_tokens, Some(256));
+        assert_eq!(bypass.max_ratio, 0.25);
+        assert_eq!(
+            bypass.policy,
+            PdPrefillBypassPolicy::ShortSuffixOrBusyPrefill
+        );
+        assert_eq!(bypass.p_busy_requests, Some(4));
+        let defaults = CliArgs::try_parse_from(["vllm-router", "--pd-prefill-bypass"])
+            .unwrap()
+            .prefill_bypass_config()
+            .unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.max_tokens, None);
+        assert_eq!(defaults.max_ratio, 0.7);
     }
 
     #[test]

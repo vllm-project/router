@@ -174,6 +174,44 @@ For KV-aware Decode, add `--decode-policy kv_aware` and run the event setup on D
 --pd-pair 'http://p2:8000=http://d3:8000'
 ```
 
+#### Prefill bypass
+
+Prefill bypass is off by default. Enable it with `--pd-prefill-bypass`.
+The default `short_suffix` policy requires fewer than 2,048 uncached tokens and
+less than 70% of the full prompt. Setting a positive token limit also opts in.
+For a single text prompt with `n=1`, sequential NIXL P/D can send the full
+request directly to the selected KV-aware Decode rank. The rank must advertise
+support, have verified reusable KV on device, and have no other pending or
+active Decode requests in the Router. Its estimated uncached prompt tokens must
+be below the configured token limit for every policy. Requests with prompt
+echo, logprobs, or tool calls in the message history use the usual P/D path.
+
+The hook runs before Prefill dispatch. On a typed refusal, HTTP re-enters the
+Router's internal `route_transparent` method and gRPC re-enters
+`route_grpc_prepared`, each once with bypass disabled. The retry reruns P/D
+selection and dispatch within the original API request. Ingress middleware
+and its concurrency limiter run once. HTTP may render the prompt again,
+and gRPC reuses the prepared tokens.
+
+See [Prefill/decode CLI options](../cli_reference.md#prefilldecode-disaggregation)
+for the available flags and defaults.
+
+Decode workers opt in with `"nixl_pull_local_prefill": true` in their routing
+capabilities JSON. Router sends both remote transfer flags as `false` and sets
+`kv_transfer_params.max_local_prefill_tokens` to the configured limit minus
+one. Before generation, the worker must reject when the actual uncached token
+count exceeds this inclusive maximum. A configured limit of 2,048 therefore
+sends 2,047 and rejects 2,048 or more. The worker returns HTTP 422 or gRPC
+`FAILED_PRECONDITION` before opening the `GenerateStream` response, with
+`x-vllm-error-code: local_prefill_limit_exceeded`. Only this refusal triggers
+a fresh P/D attempt. Workers without the capability use the usual P/D path.
+
+The Router counter `vllm_router_pd_prefill_bypass_total` counts direct Decode
+dispatches by result (`accepted`, `refused`, or `failed`).
+`vllm_router_pd_decode_requests_total` counts worker dispatches, including both
+Decode calls on a refusal followed by a split. The completed split contributes
+one to `vllm_router_pd_requests_total`.
+
 ## Layout files
 
 ### Layout template

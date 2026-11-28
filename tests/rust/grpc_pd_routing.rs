@@ -832,6 +832,133 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
     }
 }
 
+#[tokio::test]
+async fn grpc_pd_prefill_bypass_uses_verified_decode_kv_and_retries_typed_refusal() {
+    use vllm_router_rs::backend::{control::KvEventSourcesResponse, pb::KvEventSource};
+
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        ..Default::default()
+    })
+    .await;
+    let publisher = KvPublisher::bind();
+    let mut capabilities = publisher.layout("mock-model", 16);
+    capabilities.nixl_pull_local_prefill = Some(true);
+    let decode = MockVllmRsServer::spawn_with_control(
+        MockVllmRs {
+            kv_block_size: 16,
+            ..Default::default()
+        },
+        Some(KvEventSourcesResponse {
+            sources: vec![KvEventSource {
+                transport: "zmq".into(),
+                endpoint: publisher.endpoint.clone(),
+                replay_endpoint: publisher.replay_endpoint.clone(),
+                topic: kv_fixture::TOPIC.into(),
+                data_parallel_rank: Some(0),
+                encoding: "msgpack".into(),
+                schema_version: 1,
+                ..Default::default()
+            }],
+            kv_routing_capabilities: Some(serde_json::to_vec(&capabilities).unwrap()),
+        }),
+    )
+    .await;
+    let prefill_urls = vec![(prefill.grpc_url.clone(), None)];
+    let decode_urls = vec![decode.grpc_url.clone()];
+    let decode_policy = PolicyConfig::KvAware {
+        router_temperature: 0.0,
+        kv_penalty_host: 0.8,
+        kv_penalty_external: 0.6,
+        kv_penalty_disk: 0.4,
+        static_kv_event_sources: Default::default(),
+    };
+    let config = RouterConfig {
+        mode: RoutingMode::VllmPrefillDecode {
+            prefill_urls: prefill_urls.clone(),
+            decode_urls: decode_urls.clone(),
+            prefill_policy: None,
+            decode_policy: Some(decode_policy.clone()),
+            discovery_address: None,
+        },
+        policy: PolicyConfig::RoundRobin,
+        worker_startup_timeout_secs: 5,
+        intra_node_data_parallel_size: 1,
+        ..RouterConfig::default()
+    };
+    let ctx = create_test_context(config);
+    ctx.policy_registry
+        .set_decode_policy(PolicyFactory::create_from_config(&decode_policy, None));
+    let router = VllmPDRouter::new(prefill_urls, decode_urls, None, &ctx)
+        .await
+        .unwrap();
+    router
+        .configure_prefill_bypass(
+            vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig {
+                max_tokens: Some(8),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let prompt: Vec<u32> = (0..33).collect();
+    publisher.restore(&prompt[..32], 16).await;
+    let mut request = chat(false);
+    request.model = Some("mock-model".into());
+
+    router.pin_test_token_ids((100..133).collect());
+    assert!(router
+        .route_chat(None, &request, None)
+        .await
+        .status()
+        .is_success());
+    assert_eq!(prefill.captured().len(), 1);
+
+    router.pin_test_token_ids(prompt.clone());
+    assert!(router
+        .route_chat(None, &request, None)
+        .await
+        .status()
+        .is_success());
+    assert_eq!(prefill.captured().len(), 1);
+    assert_eq!(
+        decode.captured()[1].kv_transfer_params,
+        Some(json!({
+            "do_remote_prefill": false,
+            "do_remote_decode": false,
+            "max_local_prefill_tokens": 7,
+        }))
+    );
+
+    let mut refusal = tonic::Status::failed_precondition("prefix evicted");
+    refusal.metadata_mut().insert(
+        "x-vllm-error-code",
+        "local_prefill_limit_exceeded".parse().unwrap(),
+    );
+    *decode.state.local_prefill_rejection.lock().unwrap() = Some(refusal);
+    assert!(router
+        .route_chat(None, &request, None)
+        .await
+        .status()
+        .is_success());
+    assert_eq!(prefill.captured().len(), 2);
+    assert_eq!(decode.captured().len(), 4);
+    assert_eq!(decode.captured()[3].kv_transfer_params, Some(prefill_kv()));
+    assert_ne!(
+        decode.captured()[2].request_id,
+        decode.captured()[3].request_id
+    );
+
+    *decode.state.local_prefill_rejection.lock().unwrap() =
+        Some(tonic::Status::deadline_exceeded("worker outcome unknown"));
+    assert!(!router
+        .route_chat(None, &request, None)
+        .await
+        .status()
+        .is_success());
+    assert_eq!(prefill.captured().len(), 2);
+    assert_eq!(decode.captured().len(), 5);
+}
+
 /// Names the model the mocks report from `Control.GetModelInfo`.
 async fn send_chat_ok(router: &VllmPDRouter) {
     let mut request = chat(false);

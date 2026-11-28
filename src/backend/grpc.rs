@@ -419,11 +419,14 @@ impl GrpcEngineBackend {
                 Ok(Err(status)) => {
                     abort.disarm();
                     warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
-                    return (
+                    let mut response = (
                         grpc_status_code(&status),
                         format!("grpc GenerateStream: {}", status.message()),
                     )
                         .into_response();
+                    // Preserve the pre-stream status and metadata for the P/D bypass refusal check.
+                    response.extensions_mut().insert(status);
+                    return response;
                 }
                 Err(_) => {
                     return (

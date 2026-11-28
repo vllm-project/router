@@ -7,6 +7,9 @@ use std::collections::HashSet;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CacheCapabilities {
     pub schema_version: u32,
+    /// The worker accepts and enforces a local prefill token limit with NIXL pull.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nixl_pull_local_prefill: Option<bool>,
     /// LoRA adapters this worker serves. The engine hashes an adapter's pages
     /// with the adapter identity, so the Router can only credit them when the
     /// layout names them.

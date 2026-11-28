@@ -355,6 +355,25 @@ impl KvIndexSupervisor {
         self
     }
 
+    /// Revision of a trusted live rank that advertises local prefill support.
+    pub(crate) fn local_prefill_revision(&self, base: &str, rank: u32) -> Option<u64> {
+        if self.static_pd_sources.contains_key(base) {
+            return None;
+        }
+        let lifecycles = self.lifecycles.lock();
+        let lifecycle = lifecycles.get(base)?;
+        let state = lifecycle.state.lock();
+        let info = state.info.as_ref()?;
+        (lifecycle.trusted_at(&state, std::time::Instant::now)
+            && state
+                .descriptor
+                .as_ref()
+                .and_then(probe::WorkerDescriptor::layout)
+                .is_some_and(|layout| layout.nixl_pull_local_prefill == Some(true))
+            && info.ranks.contains(&rank))
+        .then_some(state.revision)
+    }
+
     /// Resolve a worker's declared sources, folding per-rank declarations
     /// (`base@0`, `base@1`) into the base entry. Regular startup discovers the
     /// base URL and fans it out to its DP ranks afterwards, so a declaration
@@ -1201,6 +1220,7 @@ fn synthesize_plain_full_layout(
     ranks.sort_unstable_by_key(|rank| rank.rank);
     Some(CacheCapabilities {
         schema_version: 1,
+        nixl_pull_local_prefill: None,
         adapters: Vec::new(),
         ranks,
     })

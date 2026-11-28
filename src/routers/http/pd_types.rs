@@ -702,6 +702,20 @@ impl PdAttempt {
     pub(super) fn decode_endpoint(&self) -> Option<PdEndpoint> {
         self.0.state.lock().decode_endpoint.clone()
     }
+
+    /// Inspect both stage loads while the selected Decode admission is still pending.
+    pub(super) fn check_reserved_decode(
+        &self,
+        decode: &PdEndpoint,
+        check: impl FnOnce(&Loads) -> bool,
+    ) -> bool {
+        let state = self.0.state.lock();
+        state.prefill
+            && state.decode == DecodeState::Pending
+            && state.decode_endpoint.as_ref() == Some(decode)
+            && check(&self.0.loads.lock())
+    }
+
     pub fn finish_prefill(&self) {
         self.0.finish_prefill();
     }

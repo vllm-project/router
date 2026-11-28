@@ -1,5 +1,8 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
+#[path = "common/grpc_kv_fixture.rs"]
+mod kv_fixture;
+
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod test_pd_routing {
     use vllm_router_rs::config::{
@@ -87,6 +90,239 @@ mod test_pd_routing {
         );
         let router = RouterFactory::create_router(&context).await.unwrap();
         (router, server)
+    }
+
+    #[tokio::test]
+    async fn http_pd_bypass_only_redispatches_after_tagged_refusal() {
+        verify_http_bypass_refusal(false).await;
+    }
+
+    #[tokio::test]
+    async fn http_pd_bypass_refusal_readmits_through_discovery() {
+        verify_http_bypass_refusal(true).await;
+    }
+
+    async fn verify_http_bypass_refusal(discovery: bool) {
+        use crate::kv_fixture::{KvPublisher, TOPIC};
+        use axum::{
+            body::Body,
+            http::{header, Request, StatusCode},
+            response::{IntoResponse, Response},
+            routing::{get, post},
+            Json, Router,
+        };
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use serde_json::{json, Value};
+        use std::future::{poll_fn, Future};
+        use std::pin::pin;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tower::ServiceExt;
+        use vllm_router_rs::config::KvConnector;
+        use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig;
+        use vllm_router_rs::server::{build_app, AppContext, AppState};
+
+        #[derive(Clone, Copy)]
+        enum Refusal {
+            Tagged,
+            Untagged,
+            NoResponse,
+        }
+
+        let publisher = KvPublisher::bind();
+        let mut layout = publisher.layout("mock-model", 16);
+        layout.nixl_pull_local_prefill = Some(true);
+        let sources = json!({"0": {
+            "publisher": "zmq", "endpoint": publisher.endpoint, "replay_endpoint": publisher.replay_endpoint,
+            "topic": TOPIC, "enable_kv_cache_events": true,
+        }});
+        let handoff = json!({"do_remote_prefill": true, "remote_engine_id": "P"});
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let refusal = Arc::new(Mutex::new(Refusal::Tagged));
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route(
+                "/d/server_info",
+                get(|| async {
+                    Json(json!({"vllm_config": {
+                        "model_config": {"model": "mock-model"},
+                        "cache_config": {"block_size": 16},
+                    }}))
+                }),
+            )
+            .route(
+                "/d/kv_event_sources",
+                get(move || async move { Json(sources) }),
+            )
+            .route(
+                "/d/kv_routing_capabilities",
+                get(move || async move { Json(layout) }),
+            )
+            .route(
+                "/d/v1/models",
+                get(|| async { Json(json!({"data": [{"id": "mock-model"}]})) }),
+            )
+            .route(
+                "/p/v1/completions",
+                post({
+                    let calls = calls.clone();
+                    let handoff = handoff.clone();
+                    move || async move {
+                        calls.lock().unwrap().push(("P", Value::Null));
+                        Json(json!({"kv_transfer_params": handoff}))
+                    }
+                }),
+            )
+            .route(
+                "/d/v1/completions",
+                post({
+                    let calls = calls.clone();
+                    let refusal = refusal.clone();
+                    move |Json(body): Json<Value>| async move {
+                        let params = body["kv_transfer_params"].clone();
+                        let direct = params.get("max_local_prefill_tokens").is_some();
+                        calls.lock().unwrap().push(("D", params));
+                        if !direct {
+                            return Json(json!({"choices": [{"text": "answer"}]})).into_response();
+                        }
+                        let result = *refusal.lock().unwrap();
+                        match result {
+                            Refusal::Tagged => (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                [("x-vllm-error-code", "local_prefill_limit_exceeded")],
+                            )
+                                .into_response(),
+                            Refusal::Untagged => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+                            Refusal::NoResponse => std::future::pending::<Response>().await,
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let discovery_address = discovery.then(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .to_string()
+        });
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: (!discovery)
+                    .then(|| (format!("{base}/p"), None))
+                    .into_iter()
+                    .collect(),
+                decode_urls: (!discovery)
+                    .then(|| format!("{base}/d"))
+                    .into_iter()
+                    .collect(),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.4,
+                    static_kv_event_sources: Default::default(),
+                }),
+                discovery_address: discovery_address.clone(),
+            },
+            kv_connector: KvConnector::Nixl,
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        // Exercise the API with one ingress slot and no queue.
+        let context = Arc::new(AppContext::new(config, client, 1, None, vec![]).unwrap());
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        router
+            .as_any()
+            .downcast_ref::<vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter>()
+            .unwrap()
+            .configure_prefill_bypass(PdPrefillBypassConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let app = build_app(
+            Arc::new(AppState {
+                router: Arc::from(router),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            4096,
+            vec![],
+            vec![],
+            false,
+        );
+        let _registration_socket = discovery_address.map(|address| {
+            let zmq_context = zmq::Context::new();
+            let dealer = zmq_context.socket(zmq::DEALER).unwrap();
+            dealer.set_linger(0).unwrap();
+            dealer.connect(&format!("tcp://{address}")).unwrap();
+            for (role, suffix) in [("P", "p"), ("D", "d")] {
+                let registration = json!({
+                    "type": role,
+                    "http_address": format!("{base}/{suffix}"),
+                    "zmq_address": format!("tcp://{role}:1"),
+                });
+                dealer
+                    .send(rmp_serde::to_vec_named(&registration).unwrap(), 0)
+                    .unwrap();
+            }
+            dealer
+        });
+        let prompt: Vec<u32> = (0..33).collect();
+        publisher.restore(&prompt[..32], 16).await;
+        let request = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 8});
+        let direct = json!({"do_remote_prefill": false, "do_remote_decode": false, "max_local_prefill_tokens": 2047});
+
+        let cases = [
+            (Refusal::Tagged, StatusCode::OK, true),
+            (Refusal::Untagged, StatusCode::UNPROCESSABLE_ENTITY, false),
+            (Refusal::NoResponse, StatusCode::GATEWAY_TIMEOUT, false),
+        ];
+        let cases = if discovery { &cases[..1] } else { &cases[..] };
+        for &(result, status, splits) in cases {
+            *refusal.lock().unwrap() = result;
+            let request = Request::post("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap();
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let mut response = pin!(app.clone().oneshot(request));
+            let response = poll_fn(|cx| {
+                metrics::with_local_recorder(&recorder, || response.as_mut().poll(cx))
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status);
+            let metrics = recorder.handle().render();
+            let request_counter = metrics
+                .lines()
+                .find(|line| line.starts_with("vllm_router_pd_requests_total{"));
+            assert_eq!(
+                request_counter,
+                Some(r#"vllm_router_pd_requests_total{route="/v1/completions"} 1"#),
+                "{metrics}"
+            );
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let mut expected = vec![("D", direct.clone())];
+            if splits {
+                expected.extend([("P", Value::Null), ("D", handoff.clone())]);
+            }
+            assert_eq!(std::mem::take(&mut *calls.lock().unwrap()), expected);
+        }
+        server.abort();
     }
 
     #[tokio::test]

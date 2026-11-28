@@ -71,6 +71,7 @@ pub struct MockVllmRs {
     /// After `hold_after` recorded requests, wait until [`HoldGate::release`].
     pub hold: Option<HoldGate>,
     pub kv_block_size: u32,
+    pub local_prefill_rejection: Arc<Mutex<Option<Status>>>,
 }
 
 /// Blocks requests after the first `hold_after` ones until [`HoldGate::release`].
@@ -134,6 +135,7 @@ impl Default for MockVllmRs {
             aborts: Arc::new(Mutex::new(Vec::new())),
             hold: None,
             kv_block_size: 0,
+            local_prefill_rejection: Default::default(),
         }
     }
 }
@@ -168,7 +170,7 @@ impl MockVllmRsServer {
         .await
     }
 
-    async fn spawn_with_control(
+    pub async fn spawn_with_control(
         state: MockVllmRs,
         kv_event_sources: Option<KvEventSourcesResponse>,
     ) -> Self {
@@ -294,6 +296,11 @@ impl Inference for MockVllmRs {
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
             None => (Vec::new(), false),
         };
+        let local_prefill = req
+            .kv
+            .as_ref()
+            .and_then(|kv| kv.kv_transfer_params.as_ref())
+            .is_some_and(|params| params.fields.contains_key("max_local_prefill_tokens"));
         {
             let mut captured = self.captured.lock().unwrap();
             if captured.len() < self.capture_limit {
@@ -327,6 +334,11 @@ impl Inference for MockVllmRs {
             .is_ok()
         {
             return Err(Status::unavailable("retry test"));
+        }
+        if local_prefill {
+            if let Some(status) = self.local_prefill_rejection.lock().unwrap().take() {
+                return Err(status);
+            }
         }
         if let Some(hold) = &self.hold {
             hold.wait().await;

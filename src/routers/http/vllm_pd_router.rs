@@ -40,6 +40,14 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+mod native_prefill_bypass;
+pub(super) mod prefill_bypass;
+
+use native_prefill_bypass::SelectedPair;
+pub(crate) use native_prefill_bypass::{install_prefill_bypass, prepare_prefill_bypass};
+use prefill_bypass::PrefillBypass;
+pub use prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
+
 type ProgramPrefillCandidate = (String, Arc<dyn Worker>);
 type MooncakePrefillTable = HashMap<u16, HashMap<String, MooncakePrefillInfo>>;
 
@@ -116,6 +124,7 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
+    prefill_bypass: std::sync::OnceLock<PrefillBypass>,
     /// Startup-only bootstrap table keyed by port and transport base URL.
     /// Ranks sharing both keys use the engine IDs reported by that bootstrap.
     /// Runtime registration and per-request snapshots are tracked in #209.
@@ -1127,16 +1136,30 @@ impl VllmPDRouter {
         instances: Vec<(String, String, Option<usize>)>,
         service_type: ServiceType,
     ) -> Result<Vec<Arc<dyn Worker>>, String> {
+        Self::expand_discovery_candidates(
+            instances,
+            service_type,
+            self.kv_connector,
+            self.intra_node_data_parallel_size,
+        )
+    }
+
+    fn expand_discovery_candidates(
+        instances: Vec<(String, String, Option<usize>)>,
+        service_type: ServiceType,
+        kv_connector: KvConnector,
+        intra_node_data_parallel_size: usize,
+    ) -> Result<Vec<Arc<dyn Worker>>, String> {
         let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
         for (address, _, registered_dp_size) in instances {
             let (base, _) = dp_utils::parse_worker_url(&address);
-            let dp_size = match self.kv_connector {
+            let dp_size = match kv_connector {
                 // Respect an explicit registration, including an explicit
                 // single-rank size. Preserve the legacy single-rank MoRI-IO default.
                 KvConnector::MoriIO => registered_dp_size.unwrap_or(1).max(1),
                 _ => registered_dp_size
                     .unwrap_or(1)
-                    .max(self.intra_node_data_parallel_size)
+                    .max(intra_node_data_parallel_size)
                     .max(1),
             };
             let ranks = dp_utils::expand_dp_ranks(&address, dp_size)?;
@@ -2034,14 +2057,13 @@ impl VllmPDRouter {
             )
         });
         match self
-            .process_vllm_two_stage_request(
+            .process_native_http_pair(
                 request,
                 prefill_worker,
                 decode_worker,
                 path,
                 headers,
                 attempt.clone(),
-                None,
                 commit.as_ref(),
             )
             .await
@@ -2307,9 +2329,27 @@ impl VllmPDRouter {
                 affinity_key,
                 &request_json,
                 path,
-                Some(router_prompts),
+                Some(router_prompts.clone()),
             )
         });
+        if let Some(response) = self
+            .try_grpc_prefill_bypass(
+                &request_json,
+                path,
+                headers,
+                &prepared,
+                &router_prompts,
+                SelectedPair {
+                    prefill: &prefill_worker,
+                    decode: &decode_worker,
+                    attempt: &attempt,
+                    commit: commit.as_ref(),
+                },
+            )
+            .await
+        {
+            return attempt.track_response(response);
+        }
         let response = self
             .process_grpc_two_stage(
                 prepared,
@@ -2690,36 +2730,17 @@ impl VllmPDRouter {
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
 
-        let mut decode_request_builder = self
-            .pd_router
-            .client
-            .post(&decode_url)
-            .header("Content-Type", "application/json")
-            .header(
-                "Authorization",
-                format!(
-                    "Bearer {}",
-                    std::env::var("OPENAI_API_KEY").unwrap_or_default()
-                ),
-            )
-            .header("X-Request-Id", &request_id);
-
-        // Add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
-
         attempt.begin_decode();
-        let decode_response = match otel_http::send_client_request(
-            decode_request_builder.json(&decode_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
-        )
-        .await
+        let decode_response = match self
+            .send_http_decode(
+                &decode_url,
+                decode_dp_rank,
+                &request_id,
+                path,
+                headers,
+                &decode_request,
+            )
+            .await
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -2751,6 +2772,35 @@ impl VllmPDRouter {
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
+    }
+
+    async fn send_http_decode(
+        &self,
+        url: &str,
+        rank: Option<usize>,
+        request_id: &str,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        request: &Value,
+    ) -> reqwest::Result<reqwest::Response> {
+        let builder = self
+            .pd_router
+            .client
+            .post(url)
+            .bearer_auth(std::env::var("OPENAI_API_KEY").unwrap_or_default())
+            .header("X-Request-Id", request_id)
+            .json(request);
+        otel_http::send_client_request(
+            dp_utils::add_dp_rank_header(builder, rank),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
     }
 
     /// P/D dispatch on `grpc://` pools for chat and token-id completions. The connector JSON is the same as on the
@@ -3304,6 +3354,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                prefill_bypass: Default::default(),
                 // No static prefills in discovery mode; this stays empty.
                 // Runtime Mooncake registration is tracked in #209.
                 mooncake_prefill_info: Arc::new(HashMap::new()),
@@ -3423,6 +3474,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                prefill_bypass: Default::default(),
                 mooncake_prefill_info: Arc::new(mooncake_prefill_info),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,
@@ -3914,14 +3966,13 @@ impl RouterTrait for VllmPDRouter {
 
             // Execute two-stage processing
             match self
-                .process_vllm_two_stage_request(
+                .process_native_http_pair(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     path,
                     headers,
                     attempt.clone(),
-                    None,
                     commit.as_ref(),
                 )
                 .await
