@@ -39,9 +39,8 @@ use uuid::Uuid;
 
 mod native_prefill_bypass;
 pub(crate) use native_prefill_bypass::validate_prefill_bypass;
-use native_prefill_bypass::{
-    BeforePrefill, DecodeAdmission, NativeBypass, SplitDispatch, Transport,
-};
+mod prefill_bypass_wiring;
+use native_prefill_bypass::SplitDispatch;
 
 pub use super::prefill_bypass::{PdPrefillBypassConfig, PdPrefillBypassPolicy};
 use super::prefill_bypass::{PrefillBypass, PrefillDispatch};
@@ -1961,52 +1960,18 @@ impl VllmPDRouter {
         })
     }
 
-    fn native_prefill_bypass(&self) -> Option<NativeBypass<'_>> {
-        Some(NativeBypass {
-            feature: self.prefill_bypass.as_ref()?,
-            state: self.pd_router.kv_state.as_deref()?,
-            admission: self,
-        })
-    }
-
     async fn process_vllm_request(
         &self,
         request: Value,
         path: &str,
         headers: Option<&HeaderMap>,
     ) -> Response {
-        let pool = if self.use_discovery {
-            DecodePoolSource::Discovery
-        } else {
-            DecodePoolSource::Registry
-        };
-        let dispatch = native_prefill_bypass::admit_for_dispatch(
-            self.native_prefill_bypass(),
-            BeforePrefill {
-                request: &request,
-                path,
-                headers,
-                transport: Transport::Http {
-                    client: &self.pd_router.client,
-                    pool,
-                },
-            },
-            |_| async {
-                self.admit_http_pair(pool, &request, path, headers)
-                    .await
-                    .map_err(|error| {
-                        RouterMetrics::record_pd_error("server_selection");
-                        Box::new((StatusCode::SERVICE_UNAVAILABLE, error).into_response())
-                    })
-            },
-        )
-        .await;
         let SplitDispatch {
             prefill,
             decode,
             attempt,
             commit,
-        } = match dispatch {
+        } = match self.admit_http_for_dispatch(&request, path, headers).await {
             PrefillDispatch::Split(split) => split,
             PrefillDispatch::Respond(response) => return response,
         };
@@ -2289,43 +2254,15 @@ impl VllmPDRouter {
         prepared: crate::backend::PreparedRequest,
         workers: GrpcPdWorkers,
     ) -> Response {
-        let prompts: Arc<[Vec<u32>]> = Arc::from([prepared.tokenized.token_ids.to_vec()]);
-        let (request, workers, prompts) = (&request_json, &workers, &prompts);
-        let dispatch = native_prefill_bypass::admit_for_dispatch(
-            self.native_prefill_bypass(),
-            BeforePrefill {
-                request,
-                path,
-                headers,
-                transport: Transport::Grpc {
-                    frontend: &self.grpc_frontend,
-                    prepared: &prepared,
-                    prompts,
-                },
-            },
-            |readmit| async move {
-                let refreshed = if readmit {
-                    Some(self.available_grpc_workers()?)
-                } else {
-                    None
-                };
-                self.admit_grpc_pair(
-                    refreshed.as_ref().unwrap_or(workers),
-                    request,
-                    path,
-                    headers,
-                    prompts,
-                )
-                .await
-            },
-        )
-        .await;
         let SplitDispatch {
             prefill,
             decode,
             attempt,
             commit,
-        } = match dispatch {
+        } = match self
+            .admit_grpc_for_dispatch(&request_json, path, headers, &prepared, &workers)
+            .await
+        {
             PrefillDispatch::Split(split) => split,
             PrefillDispatch::Respond(response) => return response,
         };
@@ -3487,45 +3424,6 @@ impl VllmPDRouter {
             self.grpc_frontend.tokenizer_cache_stats(),
             self.grpc_frontend.l1_cache_stats(),
         )
-    }
-}
-
-#[async_trait]
-impl DecodeAdmission for VllmPDRouter {
-    fn supports_prefill(&self, prefill: &dyn Worker) -> bool {
-        self.kv_connector == KvConnector::Nixl
-            && self.epd.is_none()
-            && self
-                .get_nixl_push_identity(prefill.base_url(), prefill.dp_rank())
-                .is_none()
-    }
-
-    fn decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
-        self.policy_registry.get_decode_policy()
-    }
-
-    fn eligible_decode_candidates(
-        &self,
-        pool: DecodePoolSource,
-        model: Option<&str>,
-        endpoint: &PdEndpoint,
-    ) -> Vec<Arc<dyn Worker>> {
-        let mut candidates = self.live_decode_candidates(pool);
-        Self::retain_commit_candidates(&mut candidates, model, Some(endpoint));
-        candidates
-    }
-
-    async fn commit_provisional_decode(
-        &self,
-        attempt: &PdAttempt,
-        commit: &DecodeCommitInput,
-        request: &Value,
-        headers: Option<&HeaderMap>,
-        guard: &DecodeCommitGuard<'_>,
-    ) -> Option<Arc<dyn Worker>> {
-        self.select_and_commit_decode(attempt, commit, request, headers, true, Some(guard))
-            .await
-            .ok()
     }
 }
 
