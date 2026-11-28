@@ -236,6 +236,7 @@ The bootstrap port annotation is fixed to `vllm.ai/bootstrap-port`.
 | `--health-check-timeout-secs` | `u64` | `5` | `integer` | `5` | Health check request timeout in seconds. |
 | `--health-check-interval-secs` | `u64` | `60` | `integer` | `60` | Seconds between runtime health checks. |
 | `--health-check-endpoint` | `string` | `/health` | `string` | `/health` | Worker health endpoint path. |
+| `--worker-canary-interval-secs` | `u64` | `0` | `integer` | `0` | Idle worker generation check interval, or 0 to disable. See [worker canary](worker_canary.md). |
 
 ## Logging and metrics
 

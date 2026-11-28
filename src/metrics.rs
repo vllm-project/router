@@ -59,6 +59,14 @@ pub fn init_metrics() {
         "Total number of circuit breaker outcomes by worker and outcome type (success/failure)"
     );
 
+    describe_counter!(
+        "vllm_router_worker_canary_total",
+        "One-token generation checks of idle HTTP workers by result"
+    );
+    describe_gauge!(
+        "vllm_router_worker_idle_seconds",
+        "Oldest Router-observed idle HTTP worker eligible for generation checks, in seconds"
+    );
     // Worker metrics
     describe_gauge!(
         "vllm_router_active_workers",

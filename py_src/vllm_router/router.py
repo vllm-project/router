@@ -103,6 +103,7 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        worker_canary_interval_secs: Idle worker generation probe interval. Default: 0 (disabled)
         enable_program_scheduling: Enable Program-level scheduling with verified exact counts and estimation fallback. Default: False
         program_scheduling_config_json: Optional JSON object overriding Program-level scheduling defaults.
             Requires enable_program_scheduling. Use {"token_count_mode":"estimated"}

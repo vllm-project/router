@@ -69,6 +69,24 @@ class TestKvLauncherArgs:
         assert router._router is native_router.return_value
 
 
+@pytest.mark.parametrize("use_prefix", [False, True])
+def test_worker_canary_launcher_args(use_prefix):
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser, use_router_prefix=use_prefix)
+    assert (
+        RouterArgs.from_cli_args(
+            parser.parse_args([]), use_router_prefix=use_prefix
+        ).worker_canary_interval_secs
+        == 0
+    )
+    prefix = "router-" if use_prefix else ""
+    namespace = parser.parse_args([f"--{prefix}worker-canary-interval-secs", "7"])
+    args = RouterArgs.from_cli_args(namespace, use_router_prefix=use_prefix)
+    with patch("vllm_router.router._Router") as native_router:
+        Router.from_args(args)
+    assert native_router.call_args.kwargs["worker_canary_interval_secs"] == 7
+
+
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
 

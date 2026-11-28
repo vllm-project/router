@@ -114,6 +114,7 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    worker_canary_interval_secs: u64,
     // IGW (Inference Gateway) configuration
     enable_igw: bool,
     queue_size: usize,
@@ -396,7 +397,8 @@ impl Router {
         kv_event_strict_recovery = false,
         kv_hybrid_layout = None,
         kv_event_topic = vec![],
-        pd_pair = vec![]
+        pd_pair = vec![],
+        worker_canary_interval_secs = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -478,6 +480,7 @@ impl Router {
         kv_hybrid_layout: Option<std::path::PathBuf>,
         kv_event_topic: Vec<String>,
         pd_pair: Vec<String>,
+        worker_canary_interval_secs: u64,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -565,6 +568,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            worker_canary_interval_secs,
             enable_igw,
             queue_size,
             queue_timeout_secs,
@@ -636,6 +640,7 @@ impl Router {
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                worker_canary_interval_secs: self.worker_canary_interval_secs,
                 pool_idle_timeout_secs: server::DEFAULT_POOL_IDLE_TIMEOUT_SECS,
                 request_id_headers: self.request_id_headers.clone(),
                 trace_config: if self.enable_trace {

@@ -16,6 +16,7 @@ use crate::backend::{
 use crate::config::types::RetryConfig;
 use crate::core::worker::worker_get;
 use crate::core::worker::UNLABELED_WORKER_MODEL_ID;
+use crate::core::worker_canary::UserTraffic;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
     RetryExecutor, Worker, WorkerRegistry, WorkerType,
@@ -284,6 +285,7 @@ struct TypedDispatch<'a> {
     prepared: Option<crate::backend::PreparedRequest>,
     /// Body to forward instead of `typed_req` (usage-injected HTTP stream).
     request_body: Option<serde_json::Value>,
+    traffic: Option<UserTraffic>,
 }
 
 struct SelectedWorker {
@@ -2189,6 +2191,7 @@ impl Router {
                             load,
                             prepared: (*prepared).clone(),
                             request_body: injected_body.clone(),
+                            traffic: UserTraffic::begin(worker.as_ref()),
                         },
                         program_completion.clone(),
                     )
@@ -2373,6 +2376,7 @@ impl Router {
             load,
             prepared,
             request_body,
+            traffic,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -2624,11 +2628,15 @@ impl Router {
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
             let producer = tokio::spawn(async move {
+                let _traffic = traffic;
                 let mut stream = stream;
                 let mut usage_stripper = strip_usage.then(SseUsageStripper::default);
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    chunk = stream.next() => chunk,
+                    _ = tx.closed(), if _traffic.is_some() => { stream_succeeded = false; None }
+                } {
                     match chunk {
                         Ok(bytes) => {
                             if completion_echo.is_none() {
@@ -2741,10 +2749,14 @@ impl Router {
 
             // Spawn task to forward stream
             tokio::spawn(async move {
+                let _traffic = traffic;
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = tokio::select! {
+                    chunk = stream.next() => chunk,
+                    _ = tx.closed(), if _traffic.is_some() => { stream_succeeded = false; None }
+                } {
                     match chunk {
                         Ok(bytes) => {
                             if first_sse {
@@ -3892,6 +3904,7 @@ impl RouterTrait for Router {
         }
 
         // Send request
+        let traffic = UserTraffic::begin(worker.as_ref());
         let response = match otel_http::send_client_request(
             request_builder,
             headers,
@@ -3934,15 +3947,18 @@ impl RouterTrait for Router {
                 }
 
                 if Self::should_proxy_transparent_directly(program_completion.is_some()) {
-                    response_builder
-                        .body(Body::from_stream(response.bytes_stream()))
-                        .unwrap_or_else(|error| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build response: {error}"),
-                            )
-                                .into_response()
-                        })
+                    let body = if traffic.is_some() {
+                        Body::from_stream(UserTraffic::track(traffic, response.bytes_stream()))
+                    } else {
+                        Body::from_stream(response.bytes_stream())
+                    };
+                    response_builder.body(body).unwrap_or_else(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to build response: {error}"),
+                        )
+                            .into_response()
+                    })
                 } else if Self::should_buffer_transparent_response(
                     is_stream,
                     program_completion.is_some(),
@@ -3984,9 +4000,13 @@ impl RouterTrait for Router {
                     let completion = status.is_success().then_some(program_completion).flatten();
                     let stream_end = StreamEnd::for_http_route(path);
                     tokio::spawn(async move {
+                        let _traffic = traffic;
                         let mut stream = stream;
                         let mut stream_ok = true;
-                        while let Some(chunk) = stream.next().await {
+                        while let Some(chunk) = tokio::select! {
+                            chunk = stream.next() => chunk,
+                            _ = tx.closed(), if _traffic.is_some() => { stream_ok = false; None }
+                        } {
                             match chunk {
                                 Ok(bytes) => {
                                     if let Some(completion) = &completion {
@@ -5441,6 +5461,7 @@ mod tests {
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
                     request_body: None,
+                    traffic: None,
                 },
                 None,
             )
@@ -7123,6 +7144,7 @@ mod tests {
                     load,
                     prepared: None,
                     request_body: None,
+                    traffic: None,
                 },
                 None,
             )
@@ -7307,6 +7329,7 @@ mod tests {
                         load,
                         prepared: None,
                         request_body: None,
+                        traffic: None,
                     },
                     None,
                 )

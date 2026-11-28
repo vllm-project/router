@@ -7381,6 +7381,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.6",
  "tonic-health",
  "tonic-prost",

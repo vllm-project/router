@@ -101,6 +101,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    worker_canary_interval_secs: int = 0
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -599,6 +600,12 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}worker-canary-interval-secs",
+            type=int,
+            default=RouterArgs.worker_canary_interval_secs,
+            help="Probe idle standalone HTTP workers every N seconds (0 disables canaries)",
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",
