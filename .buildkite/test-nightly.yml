@@ -112,10 +112,15 @@ steps:
   # L3 Rust gRPC P/D full GSM8K — same layout as the HTTP job above: one
   # prefill and one decode, each at data-parallel size 2, on four L4s.
   # ============================================================================
-  - label: ":satellite: gRPC P/D Disaggregation Test (4 GPUs)"
+  - label: ":satellite: gRPC P/D Disaggregation Test ({{matrix.policy}}, 4 GPUs)"
     key: "grpc-pd-disagg-test"
     if: build.env("ROCM_ONLY") != "1"
     timeout_in_minutes: 60
+    matrix:
+      setup:
+        policy:
+          - power_of_two
+          - kv_aware_affinity
     retry:
       automatic:
         - exit_status: "*"
@@ -129,6 +134,7 @@ steps:
       bash <<'BASH'
       set -euo pipefail
       export RUN_LM_EVAL=1
+      export GRPC_PD_POLICY="{{matrix.policy}}"
       export LOG_DIR=/tmp/vllm-router-grpc-pd
       pytest tests/python/integration/test_grpc_pd_disagg.py -v -m "ready and L4 and cards_4"
       BASH

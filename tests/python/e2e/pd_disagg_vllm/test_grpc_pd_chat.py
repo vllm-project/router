@@ -7,7 +7,9 @@ so this is the chat counterpart of ``test_pd_accuracy.py``.
 
 import argparse
 import json
+import re
 import sys
+from uuid import uuid4
 
 import requests
 
@@ -221,6 +223,67 @@ def _report(name: str, total: int, failures: list[str]) -> bool:
     return not failures
 
 
+def _decode_affinity_counts(client: requests.Session, metrics_url: str) -> dict:
+    response = client.get(metrics_url, timeout=10)
+    response.raise_for_status()
+    counts = {}
+    for line in response.text.splitlines():
+        if not line.startswith("vllm_router_pd_affinity_decisions_total{"):
+            continue
+        labels, value = line.split("}", 1)
+        tags = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+        if tags.get("stage") == "decode":
+            counts[tags["outcome"]] = float(value)
+    return counts
+
+
+def check_decode_affinity(
+    router_url: str, metrics_url: str, model: str, max_tokens: int
+) -> None:
+    # Run against the dedicated, idle test stack so each counter change can
+    # be attributed to the request that just completed.
+    with requests.Session() as client:
+        before = _decode_affinity_counts(client, metrics_url)
+        session_ids = [uuid4().hex, uuid4().hex]
+        for turn in range(4):
+            for session_id in session_ids:
+                stream = turn % 2 == 1
+                body = _request_body(model, SAMPLE_PROMPTS[turn], max_tokens, stream)
+                body["session_params"] = {"session_id": session_id}
+                with client.post(
+                    f"{router_url}/v1/chat/completions",
+                    json=body,
+                    timeout=120,
+                    stream=stream,
+                ) as response:
+                    response.raise_for_status()
+                    if stream:
+                        failure = _stream_failure(response.iter_lines())
+                        if failure:
+                            raise ValueError(f"Affinity stream: {failure}")
+                    else:
+                        choice = response.json()["choices"][0]
+                        if choice.get("finish_reason") not in ("stop", "length"):
+                            raise ValueError(f"Affinity chat finish: {choice}")
+                        if not _generated_text(choice["message"]):
+                            raise ValueError("Affinity chat returned empty generation")
+
+                after = _decode_affinity_counts(client, metrics_url)
+                delta = {
+                    outcome: count - before.get(outcome, 0)
+                    for outcome, count in after.items()
+                    if count != before.get(outcome, 0)
+                }
+                expected = "bind" if turn == 0 else "sticky_hit"
+                if delta != {expected: 1}:
+                    raise ValueError(
+                        f"Session {session_id}, turn {turn + 1}: "
+                        f"expected one decode {expected}, got {delta}"
+                    )
+                before = after
+    print_success("Both sessions bound once and kept their decode worker")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--router-url", required=True)
@@ -229,6 +292,7 @@ def main() -> int:
     parser.add_argument("--num-streaming-requests", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--skip-streaming", action="store_true")
+    parser.add_argument("--affinity-metrics-url")
     args = parser.parse_args()
 
     print_info(f"Router: {args.router_url}")
@@ -247,6 +311,17 @@ def main() -> int:
             args.max_tokens,
         )
     if chat_ok and stream_ok:
+        if args.affinity_metrics_url:
+            try:
+                check_decode_affinity(
+                    args.router_url,
+                    args.affinity_metrics_url,
+                    args.model,
+                    args.max_tokens,
+                )
+            except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+                print_error(f"gRPC P/D decode affinity failed: {exc}")
+                return 1
         print_success("gRPC P/D chat accuracy passed")
         return 0
     print_error("gRPC P/D chat accuracy failed")

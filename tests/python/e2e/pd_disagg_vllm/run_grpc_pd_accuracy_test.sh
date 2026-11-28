@@ -9,6 +9,7 @@
 #
 #   PREFILL_GPUS=0,1 DECODE_GPUS=2,3 MODEL_NAMES=/path/or/hf-id \
 #     bash tests/python/e2e/pd_disagg_vllm/run_grpc_pd_accuracy_test.sh
+# Set GRPC_PD_POLICY=kv_aware_affinity to also exercise decode session affinity.
 set -euo pipefail
 
 MODEL_NAMES=${MODEL_NAMES:-meta-llama/Llama-3.2-1B-Instruct}
@@ -31,6 +32,10 @@ DECODE_GRPC_PORT=${DECODE_GRPC_PORT:-55421}
 PREFILL_SIDE_PORT=${PREFILL_SIDE_PORT:-58620}
 DECODE_SIDE_PORT=${DECODE_SIDE_PORT:-58640}
 ROUTER_PORT=${ROUTER_PORT:-30420}
+PROMETHEUS_PORT=${PROMETHEUS_PORT:-30421}
+GRPC_PD_POLICY=${GRPC_PD_POLICY:-power_of_two}
+PREFILL_KV_EVENTS_PORT=${PREFILL_KV_EVENTS_PORT:-58720}
+DECODE_KV_EVENTS_PORT=${DECODE_KV_EVENTS_PORT:-58740}
 UCX_TLS=${UCX_TLS:-all}
 NUM_REQUESTS=${NUM_REQUESTS:-20}
 NUM_STREAMING_REQUESTS=${NUM_STREAMING_REQUESTS:-4}
@@ -48,6 +53,26 @@ mkdir -p "$LOG_DIR"
 PREFILL_PID=""
 DECODE_PID=""
 ROUTER_PID=""
+
+POLICY_ARGS=()
+AFFINITY_ARGS=()
+EXTRA_PORTS=()
+case "$GRPC_PD_POLICY" in
+  power_of_two)
+    POLICY_ARGS=(--policy power_of_two)
+    ;;
+  kv_aware_affinity)
+    POLICY_ARGS=(--policy kv_aware --kv-aware-session-affinity-ttl-secs 600)
+    AFFINITY_ARGS=(--affinity-metrics-url "http://127.0.0.1:${PROMETHEUS_PORT}/metrics")
+    for ((rank = 0; rank < INTRA_NODE_DP_SIZE; rank++)); do
+      EXTRA_PORTS+=("$((PREFILL_KV_EVENTS_PORT + rank))" "$((DECODE_KV_EVENTS_PORT + rank))")
+    done
+    ;;
+  *)
+    echo "Unsupported GRPC_PD_POLICY: ${GRPC_PD_POLICY}" >&2
+    exit 1
+    ;;
+esac
 
 cleanup() {
   local pid
@@ -153,7 +178,7 @@ done
 for port in \
   "$PREFILL_HTTP_PORT" "$PREFILL_GRPC_PORT" "$PREFILL_SIDE_PORT" \
   "$DECODE_HTTP_PORT" "$DECODE_GRPC_PORT" "$DECODE_SIDE_PORT" \
-  "$ROUTER_PORT"
+  "$ROUTER_PORT" "$PROMETHEUS_PORT" "${EXTRA_PORTS[@]}"
 do
   if port_busy "$port"; then
     echo "port ${port} is already in use" >&2
@@ -180,10 +205,18 @@ launch_worker() {
   local grpc=$4
   local side=$5
   local role=$6
+  local events_port=$7
   local kv
+  local events_args=()
   kv=$(printf '{"kv_connector":"NixlConnector","kv_role":"%s"}' "$role")
+  if [[ "$GRPC_PD_POLICY" == "kv_aware_affinity" ]]; then
+    local kv_topic
+    kv_topic="$(python3 -c 'from uuid import uuid4; print(uuid4().hex)')"
+    events_args=(--kv-events-config "$(printf '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:%s","topic":"%s","replay_endpoint":"tcp://127.0.0.1:%s","buffer_steps":10000}' "$events_port" "$kv_topic" "$((events_port + 1))")")
+  fi
   echo "launch ${name} gpus=${gpus} dp=${INTRA_NODE_DP_SIZE} http=${http} grpc=${grpc} side=${side} role=${role}"
   CUDA_VISIBLE_DEVICES="$gpus" \
+    VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 \
     VLLM_NIXL_SIDE_CHANNEL_HOST=127.0.0.1 \
     VLLM_NIXL_SIDE_CHANNEL_PORT="$side" \
     UCX_TLS="$UCX_TLS" \
@@ -200,15 +233,17 @@ launch_worker() {
       --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
       --enforce-eager \
       --enable-prefix-caching \
+      --prefix-caching-hash-algo sha256_cbor \
       --disable-hybrid-kv-cache-manager \
       --served-model-name "$SERVED_MODEL" \
       --kv-transfer-config "$kv" \
+      "${events_args[@]}" \
       >"${LOG_DIR}/${name}.log" 2>&1 &
 }
 
-launch_worker prefill "$PREFILL_GPUS" "$PREFILL_HTTP_PORT" "$PREFILL_GRPC_PORT" "$PREFILL_SIDE_PORT" kv_producer
+launch_worker prefill "$PREFILL_GPUS" "$PREFILL_HTTP_PORT" "$PREFILL_GRPC_PORT" "$PREFILL_SIDE_PORT" kv_producer "$PREFILL_KV_EVENTS_PORT"
 PREFILL_PID=$!
-launch_worker decode "$DECODE_GPUS" "$DECODE_HTTP_PORT" "$DECODE_GRPC_PORT" "$DECODE_SIDE_PORT" kv_consumer
+launch_worker decode "$DECODE_GPUS" "$DECODE_HTTP_PORT" "$DECODE_GRPC_PORT" "$DECODE_SIDE_PORT" kv_consumer "$DECODE_KV_EVENTS_PORT"
 DECODE_PID=$!
 echo "prefill pid=${PREFILL_PID} decode pid=${DECODE_PID}"
 
@@ -232,12 +267,13 @@ echo "launch router on ${ROUTER_PORT}"
 "$ROUTER" \
   --host 127.0.0.1 \
   --port "$ROUTER_PORT" \
+  --prometheus-port "$PROMETHEUS_PORT" \
   --vllm-pd-disaggregation \
   --intra-node-data-parallel-size "$INTRA_NODE_DP_SIZE" \
   --prefill "grpc://127.0.0.1:${PREFILL_GRPC_PORT}" \
   --decode "grpc://127.0.0.1:${DECODE_GRPC_PORT}" \
   --kv-connector nixl \
-  --policy power_of_two \
+  "${POLICY_ARGS[@]}" \
   --worker-startup-check-interval 1 \
   >"${LOG_DIR}/router.log" 2>&1 &
 ROUTER_PID=$!
@@ -252,7 +288,8 @@ if ! python3 "${SCRIPT_DIR}/test_grpc_pd_chat.py" \
   --model "$SERVED_MODEL" \
   --num-requests "$NUM_REQUESTS" \
   --num-streaming-requests "$NUM_STREAMING_REQUESTS" \
-  --max-tokens "$MAX_TOKENS"
+  --max-tokens "$MAX_TOKENS" \
+  "${AFFINITY_ARGS[@]}"
 then
   echo "chat accuracy failed" >&2
   tail -n 80 "${LOG_DIR}/router.log" || true
