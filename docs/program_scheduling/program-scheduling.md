@@ -283,7 +283,7 @@ Exactness covers only the input IDs sent to the Engine. Future output length, th
 
 ## Compatibility identity inputs
 
-`auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; DeepSeek Harness (`dsh`) uses `x-deepseek-harness-session-id` (and may also send `x-deepseek-harness-user-id`, which is not part of Program identity); the generic schema uses `x-session-id`. Recognized schemas are not mixed.
+`auto` uses this strict precedence: canonical context, `agent_hint`, then one known Header schema. Claude Code uses `x-claude-code-session-id`, `x-claude-code-agent-id`, and `x-claude-code-parent-agent-id`; Codex/OpenCode uses `session-id` and `thread-id`; DeepSeek Harness (`dsh`) uses `x-deepseek-harness-session-id` (and may also send `x-deepseek-harness-user-id`, which is not part of Program identity); the generic schema uses `x-session-id`. Recognized schemas are not mixed. The DSH session header enables Program scheduling under `auto` and KV-aware affinity; standalone sticky, consistent-hash, and rendezvous-hash policies do not consume it.
 
 For `agent_hint`, `session_id` becomes both Program ID and session ID, `task_id` remains absent, and `blocks_parent` defaults to true. A blocking hint requires `parent_session_id`. Explicit `expected_resume` always overrides the blocking-subagent default.
 
