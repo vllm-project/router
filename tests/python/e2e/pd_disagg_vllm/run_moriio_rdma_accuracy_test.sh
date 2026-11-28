@@ -222,8 +222,6 @@ worker_run docker rm -f "${DECODE_CONTAINER}" >/dev/null 2>&1 || true
 "${ROUTER_BIN}" \
   --port "${ROUTER_PORT}" \
   --policy consistent_hash \
-  --prefill-policy consistent_hash \
-  --decode-policy consistent_hash \
   --vllm-pd-disaggregation \
   --kv-connector moriio \
   --vllm-discovery-address "0.0.0.0:${PROXY_PING_PORT}" \

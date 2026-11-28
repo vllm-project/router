@@ -65,7 +65,11 @@ impl PdProgramRuntime {
         }
         let observer_warm_remote = warm_remote.clone();
         let scheduler = Arc::new(ProgramScheduler::new(
-            ProgramSchedulerConfig::from_program_config(config, true),
+            ProgramSchedulerConfig::from_program_config(
+                config,
+                true,
+                ctx.router_config.policy.program(),
+            ),
         ));
         let observation_scheduler = scheduler.clone();
         let workers = ctx.worker_registry.clone();
@@ -291,13 +295,17 @@ impl PdProgramRuntime {
         // its first real turn obtain a capacity-checked placement ticket.
         identity.session_admission = scorer.is_some();
         self.scheduler.sync_targets(identity.model_pool(), targets);
+        let routing_text = self
+            .scheduler
+            .uses_cache_aware_binding()
+            .then(|| crate::protocols::spec::cache_routing::for_route(request, path));
         let dispatch = self
             .scheduler
             .acquire_with_scorer(
                 identity,
                 crate::program_scheduling::ContextTokens::estimated(tokens),
                 targets,
-                None,
+                routing_text,
                 scorer,
             )
             .await?;

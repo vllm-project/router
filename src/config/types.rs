@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::program_scheduling::{
-    CapacityRepairPolicy, DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy,
-    ProgramResumeOrder, ProgramSchedulingEnableKey, TokenCountMode,
+    CapacityRepairPolicy, DecodeThroughputModel, PrefillCostModel, ProgramResumeOrder,
+    ProgramSchedulingEnableKey, TokenCountMode,
 };
 
 /// Main router configuration
@@ -31,7 +31,7 @@ pub struct RouterConfig {
     #[serde(default)]
     pub connection_mode: ConnectionMode,
     /// Policy configuration
-    pub policy: PolicyConfig,
+    pub policy: super::RoutingPolicy,
     /// Server host address
     pub host: String,
     /// Server port
@@ -416,8 +416,6 @@ pub struct ProgramSchedulingConfig {
     pub resume_order: ProgramResumeOrder,
     #[serde(default = "default_program_cross_rank_headroom_ratio")]
     pub cross_rank_headroom_ratio: f64,
-    #[serde(default)]
-    pub binding_strategy: ProgramBindingStrategy,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub binding_kv_sources: HashMap<String, StaticKvEventSources>,
     #[serde(default = "default_program_hash_virtual_nodes")]
@@ -642,7 +640,6 @@ impl Default for ProgramSchedulingConfig {
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: default_program_cross_rank_headroom_ratio(),
-            binding_strategy: ProgramBindingStrategy::default(),
             binding_kv_sources: HashMap::new(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
@@ -698,8 +695,12 @@ struct ProgramSchedulingConfigInput {
     resume_order: ProgramResumeOrder,
     #[serde(default = "default_program_cross_rank_headroom_ratio")]
     cross_rank_headroom_ratio: f64,
-    #[serde(default)]
-    binding_strategy: ProgramBindingStrategy,
+    #[serde(
+        default,
+        rename = "binding_strategy",
+        deserialize_with = "removed_binding_strategy"
+    )]
+    _removed_strategy: (),
     #[serde(default)]
     binding_kv_sources: HashMap<String, StaticKvEventSources>,
     #[serde(default = "default_program_hash_virtual_nodes")]
@@ -769,6 +770,12 @@ struct DecodeThroughputModelInput {
     fixed_step_seconds: Option<f64>,
     batch_step_seconds_per_request: Option<f64>,
     context_step_seconds_per_token: Option<f64>,
+}
+
+fn removed_binding_strategy<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "binding_strategy was removed; set policy.program or use a shared policy",
+    ))
 }
 
 impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
@@ -843,7 +850,6 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             global_queue: input.global_queue,
             resume_order: input.resume_order,
             cross_rank_headroom_ratio: input.cross_rank_headroom_ratio,
-            binding_strategy: input.binding_strategy,
             binding_kv_sources: input.binding_kv_sources,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
@@ -1052,7 +1058,7 @@ pub enum ConnectionMode {
 
 /// Routing mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum RoutingMode {
     #[serde(rename = "regular")]
     Regular {
@@ -1070,12 +1076,6 @@ pub enum RoutingMode {
         prefill_urls: Vec<(String, Option<u16>)>,
         /// Decode worker URLs
         decode_urls: Vec<String>,
-        /// Optional separate policy for prefill workers
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prefill_policy: Option<PolicyConfig>,
-        /// Optional separate policy for decode workers (defaults to the main policy)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        decode_policy: Option<PolicyConfig>,
         /// ZMQ service discovery address (e.g., "0.0.0.0:30001")
         #[serde(skip_serializing_if = "Option::is_none")]
         discovery_address: Option<String>,
@@ -1101,28 +1101,6 @@ impl RoutingMode {
             } => prefill_urls.len() + decode_urls.len(),
             // OpenAI mode represents a single upstream
             RoutingMode::OpenAI { .. } => 1,
-        }
-    }
-
-    /// Get the effective prefill policy for PD mode
-    /// Falls back to the main policy if no specific prefill policy is set
-    pub fn get_prefill_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
-        match self {
-            RoutingMode::VllmPrefillDecode { prefill_policy, .. } => {
-                crate::policies::effective_stage_policy(main_policy, prefill_policy.as_ref())
-            }
-            _ => main_policy,
-        }
-    }
-
-    /// Get the effective decode policy for PD mode
-    /// Falls back to the main policy if no specific decode policy is set.
-    pub fn get_decode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
-        match self {
-            RoutingMode::VllmPrefillDecode { decode_policy, .. } => {
-                crate::policies::effective_stage_policy(main_policy, decode_policy.as_ref())
-            }
-            _ => main_policy,
         }
     }
 }
@@ -1411,7 +1389,7 @@ impl Default for RouterConfig {
             pd_kv_event_sources: HashMap::new(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "127.0.0.1".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
@@ -1453,9 +1431,7 @@ impl RouterConfig {
     /// In PD mode the Program's first Decode binding can consume KV events
     /// even when native requests use a different Decode policy.
     pub(crate) fn uses_program_kv_binding(&self) -> bool {
-        self.program_scheduling
-            .as_ref()
-            .is_some_and(|program| program.binding_strategy.uses_kv_index())
+        self.program_scheduling.is_some() && self.policy.program().uses_kv_index()
     }
 
     /// Program dispatch may score local P/D indexes. The cross-turn remote-read
@@ -1464,18 +1440,15 @@ impl RouterConfig {
         self.program_scheduling.as_ref().is_none_or(|program| {
             self.kv_connector == KvConnector::Nixl
                 && !program.pd.warm_remote_enabled()
-                && !matches!(
-                    self.mode.get_decode_policy(&self.policy),
-                    PolicyConfig::KvAware { .. }
-                )
+                && !matches!(self.policy.native_decode(), PolicyConfig::KvAware { .. })
         })
     }
 
     /// Create a new configuration with mode and policy
-    pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
+    pub fn new(mode: RoutingMode, policy: impl Into<super::RoutingPolicy>) -> Self {
         Self {
             mode,
-            policy,
+            policy: policy.into(),
             ..Default::default()
         }
     }
@@ -1613,7 +1586,7 @@ mod tests {
         assert!(
             matches!(config.mode, RoutingMode::Regular { worker_urls } if worker_urls.is_empty())
         );
-        assert!(matches!(config.policy, PolicyConfig::Random));
+        assert!(matches!(config.policy.default, PolicyConfig::Random));
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
@@ -1656,7 +1629,7 @@ mod tests {
             _ => panic!("Expected Regular mode"),
         }
 
-        assert!(matches!(config.policy, PolicyConfig::RoundRobin));
+        assert!(matches!(config.policy.default, PolicyConfig::RoundRobin));
         // Other fields should be default
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3001);
@@ -1689,8 +1662,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::KvAware {
@@ -1747,7 +1718,7 @@ mod tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "0.0.0.0".to_string(),
             port: 8080,
             log_dir: Some("/var/log".to_string()),
@@ -1880,7 +1851,11 @@ mod tests {
                 .batch_step_seconds_per_request,
             0.6
         );
-        let scheduler = crate::program_scheduling::ProgramSchedulerConfig::from(&config);
+        let scheduler = crate::program_scheduling::ProgramSchedulerConfig::from_program_config(
+            &config,
+            false,
+            Default::default(),
+        );
         assert_eq!(scheduler.progress_ttl.prefill, config.prefill_cost_model);
         assert_eq!(
             scheduler.progress_ttl.decode,
@@ -1942,8 +1917,6 @@ mod tests {
         let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
         assert!(pd.is_pd_mode());
@@ -1970,8 +1943,6 @@ mod tests {
                 "http://decode2".to_string(),
                 "http://decode3".to_string(),
             ],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
         assert_eq!(pd.worker_count(), 5);
@@ -1996,8 +1967,6 @@ mod tests {
         let pd = RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
         let json = serde_json::to_string(&pd).unwrap();
@@ -2195,8 +2164,6 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             ..Default::default()
@@ -2321,8 +2288,6 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
@@ -2330,7 +2295,8 @@ mod tests {
             kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
-            },
+            }
+            .into(),
             host: "0.0.0.0".to_string(),
             port: 3000,
             max_payload_size: 1048576,
@@ -2375,7 +2341,7 @@ mod tests {
 
         assert!(config.mode.is_pd_mode());
         assert_eq!(config.mode.worker_count(), 4);
-        assert_eq!(config.policy.name(), "power_of_two");
+        assert_eq!(config.policy.default.name(), "power_of_two");
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
     }
@@ -2402,7 +2368,8 @@ mod tests {
                 balance_rel_threshold: 1.2,
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
-            },
+            }
+            .into(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536870912,
@@ -2447,7 +2414,7 @@ mod tests {
 
         assert!(!config.mode.is_pd_mode());
         assert_eq!(config.mode.worker_count(), 3);
-        assert_eq!(config.policy.name(), "cache_aware");
+        assert_eq!(config.policy.default.name(), "cache_aware");
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
     }
@@ -2465,7 +2432,7 @@ mod tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::RoundRobin,
+            policy: PolicyConfig::RoundRobin.into(),
             host: "::1".to_string(), // IPv6
             port: 8888,
             max_payload_size: 1024 * 1024 * 512, // 512MB
@@ -2527,160 +2494,5 @@ mod tests {
             deserialized.discovery.unwrap().namespace,
             Some("production".to_string())
         );
-    }
-
-    // ============= Policy Fallback Tests =============
-
-    #[test]
-    fn test_pd_policy_fallback_both_specified() {
-        // When both prefill and decode policies are specified, they should be used
-        let pd = RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![("http://prefill1".to_string(), None)],
-            decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            }),
-            decode_policy: Some(PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
-            }),
-            discovery_address: None,
-        };
-
-        let main_policy = PolicyConfig::Random;
-
-        // Both specific policies should be used
-        match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::CacheAware { .. } => {} // Success
-            _ => panic!("Expected CacheAware for prefill"),
-        }
-
-        match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::PowerOfTwo { .. } => {} // Success
-            _ => panic!("Expected PowerOfTwo for decode"),
-        }
-    }
-
-    #[test]
-    fn test_pd_policy_fallback_only_prefill() {
-        // When only prefill is overridden, decode inherits the main policy.
-        let pd = RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![("http://prefill1".to_string(), None)],
-            decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-            }),
-            decode_policy: None,
-            discovery_address: None,
-        };
-
-        let main_policy = PolicyConfig::Random;
-
-        // Prefill should use specific policy
-        match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::CacheAware { .. } => {} // Success
-            _ => panic!("Expected CacheAware for prefill"),
-        }
-
-        // Decode inherits the main policy when no decode override is set.
-        match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::Random => {}
-            _ => panic!("Expected decode to inherit the main policy"),
-        }
-    }
-
-    #[test]
-    fn test_pd_policy_fallback_only_decode() {
-        // When only decode policy is specified, prefill should use main policy
-        let pd = RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![("http://prefill1".to_string(), None)],
-            decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: None,
-            decode_policy: Some(PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
-            }),
-            discovery_address: None,
-        };
-
-        let main_policy = PolicyConfig::Random;
-
-        // Prefill should fall back to main policy
-        match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::Random => {} // Success
-            _ => panic!("Expected Random for prefill"),
-        }
-
-        // Decode should use specific policy
-        match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::PowerOfTwo { .. } => {} // Success
-            _ => panic!("Expected PowerOfTwo for decode"),
-        }
-    }
-
-    #[test]
-    fn test_pd_policy_fallback_none_specified() {
-        // When no specific policies are specified, both should use main policy
-        let pd = RoutingMode::VllmPrefillDecode {
-            prefill_urls: vec![("http://prefill1".to_string(), None)],
-            decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: None,
-            decode_policy: None,
-            discovery_address: None,
-        };
-
-        let main_policy = PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 2000,
-        };
-
-        // Both stages inherit the main policy.
-        match pd.get_prefill_policy(&main_policy) {
-            PolicyConfig::CacheAware {
-                cache_threshold, ..
-            } => {
-                assert!((cache_threshold - 0.7).abs() < 0.0001);
-            }
-            _ => panic!("Expected CacheAware for prefill"),
-        }
-
-        match pd.get_decode_policy(&main_policy) {
-            PolicyConfig::CacheAware {
-                cache_threshold, ..
-            } => {
-                assert!((cache_threshold - 0.7).abs() < 0.0001);
-            }
-            _ => panic!("Expected CacheAware for decode"),
-        }
-    }
-
-    #[test]
-    fn test_regular_mode_policy_fallback() {
-        // For regular mode, the helper methods should just return the main policy
-        let regular = RoutingMode::Regular {
-            worker_urls: vec!["http://worker1".to_string()],
-        };
-
-        let main_policy = PolicyConfig::RoundRobin;
-
-        // Both methods should return main policy for regular mode
-        match regular.get_prefill_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
-            _ => panic!("Expected RoundRobin for regular mode"),
-        }
-
-        match regular.get_decode_policy(&main_policy) {
-            PolicyConfig::RoundRobin => {} // Success
-            _ => panic!("Expected RoundRobin for regular mode"),
-        }
     }
 }

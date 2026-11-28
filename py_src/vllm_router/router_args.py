@@ -1,9 +1,24 @@
 import argparse
 import dataclasses
+import json
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_policy(value: str):
+    try:
+        from vllm_router_rs import _validate_policy
+    except ImportError:
+        # The standalone Python MiniLB can start without the Rust extension.
+        _validate_policy = None
+    try:
+        if _validate_policy is not None:
+            _validate_policy(value)
+        return json.loads(value) if value.lstrip().startswith("{") else value
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 @dataclasses.dataclass
@@ -23,9 +38,7 @@ class RouterArgs:
     pd_kv_events: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
-    policy: str = "cache_aware"
-    prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
-    decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    policy: Union[str, Dict[str, Any]] = "cache_aware"
     router_temperature: float = 0.0
     kv_penalty_host: float = 0.8
     kv_penalty_external: float = 0.6
@@ -167,48 +180,10 @@ class RouterArgs:
         # Routing policy configuration
         parser.add_argument(
             f"--{prefix}policy",
-            type=str,
+            type=_parse_policy,
             default=RouterArgs.policy,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "kv_aware",
-                "power_of_two",
-                "consistent_hash",
-                "sticky_least_loaded",
-            ],
-            help="Load balancing policy to use. In PD mode, prefill and decode inherit this policy unless overridden",
-        )
-        parser.add_argument(
-            f"--{prefix}prefill-policy",
-            type=str,
-            default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "kv_aware",
-                "power_of_two",
-                "consistent_hash",
-                "sticky_least_loaded",
-            ],
-            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
-        )
-        parser.add_argument(
-            f"--{prefix}decode-policy",
-            type=str,
-            default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "kv_aware",
-                "power_of_two",
-                "consistent_hash",
-                "sticky_least_loaded",
-            ],
-            help="Specific policy for decode nodes in PD mode. Defaults to --policy",
+            metavar="NAME_OR_JSON",
+            help="Shared algorithm or JSON with default, program, prefill and native_decode",
         )
 
         parser.add_argument(
@@ -677,6 +652,11 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        from vllm_router_rs import _validate_policy
+
+        _validate_policy(
+            self.policy if isinstance(self.policy, str) else json.dumps(self.policy)
+        )
         if self.kv_aware_session_affinity_ttl_secs is not None and not (
             1 <= self.kv_aware_session_affinity_ttl_secs <= 31_536_000
         ):
@@ -695,23 +675,6 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
-
-            # Warn about policy usage in PD mode
-            if self.prefill_policy and self.decode_policy and self.policy:
-                logger.warning(
-                    "Both --prefill-policy and --decode-policy are specified. "
-                    "The main --policy flag will be ignored for PD mode."
-                )
-            elif self.prefill_policy and not self.decode_policy and self.policy:
-                logger.info(
-                    f"Using --prefill-policy '{self.prefill_policy}' for prefill nodes "
-                    f"and --policy '{self.policy}' for decode nodes."
-                )
-            elif self.decode_policy and not self.prefill_policy and self.policy:
-                logger.info(
-                    f"Using --policy '{self.policy}' for prefill nodes "
-                    f"and --decode-policy '{self.decode_policy}' for decode nodes."
-                )
 
     @staticmethod
     def _parse_selector(selector_list):

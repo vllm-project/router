@@ -129,7 +129,7 @@ export VLLM_NIXL_SIDE_CHANNEL_PORT=5601
 KV_ARGS=()
 ```
 
-In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` if a scored worker needs a manual layout. Otherwise use `LAYOUT_ARGS=()`. With HTTP Program scheduling, a NIXL pool can use a hybrid layout for local Prefill scoring and for the first Decode binding. Set `--prefill-policy kv_aware` to score P each turn and `"binding_strategy": "kv_aware"` in the Program configuration to score D at first binding. With hybrid caches, use a native Decode policy such as `--decode-policy round_robin` and leave the Program remote-read, local-append and automatic-TTL switches off. Supply a verified layout and KV event source for each rank you want to score.
+In the Router terminal, set `LAYOUT_ARGS=(--kv-hybrid-layout layout.json)` if a scored worker needs a manual layout. Otherwise use `LAYOUT_ARGS=()`. With HTTP Program scheduling, a NIXL pool can use a hybrid layout for local Prefill scoring and for the first Decode binding. Set `--policy '{"default":"kv_aware","native_decode":"round_robin"}'` for local P scoring, Program D binding and native Decode round robin, and leave the Program remote-read, local-append and automatic-TTL switches off. Supply a verified layout and KV event source for each rank you want to score.
 
 #### HTTP P/D
 
@@ -143,7 +143,7 @@ vllm serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" \
 ```bash
 vllm-router --vllm-pd-disaggregation \
   --prefill http://127.0.0.1:8000 --decode http://127.0.0.1:8001 \
-  --prefill-policy kv_aware \
+  --policy '{"default":"cache_aware","prefill":"kv_aware"}' \
   "${LAYOUT_ARGS[@]}"
 ```
 
@@ -159,11 +159,11 @@ vllm-rs serve "$MODEL" --host 127.0.0.1 --port "$HTTP_PORT" --grpc-port "$GRPC_P
 ```bash
 vllm-router --vllm-pd-disaggregation \
   --prefill grpc://127.0.0.1:50051 --decode grpc://127.0.0.1:50052 \
-  --prefill-policy kv_aware \
+  --policy '{"default":"cache_aware","prefill":"kv_aware"}' \
   "${LAYOUT_ARGS[@]}"
 ```
 
-For KV-aware Decode, add `--decode-policy kv_aware` and run the event setup on Decode with separate ports. Include its layout if needed. HTTP Decode scoring requires explicit prompt token IDs.
+For KV-aware Decode, set `policy.native_decode` to `kv_aware` and run the event setup on Decode with separate ports. Include its layout if needed. HTTP Decode scoring requires explicit prompt token IDs.
 
 #### P/D worker pairs
 
@@ -587,8 +587,8 @@ Both the Rust and Python launchers accept these options. Configure vLLM workers 
 | `--vllm-pd-disaggregation` | Flag | Off | Enable P/D routing. |
 | `--prefill` | `URL [PORT or none]`, repeatable | No workers | Register a Prefill worker with an optional bootstrap port. |
 | `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
-| `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
-| `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
+| `policy.prefill` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
+| `policy.native_decode` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
 | `--kv-connector` | `nixl`, `mooncake`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. |
 | `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
 | `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |

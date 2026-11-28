@@ -73,7 +73,8 @@ async fn grpc_prefix_selection_uses_the_ids_actually_dispatched() {
                     },
                 )])
                 .into(),
-            },
+            }
+            .into(),
             disable_circuit_breaker: true,
             ..Default::default()
         };
@@ -180,7 +181,8 @@ async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-        },
+        }
+        .into(),
         disable_circuit_breaker: true,
         ..Default::default()
     };
@@ -240,7 +242,8 @@ async fn grpc_completion_text_prompt_bos_default_end_to_end() {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-        },
+        }
+        .into(),
         disable_circuit_breaker: true,
         ..Default::default()
     };
@@ -328,7 +331,8 @@ async fn grpc_discovers_native_full_attention_without_layout_json() {
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
             static_kv_event_sources: Default::default(),
-        },
+        }
+        .into(),
         disable_circuit_breaker: true,
         ..Default::default()
     });

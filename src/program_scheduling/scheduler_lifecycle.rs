@@ -1290,7 +1290,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::from(&config));
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::from_program_config(
+            &config,
+            false,
+            Default::default(),
+        ));
         let targets = [ProgramTarget {
             id: "rank-0".into(),
             base_url: "http://rank-0".into(),

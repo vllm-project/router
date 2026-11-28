@@ -238,9 +238,12 @@ fn warm_router_config(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: prefill_urls.clone(),
             decode_urls: vec![d.url.clone()],
-            prefill_policy: Some(policy.clone()),
-            decode_policy: Some(PolicyConfig::RoundRobin),
             discovery_address: None,
+        },
+        policy: vllm_router_rs::config::RoutingPolicy {
+            prefill: Some(policy.clone()),
+            native_decode: Some(PolicyConfig::RoundRobin),
+            ..vllm_router_rs::config::RoutingPolicy::from(PolicyConfig::Random)
         },
         ..Default::default()
     };

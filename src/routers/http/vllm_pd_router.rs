@@ -4028,7 +4028,7 @@ mod tests {
 
     async fn test_vllm_pd_router() -> VllmPDRouter {
         let config = crate::config::RouterConfig {
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             ..Default::default()
         };
         let ctx = Arc::new(
@@ -4409,7 +4409,7 @@ mod tests {
         ];
         let config = crate::config::RouterConfig {
             kv_connector: KvConnector::Mooncake,
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 2,
@@ -4500,7 +4500,7 @@ mod tests {
         let prefill_url = format!("{}/prefill", bootstraps[0]);
         let config = crate::config::RouterConfig {
             kv_connector: KvConnector::Mooncake,
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 2,
@@ -4948,7 +4948,7 @@ mod tests {
             let context = Arc::new(
                 crate::server::AppContext::new(
                     RouterConfig {
-                        policy: PolicyConfig::Random,
+                        policy: PolicyConfig::Random.into(),
                         kv_connector: KvConnector::Nixl,
                         disable_retries: true,
                         disable_circuit_breaker: true,
@@ -5799,7 +5799,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             kv_aware_session_affinity_ttl_secs: Some(1800),
             ..Default::default()
         };
@@ -6183,8 +6184,6 @@ mod tests {
                 mode: RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![(p.clone(), None)],
                     decode_urls: vec![d.clone()],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
                 policy: PolicyConfig::KvAware {
@@ -6193,7 +6192,8 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                },
+                }
+                .into(),
                 worker_startup_timeout_secs: 5,
                 ..RouterConfig::default()
             };
@@ -6521,8 +6521,6 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), None)],
                 decode_urls: vec![d0.clone(), d1.clone()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             policy: PolicyConfig::KvAware {
@@ -6531,7 +6529,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             worker_startup_timeout_secs: 5,
             ..RouterConfig::default()
         };
@@ -6648,17 +6647,20 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d.clone()],
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::KvAware {
+                discovery_address: None,
+            },
+            policy: crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::RoundRobin),
+                native_decode: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
             },
-            policy: PolicyConfig::RoundRobin,
+
             pd_kv_event_sources: HashMap::from([(
                 d.clone(),
                 crate::config::types::PdKvEventSources {
@@ -6773,17 +6775,20 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d.clone()],
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::KvAware {
+                discovery_address: None,
+            },
+            policy: crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::RoundRobin),
+                native_decode: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
             },
-            policy: PolicyConfig::RoundRobin,
+
             pd_kv_event_sources: HashMap::from([(
                 d.clone(),
                 crate::config::types::PdKvEventSources {
@@ -7035,12 +7040,11 @@ mod tests {
                 balance_rel_threshold: 1.5,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
-            },
+            }
+            .into(),
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.clone(), Some(bootstrap_port))],
                 decode_urls: vec![d0.clone()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             epd: Some(EpdConfig {
@@ -7256,7 +7260,7 @@ mod tests {
     #[tokio::test]
     async fn discovered_zmq_addresses_preserve_pinned_and_expanded_ranks() {
         let config = crate::config::RouterConfig {
-            policy: crate::config::PolicyConfig::RoundRobin,
+            policy: crate::config::PolicyConfig::RoundRobin.into(),
             ..Default::default()
         };
         let ctx = Arc::new(

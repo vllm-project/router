@@ -52,8 +52,8 @@ pub struct ProgramSchedulerConfig {
     pub resume_order: ProgramResumeOrder,
     /// Required destination-over-source headroom in complete Program contexts.
     pub cross_rank_headroom_ratio: f64,
-    /// Initial Program generation binding policy.
-    pub binding_strategy: ProgramBindingStrategy,
+    /// Initial placement algorithm resolved from the router policy.
+    pub placement_policy: ProgramBindingStrategy,
     /// Consistent-hash virtual nodes used only by Program binding.
     pub hash_virtual_nodes: u32,
     /// Coarse Program-count guard when explicit token capacity is unavailable.
@@ -103,7 +103,7 @@ impl Default for ProgramSchedulerConfig {
             global_queue: false,
             resume_order: ProgramResumeOrder::default(),
             cross_rank_headroom_ratio: 1.2,
-            binding_strategy: ProgramBindingStrategy::ConsistentHash,
+            placement_policy: ProgramBindingStrategy::ConsistentHash,
             hash_virtual_nodes: 160,
             max_active_programs_per_target: 64,
             token_count_mode: TokenCountMode::default(),
@@ -136,18 +136,13 @@ pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> u
     (2 * prefill_permits.max(1)).clamp(4, 64)
 }
 
-impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
-    fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
-        Self::from_program_config(config, false)
-    }
-}
-
 impl ProgramSchedulerConfig {
     /// Build the scheduler config for one routing mode. PD mode comes from the
     /// active `--vllm-pd-disaggregation` route, not from a second config flag.
     pub fn from_program_config(
         config: &crate::config::types::ProgramSchedulingConfig,
         pd_mode: bool,
+        placement_policy: ProgramBindingStrategy,
     ) -> Self {
         // Auto sizing is a PD-mode concept. A regular-mode config that omitted
         // the fields deserializes the zero defaults; keep the historical
@@ -181,7 +176,7 @@ impl ProgramSchedulerConfig {
             global_queue: config.global_queue,
             resume_order: config.resume_order,
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
-            binding_strategy: config.binding_strategy,
+            placement_policy,
             hash_virtual_nodes: config.hash_virtual_nodes,
             max_active_programs_per_target,
             token_count_mode: config.token_count_mode,
@@ -611,7 +606,11 @@ mod tests {
 
         let parsed: crate::config::types::ProgramSchedulingConfig =
             serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
-        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
+        let runtime = ProgramSchedulerConfig::from_program_config(
+            &parsed,
+            true,
+            ProgramBindingStrategy::default(),
+        );
         assert_eq!(runtime.max_active_programs_per_target, 8);
         assert_eq!(runtime.admission_waiting_request_threshold, 8);
         assert!(runtime.pd_exclusive_capacity_accounting);
@@ -622,7 +621,8 @@ mod tests {
         // historical admission pool and overload gate.
         let regular: crate::config::types::ProgramSchedulingConfig =
             serde_json::from_str("{}").unwrap();
-        let runtime = ProgramSchedulerConfig::from(&regular);
+        let runtime =
+            ProgramSchedulerConfig::from_program_config(&regular, false, Default::default());
         assert!(!runtime.pd_mode);
         assert_eq!(runtime.max_active_programs_per_target, 64);
         assert_eq!(runtime.admission_waiting_request_threshold, 1);

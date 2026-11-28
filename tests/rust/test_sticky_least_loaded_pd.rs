@@ -39,11 +39,10 @@ mod sticky_least_loaded_pd_tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
-                prefill_policy: Some(PolicyConfig::StickyLeastLoaded),
-                decode_policy: Some(PolicyConfig::StickyLeastLoaded),
                 discovery_address: None,
             },
-            policy: PolicyConfig::StickyLeastLoaded,
+            policy: PolicyConfig::StickyLeastLoaded.into(),
+
             port: 0,
             request_timeout_secs: 10,
             worker_startup_timeout_secs: 5,

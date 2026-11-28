@@ -265,20 +265,11 @@ impl PolicyRegistry {
         )
     }
 
-    pub(crate) fn configure_pd(
-        &self,
-        main: &PolicyConfig,
-        prefill: Option<&PolicyConfig>,
-        decode: Option<&PolicyConfig>,
-    ) {
-        let build = |stage| {
-            PolicyFactory::create_from_config(
-                super::effective_stage_policy(main, stage),
-                Some(&self.kv_affinity_table),
-            )
-        };
-        self.set_prefill_policy(build(prefill));
-        self.set_decode_policy(build(decode));
+    pub(crate) fn configure_pd(&self, policy: &crate::config::RoutingPolicy) {
+        let build =
+            |config| PolicyFactory::create_from_config(config, Some(&self.kv_affinity_table));
+        self.set_prefill_policy(build(policy.prefill()));
+        self.set_decode_policy(build(policy.native_decode()));
     }
 
     /// Set the prefill policy for PD mode

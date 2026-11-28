@@ -1173,7 +1173,7 @@ mod tests {
     #[test]
     fn cache_aware_cold_burst_accounts_bound_unadmitted_programs() {
         let config = ProgramSchedulerConfig {
-            binding_strategy: ProgramBindingStrategy::CacheAware,
+            placement_policy: ProgramBindingStrategy::CacheAware,
             progress_ttl: ProgressTtlConfig {
                 token_capacity: Some(1_000),
                 ..ProgressTtlConfig::default()

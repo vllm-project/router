@@ -119,7 +119,6 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 | `token_capacity_per_dp_rank` | required in PD | KV tokens of one D rank; capacity and low-watermark checks use it |
 | `max_active_programs_per_target` | `0` (auto) | auto = `2 × pd.max_prefill_requests_per_target`, clamped to `[4, 64]`; set explicitly to reproduce a run |
 | `admission_waiting_request_threshold` | `0` (auto) | auto = `2 × pd.max_prefill_requests_per_target`, clamped to `[4, 64]`; `1` makes the active-Program bound ineffective |
-| `binding_strategy` | `consistent_hash` | `consistent_hash`, `program_round_robin`, `least_program_count`, `reasoning_token_balance`, `cache_aware` |
 | `global_queue` | `false` | one Router-wide Program queue instead of per-rank queues |
 | `resume_order` | `mru` | `mru` or `fcfs` |
 | `queue_timeout_seconds` | `600` | per-turn Router queue bound; exceeding it returns HTTP 429 |
@@ -147,13 +146,13 @@ Upstream failures are forwarded unchanged: if a prefill or decode target rejects
 
 ### First-turn Decode selection
 
-Set `"binding_strategy": "kv_aware"` in the Program scheduling configuration to score the first Decode placement of each Program. Configure KV events for the D ranks (worker discovery or `--pd-kv-events`). The native `--decode-policy` and the per-turn `--prefill-policy` can be configured independently.
+Set `--policy '{"default":"round_robin","program":"kv_aware"}'` to score the first Decode placement of each Program. Configure KV events for the D ranks (worker discovery or `--pd-kv-events`). The native `policy.native_decode` and the per-turn `policy.prefill` can be configured independently.
 
 The scheduler first filters D ranks against the turn's capacity and queue limits. Among these ranks the Router minimizes existing Program token reservations plus the prompt tokens that would have to be added on that D. It uses the D rank's own device cache and the engine's token IDs, including worker-rendered chat inputs. If the full set cannot be priced, the Router compares load across eligible ranks. Admission rechecks the recommendation before binding. An ordinary continuation keeps its D. A new session with the same prefix can choose the same D while it has room. The counter `vllm_router_prefix_routing_decisions_total` reports `stage="program_decode"` and an outcome of `prefix_cost`, `load_fallback`, or `single_candidate`. A single eligible D skips token rendering and scoring.
 
 ### Per-turn prefill selection
 
-With `--prefill-policy kv_aware`, each admitted Program turn selects a P after the scheduler commits its D. The Router uses backend-effective prompt tokens, the P rank’s confirmed device prefix and its outstanding prefill token work. An unpriced candidate or an unknown-size backlog switches the comparison to request counts for the whole eligible pool. Configure a KV event source for each P that should receive local prefix credit. An inherited KV-aware policy follows the same path.
+With `policy.prefill` set to `kv_aware`, each admitted Program turn selects a P after the scheduler commits its D. The Router uses backend-effective prompt tokens, the P rank’s confirmed device prefix and its outstanding prefill token work. An unpriced candidate or an unknown-size backlog switches the comparison to request counts for the whole eligible pool. Configure a KV event source for each P that should receive local prefix credit. An inherited KV-aware policy follows the same path.
 
 For exact-token completions on bidirectional NIXL, a reader with compatible capabilities can also receive credit for the portion of a retained D prefix that extends past its local prefix. The Router checks the source again after acquiring the P permit. A cold retry keeps the selected worker and adjusts the same in-flight token charge.
 

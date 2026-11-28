@@ -2,7 +2,7 @@
 
 **提议的决策**：在 PD 模型池中，把 #634 的会话绑定目标具体化为 **decode 实例的 DP rank（D rank）**。准入模块按本轮需求筛选 D，绑定策略从合格集合选 D，准入模块复核并签发固定 D 的派发凭证。Router 拿到凭证后，再为本轮选择可与 D 协作的 prefill worker（P）、取得 P 并发许可，交给现有 PD 发送端。会话可以在两轮间保留 D 亲和，每轮可以使用不同的 P。
 
-本提案也将 Program 请求接入 P 侧 `--prefill-policy kv_aware`。每一轮都可以根据各 P 已接下的工作和可复用前缀选 P。普通 chat 使用 P 本地 KV 证据；支持跨轮热读的续轮，还会估算从历史 D 多读一段前缀能额外省下多少计算。配置和接口见第 5.1 节。
+本提案也将 Program 请求接入 P 侧 `policy.prefill = kv_aware`。每一轮都可以根据各 P 已接下的工作和可复用前缀选 P。普通 chat 使用 P 本地 KV 证据；支持跨轮热读的续轮，还会估算从历史 D 多读一段前缀能额外省下多少计算。配置和接口见第 5.1 节。
 
 例如，首轮到达时，D0 有历史前缀但容量已满，D1 有余量。策略只看见 D1，首轮通过 P0→D1 完成。第二轮到达时，若 D1 仍是有效绑定，调度器只在 D1 检查新增需求；即使这轮改由 P1 预填充，也继续发往 D1。若 D1 下线，才用队首的真实需求重新筛选 D。这样可以单独检验两件事：首绑能否避开满载 D，以及跨轮亲和能否改善整个 Program 的完成时间。
 
@@ -101,7 +101,7 @@ sequenceDiagram
 
 Qwen3.8-27B 的每个 P rank 同时保存注意力 KV 和线性注意力状态。一次续轮只计入两类缓存共同支持的前缀。Router 用引擎事件中的组编号、块哈希和 rank 建索引，再将预计重算的 token 和已排队的工作量一起用于选 P。比如两个 P 都保留了旧代码的注意力 KV，只有 P1 在对应位置保留了可用的线性注意力状态，就只有 P1 可以获得这一段的完整复用分。实验使用 HTTP NIXL，D 的 Program 绑定策略固定为 `consistent_hash`，普通请求的 D 策略设为 `round_robin`。两组都关闭跨轮热读、LocalAppend 和自动 TTL。
 
-**配置。** 在已有 Program PD 配置上设置 `--prefill-policy kv_aware` 即选用该策略；未显式设置 P 策略时，沿用既有的 `--policy` 继承规则。D 首绑和失效重绑仍由 Program 的 `binding_strategy` 控制。例如可保留 D 的 `consistent_hash`，只在 P 侧打开 KV 感知。P 本地缓存评分也可用于首轮及关闭 `pd.warm_remote` 的部署。[PD 策略的配置优先级](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/config/types.rs#L1090-L1108)
+**配置方式见第 5.4 节。** P 继承共享策略，也可用 `policy.prefill` 单独指定。若要固定首轮 D 的一致性哈希，只让 P 按缓存选点，可使用 `--policy '{"default":"consistent_hash","prefill":"kv_aware"}'`。P 本地缓存评分适用于首轮及关闭跨轮热读的部署。
 
 **接口改动。** 基线的 `select_program_prefill_index` 走文本、headers 通用接口，返回一个候选下标；该入口调用 `kv_aware` 时没有传入 token ID。基线的 `admit_bound` 又把实际发往 P 的请求一律记为大小未知。拟将下列改动接在领取 D 凭证之后，直接复用原生 PD 的 P 阶段实现。[Program 选 P 入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/routers/http/vllm_pd_router.rs#L1754-L1785) · [通用 KV 入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/policies/kv_aware.rs#L1795-L1803) · [固定目标记账入口](https://github.com/vllm-project/router/blob/0f96d605f13b5957eae5f4bb86783cf90a15d68c/src/routers/http/pd_types.rs#L391-L444)
 
@@ -139,9 +139,9 @@ Acting TTL 表示工具调用期间可以保留 D 的**逻辑席位**。完整 D
 
 ### 5.3 分支实现与配置
 
-分支 `experiment/pd-program-kv-aware` 从 `experiment/router-program-admission` 的 `65f704a` 建立，首先实现了第 5.1、5.2 节的逐轮选 P。现在 HTTP Program 的 D 首绑也支持 `binding_strategy: kv_aware`。第 4 节提出的跨观测容量账本仍是单独的实施项。
+分支 `experiment/pd-program-kv-aware` 从 `experiment/router-program-admission` 的 `65f704a` 建立，首先实现了第 5.1、5.2 节的逐轮选 P。现在 HTTP Program 的 D 首绑也支持 `policy.program = kv_aware`。第 4 节提出的跨观测容量账本仍是单独的实施项。
 
-例如，会话 A 和 B 的输入从同一段代码开头。B 首轮到来时，调度器先列出能容纳本轮的 D。Router 用各个 D rank 自己的事件估算本轮还需新增多少 token，加上该 rank 已经为 Program 记下的 token 数，选择总量较小的一台。在所有合格 D 上无法得到可比较的价格时，按负载选择。调度器提交前复核容量，普通续轮继续使用已绑定的 D。配置 `--prefill-policy kv_aware` 可同时在每轮按缓存选 P。第 8.1 节的 8 卡实验固定了 D，只衡量逐轮选 P 的收益。
+例如，会话 A 和 B 的输入从同一段代码开头。B 首轮到来时，调度器先列出能容纳本轮的 D。Router 用各个 D rank 自己的事件估算本轮还需新增多少 token，加上该 rank 已经为 Program 记下的 token 数，选择总量较小的一台。在所有合格 D 上无法得到可比较的价格时，按负载选择。调度器提交前复核容量，普通续轮继续使用已绑定的 D。配置 `policy.prefill = kv_aware` 可同时在每轮按缓存选 P。第 8.1 节的 8 卡实验固定了 D，只衡量逐轮选 P 的收益。
 
 HTTP 集成测试使用两个模拟 D 和独立的 KV 事件发布端。一组使用全注意力缓存，另一组交换热前缀的位置并使用三组线性状态加一组全注意力 KV。两个新会话可命中同一台 D，已绑会话的下一轮可继续使用它；当它的名额用完时，另一个新会话改选有容量的 D。带缓存盐的请求按负载回退。[回归用例](../../tests/rust/test_pd_program_scheduling.rs)
 
@@ -151,21 +151,35 @@ HTTP 集成测试使用两个模拟 D 和独立的 KV 事件发布端。一组�
 
 ### 5.4 混布和 PD 分离共用的策略层
 
-`src/policies` 负责回答“这几个候选里推荐谁”。配置仍然分两层，`binding_strategy` 管一个 Program 第一次落在哪台机器，`policy` 和 P、D 各自的覆盖项管请求级选点。两层可以各选各的算法。
+部署时只有一个负载均衡入口 `policy`。命令行写 `--policy kv_aware` 即可让支持 KV 评分的混布请求、Program 首绑、P 和原生 PD 的 D 共同使用 KV aware。Program 调度仍需显式开启。需要分工时，把同一个参数写成 JSON。下面是 Qwen3.8-27B 混合缓存、NIXL、本地评分的配置示例。
+
+```sh
+--enable-program-scheduling --policy '{"default":"kv_aware","native_decode":"round_robin"}'
+```
+
+这个例子中，新会话首轮的 D 和每轮的 P 都继承 `default`。无 Program 身份的原生 PD 请求在 D 上轮询。即使使用同一个算法名，P 仍按预填充工作量评分，Program D 只比较调度器提供的合格 rank，续轮继续检查已绑 D 的容量。该混合缓存部署仍须关闭跨轮热读、LocalAppend 和自动 TTL，并为参与 KV 评分的 rank 配好事件源。
 
 | 场景 | 什么时候挑、按哪个配置挑 |
 | --- | --- |
 | 混布普通请求 | 挑一台同时跑 P 和 D 的 worker。优先用模型在注册表中的策略，否则用主 `policy`。结构化和透传请求都经 `select_regular`，沿用 KV、cache aware 和其他策略各自的输入与回退。 |
-| 原生 PD 请求 | P 用 `prefill_policy`，D 用 `decode_policy`。某侧未配置就继承主 `policy`。原有连接器和策略允许延后选 D 时，发送前再按最新负载确定 D。 |
-| 混布 Program 首绑或失效重绑 | `binding_strategy` 为 Program 选择整台 worker。启用 HTTP 会话 KV 评分时，按合格 worker 的 KV 证据和执行负载推荐。有效续轮跟随已有绑定。 |
-| PD Program 首绑或失效重绑 | `binding_strategy` 选择 D rank。HTTP 的 `kv_aware` 路径先取调度器给的合格名单。只有一个候选就直接推荐，有多个则比较每台已记账的 token 加本轮预计新增的 token。只要一台缺少可比估算，整组改用请求数和已记账 Program 数中较大的值比较。其他绑定策略沿用各自的绑定流程。 |
+| 原生 PD 请求 | P 用 `policy.prefill`，D 用 `policy.native_decode`。某侧未配置就继承主 `policy`。原有连接器和策略允许延后选 D 时，发送前再按最新负载确定 D。 |
+| 混布 Program 首绑或失效重绑 | `policy.program` 为 Program 选择整台 worker。启用 HTTP 会话 KV 评分时，按合格 worker 的 KV 证据和执行负载推荐。有效续轮跟随已有绑定。 |
+| PD Program 首绑或失效重绑 | `policy.program` 选择 D rank。HTTP 的 `kv_aware` 路径先取调度器给的合格名单。只有一个候选就直接推荐，有多个则比较每台已记账的 token 加本轮预计新增的 token。只要一台缺少可比估算，整组改用请求数和已记账 Program 数中较大的值比较。其他绑定策略沿用各自的绑定流程。 |
 | PD Program 每一轮 | 取得 D 的派发凭证后，按本轮 P 策略挑与该 D 兼容的 P。KV aware 比较 P 已接的 token 工作量加本轮还需计算的部分，可计入通过检查的热读收益。某台工作量未知时整组按 P 的请求数比较。其他 P 策略继续使用原有请求文本、头和 worker 负载。 |
 
-以两个 D、两个 P 为例。配置 `binding_strategy: kv_aware`、`--prefill-policy round_robin`。新会话首轮，两台 D 都容得下，策略比较后推荐 D1。调度器在锁内复核并给 D1 记账，随后 P 轮询挑到 P0。第二轮只要 D1 绑定有效，调度器检查 D1 能否容纳新增内容；放行后，P 轮询可以挑到 P1。若希望 P 也参考缓存，把 `--prefill-policy` 改为 `kv_aware` 即可。
+以两台 D 和两台 P 为例，`--policy '{"default":"round_robin","program":"kv_aware"}'` 表示首轮 D 按 KV 选、P 按轮询选。首轮两台 D 都容得下时，策略推荐 D1，调度器复核记账后，P 轮询选到 P0。第二轮 D1 的绑定有效，调度器对 D1 检查新增需求，放行后 P 可以轮询到 P1。
+
+三个位置也可以分别指定。例如下面的配置让混布普通请求轮询，Program 首轮 D 按 KV 选，每轮 P 按 KV 选，原生 PD 的 D 用一致性哈希。
+
+```sh
+--policy '{"default":"round_robin","program":"kv_aware","prefill":"kv_aware","native_decode":"consistent_hash"}'
+```
+
+迁移现有部署时，把原主策略写到 `default`，原 `binding_strategy` 移到 `program`，原 `--prefill-policy`、`--decode-policy` 分别移到 `prefill`、`native_decode`。原先省略绑定策略的部署若要保留历史行为，显式写 `"program":"consistent_hash"`。省略覆盖项会继承 `default`。Program 的轮询可写 `round_robin`，已有算法名 `program_round_robin` 在 `program` 里也有效。`least_program_count`、`reasoning_token_balance` 只用于 `program`，后者需要配置每 rank 的 token 容量。KV 事件的支持范围沿用现有数据路径，混布的仅绑定模式和缺少 HTTP 会话评分器的路径沿用原有的一致性哈希行为。
 
 Router 准备各 worker 的输入、KV 事件证据和可用的热读估算。策略层据此打分并处理证据不足时的负载回退。准入、队列、票据复核及容量记账仍由调度器负责，P 许可和实际传输由 PD Router 执行。选 P 时估出的热读收益要在实际读取前重新验证。
 
-实现入口见 [策略注册表](../../src/policies/registry.rs)、[混布请求选择](../../src/policies/selection.rs)、[Program 绑定策略](../../src/policies/binding.rs)、[原生 PD 阶段选择](../../src/policies/pd/mod.rs) 和 [PD Program 的 D、P 选择](../../src/policies/pd/program.rs)。
+实现入口见 [统一配置与继承规则](../../src/policies/config.rs)、[策略注册表](../../src/policies/registry.rs)、[混布请求选择](../../src/policies/selection.rs)、[Program 绑定策略](../../src/policies/binding.rs)、[原生 PD 阶段选择](../../src/policies/pd/mod.rs) 和 [PD Program 的 D、P 选择](../../src/policies/pd/program.rs)。
 
 ## 6. 失败和重试契约
 

@@ -131,8 +131,7 @@ cargo run --release -- \
     --vllm-discovery-address 0.0.0.0:30001 \
     --host 0.0.0.0 \
     --port 10001 \
-    --prefill-policy consistent_hash \
-    --decode-policy consistent_hash
+    --policy consistent_hash
 
 # When vLLM runs the Mooncake connector, pass --kv-connector mooncake.
 # The router queries each prefill node's Mooncake bootstrap server at startup

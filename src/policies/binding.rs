@@ -13,7 +13,12 @@ pub enum ProgramBindingStrategy {
     #[default]
     ConsistentHash,
     /// Assign each new Program generation to the next backend in target order.
+    #[serde(rename = "round_robin", alias = "program_round_robin")]
     ProgramRoundRobin,
+    Random,
+    PowerOfTwo,
+    RendezvousHash,
+    StickyLeastLoaded,
     /// Select the backend with the fewest accounted Programs.
     LeastProgramCount,
     /// Select the backend with the greatest unaccounted token capacity.
@@ -93,10 +98,53 @@ pub(crate) fn make_binding_policy(
         ProgramBindingStrategy::ConsistentHash | ProgramBindingStrategy::KvAware => {
             Box::new(ConsistentHashBinding::new(hash_virtual_nodes))
         }
+        ProgramBindingStrategy::Random => Box::new(SnapshotBinding::Random),
+        ProgramBindingStrategy::PowerOfTwo => Box::new(SnapshotBinding::PowerOfTwo),
+        ProgramBindingStrategy::RendezvousHash => Box::new(SnapshotBinding::RendezvousHash),
+        ProgramBindingStrategy::StickyLeastLoaded => Box::new(SnapshotBinding::StickyLeastLoaded),
         ProgramBindingStrategy::ProgramRoundRobin => Box::new(RoundRobinBinding::default()),
         ProgramBindingStrategy::LeastProgramCount => Box::new(LeastProgramCountBinding),
         ProgramBindingStrategy::ReasoningTokenBalance => Box::new(ReasoningTokenBalanceBinding),
         ProgramBindingStrategy::CacheAware => Box::new(CacheAwareBinding::default()),
+    }
+}
+
+/// Request algorithms applied to a Program candidate snapshot. Admission owns
+/// the sticky placement and supplies the count of Programs on each rank.
+#[derive(Debug)]
+enum SnapshotBinding {
+    Random,
+    PowerOfTwo,
+    RendezvousHash,
+    StickyLeastLoaded,
+}
+
+impl ProgramBindingPolicy for SnapshotBinding {
+    fn select(
+        &mut self,
+        identity: &ProgramIdentity,
+        candidates: &[ProgramBindingCandidate],
+        _: Option<&str>,
+    ) -> Option<String> {
+        use rand::seq::IndexedRandom;
+        let weight = |rank: &ProgramBindingCandidate| {
+            ConsistentHashPolicy::fbi_hash(&format!(
+                "{}:{}",
+                identity.placement_hash_key(),
+                rank.target_id
+            ))
+        };
+        let rank = match self {
+            Self::Random => candidates.choose(&mut rand::rng()),
+            Self::PowerOfTwo => candidates
+                .choose_multiple(&mut rand::rng(), 2)
+                .min_by_key(|rank| rank.accounted_programs),
+            Self::RendezvousHash => candidates.iter().max_by_key(|rank| weight(rank)),
+            Self::StickyLeastLoaded => candidates
+                .iter()
+                .min_by_key(|rank| (rank.accounted_programs, std::cmp::Reverse(weight(rank)))),
+        }?;
+        Some(rank.target_id.clone())
     }
 }
 

@@ -30,7 +30,7 @@ impl std::ops::Deref for ProgramRouter {
 impl ProgramRouter {
     pub fn new(config: ProgramSchedulerConfig) -> Self {
         let policy =
-            super::binding::make_binding_policy(config.binding_strategy, config.hash_virtual_nodes);
+            super::binding::make_binding_policy(config.placement_policy, config.hash_virtual_nodes);
         Self {
             admission: ProgramAdmission::new(config),
             policy: Mutex::new(policy),
@@ -60,6 +60,7 @@ impl ProgramRouter {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn ensure_decision_state(
         &self,
         state: &mut ProgramSchedulerState,
@@ -314,16 +315,17 @@ impl ProgramRouter {
     }
 
     pub(crate) fn uses_kv_binding(&self) -> bool {
-        self.admission.config.binding_strategy.uses_kv_index()
+        self.admission.config.placement_policy.uses_kv_index()
     }
 
     /// Whether initial Program binding needs the request text for prefix affinity.
     pub fn uses_cache_aware_binding(&self) -> bool {
-        self.admission.config.binding_strategy.needs_routing_text()
+        self.admission.config.placement_policy.needs_routing_text()
     }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{ProgramBindingCandidate, ProgramBindingStrategy};

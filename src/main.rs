@@ -4,8 +4,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, ProgramSchedulingConfig,
+    RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -122,8 +122,8 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode.
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
+    /// Shared algorithm or a JSON object with default, program, prefill and native_decode.
+    #[arg(long, default_value = "cache_aware", value_name = "NAME_OR_JSON")]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -164,14 +164,6 @@ struct CliArgs {
         value_name = "URL=ENDPOINT[,ENDPOINT...]"
     )]
     pd_kv_events: Vec<String>,
-    /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
-    prefill_policy: Option<String>,
-
-    /// Specific policy for decode nodes in PD mode (defaults to --policy).
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "sticky_least_loaded", "rendezvous_hash"])]
-    decode_policy: Option<String>,
-
     /// Timeout in seconds for worker startup
     #[arg(long, default_value_t = 600)]
     worker_startup_timeout_secs: u64,
@@ -452,37 +444,6 @@ impl CliArgs {
         map
     }
 
-    /// Convert policy string to PolicyConfig
-    fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
-        match policy_str {
-            "random" => PolicyConfig::Random,
-            "round_robin" => PolicyConfig::RoundRobin,
-            "cache_aware" => PolicyConfig::CacheAware {
-                cache_threshold: self.cache_threshold,
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
-                eviction_interval_secs: self.eviction_interval,
-                max_tree_size: self.max_tree_size,
-            },
-            "kv_aware" => PolicyConfig::KvAware {
-                router_temperature: self.router_temperature,
-                kv_penalty_host: self.kv_penalty_host,
-                kv_penalty_external: self.kv_penalty_external,
-                kv_penalty_disk: self.kv_penalty_disk,
-                static_kv_event_sources: Box::default(),
-            },
-            "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 5, // Default value
-            },
-            "consistent_hash" => PolicyConfig::ConsistentHash {
-                virtual_nodes: 160, // Default value
-            },
-            "sticky_least_loaded" => PolicyConfig::StickyLeastLoaded,
-            "rendezvous_hash" => PolicyConfig::RendezvousHash,
-            _ => PolicyConfig::RoundRobin, // Fallback
-        }
-    }
-
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn parse_pd_kv_events(
@@ -557,8 +518,6 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -586,7 +545,18 @@ impl CliArgs {
         .load(&mode)?;
 
         // Main policy
-        let mut policy = self.parse_policy(&self.policy);
+        let mut policy = vllm_router_rs::config::PolicyTuning {
+            cache_threshold: self.cache_threshold,
+            balance_abs_threshold: self.balance_abs_threshold,
+            balance_rel_threshold: self.balance_rel_threshold,
+            eviction_interval_secs: self.eviction_interval,
+            max_tree_size: self.max_tree_size,
+            router_temperature: self.router_temperature,
+            kv_penalty_host: self.kv_penalty_host,
+            kv_penalty_external: self.kv_penalty_external,
+            kv_penalty_disk: self.kv_penalty_disk,
+        }
+        .parse(&self.policy)?;
         let mut program_scheduling = ProgramSchedulingConfig::resolve(
             self.enable_program_scheduling,
             self.program_scheduling_config_json.as_deref(),
@@ -915,8 +885,8 @@ mod tests {
         let args = CliArgs::try_parse_from([
             "vllm-router",
             "--vllm-pd-disaggregation",
-            "--prefill-policy",
-            "kv_aware",
+            "--policy",
+            r#"{"default":"cache_aware","prefill":"kv_aware"}"#,
             "--decode",
             "http://127.0.0.1:8001",
             "--pd-pair",
@@ -967,10 +937,10 @@ mod tests {
             let layout = if pd {
                 config.pd_kv_event_sources[worker].hybrid.as_ref().unwrap()
             } else {
-                let PolicyConfig::KvAware {
+                let vllm_router_rs::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
                     ..
-                } = &config.policy
+                } = &config.policy.default
                 else {
                     unreachable!()
                 };
@@ -982,19 +952,35 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_is_shared_and_old_stage_switches_are_rejected() {
+        let args = CliArgs::try_parse_from(["vllm-router", "--service-discovery"]).unwrap();
+        let config = args.to_router_config(vec![]).unwrap();
+        assert_eq!(
+            config.policy.program(),
+            vllm_router_rs::program_scheduling::ProgramBindingStrategy::CacheAware
+        );
+        assert_eq!(config.policy.prefill().name(), "cache_aware");
+        assert_eq!(config.policy.native_decode().name(), "cache_aware");
+        for flag in ["--prefill-policy", "--decode-policy"] {
+            assert!(CliArgs::try_parse_from(["vllm-router", flag, "random"]).is_err());
+        }
+    }
+
+    #[test]
     fn parses_pd_kv_aware_with_affinity_ttl() {
         let args = CliArgs::try_parse_from([
             "vllm-router",
-            "--prefill-policy",
-            "kv_aware",
-            "--decode-policy",
-            "kv_aware",
+            "--policy",
+            r#"{"default":"random","prefill":"kv_aware","native_decode":"kv_aware"}"#,
             "--kv-aware-session-affinity-ttl-secs",
             "1800",
         ])
         .unwrap();
-        assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
-        assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
+        let policy = vllm_router_rs::config::PolicyTuning::default()
+            .parse(&args.policy)
+            .unwrap();
+        assert_eq!(policy.prefill().name(), "kv_aware");
+        assert_eq!(policy.native_decode().name(), "kv_aware");
         assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
     }
 

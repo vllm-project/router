@@ -82,7 +82,7 @@ pub struct ConfiguredKvSources {
 impl ConfiguredKvSources {
     pub fn install_regular(
         &mut self,
-        policy: &mut PolicyConfig,
+        policy: &mut crate::config::RoutingPolicy,
         program: Option<&mut crate::config::ProgramSchedulingConfig>,
     ) -> ConfigResult<()> {
         if self.regular.is_empty() {
@@ -91,10 +91,10 @@ impl ConfiguredKvSources {
         if let PolicyConfig::KvAware {
             static_kv_event_sources,
             ..
-        } = policy
+        } = &mut policy.default
         {
             **static_kv_event_sources = std::mem::take(&mut self.regular);
-        } else if let Some(program) = program.filter(|p| p.binding_strategy.uses_kv_index()) {
+        } else if let Some(program) = program.filter(|_| policy.program().uses_kv_index()) {
             program.binding_kv_sources = std::mem::take(&mut self.regular);
         } else {
             return Err(ConfigError::IncompatibleConfig {
@@ -396,7 +396,7 @@ fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
-    let static_sources = match &config.policy {
+    let static_sources = match &config.policy.default {
         PolicyConfig::KvAware {
             static_kv_event_sources,
             ..
@@ -486,16 +486,10 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     });
                 }
                 let prefill_kv = prefill_keyed
-                    && matches!(
-                        config.mode.get_prefill_policy(&config.policy),
-                        PolicyConfig::KvAware { .. }
-                    );
+                    && matches!(config.policy.prefill(), PolicyConfig::KvAware { .. });
                 let decode_kv = decode_keyed
                     && (config.uses_program_kv_binding()
-                        || matches!(
-                            config.mode.get_decode_policy(&config.policy),
-                            PolicyConfig::KvAware { .. }
-                        ));
+                        || matches!(config.policy.native_decode(), PolicyConfig::KvAware { .. }));
                 if !prefill_kv && !decode_kv {
                     let stage = match (prefill_keyed, decode_keyed) {
                         (true, true) => "prefill and decode",

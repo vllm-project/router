@@ -67,7 +67,6 @@ def run_arm(args, policy, arm, reset_p=False, warm_read=False):
             )
     listen, metrics = port(), port()
     config = {
-        "binding_strategy": "consistent_hash",
         "enable_batch_gain_admission": False,
         "token_capacity_per_dp_rank": args.decode_capacity,
         "metrics_interval_seconds": 0.1,
@@ -98,9 +97,9 @@ def run_arm(args, policy, arm, reset_p=False, warm_read=False):
         "--decode",
         args.d,
         "--policy",
-        "round_robin",
-        "--prefill-policy",
-        policy,
+        json.dumps(
+            {"default": "round_robin", "program": "consistent_hash", "prefill": policy}
+        ),
         "--enable-program-scheduling",
         "--program-scheduling-config-json",
         json.dumps(config),

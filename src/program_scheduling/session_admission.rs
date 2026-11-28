@@ -246,6 +246,7 @@ impl ProgramRouter {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{
@@ -300,7 +301,7 @@ mod tests {
     }
     fn router() -> ProgramRouter {
         ProgramRouter::new(ProgramSchedulerConfig {
-            binding_strategy: ProgramBindingStrategy::ProgramRoundRobin,
+            placement_policy: ProgramBindingStrategy::ProgramRoundRobin,
             max_active_programs_per_target: 1,
             metrics_interval: Duration::from_millis(10),
             queue_timeout: Duration::from_millis(250),
@@ -465,7 +466,7 @@ mod tests {
             queue_timeout: Duration::from_millis(50),
             metrics_interval: Duration::from_millis(5),
             max_active_programs_per_target: 1,
-            binding_strategy: ProgramBindingStrategy::ProgramRoundRobin,
+            placement_policy: ProgramBindingStrategy::ProgramRoundRobin,
             ..Default::default()
         });
         let ranks = [rank("a")];
@@ -486,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_growth_stays_on_current_rank_and_tail_cannot_overtake() {
         let mut config = ProgramSchedulerConfig {
-            binding_strategy: ProgramBindingStrategy::ProgramRoundRobin,
+            placement_policy: ProgramBindingStrategy::ProgramRoundRobin,
             ..Default::default()
         };
         config.progress_ttl.token_capacity = Some(200);

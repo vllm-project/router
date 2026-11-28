@@ -69,7 +69,7 @@ impl AppContext {
         if let crate::config::PolicyConfig::KvAware {
             static_kv_event_sources,
             ..
-        } = &router_config.policy
+        } = &router_config.policy.default
         {
             for (worker, source) in static_kv_event_sources.iter() {
                 source.validate(worker).map_err(|error| error.to_string())?;
@@ -80,12 +80,15 @@ impl AppContext {
 
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new_with_affinity_ttl(
-            router_config.policy.clone(),
+            router_config.policy.default.clone(),
             router_config
                 .kv_aware_session_affinity_ttl_secs
                 .map(std::time::Duration::from_secs),
         ));
 
+        if router_config.mode.is_pd_mode() || router_config.enable_igw {
+            policy_registry.configure_pd(&router_config.policy);
+        }
         let router_manager = None;
 
         // Initialize response storage based on configuration
@@ -1090,17 +1093,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             }
 
             // 2. HTTP vLLM PD Router
-            match RouterFactory::create_vllm_pd_router(
-                &[],
-                &[],
-                None,
-                None,
-                None,
-                &config.router_config.policy,
-                &app_context,
-            )
-            .await
-            {
+            match RouterFactory::create_vllm_pd_router(&[], &[], None, &app_context).await {
                 Ok(http_pd) => {
                     info!("Created HTTP vLLM PD router");
                     router_manager
@@ -1477,7 +1470,8 @@ mod tests {
                 kv_penalty_external: 0.05,
                 kv_penalty_disk: 0.01,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             ..Default::default()
         };
         let context = Arc::new(

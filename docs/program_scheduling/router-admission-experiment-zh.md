@@ -20,8 +20,8 @@
 总开关沿用 `--enable-program-scheduling`。关闭 Program 功能时客户端走普通路由。开启后默认 `enable_acting_ttl: true`，已有配置保留原语义。以下参数可追加到普通 HTTP Router 的启动命令，得到“Program 绑定、容量准入和恢复开启，工具间隔不留座”的组合。
 
 ```sh
---enable-program-scheduling \
---program-scheduling-config-json '{"binding_strategy":"program_round_robin","binding_only":false,"enable_acting_ttl":false}'
+--enable-program-scheduling --policy '{"default":"cache_aware","program":"round_robin"}' \
+--program-scheduling-config-json '{"binding_only":false,"enable_acting_ttl":false}'
 ```
 
 ## 实验与结果

@@ -4,7 +4,7 @@ use super::{
     http::{openai_router::OpenAIRouter, router::Router, vllm_pd_router::VllmPDRouter},
     RouterTrait,
 };
-use crate::config::{PolicyConfig, RoutingMode};
+use crate::config::RoutingMode;
 use crate::server::AppContext;
 use std::sync::Arc;
 
@@ -21,8 +21,6 @@ impl RouterFactory {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
-                prefill_policy,
-                decode_policy,
                 discovery_address,
             } => {
                 tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
@@ -31,9 +29,6 @@ impl RouterFactory {
                     prefill_urls,
                     decode_urls,
                     discovery_address.clone(),
-                    prefill_policy.as_ref(),
-                    decode_policy.as_ref(),
-                    &ctx.router_config.policy,
                     ctx,
                 )
                 .await
@@ -60,17 +55,8 @@ impl RouterFactory {
         prefill_urls: &[(String, Option<u16>)],
         decode_urls: &[String],
         discovery_address: Option<String>,
-        prefill_policy_config: Option<&PolicyConfig>,
-        decode_policy_config: Option<&PolicyConfig>,
-        main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        ctx.policy_registry.configure_pd(
-            main_policy_config,
-            prefill_policy_config,
-            decode_policy_config,
-        );
-
         // Create vLLM PD router with both static URLs and service discovery support
         if discovery_address.is_some() {
             tracing::info!(
@@ -136,7 +122,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             kv_aware_session_affinity_ttl_secs: Some(1800),
             // Worker lists stay empty on purpose: the prefill/decode policies
             // are wired before worker startup, and an empty set keeps this test
@@ -145,8 +132,6 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             ..RouterConfig::default()

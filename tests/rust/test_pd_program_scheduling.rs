@@ -213,10 +213,9 @@ async fn router_with_capacity(
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![(p.url.clone(), None)],
             decode_urls: vec![d.url.clone()],
-            prefill_policy: Some(PolicyConfig::RoundRobin),
-            decode_policy: Some(PolicyConfig::RoundRobin),
             discovery_address: None,
         },
+        policy: PolicyConfig::RoundRobin.into(),
         intra_node_data_parallel_size: dp_size,
         worker_startup_timeout_secs: 2,
         disable_circuit_breaker: true,
@@ -247,19 +246,6 @@ async fn build_router(config: RouterConfig) -> VllmPDRouter {
     };
     ConfigValidator::validate(&config).unwrap();
     let ctx = Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
-    let kv_affinity_table = ctx.policy_registry.kv_affinity_table();
-    ctx.policy_registry.set_prefill_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
-            Some(&kv_affinity_table),
-        ),
-    );
-    ctx.policy_registry.set_decode_policy(
-        vllm_router_rs::policies::PolicyFactory::create_from_config(
-            &PolicyConfig::RoundRobin,
-            Some(&kv_affinity_table),
-        ),
-    );
     VllmPDRouter::new(prefill_urls, decode_urls, None, &ctx)
         .await
         .unwrap()
@@ -303,14 +289,17 @@ async fn new_sessions_use_decode_events_and_bound_turns_keep_their_rank() {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(p.url.clone(), None)],
                 decode_urls: decodes.iter().map(|d| d.url.clone()).collect(),
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::RoundRobin),
                 discovery_address: None,
             },
+            policy: serde_json::from_value(if hot == 0 {
+                json!({"default":"round_robin","program":"kv_aware"})
+            } else {
+                json!({"default":"kv_aware","native_decode":"round_robin"})
+            }).unwrap(),
             kv_connector: KvConnector::Nixl,
             pd_kv_event_sources: sources,
             program_scheduling: Some(serde_json::from_value(json!({
-                "binding_strategy":"kv_aware", "token_capacity_per_dp_rank":10000,
+                "token_capacity_per_dp_rank":10000,
                 "enable_batch_gain_admission":false, "max_active_programs_per_target":1,
                 "decode_buffer_tokens":8, "metrics_interval_seconds":0.02, "queue_timeout_seconds":2,
                 "force_resume_timeout_seconds":1,
@@ -525,8 +514,6 @@ fn pd_requires_explicit_capacity_and_rejects_unverified_modes() {
         mode: RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), None)],
             decode_urls: vec!["http://d:8000".into()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         },
         program_scheduling: Some(valid),

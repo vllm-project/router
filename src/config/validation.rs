@@ -27,9 +27,23 @@ impl ConfigValidator {
             );
 
         Self::validate_mode(&config.mode, has_service_discovery)?;
-        Self::validate_policy(&config.policy)?;
+        Self::validate_policy(&config.policy.default)?;
+        for stage in [&config.policy.prefill, &config.policy.native_decode]
+            .into_iter()
+            .flatten()
+        {
+            Self::validate_policy(stage)?;
+        }
         Self::validate_server_settings(config)?;
         if let Some(program_scheduling) = &config.program_scheduling {
+            if config.policy.program() == ProgramBindingStrategy::ReasoningTokenBalance
+                && program_scheduling.token_capacity_per_dp_rank.is_none()
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "reasoning_token_balance requires token_capacity_per_dp_rank"
+                        .to_string(),
+                });
+            }
             Self::validate_program_scheduling(program_scheduling)?;
         }
         Self::validate_epd(config)?;
@@ -56,13 +70,6 @@ impl ConfigValidator {
     fn validate_program_scheduling(config: &ProgramSchedulingConfig) -> ConfigResult<()> {
         for (worker, source) in &config.binding_kv_sources {
             source.validate(worker)?;
-        }
-        if config.binding_strategy == ProgramBindingStrategy::ReasoningTokenBalance
-            && config.token_capacity_per_dp_rank.is_none()
-        {
-            return Err(ConfigError::ValidationFailed {
-                reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
-            });
         }
         let positive_finite = [
             ("metrics_interval_seconds", config.metrics_interval_seconds),
@@ -323,8 +330,6 @@ impl ConfigValidator {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
-                prefill_policy,
-                decode_policy,
                 discovery_address: _,
             } => {
                 // Only require URLs if service discovery is disabled
@@ -384,14 +389,6 @@ impl ConfigValidator {
                             });
                         }
                     }
-                }
-
-                // Validate optional prefill and decode policies
-                if let Some(p_policy) = prefill_policy {
-                    Self::validate_policy(p_policy)?;
-                }
-                if let Some(d_policy) = decode_policy {
-                    Self::validate_policy(d_policy)?;
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
@@ -801,7 +798,7 @@ impl ConfigValidator {
         // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {
             // Check if power-of-two policy makes sense with insufficient workers
-            if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
+            if let PolicyConfig::PowerOfTwo { .. } = &config.policy.default {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
                     return Err(ConfigError::IncompatibleConfig {
@@ -814,13 +811,11 @@ impl ConfigValidator {
             if let RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,
-                prefill_policy,
-                decode_policy,
                 ..
             } = &config.mode
             {
                 // Check power-of-two for prefill
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.policy.prefill {
                     if prefill_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
@@ -829,7 +824,7 @@ impl ConfigValidator {
                 }
 
                 // Check power-of-two for decode
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
+                if let Some(PolicyConfig::PowerOfTwo { .. }) = &config.policy.native_decode {
                     if decode_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
                             reason:
@@ -948,10 +943,7 @@ fn validate_pd_worker_pairs(config: &RouterConfig) -> ConfigResult<()> {
         return Err(invalid("--pd-pair requires P/D disaggregation".into()));
     };
     if config.program_scheduling.is_some()
-        || !matches!(
-            config.mode.get_prefill_policy(&config.policy),
-            PolicyConfig::KvAware { .. }
-        )
+        || !matches!(config.policy.prefill(), PolicyConfig::KvAware { .. })
     {
         return Err(invalid(
             "--pd-pair requires a KV-aware Prefill policy with Program scheduling disabled".into(),
@@ -1107,8 +1099,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::Random,
@@ -1245,8 +1235,6 @@ mod tests {
                 RoutingMode::VllmPrefillDecode {
                     prefill_urls: vec![(consumer.clone(), None)],
                     decode_urls: vec![format!("{consumer_scheme}://decode:8000")],
-                    prefill_policy: None,
-                    decode_policy: None,
                     discovery_address: None,
                 },
             ] {
@@ -1343,8 +1331,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::Random,
@@ -1358,8 +1344,6 @@ mod tests {
         let mode = || RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("http://prefill:8000".to_string(), None)],
             decode_urls: vec!["http://decode:8000".to_string()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address: None,
         };
         for pd in [
@@ -1400,8 +1384,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::RoundRobin,
@@ -1418,8 +1400,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::CacheAware {
@@ -1467,19 +1447,21 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: Some(PolicyConfig::CacheAware {
+                discovery_address: None,
+            },
+            crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
                 }),
-                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                native_decode: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }),
-                discovery_address: None,
-            },
-            PolicyConfig::Random, // Main policy as fallback
+                ..crate::config::RoutingPolicy::from(PolicyConfig::Random)
+            }, // Main policy as fallback
         );
 
         let result = ConfigValidator::validate(&config);
@@ -1492,8 +1474,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::KvAware {
@@ -1518,13 +1498,15 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
-                }), // Requires 2+ workers
-                decode_policy: None,
                 discovery_address: None,
             },
-            PolicyConfig::Random,
+            crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+                native_decode: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::Random)
+            },
         );
 
         let result = ConfigValidator::validate(&config);
@@ -1580,8 +1562,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![],
                 decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: Some("0.0.0.0:36367".to_string()),
             },
             PolicyConfig::Random,
@@ -1597,8 +1577,6 @@ mod tests {
         let pd_mode = |discovery_address: Option<String>| RoutingMode::VllmPrefillDecode {
             prefill_urls: vec![("grpc://prefill:50051".to_string(), None)],
             decode_urls: vec!["grpc://decode:50052".to_string()],
-            prefill_policy: None,
-            decode_policy: None,
             discovery_address,
         };
 
@@ -1634,8 +1612,6 @@ mod tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(prefill.to_string(), None)],
                 decode_urls: vec![decode.to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             program_scheduling: Some(program.clone()),
@@ -1652,8 +1628,6 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             PolicyConfig::KvAware {
@@ -1727,9 +1701,7 @@ mod tests {
             .pd_kv_event_sources
             .insert("http://decode:8000".into(), source);
         assert!(ConfigValidator::validate(&decode_layout).is_ok());
-        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut decode_layout.mode {
-            *decode_policy = Some(PolicyConfig::RoundRobin);
-        }
+        decode_layout.policy.native_decode = Some(PolicyConfig::RoundRobin);
         assert!(ConfigValidator::validate(&decode_layout)
             .unwrap_err()
             .to_string()
@@ -1796,9 +1768,7 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_err());
         config.pd_worker_pairs.clear();
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
-        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
-            *decode_policy = Some(PolicyConfig::RoundRobin);
-        }
+        config.policy.native_decode = Some(PolicyConfig::RoundRobin);
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_ok());
         let source = config
             .pd_kv_event_sources
@@ -1807,9 +1777,9 @@ mod tests {
         config
             .pd_kv_event_sources
             .insert("http://decode:8000".into(), source);
+        config.policy.program = Some(ProgramBindingStrategy::ConsistentHash);
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
-        config.program_scheduling.as_mut().unwrap().binding_strategy =
-            crate::program_scheduling::ProgramBindingStrategy::KvAware;
+        config.policy.program = None; // inherit kv_aware while native Decode remains round_robin
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_ok());
         config.program_scheduling.as_mut().unwrap().pd.warm_remote = true;
         assert!(crate::kv_index::config::validate_pd_sources(&config).is_err());
@@ -1852,22 +1822,20 @@ mod tests {
         for decode_only_policy in [false, true] {
             let mut config = pd_config_with_static_kv_sources();
             if decode_only_policy {
-                config.policy = PolicyConfig::CacheAware {
+                config.policy.default = PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
                     balance_abs_threshold: 5,
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 4096,
                 };
-                if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
-                    *decode_policy = Some(PolicyConfig::KvAware {
-                        router_temperature: 0.0,
-                        kv_penalty_host: 0.8,
-                        kv_penalty_external: 0.6,
-                        kv_penalty_disk: 0.3,
-                        static_kv_event_sources: Default::default(),
-                    });
-                }
+                config.policy.native_decode = Some(PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                    static_kv_event_sources: Default::default(),
+                });
             }
             let sources = config
                 .pd_kv_event_sources
@@ -1891,17 +1859,19 @@ mod tests {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(format!("{base}@0"), None)],
                 decode_urls: vec![format!("{base}@1")],
-                prefill_policy: Some(PolicyConfig::RoundRobin),
-                decode_policy: Some(PolicyConfig::KvAware {
+                discovery_address: None,
+            },
+            crate::config::RoutingPolicy {
+                prefill: Some(PolicyConfig::RoundRobin),
+                native_decode: Some(PolicyConfig::KvAware {
                     router_temperature: 0.0,
                     kv_penalty_host: 0.8,
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
                 }),
-                discovery_address: None,
+                ..crate::config::RoutingPolicy::from(PolicyConfig::RoundRobin)
             },
-            PolicyConfig::RoundRobin,
         );
         config.pd_kv_event_sources.insert(
             base.to_string(),
@@ -1927,18 +1897,14 @@ mod tests {
         config
             .pd_kv_event_sources
             .insert("http://decode:8000".to_string(), sources);
-        if let RoutingMode::VllmPrefillDecode { decode_policy, .. } = &mut config.mode {
-            *decode_policy = Some(PolicyConfig::RoundRobin);
-        }
+        config.policy.native_decode = Some(PolicyConfig::RoundRobin);
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("policy is not kv_aware"), "{err}");
 
         // A Prefill-keyed source with a count-based Prefill policy is the same
         // mistake on the other side.
         let mut config = pd_config_with_static_kv_sources();
-        if let RoutingMode::VllmPrefillDecode { prefill_policy, .. } = &mut config.mode {
-            *prefill_policy = Some(PolicyConfig::RoundRobin);
-        }
+        config.policy.prefill = Some(PolicyConfig::RoundRobin);
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("policy is not kv_aware"), "{err}");
     }
@@ -2038,12 +2004,12 @@ mod tests {
         assert!(err.contains("requires vllm_prefill_decode mode"), "{err}");
 
         let mut config = pd_config_with_static_kv_sources();
-        config.policy = PolicyConfig::RoundRobin;
+        config.policy.default = PolicyConfig::RoundRobin;
         let err = ConfigValidator::validate(&config).unwrap_err().to_string();
         assert!(err.contains("policy is not kv_aware"), "{err}");
 
         let mut config = pd_config_with_static_kv_sources();
-        config.policy = PolicyConfig::CacheAware {
+        config.policy.default = PolicyConfig::CacheAware {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
             balance_rel_threshold: 1.1,

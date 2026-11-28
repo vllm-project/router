@@ -36,7 +36,7 @@ impl TestContext {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "127.0.0.1".to_string(),
             port: 3002,
             max_payload_size: 256 * 1024 * 1024,
@@ -484,7 +484,7 @@ mod generation_tests {
     #[tokio::test]
     async fn test_program_request_is_tracked_without_changing_response() {
         let config = RouterConfig {
-            policy: PolicyConfig::RoundRobin,
+            policy: PolicyConfig::RoundRobin.into(),
             program_scheduling: Some(ProgramSchedulingConfig::default()),
             ..Default::default()
         };
@@ -544,7 +544,7 @@ mod generation_tests {
             mode: RoutingMode::Regular {
                 worker_urls: vec![backend_url],
             },
-            policy: PolicyConfig::RoundRobin,
+            policy: PolicyConfig::RoundRobin.into(),
             program_scheduling: Some(ProgramSchedulingConfig::default()),
             retry: RetryConfig {
                 max_retries: 2,
@@ -1205,7 +1205,7 @@ mod responses_endpoint_tests {
     #[tokio::test]
     async fn test_v1_responses_program_request_is_tracked() {
         let config = RouterConfig {
-            policy: PolicyConfig::RoundRobin,
+            policy: PolicyConfig::RoundRobin.into(),
             program_scheduling: Some(ProgramSchedulingConfig::default()),
             ..Default::default()
         };
@@ -1587,7 +1587,7 @@ mod error_tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "127.0.0.1".to_string(),
             port: 3010,
             max_payload_size: 1024, // 1KB limit
@@ -1948,14 +1948,12 @@ mod pd_mode_tests {
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![(prefill_url, Some(prefill_port))],
                 decode_urls: vec![decode_url],
-                prefill_policy: None,
-                decode_policy: None,
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "127.0.0.1".to_string(),
             port: 3011,
             max_payload_size: 256 * 1024 * 1024,
@@ -2126,7 +2124,7 @@ mod request_id_tests {
             pd_kv_event_sources: Default::default(),
             pd_worker_pairs: Default::default(),
             kv_event_strict_recovery: false,
-            policy: PolicyConfig::Random,
+            policy: PolicyConfig::Random.into(),
             host: "127.0.0.1".to_string(),
             port: 3002,
             max_payload_size: 256 * 1024 * 1024,

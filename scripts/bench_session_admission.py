@@ -176,13 +176,17 @@ def router(args, label, binary, strategy, workers):
         prom = port()
     url = f"http://127.0.0.1:{listen}"
     config = {
-        "binding_strategy": strategy,
         "max_active_programs_per_target": 1,
         "queue_timeout_seconds": 10,
         "force_resume_timeout_seconds": 10,
         "token_count_mode": "estimated",
         "metrics_interval_seconds": 0.1,
     }
+    policy = json.dumps({"default": "round_robin", "program": strategy})
+    # The baseline may predate role overrides. Keep both binaries on the same algorithms.
+    if "--prefill-policy" in subprocess.check_output([binary, "--help"], text=True):
+        policy = "round_robin"
+        config["binding_strategy"] = strategy
     cmd = [
         binary,
         "--host",
@@ -192,7 +196,7 @@ def router(args, label, binary, strategy, workers):
         "--worker-urls",
         *workers,
         "--policy",
-        "round_robin",
+        policy,
         "--prometheus-host",
         "127.0.0.1",
         "--prometheus-port",

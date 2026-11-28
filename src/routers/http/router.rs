@@ -506,7 +506,7 @@ impl Router {
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
-            let static_sources = match &ctx.router_config.policy {
+            let static_sources = match &ctx.router_config.policy.default {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
                     ..
@@ -730,7 +730,9 @@ impl Router {
             .router_config
             .program_scheduling
             .as_ref()
-            .map(ProgramSchedulerConfig::from)
+            .map(|config| {
+                ProgramSchedulerConfig::from_program_config(config, false, ctx.router_config.policy.program())
+            })
             .map(ProgramRouter::new)
             .inspect(|scheduler| {
                 scheduler.publish_token_count_mode();
@@ -1151,6 +1153,7 @@ impl Router {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn program_targets_for_model(&self, pool: &ResolvedProgramModelPool) -> Arc<[ProgramTarget]> {
         self.program_snapshot_for_model(pool).targets
     }
@@ -4305,7 +4308,7 @@ mod tests {
             }));
         }
         let config = RouterConfig {
-            policy: PolicyConfig::RoundRobin,
+            policy: PolicyConfig::RoundRobin.into(),
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             ..Default::default()
@@ -4411,7 +4414,8 @@ mod tests {
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
                 static_kv_event_sources: Default::default(),
-            },
+            }
+            .into(),
             worker_startup_timeout_secs: 5,
             ..Default::default()
         };
@@ -4624,7 +4628,8 @@ mod tests {
                     }}))
                     .unwrap(),
                 ),
-            },
+            }
+            .into(),
             worker_startup_timeout_secs: 5,
             ..Default::default()
         };
@@ -4857,7 +4862,8 @@ mod tests {
                     kv_penalty_external: 0.6,
                     kv_penalty_disk: 0.3,
                     static_kv_event_sources: Default::default(),
-                },
+                }
+                .into(),
                 worker_startup_timeout_secs: 5,
                 worker_startup_check_interval_secs: 1,
                 ..Default::default()
@@ -6980,7 +6986,7 @@ mod tests {
             WorkerType::Regular,
         )));
         let scheduling = Arc::new(ProgramRouter::new(ProgramSchedulerConfig {
-            binding_strategy: crate::program_scheduling::ProgramBindingStrategy::ProgramRoundRobin,
+            placement_policy: crate::program_scheduling::ProgramBindingStrategy::ProgramRoundRobin,
             enable_acting_ttl: false,
             ..Default::default()
         }));

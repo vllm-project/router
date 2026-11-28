@@ -91,6 +91,7 @@ impl ProgramBindings {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn commit_placement(&self, program: &ProgramRef, text: &str, target_id: &str) {
         self.policy
             .commit_placement(program.model_pool(), text, target_id);
@@ -190,6 +191,35 @@ mod tests {
                 .as_deref(),
             Some("rank-1")
         );
+    }
+
+    #[test]
+    fn inherited_request_algorithms_select_among_program_candidates() {
+        let program = identity("shared-policy");
+        let candidates = [candidate("a", 3, 0.0, 100), candidate("b", 1, 0.0, 100)];
+        for strategy in [
+            ProgramBindingStrategy::Random,
+            ProgramBindingStrategy::PowerOfTwo,
+            ProgramBindingStrategy::RendezvousHash,
+            ProgramBindingStrategy::StickyLeastLoaded,
+        ] {
+            let mut policy = make_binding_policy(strategy, 160);
+            assert_eq!(policy.select(&program, &[], None), None);
+            assert_eq!(
+                policy.select(&program, &candidates[..1], None).as_deref(),
+                Some("a")
+            );
+            let selected = policy.select(&program, &candidates, None).unwrap();
+            match strategy {
+                ProgramBindingStrategy::PowerOfTwo | ProgramBindingStrategy::StickyLeastLoaded => {
+                    assert_eq!(selected, "b")
+                }
+                ProgramBindingStrategy::RendezvousHash => {
+                    assert_eq!(Some(selected), policy.select(&program, &candidates, None))
+                }
+                _ => assert!(candidates.iter().any(|c| c.target_id == selected)),
+            }
+        }
     }
 
     #[test]
