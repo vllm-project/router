@@ -78,6 +78,15 @@ pub struct GroupCapability {
 }
 
 impl RankCapability {
+    pub(crate) fn reported_hash_mismatch<'a>(
+        &'a self,
+        reported: Option<&'a str>,
+    ) -> Option<(&'a str, &'a str)> {
+        let reported = reported?;
+        let expected = self.hash_algorithm.as_str();
+        (expected != reported).then_some((expected, reported))
+    }
+
     pub(crate) fn has_plain_full_attention_shape(&self) -> bool {
         self.declared_groups == Some(1)
             && self.hash_lookahead_tokens == 0
