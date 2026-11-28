@@ -106,10 +106,23 @@ impl WorkerRegistry {
         };
         // Stale index entries of a replaced worker are dropped after the new
         // ones are in place, so `has_model` and `get_by_model_fast` never see
-        // the worker missing. `get_by_model`, `get_by_type` and
-        // `get_by_connection` skip it under a key it no longer has, and find
-        // it under its new key once that entry is written.
+        // the worker missing under a model it keeps. `get_by_model`,
+        // `get_by_type` and `get_by_connection` skip it under a key it no
+        // longer has, and find it under its new key once that entry is
+        // written.
         let old_worker = self.workers.get(&worker_id).map(|w| w.clone());
+        // `get_by_model_fast` returns the indexed instances themselves. When
+        // the replacement changes models, take the retired instance out of the
+        // old model's entry before the URL is published under the new model,
+        // and bump the revision so cached old-model target lists built from
+        // that entry are rebuilt instead of reused.
+        if let Some(old_worker) = old_worker
+            .as_ref()
+            .filter(|w| w.model_id() != worker.model_id())
+        {
+            self.remove_from_model_index(old_worker);
+            self.notify_worker_state_change();
+        }
         if is_new {
             self.registration_order
                 .write()
@@ -220,14 +233,7 @@ impl WorkerRegistry {
                 model_workers.retain(|id| id != worker_id);
             }
 
-            // Remove from optimized model index
-            if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
-                let worker_url = worker.url();
-                model_index_entry
-                    .write()
-                    .expect("RwLock for model_index is poisoned")
-                    .retain(|w| w.url() != worker_url);
-            }
+            self.remove_from_model_index(worker);
         }
 
         // Remove from type index
@@ -244,6 +250,17 @@ impl WorkerRegistry {
             {
                 conn_workers.retain(|id| id != worker_id);
             }
+        }
+    }
+
+    /// Remove a worker from the optimized model index.
+    fn remove_from_model_index(&self, worker: &Arc<dyn Worker>) {
+        if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
+            let worker_url = worker.url();
+            model_index_entry
+                .write()
+                .expect("RwLock for model_index is poisoned")
+                .retain(|w| w.url() != worker_url);
         }
     }
 
@@ -778,56 +795,69 @@ mod tests {
         ));
 
         // Hold the new model's index lock so the replacement stops after
-        // `workers` points at it but before the old index keys are removed.
-        // Do not call `has_model` or `get_by_model_fast` while it is held.
+        // `workers` points at it and the old model's fast index entry is gone,
+        // but before the remaining old index keys are removed.
+        // Do not call `has_model` or `get_by_model_fast` for any model while
+        // it is held: the paused writer holds a `model_index` shard, which
+        // other keys can share. Read the old model's entry directly instead.
+        let old_model_index = registry.model_index.get("old-model").unwrap().clone();
         let new_model_index = registry.model_index.get("new-model").unwrap().clone();
         let index_guard = new_model_index.read().unwrap();
+        let revision_before = registry.revision();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (models, types, modes, new_model_urls) = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                registry.register(labeled(
-                    url,
-                    "new-model",
-                    WorkerType::Decode,
-                    ConnectionMode::Grpc,
-                ))
-            });
-            while !registry
-                .model_workers
-                .get("new-model")
-                .is_some_and(|ids| ids.contains(&id))
-            {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "register() did not reach the model index"
+        let (models, old_model_fast_urls, revision_in_window, types, modes, new_model_urls) =
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    registry.register(labeled(
+                        url,
+                        "new-model",
+                        WorkerType::Decode,
+                        ConnectionMode::Grpc,
+                    ))
+                });
+                while !registry
+                    .model_workers
+                    .get("new-model")
+                    .is_some_and(|ids| ids.contains(&id))
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "register() did not reach the model index"
+                    );
+                    std::thread::yield_now();
+                }
+                let seen = (
+                    registry
+                        .get_by_model("old-model")
+                        .iter()
+                        .map(|w| w.model_id().to_string())
+                        .collect::<Vec<_>>(),
+                    old_model_index
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|w| w.url().to_string())
+                        .collect::<Vec<_>>(),
+                    registry.revision(),
+                    registry
+                        .get_by_type(&WorkerType::Regular)
+                        .iter()
+                        .map(|w| w.worker_type())
+                        .collect::<Vec<_>>(),
+                    registry
+                        .get_by_connection(&ConnectionMode::Http)
+                        .iter()
+                        .map(|w| w.connection_mode())
+                        .collect::<Vec<_>>(),
+                    registry
+                        .get_by_model("new-model")
+                        .iter()
+                        .map(|w| w.url().to_string())
+                        .collect::<Vec<_>>(),
                 );
-                std::thread::yield_now();
-            }
-            let seen = (
-                registry
-                    .get_by_model("old-model")
-                    .iter()
-                    .map(|w| w.model_id().to_string())
-                    .collect::<Vec<_>>(),
-                registry
-                    .get_by_type(&WorkerType::Regular)
-                    .iter()
-                    .map(|w| w.worker_type())
-                    .collect::<Vec<_>>(),
-                registry
-                    .get_by_connection(&ConnectionMode::Http)
-                    .iter()
-                    .map(|w| w.connection_mode())
-                    .collect::<Vec<_>>(),
-                registry
-                    .get_by_model("new-model")
-                    .iter()
-                    .map(|w| w.url().to_string())
-                    .collect::<Vec<_>>(),
-            );
-            drop(index_guard);
-            seen
-        });
+                drop(index_guard);
+                seen
+            });
 
         // Lookups made inside the window only return workers that still
         // carry the key they were looked up by. The worker is already found
@@ -836,6 +866,14 @@ mod tests {
             models.iter().all(|model| model == "old-model"),
             "{models:?}"
         );
+        // The fast lookup no longer offers the retired instance once its URL
+        // is published under the new model.
+        assert!(
+            !old_model_fast_urls.iter().any(|u| u == url),
+            "{old_model_fast_urls:?}"
+        );
+        // Target lists cached for the old model are invalidated by then.
+        assert_ne!(revision_in_window, revision_before);
         assert!(types.iter().all(|t| *t == WorkerType::Regular), "{types:?}");
         assert!(
             modes.iter().all(|m| *m == ConnectionMode::Http),
@@ -847,6 +885,7 @@ mod tests {
         );
 
         assert!(registry.get_by_model("old-model").is_empty());
+        assert!(registry.get_by_model_fast("old-model").is_empty());
         assert_eq!(registry.get_by_type(&WorkerType::Regular).len(), 1);
         assert_eq!(registry.get_by_type(&WorkerType::Decode).len(), 1);
         assert_eq!(registry.get_by_connection(&ConnectionMode::Grpc).len(), 1);
