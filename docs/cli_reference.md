@@ -83,9 +83,12 @@ while an earlier request is still running, even with `--max-concurrent-requests 
 | `--history-backend` | `memory, none` | `memory` | — | — | Inference Gateway history storage: in-memory storage or no storage. |
 | `--profile` | `flag` | `false` | — | — | Enable profiling calls to vLLM workers; the Rust CLI uses a 10-second profiling timeout. |
 | `--kv-event-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static KV-event source as `WORKER_URL=ENDPOINT[,ENDPOINT...]`; repeatable, one entry per worker. |
-| `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. |
-| `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for workers registered through `--kv-event-source`. |
+| `--kv-event-replay-source` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Replay endpoint(s) for a static KV-event source, same `WORKER_URL=ENDPOINT[,ENDPOINT...]` form. In P/D mode, matches a `--pd-kv-events` source. |
+| `--kv-event-block-size` | `u32` | `16` | `integer` | `16` | KV cache block size in tokens for static event publishers. |
 | `--kv-event-model` | `string` | `unset` | `string` | `unset` | Model id advertised to static KV-event sources; `unset` keeps the served model id. |
+| `--kv-event-strict-recovery` | `flag` | `false` | `flag` | `false` | Require complete worker recovery or a worker KV clear before granting cache credit. Requests remain routable by load while the source is recovering. |
+| `--kv-hybrid-layout` | `std::path::PathBuf` | `unset` | `string` | `unset` | Cache group, hash and reuse rules keyed by worker URL. [Setup](load_balancing/kv_aware.md#choose-a-layout-configuration). |
+| `--kv-event-topic` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static event topics as `WORKER_URL=TOPIC[,TOPIC...]`, in DP-rank order. |
 
 The Rust CLI requires worker URLs in regular mode unless service discovery is
 enabled. The Python launcher permits an empty worker list without service
@@ -102,7 +105,7 @@ and the Rust OpenAI backend use different configuration paths. See
 | `--decode-policy` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded, rendezvous_hash` | `unset` | `random, round_robin, cache_aware, kv_aware, power_of_two, consistent_hash, sticky_least_loaded` | `unset` | PD decode policy; unset inherits `--policy`. |
 | `--router-temperature` | `f64` | `0.0` | `float` | `0.0` | KV-aware selection temperature for regular routing and PD prefill; zero selects the lowest-cost worker. |
 | `--kv-penalty-host` | `f64` | `0.8` | `float` | `0.8` | Host-tier KV transfer credit for kv_aware. |
-| `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | External-tier KV transfer credit for kv_aware. |
+| `--kv-penalty-external` | `f64` | `0.6` | `float` | `0.6` | Transfer credit for an authorized external KV source. Worker events alone cannot establish shared-pool residency. |
 | `--kv-penalty-disk` | `f64` | `0.3` | `float` | `0.3` | Disk-tier KV transfer credit for kv_aware. |
 | `--kv-aware-session-affinity-ttl-secs` | `u64` | `unset` | `integer` | `unset` | Idle affinity TTL in seconds (1–31536000); unset disables affinity. In PD mode, applies only to decode. |
 | `--cache-threshold` | `f32` | `0.3` | `float` | `0.3` | Cache-match threshold from 0.0 to 1.0 for cache-aware routing. |
@@ -133,11 +136,18 @@ PD stage using an explicit power-of-two policy needs two workers for that stage.
 | `--prefill` | `URL [PORT or none] (repeatable)` | `[]` | `string [1..] (repeatable)` | `unset` | Add one prefill URL and optional bootstrap port: `--prefill URL [PORT]`. Omit the port or pass `none` for no bootstrap port. |
 | `--decode` | `string (repeatable)` | `[]` | `string (repeatable)` | `unset` | Add one decode URL per occurrence: `--decode URL`. |
 | `--vllm-discovery-address` | `string` | `unset` | `string` | `unset` | ZMQ registration address for vLLM workers, e.g. `0.0.0.0:30001`. |
-| `--kv-connector` | `nixl, mooncake, moriio` | `nixl` | `nixl, mooncake, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. |
-| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill KV publishers as URL=ENDPOINT[,ENDPOINT...]; requires kv_aware prefill. Endpoints follow DP-rank order; block size is 16. |
+| `--kv-connector` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | `nixl, mooncake, mooncake-v2, moriio` | `nixl` | PD KV transfer connector: NIXL, Mooncake or MoRI-IO. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` with vLLM-Ascend `MooncakeConnectorV2` in pull mode. |
+| `--pd-kv-events` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Static prefill or decode KV publishers as URL=ENDPOINT[,ENDPOINT...]; a source belongs to a stage whose policy is kv_aware. Endpoints follow DP-rank order; block size is 16. |
+| `--pd-pair` | `string (repeatable)` | `[]` | `string (repeatable)` | `[]` | Restrict a mixed P/D pool to transfer-compatible pairs as `PREFILL=DECODE[,DECODE...]`. |
 
 PD workers can come from static URLs, vLLM ZMQ discovery, or Kubernetes
-discovery. For static configuration, provide both prefill and decode workers:
+discovery. When `--api-key` is set, initial and periodic HTTP health probes
+send the shared bearer token to static and Kubernetes-registered P/D workers.
+Restrict the Kubernetes namespace and pod selectors to trusted workers.
+With native vLLM ZMQ discovery, `/health` checks the counts of registered
+prefill and decode workers.
+
+For static configuration, provide both prefill and decode workers:
 
 ```bash
 vllm-router --vllm-pd-disaggregation \
@@ -159,12 +169,26 @@ in clap's option list in `--help`.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy. |
+| `--enable-program-scheduling` | `flag` | `false` | `flag` | `false` | Enable Program-level scheduling independently of the request-level routing policy, defaulting to verified exact input-token counts with estimation fallback. |
 | `--program-scheduling-config-json` | `string` | `unset` | `string` | `unset` | JSON object overriding Program scheduling defaults; requires `--enable-program-scheduling`. |
 
 For JSON fields, defaults and request opt-in behavior, see
 [Program scheduling](program_scheduling/program-scheduling.md). The JSON option configures the
 feature; it does not enable it on its own.
+
+No JSON override is needed for the `exact` default. To select the
+supported `estimated` compatibility mode, both CLIs accept the same override:
+
+```bash
+--enable-program-scheduling \
+--program-scheduling-config-json '{"token_count_mode":"estimated"}'
+```
+
+The default verifies available prepared counts automatically and falls back to
+estimation. `estimated` remains supported and is not deprecated. HTTP chat
+tokenization remains a separate explicit opt-in. See
+[input-token configuration](program_scheduling/program-scheduling.md#input-token-facts)
+for that opt-in and the advanced `shadow` diagnostic option.
 
 ## Kubernetes service discovery
 
@@ -247,8 +271,16 @@ has tracing support.
 
 | Option | Rust value | Rust default | Python value | Python default | Description |
 | --- | --- | --- | --- | --- | --- |
-| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key used for requests to workers. |
+| `--api-key` | `string` | `unset` | `string` | `unset` | Authorization key for the router's own requests to workers, including HTTP health checks. |
 | `--api-key-validation-urls` | `string [0..] (repeatable)` | `[]` | — | — | Validation URLs; an empty list falls back to comma-separated `API_KEY_VALIDATION_URLS` from the environment or `.env`. |
+
+The key is the bearer token the router sends on its own requests to HTTP
+workers, including health checks; clients authenticate to the router
+separately with `--api-key-validation-urls`. It is not sent yet on
+`/flush_cache`, `/get_load`, gRPC requests, or `--enable-igw` health checks.
+
+The startup wait and `add_worker` always probe `/health`, regardless of
+`--health-check-endpoint`.
 
 ## WASM middleware
 

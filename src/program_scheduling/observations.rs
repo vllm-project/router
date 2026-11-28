@@ -4,6 +4,7 @@
 //! freshness, rolling statistics, logical capacity, and scheduling decisions.
 
 use super::ProgramTarget;
+use crate::protocols::prometheus_text::{parse_series, split_series_value};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashMap};
@@ -53,6 +54,13 @@ pub struct VllmMetricsObservationProvider {
     client: reqwest::Client,
     api_key: Option<String>,
     request_timeout: Duration,
+    /// Metrics endpoint override keyed by Program target base URL.
+    ///
+    /// A gRPC target's base URL is not an HTTP address, so deployments must map
+    /// it to the HTTP `/metrics` endpoint of the same Engine/DP rank. Without a
+    /// mapping the target keeps reporting a missing observation; a stale sample
+    /// is never reused as live capacity.
+    metrics_base_urls: BTreeMap<String, String>,
 }
 
 impl VllmMetricsObservationProvider {
@@ -62,7 +70,34 @@ impl VllmMetricsObservationProvider {
             client,
             api_key,
             request_timeout: Duration::from_secs(2),
+            metrics_base_urls: BTreeMap::new(),
         }
+    }
+
+    /// Map target base URLs (for example `grpc://host:50051`) to the HTTP
+    /// metrics endpoint of the same Engine.
+    pub fn with_metrics_base_urls(mut self, metrics_base_urls: BTreeMap<String, String>) -> Self {
+        self.metrics_base_urls = metrics_base_urls;
+        self
+    }
+
+    /// Resolve the HTTP metrics address for one target base URL.
+    fn metrics_base_url(&self, base_url: &str) -> Result<String, String> {
+        if let Some(mapped) = self.metrics_base_urls.get(base_url) {
+            return if mapped.starts_with("http://") || mapped.starts_with("https://") {
+                Ok(mapped.trim_end_matches('/').to_string())
+            } else {
+                Err(format!(
+                    "configured metrics URL for {base_url} is not HTTP: {mapped}"
+                ))
+            };
+        }
+        if base_url.starts_with("grpc://") || base_url.starts_with("grpcs://") {
+            return Err(format!(
+                "no HTTP metrics URL configured for gRPC target {base_url}"
+            ));
+        }
+        Ok(base_url.trim_end_matches('/').to_string())
     }
 
     /// Override the per-scrape timeout, primarily for controlled deployments.
@@ -78,40 +113,46 @@ impl BackendObservationProvider for VllmMetricsObservationProvider {
         &self,
         targets: &[ProgramTarget],
     ) -> (Vec<BackendObservation>, Vec<BackendObservationFailure>) {
-        let targets_by_base_url = targets.iter().fold(
-            BTreeMap::<String, Vec<ProgramTarget>>::new(),
-            |mut grouped, target| {
-                grouped
-                    .entry(target.base_url.clone())
+        let mut targets_by_metrics_url = BTreeMap::<String, Vec<ProgramTarget>>::new();
+        let mut unresolved = Vec::new();
+        for target in targets {
+            match self.metrics_base_url(&target.base_url) {
+                Ok(url) => targets_by_metrics_url
+                    .entry(url)
                     .or_default()
-                    .push(target.clone());
-                grouped
-            },
-        );
-        let scrapes = targets_by_base_url.into_iter().map(|(base_url, targets)| {
-            let client = self.client.clone();
-            let api_key = self.api_key.clone();
-            let timeout = self.request_timeout;
-            async move {
-                let url = format!("{}/metrics", base_url.trim_end_matches('/'));
-                let mut request = client.get(&url).timeout(timeout);
-                if let Some(api_key) = api_key {
-                    request = request.bearer_auth(api_key);
-                }
-                let result = match request.send().await {
-                    Ok(response) if response.status().is_success() => response
-                        .text()
-                        .await
-                        .map_err(|error| format!("failed to read response: {error}")),
-                    Ok(response) => Err(format!("HTTP {}", response.status())),
-                    Err(error) => Err(error.to_string()),
-                };
-                (base_url, targets, result)
+                    .push(target.clone()),
+                Err(error) => unresolved.push(BackendObservationFailure {
+                    base_url: target.base_url.clone(),
+                    error,
+                }),
             }
-        });
+        }
+        let scrapes = targets_by_metrics_url
+            .into_iter()
+            .map(|(base_url, targets)| {
+                let client = self.client.clone();
+                let api_key = self.api_key.clone();
+                let timeout = self.request_timeout;
+                async move {
+                    let url = format!("{base_url}/metrics");
+                    let mut request = client.get(&url).timeout(timeout);
+                    if let Some(api_key) = api_key {
+                        request = request.bearer_auth(api_key);
+                    }
+                    let result = match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .text()
+                            .await
+                            .map_err(|error| format!("failed to read response: {error}")),
+                        Ok(response) => Err(format!("HTTP {}", response.status())),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    (base_url, targets, result)
+                }
+            });
 
         let mut observations = Vec::new();
-        let mut failures = Vec::new();
+        let mut failures = unresolved;
         for (base_url, targets, result) in join_all(scrapes).await {
             match result {
                 Ok(text) => observations.extend(observations_from_metrics(&targets, &text)),
@@ -226,57 +267,8 @@ pub(crate) fn sum_prometheus_gauge(text: &str, family: &str) -> Option<u64> {
     total
 }
 
-fn split_series_value(line: &str) -> Option<(&str, &str)> {
-    let split = line.rfind(char::is_whitespace)?;
-    Some((line[..split].trim(), line[split..].trim()))
-}
-
-fn parse_series(series: &str) -> (&str, HashMap<String, String>) {
-    let Some(open) = series.find('{') else {
-        return (series, HashMap::new());
-    };
-    let name = &series[..open];
-    let labels = series
-        .strip_suffix('}')
-        .map(|series| &series[open + 1..])
-        .map(parse_labels)
-        .unwrap_or_default();
-    (name, labels)
-}
-
-fn parse_labels(labels: &str) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    let mut fields = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, character) in labels.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                fields.push(&labels[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    fields.push(&labels[start..]);
-    for field in fields {
-        let Some((key, value)) = field.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').replace("\\\"", "\"");
-        result.insert(key.trim().to_string(), value);
-    }
-    result
-}
-
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -348,5 +340,37 @@ unrelated_metric{engine="1",label="escaped\"comma,value"} 99
             dp_rank: Some(2),
         }];
         assert!(observations_from_metrics(&targets, METRICS).is_empty());
+    }
+
+    #[test]
+    fn grpc_targets_require_an_explicit_http_metrics_url() {
+        let provider = VllmMetricsObservationProvider::new(reqwest::Client::new(), None);
+        assert!(provider
+            .metrics_base_url("grpc://engine:50051")
+            .unwrap_err()
+            .contains("no HTTP metrics URL"));
+        let mapped = provider.with_metrics_base_urls(BTreeMap::from([(
+            "grpc://engine:50051".to_string(),
+            "http://engine:8000".to_string(),
+        )]));
+        assert_eq!(
+            mapped.metrics_base_url("grpc://engine:50051").unwrap(),
+            "http://engine:8000"
+        );
+        let invalid = VllmMetricsObservationProvider::new(reqwest::Client::new(), None)
+            .with_metrics_base_urls(BTreeMap::from([(
+                "grpc://engine:1".to_string(),
+                "grpc://engine:2".to_string(),
+            )]));
+        assert!(invalid.metrics_base_url("grpc://engine:1").is_err());
+    }
+
+    #[test]
+    fn http_targets_scrape_their_own_metrics_endpoint() {
+        let provider = VllmMetricsObservationProvider::new(reqwest::Client::new(), None);
+        assert_eq!(
+            provider.metrics_base_url("http://engine:8000/").unwrap(),
+            "http://engine:8000"
+        );
     }
 }

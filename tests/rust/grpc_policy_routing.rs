@@ -1,11 +1,13 @@
 #![cfg(all(feature = "cpu", feature = "ready"))]
 
-//! gRPC counterparts of the PD-disaggregation policy cases in
-//! `tests/python/integration/test_pd_disagg_routing.py`.
+//! gRPC counterparts of the policy cases in
+//! `tests/python/integration/test_pd_disagg_routing.py` and
+//! `tests/python/integration/test_pd_merge_routing.py`.
 //!
-//! vLLM PD mode talks to prefill and decode workers over HTTP. These cases
-//! keep the same scheduling behavior and send it through a regular pool of
-//! in-process `grpc://` Inference workers.
+//! The PD-disaggregation file runs policies across separate prefill and decode
+//! pools over HTTP. The PD-merge file runs them on a regular pool where each
+//! worker does both prefill and decode. These cases use the regular pool of
+//! in-process `grpc://` Inference workers, which is the PD-merge deployment.
 //!
 //!   cargo test --features cpu,ready --test grpc_policy_routing
 
@@ -14,6 +16,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{HeaderMap, HeaderValue};
 use common::create_test_context;
 use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
 use serde_json::{json, Value};
@@ -80,7 +83,7 @@ async fn start_router(servers: &[MockVllmRsServer], policy: PolicyConfig) -> Rou
         .await
         .expect("grpc workers should pass grpc.health.v1");
     // Completions already carry token ids. Pinning skips the Hugging Face
-    // tokenizer lookup that `prepare_token_ids` still performs for sampling defaults.
+    // tokenizer lookup that `prepare_completions` still performs for sampling defaults.
     router.pin_test_token_ids(vec![1]);
     router
 }
@@ -105,9 +108,18 @@ fn grew(before: &[usize], after: &[usize]) -> usize {
 }
 
 async fn complete(router: &Router, servers: &[MockVllmRsServer], body: Value) -> usize {
+    complete_with_headers(router, servers, None, body).await
+}
+
+async fn complete_with_headers(
+    router: &Router,
+    servers: &[MockVllmRsServer],
+    headers: Option<&HeaderMap>,
+    body: Value,
+) -> usize {
     let before = hits(servers);
     let request: CompletionRequest = serde_json::from_value(body).expect("completion request");
-    let response = router.route_completion(None, &request, None).await;
+    let response = router.route_completion(headers, &request, None).await;
     let status = response.status();
     let payload = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -248,6 +260,66 @@ async fn consistent_hash_sticks_to_session() {
     }
 }
 
+fn session_header(session_id: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_str(session_id).expect("session id is a valid header value"),
+    );
+    headers
+}
+
+#[tokio::test]
+async fn consistent_hash_header_sticks_to_session() {
+    // The session travels in X-Session-ID, the documented primary key. Every
+    // turn sends a different prompt, so a prompt-text hash would move it.
+    let servers = workers(3, Duration::ZERO).await;
+    let router = start_router(
+        &servers,
+        PolicyConfig::ConsistentHash { virtual_nodes: 160 },
+    )
+    .await;
+
+    let mut placed = std::collections::HashMap::new();
+    for session in 0..64 {
+        let headers = session_header(&format!("session-{session}"));
+        let index = complete_with_headers(
+            &router,
+            &servers,
+            Some(&headers),
+            prompt(&[session], json!({})),
+        )
+        .await;
+        placed.insert(session, index);
+        if placed
+            .values()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == servers.len()
+        {
+            break;
+        }
+    }
+    let covered: std::collections::HashSet<_> = placed.values().copied().collect();
+    assert_eq!(
+        covered.len(),
+        servers.len(),
+        "distinct sessions did not cover every worker: {placed:?}"
+    );
+
+    let mut representative = std::collections::HashMap::new();
+    for (session, index) in &placed {
+        representative.entry(*index).or_insert(*session);
+    }
+    for (index, session) in representative {
+        let headers = session_header(&format!("session-{session}"));
+        let again =
+            complete_with_headers(&router, &servers, Some(&headers), prompt(&[99], json!({})))
+                .await;
+        assert_eq!(again, index, "session-{session} left its worker");
+    }
+}
+
 #[tokio::test]
 async fn cache_aware_prefix_overrides_load() {
     use common::mock_vllm_rs::HoldGate;
@@ -275,10 +347,11 @@ async fn cache_aware_prefix_overrides_load() {
     let before = hits(&servers);
     let holder = {
         let router = Arc::clone(&router);
-        let body = prompt(
-            &[100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
-            json!({}),
-        );
+        // Sharing the cached prefix pins the holder to the cached worker.
+        // An unrelated prompt would tie on load and could land on either one.
+        let mut holder_prompt = cached_prompt.clone();
+        holder_prompt.extend(100..110);
+        let body = prompt(&holder_prompt, json!({}));
         tokio::spawn(async move {
             let request: CompletionRequest = serde_json::from_value(body).unwrap();
             let response = router.route_completion(None, &request, None).await;
@@ -344,20 +417,24 @@ async fn cache_aware_prefix_overrides_load() {
 
 #[tokio::test]
 async fn kv_aware_prefers_the_less_loaded_worker() {
+    // Equal-cost cold requests are no longer pinned to one worker, so a run
+    // of them may use either worker.
     let servers = workers(2, Duration::ZERO).await;
     let router = start_router(&servers, kv_aware()).await;
-    let mut first = None;
-    for i in 0..8 {
-        let index = complete(&router, &servers, prompt(&[i], json!({}))).await;
-        first.get_or_insert(index);
-        assert_eq!(index, first.unwrap());
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..32 {
+        seen.insert(complete(&router, &servers, prompt(&[i], json!({}))).await);
     }
+    assert_eq!(
+        seen.len(),
+        2,
+        "cold equal-cost requests should reach both workers"
+    );
 
+    // A worker that is still serving a request must not receive the next cold request.
     let delayed = workers(2, Duration::from_millis(800)).await;
-    let router = start_router(&delayed, kv_aware()).await;
-    let cached = complete(&router, &delayed, prompt(&[1, 2, 3], json!({}))).await;
+    let router = Arc::new(start_router(&delayed, kv_aware()).await);
     let before = hits(&delayed);
-    let router = Arc::new(router);
     let holder = {
         let router = Arc::clone(&router);
         tokio::spawn(async move {
@@ -371,10 +448,10 @@ async fn kv_aware_prefers_the_less_loaded_worker() {
         })
     };
     wait_for_hit(&delayed, &before).await;
-    assert_eq!(grew(&before, &hits(&delayed)), cached);
+    let busy = grew(&before, &hits(&delayed));
     let diverted = complete(&router, &delayed, prompt(&[4, 5, 6], json!({}))).await;
     holder.await.unwrap();
-    assert_ne!(diverted, cached);
+    assert_ne!(diverted, busy, "cold request should avoid the busy worker");
 }
 
 #[tokio::test]
@@ -397,8 +474,12 @@ async fn kv_aware_affinity_sticks_to_session() {
     let holder = {
         let router = Arc::clone(&router);
         tokio::spawn(async move {
-            let request: CompletionRequest =
-                serde_json::from_value(prompt(&[7, 7, 7], json!({}))).unwrap();
+            // Stay on alpha's worker so beta has a busy worker to avoid.
+            let request: CompletionRequest = serde_json::from_value(prompt(
+                &[7, 7, 7],
+                json!({"session_params": {"session_id": "alpha"}}),
+            ))
+            .unwrap();
             let response = router.route_completion(None, &request, None).await;
             assert!(response.status().is_success());
             axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -418,6 +499,41 @@ async fn kv_aware_affinity_sticks_to_session() {
     );
     assert_eq!(alpha_again, alpha);
     assert_eq!(beta_again, beta);
+}
+
+#[tokio::test]
+async fn kv_aware_spreads_concurrent_load() {
+    // Without KV cache data every worker costs the same, so kv_aware picks the
+    // least-loaded worker and breaks ties by position. Sequential requests
+    // always see zero in flight, so the requests have to overlap to spread.
+    let servers = workers(3, Duration::from_millis(300)).await;
+    let router = Arc::new(start_router(&servers, kv_aware()).await);
+    let permits = Arc::new(tokio::sync::Semaphore::new(3));
+
+    let mut tasks = Vec::new();
+    for i in 0..30 {
+        let router = Arc::clone(&router);
+        let permits = Arc::clone(&permits);
+        tasks.push(tokio::spawn(async move {
+            let _permit = permits.acquire().await.unwrap();
+            let request: CompletionRequest =
+                serde_json::from_value(prompt(&[i], json!({}))).unwrap();
+            let response = router.route_completion(None, &request, None).await;
+            assert!(response.status().is_success());
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let counts = hits(&servers);
+    assert_eq!(counts.iter().sum::<usize>(), 30, "hits={counts:?}");
+    for count in &counts {
+        assert!((6..=14).contains(count), "hits={counts:?}");
+    }
 }
 
 #[tokio::test]

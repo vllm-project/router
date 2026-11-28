@@ -154,4 +154,6 @@ def test_normalization_fixture_is_registered(request):
     registered = defs[-1]
     assert registered.argname == HARDWARE_MARK_NORMALIZATION_FIXTURE
     source = Path(inspect.getfile(registered.func)).resolve()
-    assert source == Path(__file__).resolve().parents[1] / "conftest.py"
+    assert source == (
+        Path(__file__).resolve().parents[1] / "helpers" / "fixtures" / "hardware.py"
+    )

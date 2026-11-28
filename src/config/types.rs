@@ -1,11 +1,12 @@
 use super::ConfigResult;
 use crate::config::validation::ConfigValidator;
+pub use crate::kv_index::config::{PdKvEventSources, StaticKvEventSources};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::program_scheduling::{
-    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey,
+    CapacityRepairPolicy, DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy,
+    ProgramResumeOrder, ProgramSchedulingEnableKey, TokenCountMode,
 };
 
 /// Main router configuration
@@ -20,6 +21,12 @@ pub struct RouterConfig {
     /// Workers listed here skip HTTP control-plane discovery and probing.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    /// Explicit routing pairs by Prefill base URL for a heterogeneous P/D pool.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pd_worker_pairs: HashMap<String, Vec<String>>,
+    /// Opt in to hiding KV placement until a complete authoritative recovery.
+    #[serde(default)]
+    pub kv_event_strict_recovery: bool,
     /// Worker connection mode
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -110,7 +117,8 @@ fn default_profile_timeout_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EpdConfig {
     pub encoder_urls: Vec<String>,
-    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL.
+    /// Mooncake consumer control addresses, keyed by the P or combined PD HTTP URL
+    /// with an `@rank` suffix for DP replicas.
     /// Omit for pull-based NIXL or the shared-file example connector.
     #[serde(default)]
     pub consumer_zmq_addrs: HashMap<String, String>,
@@ -137,9 +145,20 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature return-time predictions for regular-HTTP acting TTL decisions.
+    ///
+    /// Output-length prediction remains observational in this mode.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+impl PredictionMode {
+    /// Only Active predictions may alter acting TTLs, and only outside PD mode.
+    pub(crate) fn applies_acting_ttl(self, pd_mode: bool) -> bool {
+        self == Self::Active && !pd_mode
+    }
+}
+
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
@@ -397,6 +416,46 @@ pub struct ProgramSchedulingConfig {
     pub hash_virtual_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_capacity_per_dp_rank: Option<usize>,
+    /// Input-token fact source used for admission, growth, and TTL cost.
+    /// Defaults to `exact` with automatic verification and
+    /// estimation fallback. `estimated` is a supported compatibility override;
+    /// `shadow` records counterfactuals without applying prepared counts.
+    #[serde(default)]
+    pub token_count_mode: TokenCountMode,
+    /// Model pools allowed to apply prepared exact counts. Empty means all.
+    ///
+    /// Entries may be plain model names (`model-a`) or internal pool keys
+    /// (`program:model:model-a`, `program:all`,
+    /// `program:fallback:unlabeled`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_count_model_pools: Vec<String>,
+    /// Matching settlements required before a fingerprint is applied exactly.
+    ///
+    /// `0` restores the legacy trust-on-first-use behaviour. The default `1`
+    /// keeps the estimate for the first settlement of each equivalence class,
+    /// so an unverified count is never used to admit work.
+    #[serde(default = "default_token_count_verification_settlements")]
+    pub token_count_verification_settlements: usize,
+    /// Optional text endpoints allowed to use Router-tokenized facts.
+    /// Empty by default, including in `exact` mode, to avoid
+    /// adding HTTP text tokenization unless the deployment explicitly opts in.
+    ///
+    /// Exactness for HTTP text requires verified tokenizer/template
+    /// equivalence; deployments opt in per endpoint (for example
+    /// `/v1/chat/completions`) and the Router revokes a fingerprint whose
+    /// prepared count disagrees with Engine usage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_text_endpoints: Vec<String>,
+    /// Metrics endpoint override keyed by Program target base URL.
+    ///
+    /// Required for `grpc://` targets: their base URL is not an HTTP metrics
+    /// address, and an unmapped target keeps reporting a missing observation.
+    #[serde(
+        default,
+        rename = "metrics_base_urls",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub metrics_base_urls: BTreeMap<String, String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     pub max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -421,6 +480,8 @@ pub struct ProgramSchedulingConfig {
     pub high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     pub low_watermark_ratio: f64,
+    #[serde(default)]
+    pub capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     pub max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -472,13 +533,58 @@ impl ProgramSchedulingConfig {
                 reason: "program_scheduling_config_json requires enable_program_scheduling"
                     .to_string(),
             }),
-            (true, None) => Ok(Some(Self::default())),
-            (true, Some(raw)) => serde_json::from_str(raw).map(Some).map_err(|error| {
-                super::ConfigError::ValidationFailed {
-                    reason: format!("Invalid program_scheduling_config_json: {error}"),
-                }
-            }),
+            (true, None) => {
+                let config = Self::default();
+                Self::validate_token_count_config(&config)?;
+                Ok(Some(config))
+            }
+            (true, Some(raw)) => {
+                let config: Self = serde_json::from_str(raw).map_err(|error| {
+                    super::ConfigError::ValidationFailed {
+                        reason: format!("Invalid program_scheduling_config_json: {error}"),
+                    }
+                })?;
+                Self::validate_token_count_config(&config)?;
+                Ok(Some(config))
+            }
         }
+    }
+
+    /// Validate the token-count knobs before they can silently degrade.
+    fn validate_token_count_config(config: &Self) -> ConfigResult<()> {
+        const TEXT_ENDPOINTS: [&str; 2] = ["/v1/chat/completions", "/v1/completions"];
+        for endpoint in &config.exact_text_endpoints {
+            if !TEXT_ENDPOINTS.contains(&endpoint.as_str()) {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "exact_text_endpoints entry {endpoint:?} is not a Router text endpoint ({})",
+                        TEXT_ENDPOINTS.join(", ")
+                    ),
+                });
+            }
+        }
+        for (target, metrics_url) in &config.metrics_base_urls {
+            if target.trim().is_empty() {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: "metrics_base_urls contains an empty target base URL".to_string(),
+                });
+            }
+            if !(metrics_url.starts_with("http://") || metrics_url.starts_with("https://")) {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: format!(
+                        "metrics_base_urls value for {target} must be an HTTP(S) URL, got {metrics_url:?}"
+                    ),
+                });
+            }
+        }
+        for pool in &config.token_count_model_pools {
+            if pool.trim().is_empty() {
+                return Err(super::ConfigError::ValidationFailed {
+                    reason: "token_count_model_pools contains an empty entry".to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn defaulted_calibration_fields(&self) -> Vec<&'static str> {
@@ -530,6 +636,11 @@ impl Default for ProgramSchedulingConfig {
             binding_strategy: ProgramBindingStrategy::default(),
             hash_virtual_nodes: default_program_hash_virtual_nodes(),
             token_capacity_per_dp_rank: None,
+            token_count_mode: TokenCountMode::default(),
+            token_count_model_pools: Vec::new(),
+            token_count_verification_settlements: default_token_count_verification_settlements(),
+            exact_text_endpoints: Vec::new(),
+            metrics_base_urls: BTreeMap::new(),
             max_active_programs_per_target: default_program_max_active_programs_per_target(),
             metrics_interval_seconds: default_program_metrics_interval_seconds(),
             admission_waiting_request_threshold:
@@ -545,6 +656,7 @@ impl Default for ProgramSchedulingConfig {
             max_acting_ttl_seconds: default_program_max_acting_ttl_seconds(),
             high_watermark_ratio: default_program_high_watermark_ratio(),
             low_watermark_ratio: default_program_low_watermark_ratio(),
+            capacity_repair_policy: CapacityRepairPolicy::default(),
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
@@ -580,6 +692,16 @@ struct ProgramSchedulingConfigInput {
     hash_virtual_nodes: u32,
     #[serde(default, alias = "token_capacity_per_target")]
     token_capacity_per_dp_rank: Option<usize>,
+    #[serde(default)]
+    token_count_mode: TokenCountMode,
+    #[serde(default)]
+    token_count_model_pools: Vec<String>,
+    #[serde(default = "default_token_count_verification_settlements")]
+    token_count_verification_settlements: usize,
+    #[serde(default)]
+    exact_text_endpoints: Vec<String>,
+    #[serde(default, rename = "metrics_base_urls")]
+    metrics_base_urls: BTreeMap<String, String>,
     #[serde(default = "default_program_max_active_programs_per_target")]
     max_active_programs_per_target: usize,
     #[serde(default = "default_program_metrics_interval_seconds")]
@@ -604,6 +726,8 @@ struct ProgramSchedulingConfigInput {
     high_watermark_ratio: f64,
     #[serde(default = "default_program_low_watermark_ratio")]
     low_watermark_ratio: f64,
+    #[serde(default)]
+    capacity_repair_policy: CapacityRepairPolicy,
     #[serde(default = "default_program_max_segment_rounds")]
     max_segment_rounds: usize,
     #[serde(default = "default_program_stats_window_size")]
@@ -707,6 +831,11 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             binding_strategy: input.binding_strategy,
             hash_virtual_nodes: input.hash_virtual_nodes,
             token_capacity_per_dp_rank: input.token_capacity_per_dp_rank,
+            token_count_mode: input.token_count_mode,
+            token_count_model_pools: input.token_count_model_pools,
+            token_count_verification_settlements: input.token_count_verification_settlements,
+            exact_text_endpoints: input.exact_text_endpoints,
+            metrics_base_urls: input.metrics_base_urls,
             max_active_programs_per_target: input.max_active_programs_per_target,
             metrics_interval_seconds: input.metrics_interval_seconds,
             admission_waiting_request_threshold: input.admission_waiting_request_threshold,
@@ -719,6 +848,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_acting_ttl_seconds: input.max_acting_ttl_seconds,
             high_watermark_ratio: input.high_watermark_ratio,
             low_watermark_ratio: input.low_watermark_ratio,
+            capacity_repair_policy: input.capacity_repair_policy,
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
@@ -736,6 +866,10 @@ fn default_program_cross_rank_headroom_ratio() -> f64 {
 
 fn default_program_hash_virtual_nodes() -> u32 {
     160
+}
+
+fn default_token_count_verification_settlements() -> usize {
+    1
 }
 
 fn default_program_max_active_programs_per_target() -> usize {
@@ -879,6 +1013,10 @@ pub enum KvConnector {
     #[serde(rename = "mooncake")]
     #[value(name = "mooncake")]
     Mooncake,
+    /// Ascend MooncakeConnectorV2, with handoff metadata in the Prefill response.
+    #[serde(rename = "mooncake-v2")]
+    #[value(name = "mooncake-v2")]
+    MooncakeV2,
     /// MoRI-IO KV transfer
     #[serde(rename = "moriio")]
     #[value(name = "moriio")]
@@ -894,30 +1032,6 @@ pub enum ConnectionMode {
     /// vLLM rust Inference (`grpc://` / `grpcs://` worker URLs)
     #[serde(rename = "grpc")]
     Grpc,
-}
-
-/// Statically configured KV event sources for one prefill worker, used when
-/// the engine's HTTP control plane does not serve `/server_info` or
-/// `/kv_event_sources` (e.g. the `vllm-rs serve` frontend).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PdKvEventSources {
-    /// ZMQ PUB endpoints, one per data-parallel rank (index = rank).
-    pub endpoints: Vec<String>,
-    /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// KV cache block size of the engine. Must match the engine's
-    /// `--block-size` (vLLM default: 16).
-    #[serde(default = "default_pd_kv_block_size")]
-    pub block_size: u32,
-    /// Model identity for the cache key. Defaults to the worker URL; the
-    /// served-model check then relies on `/v1/models`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
-
-fn default_pd_kv_block_size() -> u32 {
-    16
 }
 
 /// Routing mode configuration
@@ -1062,27 +1176,6 @@ pub enum PolicyConfig {
 
     #[serde(rename = "rendezvous_hash")]
     RendezvousHash,
-}
-
-/// Manually configured KV event publishers for one regular-mode worker.
-///
-/// Rust struct literals must supply `topic: String::new()` to retain the
-/// previous empty subscription topic. Serde defaults preserve old JSON
-/// configurations, but do not provide Rust source compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StaticKvEventSources {
-    /// One externally reachable ZMQ PUB endpoint per DP rank.
-    pub endpoints: Vec<String>,
-    /// Optional replay ROUTER endpoint per DP rank for loss recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replay_endpoints: Option<Vec<String>>,
-    /// Exact ZMQ subscription topic shared by these ranks.
-    #[serde(default)]
-    pub topic: String,
-    /// KV cache block size used to calculate prefix placement.
-    pub block_size: u32,
-    /// Shared model identity across workers that serve the same model.
-    pub model: String,
 }
 
 impl PolicyConfig {
@@ -1300,6 +1393,8 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             pd_kv_event_sources: HashMap::new(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::Random,
             host: "127.0.0.1".to_string(),
             port: 3001,
@@ -1397,10 +1492,82 @@ impl RouterConfig {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     // ============= RouterConfig Tests =============
+
+    #[test]
+    fn token_count_knobs_fail_fast_on_unmatchable_values() {
+        let invalid = [
+            r#"{"exact_text_endpoints":["/v1/chat/completions/"]}"#,
+            r#"{"metrics_base_urls":{"grpc://engine:1":"grpc://engine:2"}}"#,
+            r#"{"token_count_model_pools":[""]}"#,
+        ];
+        for raw in invalid {
+            assert!(
+                ProgramSchedulingConfig::resolve(true, Some(raw)).is_err(),
+                "expected {raw} to be rejected"
+            );
+        }
+        let accepted = ProgramSchedulingConfig::resolve(
+            true,
+            Some(r#"{"exact_text_endpoints":["/v1/chat/completions"],"token_count_model_pools":["model-a","program:all"]}"#),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepted.exact_text_endpoints, ["/v1/chat/completions"]);
+        assert_eq!(accepted.token_count_model_pools, ["model-a", "program:all"]);
+    }
+
+    #[test]
+    fn program_token_count_mode_parses_and_defaults_to_exact() {
+        for input in [None, Some("{}")] {
+            let default = ProgramSchedulingConfig::resolve(true, input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(default.token_count_mode, TokenCountMode::Exact);
+            assert_eq!(default.token_count_verification_settlements, 1);
+            assert!(default.token_count_model_pools.is_empty());
+            assert!(default.exact_text_endpoints.is_empty());
+        }
+
+        let estimated =
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"estimated"}"#))
+                .unwrap()
+                .unwrap();
+        assert_eq!(estimated.token_count_mode, TokenCountMode::Estimated);
+
+        for mode in ["exact", "exact_when_verified"] {
+            let input = serde_json::json!({
+                "token_count_mode": mode,
+                "token_count_model_pools": ["model-a"]
+            })
+            .to_string();
+            let configured = ProgramSchedulingConfig::resolve(true, Some(&input))
+                .unwrap()
+                .unwrap();
+            assert_eq!(configured.token_count_mode, TokenCountMode::Exact);
+            assert_eq!(configured.token_count_mode.as_str(), "exact");
+            assert_eq!(
+                serde_json::to_value(&configured).unwrap()["token_count_mode"],
+                "exact"
+            );
+            assert_eq!(configured.token_count_model_pools, vec!["model-a"]);
+        }
+
+        let shadow =
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"shadow"}"#))
+                .unwrap()
+                .unwrap();
+        assert_eq!(shadow.token_count_mode, TokenCountMode::Shadow);
+
+        assert!(
+            ProgramSchedulingConfig::resolve(true, Some(r#"{"token_count_mode":"bogus"}"#))
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_router_config_default() {
@@ -1459,6 +1626,27 @@ mod tests {
     }
 
     #[test]
+    fn strict_recovery_is_explicit_and_old_configs_default_to_compatibility() {
+        let mut config = RouterConfig::default();
+        assert!(!config.kv_event_strict_recovery);
+        config.kv_event_strict_recovery = true;
+        let mut json = serde_json::to_value(&config).unwrap();
+        assert!(
+            serde_json::from_value::<RouterConfig>(json.clone())
+                .unwrap()
+                .kv_event_strict_recovery
+        );
+        json.as_object_mut()
+            .unwrap()
+            .remove("kv_event_strict_recovery");
+        assert!(
+            !serde_json::from_value::<RouterConfig>(json)
+                .unwrap()
+                .kv_event_strict_recovery
+        );
+    }
+
+    #[test]
     fn test_pd_kv_event_sources_serde_roundtrip_and_defaults() {
         let mut config = RouterConfig::new(
             RoutingMode::VllmPrefillDecode {
@@ -1483,6 +1671,7 @@ mod tests {
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
                 model: Some("m".to_string()),
+                hybrid: None,
             },
         );
         let json = serde_json::to_string(&config).unwrap();
@@ -1600,6 +1789,26 @@ mod tests {
         let serialized = serde_json::to_value(legacy).unwrap();
         assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
         assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_capacity_repair_policy_is_opt_in() {
+        let defaults: ProgramSchedulingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.capacity_repair_policy,
+            CapacityRepairPolicy::Legacy
+        );
+
+        let configured: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"capacity_repair_policy":"retention_value"}"#).unwrap();
+        assert_eq!(
+            configured.capacity_repair_policy,
+            CapacityRepairPolicy::RetentionValue
+        );
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["capacity_repair_policy"],
+            "retention_value"
+        );
     }
 
     #[test]
@@ -2080,6 +2289,8 @@ mod tests {
                 discovery_address: None,
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
@@ -2146,6 +2357,8 @@ mod tests {
                 ],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::CacheAware {
                 cache_threshold: 0.9,
                 balance_abs_threshold: 5,
@@ -2213,6 +2426,8 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             pd_kv_event_sources: Default::default(),
+            pd_worker_pairs: Default::default(),
+            kv_event_strict_recovery: false,
             policy: PolicyConfig::RoundRobin,
             host: "::1".to_string(), // IPv6
             port: 8888,

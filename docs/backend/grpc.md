@@ -22,7 +22,7 @@ Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
 | API | Status | Behavior |
 |---|---|---|
 | `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
-| `/v1/completions` | Supported, token-id prompts only | `prompt` must be `list[int]`; ids go straight to the wire. Text prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/completions` | Supported, single prompt | On the regular gRPC pool, `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. On a static P/D gRPC pool only a single token-id prompt (`list[int]`) is accepted — text prompts are rejected with `400`. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
 | `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
 | `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
 | `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
@@ -32,11 +32,22 @@ listed under [Capability Boundaries](#capability-boundaries).
 
 ### `/v1/completions` on a gRPC pool
 
-A gRPC pool also serves `/v1/completions` with token-id prompts only:
+A gRPC pool also serves `/v1/completions` with single prompts:
 `prompt: [int]` skips the chat template (step 2 above) and the client's ids go
-straight to the worker. Text and nested prompts return 400. Routing honors
-`session_params.session_id` like chat; without one, token-id prompts create no
-prefix-cache affinity (cache_aware balances them on load alone).
+straight to the worker, and `prompt: "text"` is tokenized once through the
+same encoding cache chat uses — L0 always applies, while L1 prefix reuse
+applies only when `add_special_tokens` is false (`add_special_tokens` defaults
+to `true`; chat defaults to `false`). Batched prompts (`list[str]`, `list[list[int]]` with
+more than one entry) are rejected with 400 before any tokenization: lowering
+produces one prepared request per prompt sequence, and dispatching more than
+one is Stage 3's fan-out.
+Text lowering lives on the regular-pool path only (`prepare_completions`); the
+token-id lower (`prepare_grpc_completion`) is shared with the gRPC P/D route,
+which reads its `token_ids` directly.
+Routing honors `session_params.session_id` like chat; without one, token-id
+prompts create no prefix-cache affinity (cache_aware balances them on load alone).
+For colocated `kv_aware` routing, the router can score prefix reuse from
+prepared token IDs and worker KV events independently of session affinity.
 
 The reply is shaped for completion clients — `text_completion` chunks and body
 with `choices[].text`, `cmpl-` ids — while reusing the chat pipeline internally.
@@ -57,7 +68,52 @@ A worker pool is all HTTP or all gRPC. Mixed schemes fail during startup or
 tonic, but still calls the gRPC port, not the OpenAI HTTP port.
 
 Worker liveness on `grpc://` uses `grpc.health.v1` Check with an empty service
-name. `--health-check-endpoint` only applies to HTTP workers.
+name. `--health-check-endpoint` only applies to HTTP workers. The router runs
+that check in the background and remembers the result. A Rust gRPC worker does
+not log this RPC. A quiet worker log during these probes is normal.
+
+Two curls are usable, and they check different things. With the ports from the
+start example below, the router is `30000` and the worker HTTP port is `8000`.
+
+The router reports the stored health flag. This request does not call the
+worker, so it adds nothing to the worker log:
+
+```bash
+curl -sS http://127.0.0.1:30000/health
+```
+
+A healthy pool prints `All servers healthy`. The status is 200. To print the
+status code itself:
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:30000/health
+```
+
+The worker's own HTTP server answers a separate `/health` on `--port`. The
+router does not use this URL for a `grpc://` worker. A healthy response is
+status 200 with an empty body, so a plain curl prints nothing. Print the status
+code to see it:
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/health
+```
+
+That prints `200`. It does not mean `grpc.health.v1` is serving. The gRPC port
+does not speak HTTP, so curl against `--grpc-port` is not a health check. Probe
+the port the router actually uses:
+
+```bash
+grpc_health_probe -addr=127.0.0.1:50051
+```
+
+A healthy worker prints `status: SERVING` and the command exits 0. This is the
+same `grpc.health.v1` Check the router runs, not a copy of the stored flag.
+The flag flips only after `--health-success-threshold` consecutive successes
+(default 2) or `--health-failure-threshold` consecutive failures (default 3).
+While a worker is failing or recovering, a one-off probe can print `SERVING`
+while router `/health` is still 503, or fail while `/health` is still 200.
+This RPC is not written to the worker log either. `/health_generate` on a gRPC
+pool returns `501`.
 
 ## Request Preparation
 
@@ -234,17 +290,19 @@ each prefill's `Control.GetKvEventSources`, or from
 `--pd-kv-events grpc://prefill:50051=tcp://prefill:5557` when the worker does
 not report them.
 
+See [KV-aware P/D routing](../load_balancing/kv_aware.md#pd-routing) for layout setup.
+
 ## Backend Modules
 
 | File | Role |
 |---|---|
 | `src/backend/mod.rs` | Shared backend exports and `pb` aliases for `vllm-proto` |
 | `src/backend/detect.rs` | Scheme detection, pool-kind locking, DP rank stripping, tonic URI conversion |
-| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_token_ids(chat, ids)`, and `dispatch` |
+| `src/backend/frontend.rs` | `EngineFrontend`: `prepare(chat)`, `prepare_completions(completion)`, `prepare_token_ids(chat, ids)` (token-id-only path, used by the gRPC P/D route), and `dispatch` |
 | `src/backend/health.rs` | gRPC health checks for startup and worker probes |
 | `src/backend/preprocess.rs` | Tokenizer/model cache and chat render/encode |
 | `src/backend/vllm_frontend.rs` | Adapter around `vllm-chat`, `vllm-tokenizer`, and `vllm-text` |
-| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape |
+| `src/backend/convert.rs` | OpenAI request fields to `GenerateRequest`; `prepare_grpc_completion` lowers `/v1/completions` onto the chat shape (token ids only, shared with the gRPC P/D route); `prepare_grpc_completion_prompts` is the regular-pool text lower, used only by `EngineFrontend::prepare_completions` |
 | `src/backend/grpc.rs` | Cached tonic `InferenceClient` and `GenerateStream` |
 | `src/backend/openai.rs` | Proto chunks to OpenAI JSON/SSE for clients |
 

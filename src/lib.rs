@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use pyo3::prelude::*;
 pub mod backend;
 pub mod config;
@@ -6,7 +8,6 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
-pub mod kv_hash;
 pub mod kv_index;
 pub mod metrics;
 pub mod middleware;
@@ -54,6 +55,10 @@ struct Router {
     kv_event_replay_source: Vec<String>,
     kv_event_block_size: u32,
     kv_event_model: Option<String>,
+    kv_event_strict_recovery: bool,
+    kv_hybrid_layout: Option<std::path::PathBuf>,
+    kv_event_topic: Vec<String>,
+    pd_pair: Vec<String>,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -117,7 +122,7 @@ struct Router {
     // OpenTelemetry tracing
     enable_trace: bool,
     otlp_traces_endpoint: Option<String>,
-    // KV connector for PD disaggregation ("nixl" or "mooncake")
+    // KV connector for P/D disaggregation.
     kv_connector: String,
     // Explicit Program-level scheduling feature switch and optional overrides.
     enable_program_scheduling: bool,
@@ -182,19 +187,23 @@ impl Router {
 
         // Convert main policy and attach static regular-mode KV event sources.
         let mut policy = convert_policy(&self.policy);
-        let static_sources = config::parse_static_kv_event_sources(
-            &self.kv_event_source,
-            &self.kv_event_replay_source,
-            self.kv_event_block_size,
-            self.kv_event_model.as_deref(),
-        )?;
+        let sources = config::KvSourceOptions {
+            layout: self.kv_hybrid_layout.as_deref(),
+            publishers: &self.kv_event_source,
+            pd_publishers: &self.pd_kv_events,
+            replay: &self.kv_event_replay_source,
+            topics: &self.kv_event_topic,
+            block_size: self.kv_event_block_size,
+            model: self.kv_event_model.as_deref(),
+        }
+        .load(&mode)?;
         if let ConfigPolicyConfig::KvAware {
             static_kv_event_sources,
             ..
         } = &mut policy
         {
-            **static_kv_event_sources = static_sources;
-        } else if !static_sources.is_empty() {
+            **static_kv_event_sources = sources.regular;
+        } else if !sources.regular.is_empty() {
             return Err(config::ConfigError::IncompatibleConfig {
                 reason: "--kv-event-source requires the kv_aware policy".to_string(),
             });
@@ -228,7 +237,9 @@ impl Router {
         Ok(config::RouterConfig {
             epd: None,
             mode,
-            pd_kv_event_sources: config::parse_pd_kv_events(&self.pd_kv_events)?,
+            pd_kv_event_sources: sources.pd,
+            pd_worker_pairs: config::parse_pd_worker_pairs(&self.pd_pair)?,
+            kv_event_strict_recovery: self.kv_event_strict_recovery,
             policy,
             host: self.host.clone(),
             port: self.port,
@@ -277,25 +288,32 @@ impl Router {
             history_backend: config::HistoryBackend::Memory,
             enable_profiling: false, // Profiling disabled in Python binding by default
             profile_timeout_secs: 10, // Default profiling timeout
-            kv_connector: match self.kv_connector.to_ascii_lowercase().as_str() {
-                "nixl" => config::KvConnector::Nixl,
-                "mooncake" => config::KvConnector::Mooncake,
-                "moriio" => config::KvConnector::MoriIO,
-                other => {
-                    return Err(config::ConfigError::ValidationFailed {
-                        reason: format!(
-                            "Invalid kv_connector '{}': expected 'nixl', 'mooncake', or 'moriio'",
-                            other
-                        ),
-                    });
-                }
-            },
+            kv_connector: parse_kv_connector(&self.kv_connector)?,
             program_scheduling: config::ProgramSchedulingConfig::resolve(
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
         })
     }
+}
+
+fn parse_kv_connector(value: &str) -> config::ConfigResult<config::KvConnector> {
+    use clap::ValueEnum;
+    use config::{ConfigError, KvConnector};
+
+    KvConnector::from_str(value, true).map_err(|_| {
+        let choices = KvConnector::value_variants()
+            .iter()
+            .filter_map(KvConnector::to_possible_value)
+            .map(|choice| choice.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ConfigError::InvalidValue {
+            field: "kv_connector".into(),
+            value: value.into(),
+            reason: format!("expected one of: {choices}"),
+        }
+    })
 }
 
 #[pymethods]
@@ -382,6 +400,10 @@ impl Router {
         kv_event_replay_source = vec![],
         kv_event_block_size = 16,
         kv_event_model = None,
+        kv_event_strict_recovery = false,
+        kv_hybrid_layout = None,
+        kv_event_topic = vec![],
+        pd_pair = vec![]
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -459,6 +481,10 @@ impl Router {
         kv_event_replay_source: Vec<String>,
         kv_event_block_size: u32,
         kv_event_model: Option<String>,
+        kv_event_strict_recovery: bool,
+        kv_hybrid_layout: Option<std::path::PathBuf>,
+        kv_event_topic: Vec<String>,
+        pd_pair: Vec<String>,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -490,6 +516,10 @@ impl Router {
             kv_event_replay_source,
             kv_event_block_size,
             kv_event_model,
+            kv_event_strict_recovery,
+            kv_hybrid_layout,
+            kv_event_topic,
+            pd_pair,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
@@ -635,4 +665,26 @@ fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use config::KvConnector;
+
+    #[test]
+    fn python_kv_connector_parsing_reports_valid_values() {
+        assert_eq!(
+            parse_kv_connector("mooncake-v2").unwrap(),
+            KvConnector::MooncakeV2
+        );
+        assert_eq!(parse_kv_connector("NIXL").unwrap(), KvConnector::Nixl);
+        let error = parse_kv_connector("bogus").unwrap_err().to_string();
+        assert!(
+            error.contains("Invalid value for field 'kv_connector': bogus")
+                && error.contains("nixl, mooncake, mooncake-v2, moriio"),
+            "{error}"
+        );
+    }
 }

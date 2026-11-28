@@ -2,6 +2,7 @@
 //! Loaded models share optional L0 (exact) and L1 (prefix) encoding caches.
 
 use crate::core::Worker;
+use crate::kv_index::request_hash::ImagePrefix;
 use crate::metrics::RouterMetrics;
 use crate::policies::WorkerTokenInputs;
 use http::HeaderMap;
@@ -35,7 +36,7 @@ use vllm_chat::{
 /// frontend: HTTP workers can have different templates and tokenizer settings.
 enum HttpKvInput {
     Direct(Arc<[Vec<u32>]>),
-    Render { path: &'static str },
+    Render { path: &'static str, image: bool },
 }
 
 fn dense_token_ids(value: &serde_json::Value) -> Result<Vec<u32>, &'static str> {
@@ -65,9 +66,23 @@ fn token_prompts(value: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'static 
     Ok(Arc::from(prompts))
 }
 
+pub(crate) const NAMED_LORA_FIELD: &str = "lora_name";
+
+/// Explicit adapters shared by input-credit and session-binding admission.
+/// Each caller decides which identities its own contract can model.
+pub(crate) const ADAPTER_FIELDS: [&str; 3] =
+    [NAMED_LORA_FIELD, "lora_path", "prompt_adapter_request"];
+
 fn http_cache_identity(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), &'static str> {
+    http_cache_identity_for_render(fields, false).map(|_| ())
+}
+
+fn http_cache_identity_for_render(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    allow_image: bool,
+) -> Result<bool, &'static str> {
     // The event index cannot identify multimodal/embedding or prompt-adapter
     // cache keys from token IDs alone. HTTP adapter names also need an explicit
     // mapping to the names carried by KV events before they can earn credit.
@@ -77,32 +92,213 @@ fn http_cache_identity(
         "input_embeds",
         "input_embeddings",
         "multi_modal_data",
-        "lora_path",
-        "lora_name",
-        "prompt_adapter_request",
-    ] {
+    ]
+    .into_iter()
+    .chain(ADAPTER_FIELDS)
+    {
         if fields.get(field).is_some_and(|value| !value.is_null()) {
             return Err("unsupported_cache_identity");
         }
     }
+    let mut image = false;
     if let Some(messages) = fields.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                if parts.iter().any(|part| {
-                    part.get("type").and_then(serde_json::Value::as_str) != Some("text")
-                }) {
-                    return Err("multimodal_input");
+                for part in parts {
+                    match part.get("type").and_then(serde_json::Value::as_str) {
+                        Some("text") => {}
+                        Some("image_url") if allow_image && !image => image = true,
+                        _ => return Err("multimodal_input"),
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(image)
 }
 
-fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &'static str> {
-    if let Some(fields) = body.as_object() {
-        http_cache_identity(fields)?;
+/// Requests whose cache-read semantics have not been verified must not earn
+/// placement credit. Keep their token ids for load accounting and affinity.
+pub(crate) fn http_cache_read_fallback(body: &serde_json::Value) -> Option<&'static str> {
+    let Some(fields) = body.as_object() else {
+        return Some("unsupported_cache_read");
+    };
+    cache_read_fallback(fields, false, false)
+}
+
+fn completion_lora_is_null(request: &CompletionRequest) -> bool {
+    // Flattened fields serialize last, including duplicates in borrowed API requests.
+    request.other.get("lora_path").map_or_else(
+        || matches!(request.lora_path, None | Some(LoRAPath::Single(None))),
+        serde_json::Value::is_null,
+    )
+}
+
+/// Completion's worker-render contract admits only modeled extension fields.
+pub(crate) fn completion_cache_read_fallback(request: &CompletionRequest) -> Option<&'static str> {
+    if let Some(reason) =
+        cache_read_fallback(&request.other, request.echo, request.logprobs.is_some())
+    {
+        return Some(reason);
     }
+    if !completion_lora_is_null(request)
+        || request
+            .other
+            .iter()
+            .any(|(field, value)| !match field.as_str() {
+                "add_special_tokens" => value.is_boolean(),
+                "priority" => value.is_i64() || value.is_u64(),
+                "truncate_prompt_tokens" => true,
+                // vLLM uses this flag for response IDs and echo detokenization.
+                // Its cache-read gate depends on prompt logprobs and explicit skips.
+                "return_token_ids" => value.is_boolean() || value.is_null(),
+                "session_id" => value.is_string() || value.is_null(),
+                "lora_path" => value.is_null(),
+                "extra_body" | "sampling_params" | "sampling_parameters" => {
+                    value.is_null()
+                        || value.as_object().is_some_and(|fields| {
+                            fields.iter().all(|(field, _)| {
+                                matches!(
+                                    field.as_str(),
+                                    "prompt_logprobs"
+                                        | "skip_reading_prefix_cache"
+                                        | "skip_reading_external_kv"
+                                )
+                            })
+                        })
+                }
+                "vllm_xargs" => {
+                    value.is_null()
+                        || value.as_object().is_some_and(|args| {
+                            args.iter().all(|(key, value)| {
+                                key == "kv_cache_report_mode"
+                                    && value.as_str() == Some("incremental")
+                            })
+                        })
+                }
+                _ => false,
+            })
+    {
+        return Some("unsupported_cache_identity");
+    }
+    None
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[test]
+fn completion_credit_accepts_null_lora_path() {
+    let mut request: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "model",
+        "prompt": [1, 2],
+        "lora_path": null
+    }))
+    .unwrap();
+    request.lora_path = Some(LoRAPath::Single(None));
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request
+        .other
+        .insert("lora_path".into(), serde_json::Value::Null);
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request.other.remove("lora_path");
+    request.other.insert(
+        "extra_body".into(),
+        serde_json::json!({"skip_reading_prefix_cache": false}),
+    );
+    assert_eq!(completion_cache_read_fallback(&request), None);
+    request.other.insert(
+        "extra_body".into(),
+        serde_json::json!({"truncate_prompt_tokens": 1}),
+    );
+    assert_eq!(
+        completion_cache_read_fallback(&request),
+        Some("unsupported_cache_identity")
+    );
+    request.other.remove("extra_body");
+    request.lora_path = Some(LoRAPath::Single(Some("adapter".into())));
+    assert_eq!(
+        completion_cache_read_fallback(&request),
+        Some("unsupported_cache_identity")
+    );
+}
+
+fn cache_read_fallback(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    mut echo: bool,
+    mut logprobs: bool,
+) -> Option<&'static str> {
+    fn inspect(
+        fields: &serde_json::Map<String, serde_json::Value>,
+        echo: &mut bool,
+        logprobs: &mut bool,
+    ) -> Option<&'static str> {
+        match fields.get("skip_reading_prefix_cache") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => return Some("skip_prefix_cache"),
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        match fields.get("skip_reading_external_kv") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => return Some("skip_external_kv"),
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        if fields.get("prompt_logprobs").is_some_and(|value| {
+            !matches!(
+                value,
+                serde_json::Value::Null | serde_json::Value::Bool(false)
+            )
+        }) || ["prompt_logprob_token_ids", "prompt_logprob_start"]
+            .iter()
+            .any(|name| fields.get(*name).is_some_and(|value| !value.is_null()))
+        {
+            return Some("unsupported_prompt_scoring");
+        }
+        match fields.get("echo") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => *echo = true,
+            Some(_) => return Some("unsupported_cache_read"),
+        }
+        *logprobs |= ["logprobs", "top_logprobs"].iter().any(|name| {
+            fields.get(*name).is_some_and(|value| {
+                !matches!(
+                    value,
+                    serde_json::Value::Null | serde_json::Value::Bool(false)
+                )
+            })
+        });
+        match fields.get("cache_salt") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(salt)) if salt.is_empty() => {}
+            Some(serde_json::Value::String(_)) => return Some("cache_salt"),
+            Some(_) => return Some("unsupported_cache_identity"),
+        }
+        for name in ["extra_body", "sampling_params", "sampling_parameters"] {
+            if let Some(value) = fields.get(name).filter(|value| !value.is_null()) {
+                let Some(fields) = value.as_object() else {
+                    return Some("unsupported_cache_read");
+                };
+                if let Some(reason) = inspect(fields, echo, logprobs) {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+    inspect(fields, &mut echo, &mut logprobs)
+        .or_else(|| (echo && logprobs).then_some("unsupported_prompt_scoring"))
+}
+
+fn http_kv_input(
+    body: &serde_json::Value,
+    route: &str,
+    allow_image: bool,
+) -> Result<HttpKvInput, &'static str> {
+    let image = match body.as_object() {
+        Some(fields) => {
+            http_cache_identity_for_render(fields, allow_image && route == "/v1/chat/completions")?
+        }
+        None => false,
+    };
     let path = match route {
         "/v1/completions" => {
             if body
@@ -148,13 +344,23 @@ fn http_kv_input(body: &serde_json::Value, route: &str) -> Result<HttpKvInput, &
         }
         _ => return Err("unsupported_route"),
     };
-    Ok(HttpKvInput::Render { path })
+    Ok(HttpKvInput::Render { path, image })
+}
+
+/// Whether pricing needs a backend `/render`: a string/chat body does, a
+/// direct token-id input does not.
+pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) -> bool {
+    matches!(
+        http_kv_input(body, route, true),
+        Ok(HttpKvInput::Render { .. })
+    )
 }
 
 /// Backend-effective prompts, shared by colocated and PD routing policies.
 #[derive(Clone)]
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,
+    pub image: Option<ImagePrefix>,
     pub source: &'static str,
 }
 
@@ -171,11 +377,13 @@ pub(crate) fn router_token_inputs(
     };
     let input = checked.map(|()| HttpTokenInput {
         prompts: prompts.clone(),
+        image: None,
         source: "prepared",
     });
     urls.into_iter().map(|url| (url, input.clone())).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_http_token_inputs(
     client: &Client,
     mut urls: Vec<String>,
@@ -184,11 +392,12 @@ pub(crate) async fn prepare_http_token_inputs(
     headers: Option<&HeaderMap>,
     api_key: Option<&str>,
     budget: Duration,
+    render_images: bool,
 ) -> std::collections::HashMap<String, Result<HttpTokenInput, &'static str>> {
     use futures_util::{stream, StreamExt};
     urls.sort();
     urls.dedup();
-    let input = match http_kv_input(body, route) {
+    let input = match http_kv_input(body, route, render_images) {
         Ok(input) => input,
         Err(reason) => return urls.into_iter().map(|url| (url, Err(reason))).collect(),
     };
@@ -200,15 +409,22 @@ pub(crate) async fn prepare_http_token_inputs(
                     url,
                     Ok(HttpTokenInput {
                         prompts: prompts.clone(),
+                        image: None,
                         source: "token_ids",
                     }),
                 )
             })
             .collect();
     }
-    let HttpKvInput::Render { path } = input else {
+    let HttpKvInput::Render { path, image } = input else {
         unreachable!()
     };
+    let image_body = image.then(|| {
+        let mut payload = body.clone();
+        payload["mm_payload"] = "none".into();
+        payload
+    });
+    let render_body = image_body.as_ref().unwrap_or(body);
     let expected_prompts = if route == "/v1/completions" {
         body.get("prompt")
             .and_then(serde_json::Value::as_array)
@@ -231,10 +447,16 @@ pub(crate) async fn prepare_http_token_inputs(
             let tokenize_fallback = &tokenize_fallback;
             async move {
                 let result = async {
-                    let (prompts, source) =
-                        match http_input_json(client, &url, path, body, headers, api_key).await {
-                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
-                            Err("render_unavailable") => {
+                    let (prompts, source, image) =
+                        match http_input_json(client, &url, path, render_body, headers, api_key)
+                            .await
+                        {
+                            Ok(rendered) if image => {
+                                let (tokens, image) = http_rendered_image(&rendered)?;
+                                (Arc::from(vec![tokens]), "render", Some(image))
+                            }
+                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render", None),
+                            Err("render_unavailable") if !image => {
                                 let requests = tokenize_fallback
                                     .get_or_init(|| http_tokenize_fallback(body, route))
                                     .as_ref()
@@ -260,14 +482,18 @@ pub(crate) async fn prepare_http_token_inputs(
                                     }
                                     prompts.push(ids);
                                 }
-                                (Arc::from(prompts), "tokenize")
+                                (Arc::from(prompts), "tokenize", None)
                             }
                             Err(reason) => return Err(reason),
                         };
                     if prompts.len() != expected_prompts {
                         return Err("invalid_preparation_response");
                     }
-                    Ok(HttpTokenInput { prompts, source })
+                    Ok(HttpTokenInput {
+                        prompts,
+                        source,
+                        image,
+                    })
                 }
                 .await;
                 (url, result)
@@ -407,6 +633,32 @@ fn http_rendered_tokens(body: &serde_json::Value) -> Result<Arc<[Vec<u32>]>, &'s
     Ok(Arc::from(prompts))
 }
 
+fn http_rendered_image(body: &serde_json::Value) -> Result<(Vec<u32>, ImagePrefix), &'static str> {
+    let tokens = dense_token_ids(&body["token_ids"])?;
+    let features = &body["features"];
+    let image = (|| {
+        let hashes = features["mm_hashes"].as_object()?;
+        let placeholders = features["mm_placeholders"].as_object()?;
+        if hashes.len() != 1 || placeholders.len() != 1 {
+            return None;
+        }
+        let [hash] = hashes.get("image")?.as_array()?.as_slice() else {
+            return None;
+        };
+        let [placement] = placeholders.get("image")?.as_array()?.as_slice() else {
+            return None;
+        };
+        ImagePrefix::new(
+            hash.as_str()?,
+            placement["offset"].as_u64()?.try_into().ok()?,
+            placement["length"].as_u64()?.try_into().ok()?,
+            tokens.len(),
+        )
+    })()
+    .ok_or("invalid_image_cache_identity")?;
+    Ok((tokens, image))
+}
+
 /// Prepare request-local token evidence without serializing the completion.
 /// A non-Direct plan returns no evidence and must not complete a preparation
 /// OnceCell: a later retry may need the ordinary Worker preparation path.
@@ -415,16 +667,11 @@ pub(crate) fn prepare_completion_direct_inputs(
     workers: &[Arc<dyn Worker>],
 ) -> Option<WorkerTokenInputs> {
     http_cache_identity(&request.other).ok()?;
-    // Flattened fields serialize last, including duplicates in borrowed API requests.
-    let lora_is_null = request.other.get("lora_path").map_or_else(
-        || matches!(request.lora_path, None | Some(LoRAPath::Single(None))),
-        serde_json::Value::is_null,
-    );
     let suffix_is_null = request
         .other
         .get("suffix")
         .map_or(request.suffix.is_none(), serde_json::Value::is_null);
-    if !lora_is_null
+    if !completion_lora_is_null(request)
         || !suffix_is_null
         || request
             .other
@@ -459,6 +706,7 @@ pub(crate) fn prepare_completion_direct_inputs(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_http_kv_inputs(
     client: &Client,
     workers: &[Arc<dyn Worker>],
@@ -467,19 +715,33 @@ pub(crate) async fn prepare_http_kv_inputs(
     route: &str,
     api_key: Option<&str>,
     budget: Duration,
+    render_images: bool,
 ) -> WorkerTokenInputs {
     let urls = workers
         .iter()
         .map(|worker| worker.base_url().to_owned())
         .collect();
-    let results =
-        prepare_http_token_inputs(client, urls, body, route, headers, api_key, budget).await;
+    let results = prepare_http_token_inputs(
+        client,
+        urls,
+        body,
+        route,
+        headers,
+        api_key,
+        budget,
+        render_images,
+    )
+    .await;
     let mut inputs = WorkerTokenInputs::new();
     for (url, result) in results {
         match result {
             Ok(input) => {
                 RouterMetrics::record_kv_routing_input("http", input.source);
-                inputs.insert(url, input.prompts);
+                if let Some(image) = input.image {
+                    inputs.insert_image(url, input.prompts, image);
+                } else {
+                    inputs.insert(url, input.prompts);
+                }
             }
             Err(reason) => {
                 RouterMetrics::record_kv_routing_input("http", reason);
@@ -667,29 +929,13 @@ impl TokenizeOut {
     }
 }
 
-pub fn tokenize_chat_request_timed(
-    request: &ChatCompletionRequest,
-    frontend: &FrontendHandle,
-) -> Result<TokenizeOut> {
-    match &frontend.0 {
-        Frontend::TestIds(ids) => {
-            if ids.is_empty() {
-                return Err(anyhow!("pinned test token_ids are empty"));
-            }
-            Ok(TokenizeOut {
-                token_ids: Arc::from(ids.clone()),
-                adapt_ms: 0.0,
-                template_ms: 0.0,
-                encode_ms: 0.0,
-                encode_backend: "test-pin",
-                cached_tokens: 0,
-            })
-        }
-        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
-    }
-}
-
-fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
+/// Reject request shapes whose output the gRPC response adapter cannot parse.
+///
+/// This governs *dispatch* for a `grpc://` pool, where the Router has to parse
+/// the Engine stream into the client response. It does not affect rendering or
+/// tokenization: `tokenize_chat_request_for_count_timed` deliberately skips it,
+/// because an exact input-token count only needs the rendered prompt.
+pub(crate) fn check_output_adapter_support(request: &ChatCompletionRequest) -> Result<()> {
     if request
         .tools
         .as_ref()
@@ -708,6 +954,105 @@ fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Re
             "reasoning_effort requires vllm-chat output parsing, which the gRPC response adapter does not yet expose"
         ));
     }
+    Ok(())
+}
+
+fn pinned_test_tokenize(frontend: &FrontendHandle) -> Option<Result<TokenizeOut>> {
+    match &frontend.0 {
+        Frontend::TestIds(ids) => Some(if ids.is_empty() {
+            Err(anyhow!("pinned test token_ids are empty"))
+        } else {
+            Ok(TokenizeOut {
+                token_ids: Arc::from(ids.clone()),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test-pin",
+                cached_tokens: 0,
+            })
+        }),
+        Frontend::Vllm(_) => None,
+    }
+}
+
+/// Tokenize for gRPC dispatch: output-adapter support is a precondition.
+pub fn tokenize_chat_request_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    check_output_adapter_support(request)?;
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+/// Tokenize only, for an exact input-token count.
+///
+/// The HTTP passthrough path never parses the Engine output in the Router, so a
+/// request with active tool calling (or `reasoning_effort`) can still be counted
+/// exactly; only the rendered prompt matters here. Dispatch paths that do parse
+/// the output must use `tokenize_chat_request_timed`.
+pub fn tokenize_chat_request_for_count_timed(
+    request: &ChatCompletionRequest,
+    frontend: &FrontendHandle,
+) -> Result<TokenizeOut> {
+    if let Some(pinned) = pinned_test_tokenize(frontend) {
+        return pinned;
+    }
+    match &frontend.0 {
+        Frontend::TestIds(_) => unreachable!("pinned frontend handled above"),
+        Frontend::Vllm(vllm) => tokenize_vllm(request, vllm),
+    }
+}
+
+/// Tokenize one `/v1/completions` text prompt through the same `PromptEncoder`
+/// chat uses. L0 always applies and `cached_tokens` is populated instead of
+/// staying 0; L1 prefix reuse applies only when `add_special_tokens` is false.
+/// No chat template is applied.
+///
+/// Test pins return their ids unchanged, exactly like chat prompts do, so the
+/// completion tests do not need model assets.
+pub fn tokenize_completion_text(
+    frontend: &FrontendHandle,
+    text: &str,
+    add_special_tokens: bool,
+    cache_salt: Option<&str>,
+) -> anyhow::Result<TokenizeOut> {
+    match &frontend.0 {
+        Frontend::TestIds(ids) => {
+            if ids.is_empty() {
+                return Err(anyhow!("pinned test token_ids are empty"));
+            }
+            Ok(TokenizeOut {
+                token_ids: Arc::from(ids.clone()),
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms: 0.0,
+                encode_backend: "test-pin",
+                cached_tokens: 0,
+            })
+        }
+        Frontend::Vllm(vllm) => {
+            let (token_ids, cached_tokens, encode_ms) = vllm
+                .text_tokenize_timed(text, add_special_tokens, cache_salt)
+                .map_err(|error| anyhow!("completion tokenization failed: {error}"))?;
+            Ok(TokenizeOut {
+                token_ids,
+                adapt_ms: 0.0,
+                template_ms: 0.0,
+                encode_ms,
+                encode_backend: "vllm-tokenizer",
+                cached_tokens,
+            })
+        }
+    }
+}
+
+fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
     let t0 = Instant::now();
     let kwargs = request.chat_template_kwargs.clone().unwrap_or_default();
     if request.other.contains_key("chat_template") {
@@ -956,6 +1301,7 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     #[test]
     fn router_tokens_refuse_adapter_cache_identities() {
@@ -1016,6 +1362,7 @@ mod tests {
             None,
             None,
             Duration::from_secs(1),
+            false,
         )
         .await;
         assert_eq!(
@@ -1024,6 +1371,74 @@ mod tests {
         );
         assert!(results[&bad].is_err());
         server.abort();
+    }
+
+    #[test]
+    fn http_cache_read_qualification_is_conservative_across_protocol_versions() {
+        use super::http_cache_read_fallback;
+        use serde_json::json;
+
+        for (body, expected) in [
+            (json!({"prompt":[1,2]}), None),
+            (json!({"lora_name":"adapter"}), None),
+            (json!({"skip_reading_prefix_cache":false}), None),
+            (
+                json!({"skip_reading_prefix_cache":true}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"skip_reading_prefix_cache":"false"}),
+                Some("unsupported_cache_read"),
+            ),
+            (
+                json!({"skip_reading_external_kv":true}),
+                Some("skip_external_kv"),
+            ),
+            (
+                json!({"prompt_logprobs":0}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"prompt_logprob_token_ids":[[1]]}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"prompt_logprob_start":32,"skip_reading_prefix_cache":false}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"extra_body":{"skip_reading_prefix_cache":true}}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"skip_reading_prefix_cache":false,"extra_body":{"skip_reading_prefix_cache":true}}),
+                Some("skip_prefix_cache"),
+            ),
+            (
+                json!({"sampling_params":{"prompt_logprobs":0}}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (
+                json!({"echo":true,"extra_body":{"logprobs":0}}),
+                Some("unsupported_prompt_scoring"),
+            ),
+            (json!({"echo":false,"logprobs":0}), None),
+            (
+                json!({"echo":true,"logprobs":false,"prompt_logprobs":false}),
+                None,
+            ),
+            (
+                json!({"echo":1,"logprobs":0}),
+                Some("unsupported_cache_read"),
+            ),
+            (json!({"cache_salt":12}), Some("unsupported_cache_identity")),
+            (
+                json!({"extra_body":{"cache_salt":"tenant"}}),
+                Some("cache_salt"),
+            ),
+        ] {
+            assert_eq!(http_cache_read_fallback(&body), expected, "{body}");
+        }
     }
 
     #[test]
@@ -1263,7 +1678,7 @@ mod tests {
         ]);
         for (name, request, expected) in cases {
             let body = serde_json::to_value(&request).unwrap();
-            let planned = http_kv_input(&body, "/v1/completions").map(|input| match input {
+            let planned = http_kv_input(&body, "/v1/completions", false).map(|input| match input {
                 HttpKvInput::Direct(prompts) => Some(prompts),
                 HttpKvInput::Render { .. } => None,
             });
@@ -1308,7 +1723,7 @@ mod tests {
         ));
         for ids in [json!([1, 2]), json!([[1, 2], [3, 4]])] {
             let HttpKvInput::Direct(prompts) =
-                http_kv_input(&json!({"input_ids":ids}), "/generate").unwrap()
+                http_kv_input(&json!({"input_ids":ids}), "/generate", false).unwrap()
             else {
                 panic!("native token ids")
             };
@@ -1320,7 +1735,7 @@ mod tests {
             json!({"input_ids":[1], "text":"preferred"}),
             json!({"input_ids":[1], "prompt":"preferred"}),
         ] {
-            assert!(http_kv_input(&body, "/generate").is_err());
+            assert!(http_kv_input(&body, "/generate", false).is_err());
         }
 
         for body in [
@@ -1333,16 +1748,46 @@ mod tests {
             } else {
                 "/v1/chat/completions"
             };
-            let HttpKvInput::Render { .. } = http_kv_input(&body, route).unwrap() else {
+            let HttpKvInput::Render { .. } = http_kv_input(&body, route, false).unwrap() else {
                 panic!("render options")
             };
             assert!(super::http_tokenize_fallback(&body, route).is_none());
         }
-        assert!(http_kv_input(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"image"}}]}]}),"/v1/chat/completions").is_err());
         assert!(http_rendered_tokens(
             &json!({"token_ids":[1,2],"features":{"mm_hashes":{"image":["x"]}}})
         )
         .is_err());
+    }
+
+    #[test]
+    fn image_inputs_require_one_worker_identified_image() {
+        use serde_json::json;
+
+        let rendered = |hashes, placements| {
+            json!({
+                "token_ids":[1,2,3],
+                "features":{
+                    "mm_hashes":{"image":hashes},
+                    "mm_placeholders":{"image":placements}
+                }
+            })
+        };
+        let hash = "a".repeat(64);
+        let placement = json!({"offset":1,"length":1});
+        for (hashes, placements) in [
+            (json!([format!("uuid:{hash}")]), json!([placement])),
+            (json!([hash, hash]), json!([placement, placement])),
+            (json!([hash]), json!([{"offset": 2, "length": 2}])),
+        ] {
+            assert!(super::http_rendered_image(&rendered(hashes, placements)).is_err());
+        }
+
+        let image = json!({"type":"image_url","image_url":{"url":"image"}});
+        let body = json!({"messages":[{"role":"user","content":[image, image]}]});
+        assert!(matches!(
+            http_kv_input(&body, "/v1/chat/completions", true),
+            Err("multimodal_input")
+        ));
     }
     use super::*;
     use std::path::{Path, PathBuf};

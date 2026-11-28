@@ -94,6 +94,7 @@ impl PromptEncoder {
     }
 
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn encode(
         &self,
         prompt: Prompt,
@@ -221,6 +222,7 @@ fn parse_config(read: impl Fn(&str) -> Option<String>) -> Result<Option<Tokenize
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;

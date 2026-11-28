@@ -35,6 +35,10 @@ class RouterArgs:
     kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
     kv_event_block_size: int = 16
     kv_event_model: Optional[str] = None
+    kv_event_strict_recovery: bool = False
+    kv_hybrid_layout: Optional[str] = None
+    kv_event_topic: List[str] = dataclasses.field(default_factory=list)
+    pd_pair: List[str] = dataclasses.field(default_factory=list)
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -62,7 +66,7 @@ class RouterArgs:
     bootstrap_port_annotation: str = "vllm.ai/bootstrap-port"
     # ZMQ service discovery address for vLLM PD mode
     vllm_discovery_address: Optional[str] = None
-    # KV connector for PD disaggregation (nixl pull-based or mooncake push-based)
+    # KV connector for PD disaggregation.
     kv_connector: str = "nixl"
     # Explicit Program-level scheduling switch and optional JSON overrides.
     enable_program_scheduling: bool = False
@@ -147,14 +151,17 @@ class RouterArgs:
             f"--{prefix}enable-program-scheduling",
             action="store_true",
             default=False,
-            help="Enable Program-level scheduling",
+            help="Enable Program-level scheduling (defaults to verified exact counts with estimation fallback)",
         )
 
         parser.add_argument(
             f"--{prefix}program-scheduling-config-json",
             type=str,
             default=None,
-            help="JSON object overriding Program-level scheduling defaults (requires the enable flag)",
+            help=(
+                "JSON object overriding Program-level scheduling defaults (requires the enable flag). "
+                'For compatible byte-estimated counts, use {"token_count_mode":"estimated"}; HTTP text tokenization is opt-in'
+            ),
         )
 
         # Routing policy configuration
@@ -263,15 +270,40 @@ class RouterArgs:
             default=None,
             help="Shared model identity for workers with static event sources",
         )
+        parser.add_argument(
+            f"--{prefix}kv-hybrid-layout",
+            type=str,
+            help="KV cache layout JSON keyed by worker URL.",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-topic",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=TOPIC[,TOPIC...]",
+            help="Topics for static KV event publishers in DP-rank order.",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-pair",
+            action="append",
+            default=[],
+            metavar="PREFILL=DECODE[,DECODE...]",
+            help="Explicit pairs for a mixed P/D pool.",
+        )
         # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}kv-event-strict-recovery",
+            action="store_true",
+            help="Require authoritative full KV event recovery before restoring credit",
+        )
         parser.add_argument(
             f"--{prefix}pd-kv-events",
             action="append",
             default=[],
             metavar="URL=ENDPOINT[,ENDPOINT...]",
-            help="Static KV event sources for a prefill worker in PD mode "
-            "(requires a kv_aware prefill policy). Repeat for multiple workers; "
-            "comma-separated endpoints are ordered by DP rank. Block size is 16.",
+            help="Static KV event sources for a prefill or decode worker in PD "
+            "mode; a source belongs to a stage whose policy is kv_aware. "
+            "Repeat for multiple workers; comma-separated endpoints are "
+            "ordered by DP rank. Block size is 16.",
         )
         parser.add_argument(
             f"--{prefix}mini-lb",
@@ -449,10 +481,11 @@ class RouterArgs:
             f"--{prefix}kv-connector",
             type=str,
             default=RouterArgs.kv_connector,
-            choices=["nixl", "mooncake", "moriio"],
+            choices=["nixl", "mooncake", "mooncake-v2", "moriio"],
             help="KV connector type for PD disaggregation. 'nixl' (default) uses NIXL's "
             "pull-based KV transfer; 'mooncake' uses Mooncake's push-based protocol "
             "(queries each prefill node's bootstrap server for engine_id per DP rank); "
+            "'mooncake-v2' uses vLLM-Ascend MooncakeConnectorV2 in pull mode. "
             "'moriio' uses the MoRI-IO connector (either READ or WRITE modes).",
         )
         # Prometheus configuration
