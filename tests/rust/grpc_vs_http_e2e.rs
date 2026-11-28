@@ -39,6 +39,8 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         pd_worker_pairs: Default::default(),
         kv_event_strict_recovery: false,
         policy: PolicyConfig::RoundRobin,
+        prefill_policy: None,
+        decode_policy: None,
         host: "127.0.0.1".to_string(),
         port: 3002,
         max_payload_size: 16 * 1024 * 1024,
