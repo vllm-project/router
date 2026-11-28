@@ -18,6 +18,7 @@ pub(crate) const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
 pub(crate) const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
 pub(crate) const CODEX_SESSION_HEADER: &str = "session-id";
 pub(crate) const CODEX_THREAD_HEADER: &str = "thread-id";
+pub(crate) const DSH_SESSION_HEADER: &str = "x-deepseek-harness-session-id";
 pub(crate) const GENERIC_SESSION_HEADER: &str = "x-session-id";
 
 /// Provenance of a stable identity. Affinity routing preserves the source
@@ -328,6 +329,7 @@ pub(crate) fn framework_identity_headers(
             Some(CLAUDE_PARENT_AGENT_HEADER),
         ),
         (CODEX_SESSION_HEADER, Some(CODEX_THREAD_HEADER), None),
+        (DSH_SESSION_HEADER, None, None),
         (GENERIC_SESSION_HEADER, None, None),
     ] {
         let Some(session_id) = read_nonempty_header(headers, session_header)? else {
