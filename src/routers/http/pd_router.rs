@@ -181,6 +181,7 @@ fn provisional_decode(
                 .occupancy(Stage::Decode)
         })?;
     Some(StageDecision {
+        prediction: None,
         fallback_reason: None,
         credited_prefix_tokens: None,
         worker_index,
@@ -285,7 +286,7 @@ fn select_stage(
         // Token costs and request counts have different units. If any
         // eligible P has unknown work, compare the whole pool by occupancy.
         if let Some(inputs) = inputs {
-            let work: Vec<_> = inputs.iter().map(|(_, _, work)| *work).collect();
+            let work: Vec<_> = inputs.iter().map(|(_, _, work)| work).collect();
             let costs: Vec<_> = selected_indices
                 .iter()
                 .zip(&work)
@@ -305,7 +306,7 @@ fn select_stage(
             // P follows actual token work across the full eligible pool;
             // decode session affinity must never filter or pin prefill.
             if let Some(picked) = kv.pick_prefill(&costs, &occupancy) {
-                let (input, tokens, _) = inputs[picked];
+                let (input, tokens, _) = &inputs[picked];
                 let estimate = work[picked];
                 let new_tokens = estimate.new_prefill_tokens;
                 let outcome = if !estimate.placement_verified {
@@ -317,6 +318,7 @@ fn select_stage(
                     "kv_aware", "prefill", outcome,
                 );
                 return Some(StageDecision {
+                    prediction: estimate.prediction.clone(),
                     worker_index: selected_indices[picked],
                     endpoint: endpoints[selected_indices[picked]].clone(),
                     score: Some(costs[picked]),
@@ -447,16 +449,21 @@ fn select_stage(
         }
         return None;
     };
-    let selected_tokens = (stage == Stage::Prefill)
-        .then(|| {
-            context
-                .prefill_inputs
-                .and_then(|inputs| inputs.get(worker.base_url()))
-                .and_then(|input| input.prompts.as_ref())
-                .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum())
-        })
-        .flatten();
+    let selected_input = if stage == Stage::Prefill {
+        context
+            .prefill_inputs
+            .and_then(|inputs| inputs.get(worker.base_url()))
+    } else {
+        None
+    };
+    let selected_tokens = selected_input
+        .and_then(|input| input.prompts.as_ref())
+        .map(|prompts| prompts.iter().map(|ids| ids.len() as u64).sum());
     Some(StageDecision {
+        // Occupancy fallback can still have verified placement for the winner.
+        prediction: selected_input
+            .and_then(|_| context.prefill_work(worker.url()))
+            .and_then(|estimate| estimate.prediction),
         fallback_reason: if stage == Stage::Prefill && kv_aware {
             Some(if unknown_backlog {
                 "unknown_prefill_backlog"
@@ -2846,6 +2853,10 @@ mod admission_tests {
         assert_eq!(first.prefill.worker_index, 1); // Warm P wins over the first idle P.
         assert_eq!(first.prefill.new_prefill_tokens, Some(1));
         assert_eq!(first.prefill.credited_prefix_tokens, Some(32));
+        let prediction = first.prefill.prediction.as_ref().unwrap();
+        assert_eq!(prediction.target().instance_id.as_ref(), p[1].base_url());
+        assert_eq!(prediction.cached_tokens(), Some(32));
+        assert!(a.kv_observation().is_some());
         assert_eq!(first.prefill.fallback_reason, None);
         let (second, b) = manager
             .admit(|loads| select_pd_pair(loads, &p, &d, &policy, &policy, &context, true))
@@ -2975,6 +2986,12 @@ mod admission_tests {
                         let work = context.prefill_work(workers[0].url()).unwrap();
                         assert_eq!(work.new_prefill_tokens, expected_tokens[0]);
                         assert!(work.placement_verified);
+                        assert_eq!(
+                            work.prediction
+                                .as_ref()
+                                .and_then(|prediction| prediction.cached_tokens()),
+                            (expected_tokens[0] == 1).then_some(32),
+                        );
                         select_pd_pair(
                             loads,
                             &workers,
@@ -3064,6 +3081,15 @@ mod admission_tests {
         );
         assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
         assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        assert_eq!(
+            selection
+                .prefill
+                .prediction
+                .as_ref()
+                .and_then(|prediction| prediction.cached_tokens()),
+            Some(32)
+        );
+        assert!(unknown.kv_observation().is_none());
         drop((unknown, known));
         assert!(manager.snapshot().is_empty());
     }
@@ -3280,6 +3306,69 @@ mod admission_tests {
         attempt.finish_prefill();
         drop(attempt);
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[cfg(all(feature = "cpu", feature = "ready"))]
+    #[test]
+    fn deferred_decode_commit_preserves_prefill_observation_and_full_context_charge() {
+        use crate::kv_observation::test_helpers::*;
+        let metrics = render(|| {
+            let manager = Arc::new(PdLoadManager::default());
+            let p = pool("p", 2);
+            let d = pool("d", 2);
+            let tokens: Vec<u32> = (0..33).collect();
+            let policy = resident_prefix_policy(&p, &tokens);
+            let (inputs, prices) = token_inputs(&p, &tokens, &policy);
+            let validated = prices.validate(&p);
+            let mut context = context();
+            context.prefill_inputs = Some(&inputs);
+            context.prefill_pricing = Some(StagePricing::Validated(&validated));
+            let (selection, attempt) = manager
+                .admit_deferred(|loads| {
+                    select_pd_pair(loads, &p, &d, &policy, &policy, &context, false)
+                })
+                .unwrap();
+            assert_eq!(selection.prefill.new_prefill_tokens, Some(1));
+            assert_eq!(selection.prefill.credited_prefix_tokens, Some(32));
+            let observation = attempt.kv_observation().unwrap().clone();
+            assert!(attempt.decode_pending_commit());
+            attempt.finish_prefill();
+            let decision = manager
+                .commit_decode(&attempt, |loads| {
+                    select_decode_stage(loads, &d, &policy, &context)
+                })
+                .unwrap();
+            let pending = sample(&manager, Stage::Decode, &decision.endpoint);
+            assert_eq!(pending.pending_decode_requests, 1);
+            assert_eq!(pending.decode_tokens(), Some(33));
+            assert_eq!(pending.unknown_decode_requests, 0);
+            assert!(manager
+                .commit_decode(&attempt, |loads| {
+                    select_decode_stage(loads, &d, &policy, &context)
+                })
+                .is_none());
+            attempt.begin_decode();
+            let active = sample(&manager, Stage::Decode, &decision.endpoint);
+            assert_eq!(active.pending_decode_tokens, 0);
+            assert_eq!(active.active_decode_tokens, 33);
+            assert!(Arc::ptr_eq(&observation, attempt.kv_observation().unwrap()));
+            observation.record_once(Ok(32));
+            attempt.finish_decode();
+            attempt.release();
+            drop(attempt);
+            drop(observation);
+            assert!(manager.snapshot().is_empty());
+        });
+        assert!(has_outcome(&metrics, "observed", "none"), "{metrics}");
+        assert!(
+            metrics.contains("vllm_router_kv_actual_cached_tokens_count 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics
+                .contains("vllm_router_kv_cached_token_absolute_error_sum{direction=\"exact\"} 0"),
+            "{metrics}"
+        );
     }
 
     #[test]

@@ -1,4 +1,11 @@
-//! SSE framing shared by local response consumers; payload semantics stay local.
+//! SSE framing and error-envelope detection shared by HTTP response consumers.
+
+use serde_json::Value;
+
+pub(super) fn is_error_envelope(value: &Value) -> bool {
+    value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("object").and_then(Value::as_str) == Some("error")
+}
 
 #[derive(Default)]
 pub(super) struct FrameScanner {

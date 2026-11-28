@@ -92,6 +92,22 @@ pub fn init_metrics() {
         "KV event replay attempts aggregated by outcome"
     );
     describe_counter!(
+        "vllm_router_kv_route_outcomes_total",
+        "KV-aware route predictions correlated with backend cache observations; SSE stream_error includes in-band error envelopes, upstream body failures and downstream cancellations before EOF"
+    );
+    describe_histogram!(
+        "vllm_router_kv_predicted_cached_tokens",
+        "Predicted total cached prefix tokens on paired HTTP attempts"
+    );
+    describe_histogram!(
+        "vllm_router_kv_actual_cached_tokens",
+        "Engine-reported cached prompt tokens on paired HTTP attempts"
+    );
+    describe_histogram!(
+        "vllm_router_kv_cached_token_absolute_error",
+        "Absolute error between predicted and observed cached prompt tokens"
+    );
+    describe_counter!(
         "vllm_router_policy_decisions_total",
         "Total routing policy decisions by policy and worker"
     );
@@ -603,6 +619,9 @@ fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuild
         "vllm_router_agent_aware_admission_used_tokens",
         "vllm_router_agent_aware_admission_required_tokens",
         "vllm_router_agent_aware_admission_growth_reserve_tokens",
+        "vllm_router_kv_predicted_cached_tokens",
+        "vllm_router_kv_actual_cached_tokens",
+        "vllm_router_kv_cached_token_absolute_error",
         "vllm_router_pd_new_prefill_tokens",
     ] {
         builder = set(builder, name, TOKEN_BUCKETS);
@@ -682,6 +701,40 @@ impl RouterMetrics {
 
     pub fn record_kv_placement_lookup(result: &'static str) {
         kv_placement_lookup_counter(result).increment(1);
+    }
+
+    pub fn record_kv_route_outcome(
+        status: &'static str,
+        reason: &'static str,
+        predicted_cached_tokens: Option<u64>,
+        actual_cached_tokens: Option<u64>,
+    ) {
+        counter!("vllm_router_kv_route_outcomes_total",
+            "status" => status,
+            "reason" => reason)
+        .increment(1);
+        let (Some(predicted_cached_tokens), Some(actual_cached_tokens)) =
+            (predicted_cached_tokens, actual_cached_tokens)
+        else {
+            return;
+        };
+        histogram!("vllm_router_kv_predicted_cached_tokens").record(predicted_cached_tokens as f64);
+        histogram!("vllm_router_kv_actual_cached_tokens").record(actual_cached_tokens as f64);
+        let (direction, absolute_error) = if actual_cached_tokens > predicted_cached_tokens {
+            (
+                "underpredicted",
+                actual_cached_tokens - predicted_cached_tokens,
+            )
+        } else if actual_cached_tokens < predicted_cached_tokens {
+            (
+                "overpredicted",
+                predicted_cached_tokens - actual_cached_tokens,
+            )
+        } else {
+            ("exact", 0)
+        };
+        histogram!("vllm_router_kv_cached_token_absolute_error", "direction" => direction)
+            .record(absolute_error as f64);
     }
 
     pub(crate) fn record_kv_source_recovery(strict: bool, reason: &'static str) {

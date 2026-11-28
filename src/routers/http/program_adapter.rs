@@ -3,6 +3,7 @@
 //! This module understands transport envelopes only. Identity parsing and all
 //! scheduling decisions remain in `program_scheduling`.
 
+use super::sse::is_error_envelope;
 use crate::backend::EngineOutcomeObserver;
 use crate::program_scheduling::{ProgramDispatch, ProgramScheduler, ProgramUsageObservation};
 use crate::token_estimator::{MomentumTokenEstimator, TokenEstimateCalibration};
@@ -273,11 +274,6 @@ fn sse_data(line: &[u8]) -> Option<&[u8]> {
     Some(line.strip_prefix(b"data:")?.trim_ascii())
 }
 
-fn is_error_frame(value: &Value) -> bool {
-    value.get("error").is_some_and(|error| !error.is_null())
-        || value.get("object").and_then(Value::as_str) == Some("error")
-}
-
 fn top_level_usage(value: &Value) -> Option<&Value> {
     value.get("usage").filter(|usage| !usage.is_null())
 }
@@ -296,7 +292,7 @@ fn is_usage_sse_line(line: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(data) else {
         return false;
     };
-    !is_error_frame(&value)
+    !is_error_envelope(&value)
         && top_level_usage(&value).is_some()
         && value
             .get("choices")
@@ -384,7 +380,7 @@ struct ProgramUsageAccumulator {
 impl ProgramUsageAccumulator {
     fn observe_json(&mut self, body: &[u8]) {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            self.wire_error |= is_error_frame(&value);
+            self.wire_error |= is_error_envelope(&value);
             self.observe_value(&value);
         }
     }

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 pub mod core;
 pub mod data_connector;
 pub mod kv_index;
+mod kv_observation;
 pub mod metrics;
 pub mod middleware;
 pub mod otel_http;
