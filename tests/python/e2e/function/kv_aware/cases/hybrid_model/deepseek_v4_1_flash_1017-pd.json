@@ -16,17 +16,26 @@
     "trust_remote_code": true,
     "tensor_parallel_size": 4,
     "kv_cache_dtype": "fp8",
-    "block_size": 128
+    "block_size": 64,
+    "prefix_match_unit": 32
   },
   "router_params": {
     "--kv-hybrid-layout": {
       "ranks": [
         {
           "rank": 0,
-          "hash_block_size": 128,
+          "hash_block_size": 32,
           "hash_seed": "0",
           "speculative_tokens": 0,
           "groups": [
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 128
+            },
+            {
+              "kind": "sliding_window_mla",
+              "sliding_window": 128
+            },
             {
               "kind": "sliding_window_mla",
               "sliding_window": 128

@@ -196,6 +196,7 @@ class GrpcKvWorker:
         model="test-model",
         events_enabled=True,
         adapters=None,
+        cache_layout=None,
     ):
         from collections import deque
         from concurrent.futures import ThreadPoolExecutor
@@ -208,6 +209,7 @@ class GrpcKvWorker:
         self.block_size = block_size
         self.model = model
         self.adapters = adapters or {}
+        self.cache_layout = cache_layout
         self.failures_remaining = 0
         self.captured = []
         self.condition = threading.Condition()
@@ -253,8 +255,8 @@ class GrpcKvWorker:
                 )
             ]
         )
-        # Adapter metadata supplements the default group-0 discovery contract.
-        if self.adapters:
+        # Explicit capabilities supplement the default group-0 discovery contract.
+        if self.adapters or self.cache_layout is not None:
             capabilities = json.dumps(
                 {
                     "schema_version": 1,
@@ -291,6 +293,12 @@ class GrpcKvWorker:
                     ],
                 }
             ).encode()
+            if self.cache_layout is not None:
+                layout = json.loads(capabilities)
+                rank = layout["ranks"][0]
+                rank.update(self.cache_layout)
+                rank["declared_groups"] = len(rank["groups"])
+                capabilities = json.dumps(layout).encode()
             response.MergeFromString(_native_layout_field(capabilities))
         return response
 

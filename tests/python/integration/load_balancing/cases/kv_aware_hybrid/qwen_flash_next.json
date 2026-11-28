@@ -1,0 +1,17 @@
+{
+  "rank": {
+    "hash_block_size": 4,
+    "partial_hash_hits": true,
+    "speculative_tokens": 0,
+    "groups": [
+      {"kind": "mamba", "block_size": 16, "mamba_cache_mode": "align"},
+      {"kind": "mamba", "block_size": 16, "mamba_cache_mode": "align"},
+      {"kind": "scratch", "block_size": 4, "tokens_per_state": "1"},
+      {"kind": "mla_attention", "block_size": 16, "cache_role": "sparse", "tokens_per_state": "4"}
+    ]
+  },
+  "expected": {"whole": 32, "short": 16, "rival": 20, "partial": 24, "partial_worker": "a"},
+  "mtp": {
+    "rank": {"speculative_tokens": 3, "hash_lookahead_tokens": 0, "tail_drop_groups": []}
+  }
+}

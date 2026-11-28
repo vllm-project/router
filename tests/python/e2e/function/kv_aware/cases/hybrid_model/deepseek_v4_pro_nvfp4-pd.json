@@ -13,7 +13,7 @@
     "max_model_len": 4096,
     "max_num_batched_tokens": 4096,
     "trust_remote_code": true,
-    "tensor_parallel_size": 8,
+    "tensor_parallel_size": 4,
     "kv_cache_dtype": "fp8",
     "block_size": 256,
     "prefix_match_unit": 4

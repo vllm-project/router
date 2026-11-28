@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
@@ -41,6 +42,7 @@ class RouterManager:
         env: Optional[Dict[str, str]] = None,
         *,
         timeout: float = 30.0,
+        log_path: Optional[Path] = None,
     ) -> ProcHandle:
         worker_urls = worker_urls or []
         port = port or find_free_port()
@@ -108,6 +110,7 @@ class RouterManager:
                 "balance_abs_threshold": "--balance-abs-threshold",
                 "balance_rel_threshold": "--balance-rel-threshold",
                 "router_temperature": "--router-temperature",
+                "log_level": "--log-level",
                 "kv_penalty_host": "--kv-penalty-host",
                 "kv_penalty_external": "--kv-penalty-external",
                 "kv_penalty_disk": "--kv-penalty-disk",
@@ -154,7 +157,17 @@ class RouterManager:
                 else:
                     cmd.extend([flag, str(v)])
 
-        proc = subprocess.Popen(cmd, env={**os.environ, **(env or {})})
+        log_file = log_path.open("w", encoding="utf-8") if log_path else None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env={**os.environ, **(env or {})},
+                stdout=log_file,
+                stderr=subprocess.STDOUT if log_file else None,
+            )
+        finally:
+            if log_file is not None:
+                log_file.close()
         self._children.append(proc)
         url = f"http://127.0.0.1:{port}"
         self._wait_health(url, timeout)
