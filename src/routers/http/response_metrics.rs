@@ -293,10 +293,16 @@ impl Sse {
         }
         if self.route == "/v1/responses" {
             if event_type == "response.completed" {
-                let response = value.get("response");
-                self.failed = response.is_some_and(|r| bad_response_status(r) || is_error(r));
+                let Some(response) = value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                else {
+                    self.failed = true;
+                    return Output::None;
+                };
+                self.failed = bad_response_status(response) || is_error(response);
                 self.terminal = true;
-                self.usage = response.and_then(|r| r.get("usage")).and_then(usage);
+                self.usage = response.get("usage").and_then(usage);
             } else if matches!(
                 event_type,
                 "response.output_text.delta"

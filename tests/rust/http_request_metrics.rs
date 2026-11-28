@@ -807,6 +807,99 @@ async fn chat_and_responses(metrics: &Metrics) {
     assert_eq!(sample(&scrape, "active_requests", &[]), 0.);
 }
 
+async fn pd_responses_terminal(metrics: &Metrics) {
+    let mut prefill = Worker::start().await;
+    let mut decode = Worker::start().await;
+    let router = router(
+        config(RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![(prefill.server.url.clone(), None)],
+            decode_urls: vec![decode.server.url.clone()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        }),
+        None,
+    )
+    .await;
+    let route = ("route", RESPONSES);
+    let before = metrics.scrape().await;
+    let handoff = |scrape: &str, result| sample(scrape, "pd_handoff_total", &[("result", result)]);
+    let mut ok = handoff(&before, "ok");
+    let mut failed = handoff(&before, "failed");
+    let mut usage = sample(&before, "input_tokens_count", &[route]);
+    for (event, success, has_usage) in [
+        (r#"{"type":"response.completed"}"#, false, false),
+        (
+            r#"{"type":"response.completed","response":null}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":"not an object"}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":[]}"#,
+            false,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            true,
+            false,
+        ),
+        (
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":1}}}"#,
+            true,
+            true,
+        ),
+    ] {
+        let request = post(
+            &router,
+            RESPONSES,
+            json!({"model":"test-model","input":"hello","stream":true}),
+        );
+        prefill.call().await.respond.send(prefill_reply()).unwrap();
+        let tx = stream_reply(decode.call().await);
+        tx.send(Ok(Bytes::from(format!(
+            "event: response.completed\ndata: {event}\n\n"
+        ))))
+        .await
+        .unwrap();
+        drop(tx);
+        request
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        ok += f64::from(u8::from(success));
+        failed += f64::from(u8::from(!success));
+        usage += f64::from(u8::from(has_usage));
+        let scrape = metrics.scrape().await;
+        assert_eq!(handoff(&scrape, "ok"), ok, "{event}");
+        assert_eq!(handoff(&scrape, "failed"), failed, "{event}");
+        assert_eq!(
+            sample(&scrape, "input_tokens_count", &[route]),
+            usage,
+            "{event}"
+        );
+        assert_eq!(
+            sample(&scrape, "output_tokens_count", &[route]),
+            usage,
+            "{event}"
+        );
+        assert_eq!(
+            sample(&scrape, "requests_cancelled_total", &[]),
+            sample(&before, "requests_cancelled_total", &[]),
+            "{event}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scrape_http_inference_metrics() {
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -815,6 +908,7 @@ async fn scrape_http_inference_metrics() {
         queue_and_routing_cancellation(&metrics).await;
         pd(&metrics).await;
         chat_and_responses(&metrics).await;
+        pd_responses_terminal(&metrics).await;
     })
     .await
     .unwrap();
