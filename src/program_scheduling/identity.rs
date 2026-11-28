@@ -433,8 +433,10 @@ fn apply_codex_workflow_fields(
                 .and_then(JsonValue::as_str)
                 .map(str::to_string)
         });
-    let version = read_nonempty_header(headers, "version")?
-        .or(read_nonempty_header(headers, CODEX_VERSION_HEADER)?);
+    // Prefer Codex-specific version so a gateway-supplied generic `version`
+    // cannot displace the fitted-profile key.
+    let version = read_nonempty_header(headers, CODEX_VERSION_HEADER)?
+        .or(read_nonempty_header(headers, "version")?);
 
     identity.workflow_profile_id = Some("codex".to_string());
     identity.profile_version = Some(version.unwrap_or_else(|| "1".to_string()));
@@ -763,6 +765,17 @@ mod tests {
             .unwrap();
         assert_eq!(identity.spawn_reason(), Some("compact"));
         assert!(!identity.expected_resume());
+
+        // Prefer x-codex-version when a conflicting generic version is present.
+        let mut both = HeaderMap::new();
+        both.insert(CODEX_SESSION_HEADER, "session-d".parse().unwrap());
+        both.insert(CODEX_THREAD_HEADER, "worker".parse().unwrap());
+        both.insert(CODEX_VERSION_HEADER, "0.42.0".parse().unwrap());
+        both.insert("version", "gateway-1".parse().unwrap());
+        let identity = ProgramIdentity::from_request(Some(&both), None, Some("model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.profile_version(), Some("0.42.0"));
 
         // Non-Codex header schemas are left alone.
         let mut claude = HeaderMap::new();
