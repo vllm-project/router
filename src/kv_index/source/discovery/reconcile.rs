@@ -189,6 +189,9 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
+                    if lifecycle.state.lock().fenced_vllm_instance_id.is_some() {
+                        return lifecycle.refresh_due();
+                    }
                     lifecycle.layout_rebind_due()
                         && self.resolved_static_source(base).is_none_or(|source| {
                             super::layout_only(&source)
@@ -251,7 +254,7 @@ impl KvIndexSupervisor {
         .collect()
         .await;
         let mut changed = HashSet::new();
-        for (base, lifecycle, owner, connector, probe) in probes {
+        for (base, lifecycle, owner, connector, mut probe) in probes {
             if !self
                 .lifecycles
                 .lock()
@@ -260,19 +263,14 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action =
-                lifecycle.observe_descriptor(probe.as_ref().map(|probe| &probe.descriptor));
-            match action {
-                SourceAction::Keep => {
-                    if let Some(probe) = probe {
-                        lifecycle.state.lock().base_models =
-                            probe.worker.base_models.unwrap_or_default();
-                    }
-                }
+            let (descriptor, worker) = probe
+                .as_mut()
+                .map(|probe| (&probe.descriptor, &mut probe.worker))
+                .unzip();
+            match lifecycle.observe_descriptor(descriptor, worker) {
+                SourceAction::Keep => {}
                 SourceAction::Rebuild => {
                     let probe = probe.expect("rebuilding requires a descriptor");
-                    lifecycle.state.lock().base_models =
-                        probe.worker.base_models.clone().unwrap_or_default();
                     // Both owner and control-record identities are compared under
                     // the publication lock; an old probe cannot resurrect a source.
                     let installation = self.install_observed_worker(

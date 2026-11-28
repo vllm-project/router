@@ -14,7 +14,7 @@ use super::metrics_meta::EngineCacheConfigs;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
-    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
+    SourcesUnavailable, VllmInstance, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -49,7 +49,9 @@ impl WorkerDescriptor {
 }
 
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
-    let server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
+    let mut server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
+    // Native restart evidence is used only to re-admit a fenced registration.
+    server_info.vllm_instance = None;
     let sources = match &worker.sources {
         Ok(sources) => Some(sources.clone()),
         Err(unavailable) if !unavailable.probe.retryable() => None,
@@ -75,6 +77,14 @@ impl KvIndexSupervisor {
         deadline: Instant,
     ) -> Result<RegistrationProbe, String> {
         let mut worker = self.discover_for_role(base, connector).await;
+        let fenced = lifecycle.state.lock().fenced_vllm_instance_id.is_some();
+        if fenced {
+            self.probe_static_vllm_instance(base, &mut worker).await;
+            let report = worker.server_info.as_ref().ok();
+            if lifecycle.state.lock().readmission_hash(report).is_none() {
+                return Err("hash-fenced worker has no verified replacement instance".into());
+            }
+        }
         if plain_only
             && worker
                 .hybrid
@@ -112,7 +122,7 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
+        if fenced || !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
             self.probe_admission_hashes(base, &mut worker, Some(deadline))
                 .await;
         }
@@ -555,7 +565,8 @@ async fn query_worker_control_metadata(
     worker_url: &str,
     api_key: Option<&str>,
 ) -> Result<ServerInfo, String> {
-    // 1. Multi-backend control metadata. Absent from stock vLLM.
+    // 1. Multi-backend control metadata. Native vLLM restart evidence comes
+    // from /server_info, which this path does not query on success.
     let first_error = match validate_worker_metadata(
         worker_url,
         "get_server_info",
@@ -632,9 +643,30 @@ pub(super) async fn query_server_info_json(
             }),
         _ => None,
     };
+    let parallel = &config["parallel_config"];
+    // Older vLLM versions can omit the internal API process count. Require a
+    // single DP rank and reject any explicit count other than one.
+    let vllm_instance = config["instance_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && parallel["data_parallel_size"].as_u64() == Some(1)
+                && parallel["_api_process_count"]
+                    .as_u64()
+                    .is_none_or(|count| count == 1)
+        })
+        .map(|id| VllmInstance {
+            id: id.to_owned(),
+            prefix_hash: config["cache_config"]["prefix_caching_hash_algo"]
+                .as_str()
+                .filter(|algorithm| !algorithm.trim().is_empty())
+                .map(str::to_owned),
+        });
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
+        vllm_instance,
         kv_block_size: block_size,
         effective_attention_block_size,
         mooncake_truncates_compressed,

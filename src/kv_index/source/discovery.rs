@@ -76,10 +76,19 @@ pub struct ServerInfo {
     /// Engine revision used to interpret versioned cache lookup rules.
     #[serde(skip)]
     pub(crate) vllm_version: Option<(u32, u32)>,
+    /// Native vLLM startup evidence from /server_info.
+    #[serde(skip)]
+    pub(crate) vllm_instance: Option<VllmInstance>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default)]
     pub served_model_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VllmInstance {
+    id: String,
+    prefix_hash: Option<String>,
 }
 
 /// One DP rank's event publisher, reported by the worker control plane.
@@ -457,9 +466,15 @@ impl KvIndexSupervisor {
         };
         let discovery = self.discover(worker_url).await;
         let models = discovery.base_models.clone();
-        let hashes = observed
-            .as_ref()
-            .and_then(|_| discovery.engine_cache_configs.clone());
+        let previous_report = observed.as_ref().and_then(|_| {
+            let hashes = discovery.engine_cache_configs.clone()?;
+            let instance = discovery
+                .server_info
+                .as_ref()
+                .ok()
+                .and_then(|info| info.vllm_instance.as_ref());
+            Some((hashes, instance.map(|instance| instance.id.clone())))
+        });
         let installation = self.install_observed_worker(
             worker_url,
             discovery,
@@ -471,8 +486,8 @@ impl KvIndexSupervisor {
             .as_ref()
             .is_ok_and(|info| info.cache_key.is_some())
         {
-            if let Some(hashes) = hashes {
-                self.fence_failed_registration(worker_url, &lifecycle, &hashes);
+            if let Some((hashes, id)) = previous_report {
+                self.fence_failed_registration(worker_url, &lifecycle, &hashes, id);
             }
         }
         Ok((installation?, models))
@@ -483,6 +498,21 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
+        // Only initial single-rank fences need an extra startup metadata probe.
+        if let Some((layout, configs)) = discovery
+            .hybrid
+            .as_ref()
+            .zip(discovery.engine_cache_configs.as_ref())
+        {
+            let hash = metrics_meta::reported_prefix_hash(configs, worker_url, 0);
+            if layout
+                .rank_capability(0)
+                .is_some_and(|rank| rank.reported_hash_mismatch(hash).is_some())
+            {
+                self.probe_static_vllm_instance(worker_url, &mut discovery)
+                    .await;
+            }
+        }
         discovery
     }
 
@@ -550,6 +580,11 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
+        if !self.tracks_vllm_instance(worker_url, &discovery) {
+            if let Ok(info) = &mut discovery.server_info {
+                info.vllm_instance = None;
+            }
+        }
         let Some(layout) = discovery.hybrid.as_ref() else {
             return discovery;
         };
@@ -615,6 +650,36 @@ impl KvIndexSupervisor {
             }
         }
         discovery
+    }
+
+    async fn probe_static_vllm_instance(&self, worker_url: &str, discovery: &mut WorkerDiscovery) {
+        if !self.tracks_vllm_instance(worker_url, discovery)
+            || self.resolved_static_source(worker_url).is_none()
+        {
+            return;
+        }
+        let Ok(info) = &mut discovery.server_info else {
+            return;
+        };
+        let request =
+            probe::query_server_info_json(&self.client, worker_url, self.api_key.as_deref());
+        if let Ok(Ok(native)) = tokio::time::timeout(CONTROL_TIMEOUT, request).await {
+            info.vllm_instance = native.vllm_instance;
+        }
+    }
+
+    fn tracks_vllm_instance(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
+        self.full_attention_http
+            && !crate::backend::is_grpc_url(worker_url)
+            && split_worker_rank(worker_url).1.is_none()
+            && discovery
+                .hybrid
+                .as_ref()
+                .is_some_and(|layout| layout.ranks.len() == 1)
+            && discovery
+                .sources
+                .as_ref()
+                .is_ok_and(|sources| sources.len() == 1 && sources.contains_key("0"))
     }
 
     async fn discover_declared_layout(

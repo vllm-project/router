@@ -171,6 +171,9 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
+        let native_hash = expected_lifecycle
+            .as_ref()
+            .and_then(|old| old.state.lock().readmission_hash(Some(&server_info)));
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -180,9 +183,13 @@ impl KvIndexSupervisor {
                 .engine_cache_configs
                 .as_ref()
                 .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
-            if let Some((expected, reported)) = capability
-                .rank_capability(rank)
-                .and_then(|contract| contract.reported_hash_mismatch(reported))
+            if let Some((expected, reported)) =
+                capability.rank_capability(rank).and_then(|contract| {
+                    // Either report can veto admission, even when the other matches.
+                    contract
+                        .reported_hash_mismatch(reported)
+                        .or_else(|| contract.reported_hash_mismatch(native_hash))
+                })
             {
                 warn!(
                     worker_url,
@@ -303,6 +310,8 @@ impl KvIndexSupervisor {
             self.installed.retire_worker(previous);
         }
         if load_only {
+            lifecycle.state.lock().fenced_vllm_instance_id =
+                server_info.vllm_instance.map(|instance| instance.id);
             let info = WorkerKvInfo {
                 instance_id,
                 block_size: Some(block_size),
