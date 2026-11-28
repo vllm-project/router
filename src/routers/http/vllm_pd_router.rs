@@ -2056,31 +2056,14 @@ impl VllmPDRouter {
                 None,
             )
         });
-        if let Some(response) = self
-            .try_http_prefill_bypass(
-                &request,
-                path,
-                headers,
-                SelectedPair {
-                    prefill: &prefill_worker,
-                    decode: &decode_worker,
-                    attempt: &attempt,
-                    commit: commit.as_ref(),
-                },
-            )
-            .await
-        {
-            return response;
-        }
         match self
-            .process_vllm_two_stage_request(
+            .process_native_http_pair(
                 request,
                 prefill_worker,
                 decode_worker,
                 path,
                 headers,
                 attempt.clone(),
-                None,
                 commit.as_ref(),
             )
             .await
@@ -2354,7 +2337,8 @@ impl VllmPDRouter {
                 &request_json,
                 path,
                 headers,
-                (&prepared, &router_prompts),
+                &prepared,
+                &router_prompts,
                 SelectedPair {
                     prefill: &prefill_worker,
                     decode: &decode_worker,
@@ -2364,7 +2348,7 @@ impl VllmPDRouter {
             )
             .await
         {
-            return response;
+            return attempt.track_response(response);
         }
         let response = self
             .process_grpc_two_stage(
@@ -2746,36 +2730,17 @@ impl VllmPDRouter {
         // Start profiling on decode server
         self.start_profiling(&decode_base_url).await;
 
-        let mut decode_request_builder = self
-            .pd_router
-            .client
-            .post(&decode_url)
-            .header("Content-Type", "application/json")
-            .header(
-                "Authorization",
-                format!(
-                    "Bearer {}",
-                    std::env::var("OPENAI_API_KEY").unwrap_or_default()
-                ),
-            )
-            .header("X-Request-Id", &request_id);
-
-        // Add X-data-parallel-rank header using shared utilities
-        decode_request_builder =
-            dp_utils::add_dp_rank_header(decode_request_builder, decode_dp_rank);
-
         attempt.begin_decode();
-        let decode_response = match otel_http::send_client_request(
-            decode_request_builder.json(&decode_request),
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &decode_url,
-                route: Some(path),
-                request_phase: Some("decode"),
-            },
-        )
-        .await
+        let decode_response = match self
+            .send_http_decode(
+                &decode_url,
+                decode_dp_rank,
+                &request_id,
+                path,
+                headers,
+                &decode_request,
+            )
+            .await
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -2807,6 +2772,35 @@ impl VllmPDRouter {
         )
         .await
         .map_err(|message| PDRouterError::NetworkError { message })
+    }
+
+    async fn send_http_decode(
+        &self,
+        url: &str,
+        rank: Option<usize>,
+        request_id: &str,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        request: &Value,
+    ) -> reqwest::Result<reqwest::Response> {
+        let builder = self
+            .pd_router
+            .client
+            .post(url)
+            .bearer_auth(std::env::var("OPENAI_API_KEY").unwrap_or_default())
+            .header("X-Request-Id", request_id)
+            .json(request);
+        otel_http::send_client_request(
+            dp_utils::add_dp_rank_header(builder, rank),
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url,
+                route: Some(path),
+                request_phase: Some("decode"),
+            },
+        )
+        .await
     }
 
     /// P/D dispatch on `grpc://` pools for chat and token-id completions. The connector JSON is the same as on the
@@ -3970,32 +3964,15 @@ impl RouterTrait for VllmPDRouter {
                 commit.is_some()
             );
 
-            if let Some(response) = self
-                .try_http_prefill_bypass(
-                    &request_json,
-                    path,
-                    headers,
-                    SelectedPair {
-                        prefill: prefill_worker,
-                        decode: decode_worker,
-                        attempt: &attempt,
-                        commit: commit.as_ref(),
-                    },
-                )
-                .await
-            {
-                return response;
-            }
             // Execute two-stage processing
             match self
-                .process_vllm_two_stage_request(
+                .process_native_http_pair(
                     request_json,
                     prefill_worker.clone(),
                     decode_worker.clone(),
                     path,
                     headers,
                     attempt.clone(),
-                    None,
                     commit.as_ref(),
                 )
                 .await

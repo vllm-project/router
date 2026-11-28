@@ -12,7 +12,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::super::{
-    dp_utils,
     pd_kv_state::PdKvState,
     pd_router::select_decode_stage,
     pd_types::{error_chain, Loads, PdAttempt, PdEndpoint, PdLoadManager, PdRequestContext, Stage},
@@ -23,13 +22,13 @@ use super::prefill_bypass::{
 };
 use super::{
     grpc_decode_outcome, own_grpc_decode, record_grpc_decode_stream_failure, response_with_body,
-    DecodeCommitInput, DecodePoolSource, ServiceType, VllmPDRouter, NAMED_LORA_FIELD,
+    DecodeCommitInput, DecodePoolSource, PDRouterError, ServiceType, VllmPDRouter,
+    NAMED_LORA_FIELD,
 };
-use crate::backend::{EngineFrontend, PreparedRequest};
+use crate::backend::PreparedRequest;
 use crate::config::{KvConnector, PolicyConfig, RouterConfig};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
-use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PromptHashes};
 use crate::routers::{header_utils, RouterTrait};
 
@@ -65,17 +64,6 @@ pub(crate) fn install_prefill_bypass(
         .set_prefill_bypass(feature)
 }
 
-type LiveDecode<'a> =
-    dyn Fn(DecodePoolSource, Option<&str>, &Arc<dyn Worker>) -> Option<Arc<dyn Worker>> + Sync + 'a;
-
-struct NativeBypass<'a> {
-    feature: &'a PrefillBypass,
-    state: &'a PdKvState,
-    load: &'a PdLoadManager,
-    policy: Arc<dyn LoadBalancingPolicy>,
-    live_decode: &'a LiveDecode<'a>,
-}
-
 pub(super) struct SelectedPair<'a> {
     pub(super) prefill: &'a Arc<dyn Worker>,
     pub(super) decode: &'a Arc<dyn Worker>,
@@ -86,7 +74,10 @@ pub(super) struct SelectedPair<'a> {
 #[derive(Clone, Copy)]
 enum Transport<'a> {
     Http,
-    Grpc(&'a PreparedRequest),
+    Grpc {
+        prepared: &'a PreparedRequest,
+        prompts: &'a Arc<[Vec<u32>]>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -94,14 +85,7 @@ struct BeforePrefill<'a> {
     request: &'a Value,
     path: &'a str,
     headers: Option<&'a HeaderMap>,
-    pool: DecodePoolSource,
-    prompts: Option<&'a Arc<[Vec<u32>]>>,
     transport: Transport<'a>,
-}
-
-enum DirectDecode {
-    Responded(Response),
-    Refused,
 }
 
 tokio::task_local! {
@@ -141,32 +125,36 @@ impl VllmPDRouter {
         Ok(())
     }
 
-    pub(super) async fn try_http_prefill_bypass(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn process_native_http_pair(
         &self,
-        request: &Value,
+        request: Value,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
         path: &str,
         headers: Option<&HeaderMap>,
-        pair: SelectedPair<'_>,
-    ) -> Option<Response> {
+        attempt: PdAttempt,
+        commit: Option<&DecodeCommitInput>,
+    ) -> Result<Response, PDRouterError> {
         let input = BeforePrefill {
-            request,
+            request: &request,
             path,
             headers,
-            pool: if self.use_discovery {
-                DecodePoolSource::Discovery
-            } else {
-                DecodePoolSource::Registry
-            },
-            prompts: None,
             transport: Transport::Http,
         };
-        match self.try_prefill_bypass(input, pair).await? {
-            DirectDecode::Responded(response) => Some(response),
-            DirectDecode::Refused => {
-                let retry = self.route_transparent(headers, path, &Method::POST, request.clone());
-                Some(SPLIT_RETRY.scope((), retry).await)
-            }
+        let pair = SelectedPair {
+            prefill: &prefill,
+            decode: &decode,
+            attempt: &attempt,
+            commit,
+        };
+        if let Some(response) = self.try_prefill_bypass(input, pair).await {
+            return Ok(response);
         }
+        self.process_vllm_two_stage_request(
+            request, prefill, decode, path, headers, attempt, None, commit,
+        )
+        .await
     }
 
     pub(super) async fn try_grpc_prefill_bypass(
@@ -174,112 +162,188 @@ impl VllmPDRouter {
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
-        (prepared, prompts): (&PreparedRequest, &Arc<[Vec<u32>]>),
+        prepared: &PreparedRequest,
+        prompts: &Arc<[Vec<u32>]>,
         pair: SelectedPair<'_>,
     ) -> Option<Response> {
-        let input = BeforePrefill {
-            request,
-            path,
-            headers,
-            pool: DecodePoolSource::Registry,
-            prompts: Some(prompts),
-            transport: Transport::Grpc(prepared),
-        };
-        match self.try_prefill_bypass(input, pair).await? {
-            DirectDecode::Responded(response) => Some(response),
-            DirectDecode::Refused => {
-                let workers = match self.available_grpc_workers() {
-                    Ok(workers) => workers,
-                    Err(response) => return Some(*response),
-                };
-                let retry = Box::pin(self.route_grpc_prepared(
-                    headers,
-                    request.clone(),
-                    path,
-                    prepared.clone(),
-                    workers,
-                ));
-                Some(SPLIT_RETRY.scope((), retry).await)
-            }
-        }
+        self.try_prefill_bypass(
+            BeforePrefill {
+                request,
+                path,
+                headers,
+                transport: Transport::Grpc { prepared, prompts },
+            },
+            pair,
+        )
+        .await
     }
 
     async fn try_prefill_bypass(
         &self,
         input: BeforePrefill<'_>,
         pair: SelectedPair<'_>,
-    ) -> Option<DirectDecode> {
+    ) -> Option<Response> {
         let feature = self.prefill_bypass.get()?;
+        let state = self.pd_router.kv_state.as_deref()?;
+        let BeforePrefill {
+            request,
+            path,
+            headers,
+            transport,
+        } = input;
         if SPLIT_RETRY.try_with(|_| ()).is_ok()
             || self.kv_connector != KvConnector::Nixl
             || self.epd.is_some()
-            || !PrefillBypass::eligible_request(input.path, input.request)
+            || !PrefillBypass::eligible_request(path, request)
             || self
                 .get_nixl_push_identity(pair.prefill.base_url(), pair.prefill.dp_rank())
                 .is_some()
         {
             return None;
         }
-        let live_decode = |pool, model: Option<&str>, selected: &Arc<dyn Worker>| {
-            let mut candidates = self.live_decode_candidates(pool);
-            let endpoint = PdEndpoint::for_worker(selected.as_ref());
-            Self::retain_commit_candidates(&mut candidates, model, Some(&endpoint));
-            candidates.into_iter().find(|worker| {
-                matches!(pool, DecodePoolSource::Discovery) || Arc::ptr_eq(worker, selected)
-            })
+
+        let policy = self.policy_registry.get_decode_policy();
+        let (estimate, revision) =
+            prepare_estimate(state, pair.decode.as_ref(), policy.as_ref(), input).await?;
+        if !feature.within_limit(estimate) {
+            return None;
+        }
+
+        let pool = if self.use_discovery {
+            DecodePoolSource::Discovery
+        } else {
+            DecodePoolSource::Registry
         };
-        let bypass = NativeBypass {
-            feature,
-            state: self.pd_router.kv_state.as_deref()?,
-            load: &self.pd_router.pd_load,
-            policy: self.policy_registry.get_decode_policy(),
-            live_decode: &live_decode,
+        let model = request.get("model").and_then(Value::as_str);
+        let endpoint = PdEndpoint::for_worker(pair.decode.as_ref());
+        let mut candidates = self.live_decode_candidates(pool);
+        Self::retain_commit_candidates(&mut candidates, model, Some(&endpoint));
+        let worker = candidates
+            .into_iter()
+            .find(|worker| self.use_discovery || Arc::ptr_eq(worker, pair.decode))?;
+        let prefill_endpoint = PdEndpoint::for_worker(pair.prefill.as_ref());
+        let allows = |loads: &Loads, reservation| {
+            state.local_prefill_revision(worker.as_ref()) == Some(revision)
+                && load_allows(
+                    feature,
+                    loads,
+                    &prefill_endpoint,
+                    &endpoint,
+                    reservation,
+                    estimate,
+                )
         };
-        let worker = bypass_target(&bypass, input, &pair).await?;
+        let attempt = pair.attempt;
+        if let Some(commit) = pair.commit {
+            commit_decode(
+                &self.pd_router.pd_load,
+                attempt,
+                commit,
+                &worker,
+                policy.as_ref(),
+                input,
+                |loads| allows(loads, DecodeReservation::Deferred),
+            )?;
+        } else if !attempt
+            .check_reserved_decode(&endpoint, |loads| allows(loads, DecodeReservation::Held))
+        {
+            return None;
+        }
+
+        let start = Instant::now();
         let params = feature.transfer_params();
-        let response = match input.transport {
+        attempt.finish_prefill();
+        attempt.begin_decode();
+        let response = match transport {
             Transport::Http => {
-                dispatch_http(
-                    &self.pd_router.client,
-                    input,
-                    worker.as_ref(),
-                    pair.attempt,
-                    params,
-                )
-                .await
+                let url = worker.endpoint_url(path);
+                let mut body = request.clone();
+                body["kv_transfer_params"] = params;
+                let response = self
+                    .send_http_decode(
+                        &url,
+                        worker.dp_rank(),
+                        &Uuid::new_v4().to_string(),
+                        path,
+                        headers,
+                        &body,
+                    )
+                    .await;
+                local_http_response(response, &url)
             }
-            Transport::Grpc(prepared) => {
-                dispatch_grpc(
-                    &self.grpc_frontend,
-                    prepared.clone(),
-                    input.path,
-                    worker.as_ref(),
-                    pair.attempt,
-                    params,
-                )
-                .await
-            }
-        };
-        let (result, outcome) = match response {
-            Some(response) => {
-                let result = if response.status().is_success() {
-                    "accepted"
+            Transport::Grpc { prepared, .. } => {
+                let response = self
+                    .grpc_frontend
+                    .dispatch_decode(
+                        worker.url(),
+                        prepared.clone(),
+                        Uuid::new_v4().to_string(),
+                        Some(params),
+                    )
+                    .await;
+                if response
+                    .extensions()
+                    .get::<tonic::Status>()
+                    .is_some_and(grpc_rejected)
+                {
+                    None
                 } else {
-                    "failed"
-                };
-                (
-                    result,
-                    DirectDecode::Responded(pair.attempt.clone().track_response(response)),
-                )
-            }
-            None => {
-                pair.attempt.release();
-                ("refused", DirectDecode::Refused)
+                    if response.status().is_success() {
+                        record_grpc_decode_stream_failure(
+                            grpc_decode_outcome(&response),
+                            worker.base_url(),
+                        );
+                    }
+                    Some(own_grpc_decode(response, attempt))
+                }
             }
         };
-        metrics::counter!("vllm_router_pd_prefill_bypass_total", "result" => result).increment(1);
-        Some(outcome)
+        let worker_url = worker.base_url();
+        RouterMetrics::record_pd_decode_request(worker_url);
+        let response = if let Some(response) = response {
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, start.elapsed());
+            if response.status().is_success() {
+                record_bypass("accepted");
+            } else {
+                RouterMetrics::record_pd_decode_error(worker_url);
+                record_bypass("failed");
+            }
+            response
+        } else {
+            attempt.release();
+            record_bypass("refused");
+            match transport {
+                Transport::Http => {
+                    SPLIT_RETRY
+                        .scope(
+                            (),
+                            self.route_transparent(headers, path, &Method::POST, request.clone()),
+                        )
+                        .await
+                }
+                Transport::Grpc { prepared, .. } => {
+                    let workers = match self.available_grpc_workers() {
+                        Ok(workers) => workers,
+                        Err(response) => return Some(*response),
+                    };
+                    let retry = Box::pin(self.route_grpc_prepared(
+                        headers,
+                        request.clone(),
+                        path,
+                        prepared.clone(),
+                        workers,
+                    ));
+                    SPLIT_RETRY.scope((), retry).await
+                }
+            }
+        };
+        Some(response)
     }
+}
+
+fn record_bypass(result: &'static str) {
+    metrics::counter!("vllm_router_pd_prefill_bypass_total", "result" => result).increment(1);
 }
 
 #[derive(Clone, Copy)]
@@ -318,11 +382,18 @@ async fn prepare_estimate(
     state: &PdKvState,
     worker: &dyn Worker,
     policy: &dyn LoadBalancingPolicy,
-    request: &Value,
-    route: &str,
-    headers: Option<&HeaderMap>,
-    router_prompts: Option<&Arc<[Vec<u32>]>>,
+    input: BeforePrefill<'_>,
 ) -> Option<(PrefillEstimate, u64)> {
+    let BeforePrefill {
+        request,
+        path,
+        headers,
+        transport,
+    } = input;
+    let prompts = match transport {
+        Transport::Http => None,
+        Transport::Grpc { prompts, .. } => Some(prompts),
+    };
     let worker_revision = state.local_prefill_revision(worker)?;
     let policy = kv_aware_ops(policy)?;
     let bases = vec![worker.base_url().to_owned()];
@@ -330,9 +401,7 @@ async fn prepare_estimate(
     if verified.get(worker.base_url()) != Some(&true) {
         return None;
     }
-    let inputs = state
-        .tokenize(bases, request, route, headers, router_prompts)
-        .await;
+    let inputs = state.tokenize(bases, request, path, headers, prompts).await;
     let prompts = &inputs.get(worker.base_url())?.as_ref().ok()?.prompts;
     let [prompt] = prompts.as_ref() else {
         return None;
@@ -349,191 +418,63 @@ async fn prepare_estimate(
     ))
 }
 
-async fn bypass_target(
-    bypass: &NativeBypass<'_>,
-    input: BeforePrefill<'_>,
-    pair: &SelectedPair<'_>,
-) -> Option<Arc<dyn Worker>> {
-    let BeforePrefill {
-        request,
-        path,
-        headers,
-        ..
-    } = input;
-    let SelectedPair {
-        prefill,
-        decode,
-        attempt,
-        commit,
-    } = pair;
-    let (estimate, revision) = prepare_estimate(
-        bypass.state,
-        decode.as_ref(),
-        bypass.policy.as_ref(),
-        request,
-        path,
-        headers,
-        input.prompts,
-    )
-    .await?;
-    if !bypass.feature.within_limit(estimate) {
-        return None;
-    }
-
-    let model = request.get("model").and_then(Value::as_str);
-    let worker = (bypass.live_decode)(input.pool, model, decode)?;
-    let endpoint = PdEndpoint::for_worker(worker.as_ref());
-    let prefill_endpoint = PdEndpoint::for_worker(prefill.as_ref());
-    let allows = |loads: &Loads, reservation| {
-        bypass.state.local_prefill_revision(worker.as_ref()) == Some(revision)
-            && load_allows(
-                bypass.feature,
-                loads,
-                &prefill_endpoint,
-                &endpoint,
-                reservation,
-                estimate,
-            )
-    };
-    if let Some(commit) = commit {
-        // There is one candidate: the rank whose local KV was checked. Reuse
-        // stage selection for the endpoint eligibility and session binding.
-        let context = PdRequestContext {
-            worker_pairs: None,
-            prefill_inputs: None,
-            model_id: model,
-            legacy_policy_input: None,
-            prefill_cache: None,
-            decode_cache: None,
-            headers: None,
-            affinity_key: commit.affinity_key.clone(),
-            lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
-            cache_salt: commit.cache_salt.as_deref(),
-            prefill_pricing: None,
-            decode_pricing: None,
-            route: path,
-            probe: false,
-        };
-        let decision = bypass.load.commit_decode(attempt, |loads| {
-            if !allows(loads, DecodeReservation::Deferred) {
-                return None;
-            }
-            select_decode_stage(
-                loads,
-                std::slice::from_ref(&worker),
-                bypass.policy.as_ref(),
-                &context,
-            )
-        })?;
-        RouterMetrics::record_pd_decode_commit("same");
-        if let Some(affinity) = decision.affinity_outcome {
-            RouterMetrics::record_pd_affinity_decision("decode", affinity);
-        }
-        attempt.attach_decode_worker(worker.clone());
-    } else if !attempt
-        .check_reserved_decode(&endpoint, |loads| allows(loads, DecodeReservation::Held))
-    {
-        return None;
-    }
-    Some(worker)
-}
-
-async fn dispatch_grpc(
-    frontend: &EngineFrontend,
-    prepared: PreparedRequest,
-    path: &str,
-    worker: &dyn Worker,
+fn commit_decode(
+    load: &PdLoadManager,
     attempt: &PdAttempt,
-    params: Value,
-) -> Option<Response> {
-    let start = Instant::now();
-    attempt.finish_prefill();
-    attempt.begin_decode();
-    let response = frontend
-        .dispatch_decode(
-            worker.url(),
-            prepared,
-            Uuid::new_v4().to_string(),
-            Some(params),
-        )
-        .await;
-    RouterMetrics::record_pd_decode_request(worker.base_url());
-    if response
-        .extensions()
-        .get::<tonic::Status>()
-        .is_some_and(grpc_rejected)
-    {
-        return None;
+    commit: &DecodeCommitInput,
+    worker: &Arc<dyn Worker>,
+    policy: &dyn LoadBalancingPolicy,
+    input: BeforePrefill<'_>,
+    allows: impl FnOnce(&Loads) -> bool,
+) -> Option<()> {
+    // Only the rank whose local KV was checked can take this commitment.
+    let context = PdRequestContext {
+        worker_pairs: None,
+        prefill_inputs: None,
+        model_id: commit.model_id.as_deref(),
+        legacy_policy_input: None,
+        prefill_cache: None,
+        decode_cache: None,
+        headers: None,
+        affinity_key: commit.affinity_key.clone(),
+        lora_name: input.request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
+        cache_salt: commit.cache_salt.as_deref(),
+        prefill_pricing: None,
+        decode_pricing: None,
+        route: input.path,
+        probe: false,
+    };
+    let decision = load.commit_decode(attempt, |loads| {
+        if !allows(loads) {
+            return None;
+        }
+        select_decode_stage(loads, std::slice::from_ref(worker), policy, &context)
+    })?;
+    RouterMetrics::record_pd_decode_commit("same");
+    if let Some(affinity) = decision.affinity_outcome {
+        RouterMetrics::record_pd_affinity_decision("decode", affinity);
     }
-    RouterMetrics::record_pd_request(path);
-    RouterMetrics::record_pd_request_duration(path, start.elapsed());
-    if response.status().is_success() {
-        record_grpc_decode_stream_failure(grpc_decode_outcome(&response), worker.base_url());
-    } else {
-        RouterMetrics::record_pd_decode_error(worker.base_url());
-    }
-    let response = own_grpc_decode(response, attempt);
-    Some(response)
+    attempt.attach_decode_worker(worker.clone());
+    Some(())
 }
 
 /// None is reserved for a typed refusal before generation.
-async fn dispatch_http(
-    client: &reqwest::Client,
-    input: BeforePrefill<'_>,
-    worker: &dyn Worker,
-    attempt: &PdAttempt,
-    params: Value,
-) -> Option<Response> {
-    let BeforePrefill {
-        request,
-        path,
-        headers,
-        ..
-    } = input;
-    let start = Instant::now();
-    let url = worker.endpoint_url(path);
-    let mut request = request.clone();
-    request["kv_transfer_params"] = params;
-    let builder = client
-        .post(&url)
-        .bearer_auth(std::env::var("OPENAI_API_KEY").unwrap_or_default())
-        .header("X-Request-Id", Uuid::new_v4().to_string())
-        .json(&request);
-    let builder = dp_utils::add_dp_rank_header(builder, worker.dp_rank());
-    attempt.finish_prefill();
-    attempt.begin_decode();
-    let result = otel_http::send_client_request(
-        builder,
-        headers,
-        ClientRequestOptions {
-            method: "POST",
-            url: &url,
-            route: Some(path),
-            request_phase: Some("decode"),
-        },
-    )
-    .await;
-    RouterMetrics::record_pd_decode_request(worker.base_url());
-    if let Ok(response) = &result {
-        if http_rejected(response.status(), response.headers()) {
-            return None;
-        }
+fn local_http_response(result: reqwest::Result<reqwest::Response>, url: &str) -> Option<Response> {
+    if result
+        .as_ref()
+        .is_ok_and(|response| http_rejected(response.status(), response.headers()))
+    {
+        return None;
     }
-    RouterMetrics::record_pd_request(path);
-    RouterMetrics::record_pd_request_duration(path, start.elapsed());
     Some(match result {
         Ok(response) => {
             let status = response.status();
-            if !status.is_success() {
-                RouterMetrics::record_pd_decode_error(worker.base_url());
-            }
             let mut headers = header_utils::preserve_response_headers(response.headers());
             headers.remove(ERROR_HEADER);
             response_with_body(status, &headers, Body::from_stream(response.bytes_stream()))
                 .unwrap_or_else(|error| (StatusCode::BAD_GATEWAY, error).into_response())
         }
         Err(error) => {
-            RouterMetrics::record_pd_decode_error(worker.base_url());
             let status = if error.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {

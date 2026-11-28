@@ -153,17 +153,11 @@ mod test_pd_routing {
             )
             .route(
                 "/d/kv_event_sources",
-                get(move || {
-                    let sources = sources.clone();
-                    async move { Json(sources) }
-                }),
+                get(move || async move { Json(sources) }),
             )
             .route(
                 "/d/kv_routing_capabilities",
-                get(move || {
-                    let layout = layout.clone();
-                    async move { Json(layout) }
-                }),
+                get(move || async move { Json(layout) }),
             )
             .route(
                 "/d/v1/models",
@@ -174,13 +168,9 @@ mod test_pd_routing {
                 post({
                     let calls = calls.clone();
                     let handoff = handoff.clone();
-                    move || {
-                        let calls = calls.clone();
-                        let handoff = handoff.clone();
-                        async move {
-                            calls.lock().unwrap().push(("P", Value::Null));
-                            Json(json!({"kv_transfer_params": handoff}))
-                        }
+                    move || async move {
+                        calls.lock().unwrap().push(("P", Value::Null));
+                        Json(json!({"kv_transfer_params": handoff}))
                     }
                 }),
             )
@@ -189,26 +179,22 @@ mod test_pd_routing {
                 post({
                     let calls = calls.clone();
                     let refusal = refusal.clone();
-                    move |Json(body): Json<Value>| {
+                    move |Json(body): Json<Value>| async move {
                         let params = body["kv_transfer_params"].clone();
+                        let direct = params.get("max_local_prefill_tokens").is_some();
+                        calls.lock().unwrap().push(("D", params));
+                        if !direct {
+                            return Json(json!({"choices": [{"text": "answer"}]})).into_response();
+                        }
                         let result = *refusal.lock().unwrap();
-                        calls.lock().unwrap().push(("D", params.clone()));
-                        async move {
-                            if params.get("max_local_prefill_tokens").is_none() {
-                                return Json(json!({"choices": [{"text": "answer"}]}))
-                                    .into_response();
-                            }
-                            match result {
-                                Refusal::Tagged => (
-                                    StatusCode::UNPROCESSABLE_ENTITY,
-                                    [("x-vllm-error-code", "local_prefill_limit_exceeded")],
-                                )
-                                    .into_response(),
-                                Refusal::Untagged => {
-                                    StatusCode::UNPROCESSABLE_ENTITY.into_response()
-                                }
-                                Refusal::NoResponse => std::future::pending::<Response>().await,
-                            }
+                        match result {
+                            Refusal::Tagged => (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                [("x-vllm-error-code", "local_prefill_limit_exceeded")],
+                            )
+                                .into_response(),
+                            Refusal::Untagged => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+                            Refusal::NoResponse => std::future::pending::<Response>().await,
                         }
                     }
                 }),
