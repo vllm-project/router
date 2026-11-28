@@ -272,6 +272,8 @@ impl Rig {
             kv_connector: KvConnector::Nixl,
             epd: Some(EpdConfig {
                 encoder_urls: vec![e0_url, e1_url],
+                // The rig expects image A at E0 and image B at E1.
+                encode_policy: Some(PolicyConfig::RoundRobin),
                 consumer_zmq_addrs: HashMap::from([(consumer_url, ec.address.clone())]),
             }),
             disable_retries: true,

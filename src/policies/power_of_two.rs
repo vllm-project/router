@@ -2,7 +2,6 @@
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::core::Worker;
-use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -89,9 +88,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         );
 
         // Increment processed counter
-        workers[selected_idx].increment_processed();
-        RouterMetrics::record_processed_request(workers[selected_idx].url());
-        RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
+        super::record_processed_selection(self.name(), workers[selected_idx].as_ref());
 
         Some(selected_idx)
     }
