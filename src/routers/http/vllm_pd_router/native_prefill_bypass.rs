@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
@@ -104,6 +104,11 @@ enum DirectDecode {
     Refused,
 }
 
+tokio::task_local! {
+    // The split retry reuses native admission with bypass disabled only for that future.
+    static SPLIT_RETRY: ();
+}
+
 impl VllmPDRouter {
     /// Install the optional policy before the router serves requests.
     pub fn configure_prefill_bypass(&self, config: PdPrefillBypassConfig) -> Result<(), String> {
@@ -118,7 +123,6 @@ impl VllmPDRouter {
 
     pub(super) async fn try_http_prefill_bypass(
         &self,
-        allow_bypass: bool,
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -136,17 +140,17 @@ impl VllmPDRouter {
             prompts: None,
             transport: Transport::Http,
         };
-        match self.try_prefill_bypass(allow_bypass, input, pair).await? {
+        match self.try_prefill_bypass(input, pair).await? {
             DirectDecode::Responded(response) => Some(response),
             DirectDecode::Refused => {
-                Some(Box::pin(self.route_native_http(headers, path, request.clone(), false)).await)
+                let retry = self.route_transparent(headers, path, &Method::POST, request.clone());
+                Some(SPLIT_RETRY.scope((), retry).await)
             }
         }
     }
 
     pub(super) async fn try_grpc_prefill_bypass(
         &self,
-        allow_bypass: bool,
         request: &Value,
         path: &str,
         headers: Option<&HeaderMap>,
@@ -161,36 +165,32 @@ impl VllmPDRouter {
             prompts: Some(prompts),
             transport: Transport::Grpc(prepared),
         };
-        match self.try_prefill_bypass(allow_bypass, input, pair).await? {
+        match self.try_prefill_bypass(input, pair).await? {
             DirectDecode::Responded(response) => Some(response),
             DirectDecode::Refused => {
                 let workers = match self.available_grpc_workers() {
                     Ok(workers) => workers,
                     Err(response) => return Some(*response),
                 };
-                Some(
-                    Box::pin(self.route_grpc_prepared(
-                        headers,
-                        request.clone(),
-                        path,
-                        prepared.clone(),
-                        workers,
-                        false,
-                    ))
-                    .await,
-                )
+                let retry = Box::pin(self.route_grpc_prepared(
+                    headers,
+                    request.clone(),
+                    path,
+                    prepared.clone(),
+                    workers,
+                ));
+                Some(SPLIT_RETRY.scope((), retry).await)
             }
         }
     }
 
     async fn try_prefill_bypass(
         &self,
-        allow_bypass: bool,
         input: BeforePrefill<'_>,
         pair: SelectedPair<'_>,
     ) -> Option<DirectDecode> {
         let feature = self.prefill_bypass.get()?;
-        if !allow_bypass
+        if SPLIT_RETRY.try_with(|_| ()).is_ok()
             || self.kv_connector != KvConnector::Nixl
             || self.epd.is_some()
             || !PrefillBypass::eligible_request(input.path, input.request)
@@ -533,6 +533,24 @@ async fn dispatch_http(
 mod tests {
     use super::*;
     use crate::routers::http::pd_types::{PdSelection, StageDecision};
+
+    #[tokio::test]
+    async fn split_retry_marker_is_local_to_its_future() {
+        let (entered, in_retry) = tokio::sync::oneshot::channel();
+        tokio::join!(
+            SPLIT_RETRY.scope((), async {
+                assert!(SPLIT_RETRY.try_with(|_| ()).is_ok());
+                entered.send(()).unwrap();
+                tokio::task::yield_now().await;
+                assert!(SPLIT_RETRY.try_with(|_| ()).is_ok());
+            }),
+            async {
+                in_retry.await.unwrap();
+                assert!(SPLIT_RETRY.try_with(|_| ()).is_err());
+            },
+        );
+        assert!(SPLIT_RETRY.try_with(|_| ()).is_err());
+    }
 
     #[test]
     fn bypass_rejects_other_pending_and_active_decode_requests() {

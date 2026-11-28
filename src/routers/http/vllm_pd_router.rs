@@ -2008,7 +2008,6 @@ impl VllmPDRouter {
         request: Value,
         path: &str,
         headers: Option<&HeaderMap>,
-        allow_bypass: bool,
     ) -> Response {
         let (
             prefill_worker,
@@ -2045,7 +2044,6 @@ impl VllmPDRouter {
         });
         if let Some(response) = self
             .try_http_prefill_bypass(
-                allow_bypass,
                 &request,
                 path,
                 headers,
@@ -2245,7 +2243,6 @@ impl VllmPDRouter {
             "/v1/chat/completions",
             prepared,
             workers,
-            true,
         )
         .await
     }
@@ -2277,15 +2274,8 @@ impl VllmPDRouter {
                 return (prepare_error_status(&error), error.to_string()).into_response();
             }
         };
-        self.route_grpc_prepared(
-            headers,
-            request_json,
-            "/v1/completions",
-            prepared,
-            workers,
-            true,
-        )
-        .await
+        self.route_grpc_prepared(headers, request_json, "/v1/completions", prepared, workers)
+            .await
     }
 
     /// Shared gRPC P/D admission and dispatch for an already prepared request.
@@ -2296,7 +2286,6 @@ impl VllmPDRouter {
         path: &str,
         prepared: crate::backend::PreparedRequest,
         workers: GrpcPdWorkers,
-        allow_bypass: bool,
     ) -> Response {
         let GrpcPdWorkers {
             prefill: prefill_workers,
@@ -2348,7 +2337,6 @@ impl VllmPDRouter {
         });
         if let Some(response) = self
             .try_grpc_prefill_bypass(
-                allow_bypass,
                 &request_json,
                 path,
                 headers,
@@ -3883,22 +3871,12 @@ impl RouterTrait for VllmPDRouter {
             method, path
         );
 
-        self.route_native_http(headers, path, body, true).await
-    }
-}
+        // Body is already a serde_json::Value, use it directly
+        let request_json = body;
 
-impl VllmPDRouter {
-    async fn route_native_http(
-        &self,
-        headers: Option<&HeaderMap>,
-        path: &str,
-        request_json: Value,
-        allow_bypass: bool,
-    ) -> Response {
         if self.use_discovery {
             // Discovery mode - use vLLM-specific two-stage processing
-            self.process_vllm_request(request_json, path, headers, allow_bypass)
-                .await
+            self.process_vllm_request(request_json, path, headers).await
         } else {
             // Direct URL mode - use worker registry, filtered by availability
             let all_prefill = self.pd_router.worker_registry.get_prefill_workers();
@@ -3980,7 +3958,6 @@ impl VllmPDRouter {
 
             if let Some(response) = self
                 .try_http_prefill_bypass(
-                    allow_bypass,
                     &request_json,
                     path,
                     headers,
