@@ -236,6 +236,22 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Test-only read of the affinity credit `tenant` holds for the chars of
+    /// `request_text`, scanning every model tree the same way
+    /// [`Self::remove_worker_by_url`] does. Zero means the tenant holds no
+    /// credit anywhere (evicted, or never inserted). Does not touch LRU state.
+    #[cfg(test)]
+    pub(crate) fn tenant_prefix_credit(&self, request_text: &str, tenant: &str) -> usize {
+        self.trees
+            .iter()
+            .map(|tree| {
+                tree.value()
+                    .prefix_match_tenant_char_count(request_text, tenant)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Run cache eviction to prevent unbounded growth
     pub fn evict_cache(&self, max_size: usize) {
         for tree_ref in self.trees.iter() {
@@ -730,7 +746,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by model
-        info!(
+        debug!(
             "Initializing workers for cache-aware policy: {}",
             workers
                 .iter()
