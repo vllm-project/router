@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
 use common::create_test_context;
-use common::mock_vllm_rs::{MockVllmRs, MockVllmRsServer};
+use common::mock_vllm_rs::{AuthorizationCheck, MockVllmRs, MockVllmRsServer};
 use kv_fixture::KvPublisher;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde_json::{json, Value};
@@ -96,6 +96,7 @@ async fn pd_router_with_pools(
         prefill_policy,
         HashMap::new(),
         KvConnector::Nixl,
+        None,
     )
     .await
 }
@@ -107,6 +108,7 @@ async fn pd_router_with_kv_sources(
     prefill_policy: PolicyConfig,
     pd_kv_event_sources: HashMap<String, PdKvEventSources>,
     kv_connector: KvConnector,
+    api_key: Option<String>,
 ) -> VllmPDRouter {
     metrics();
     let prefill_urls: Vec<(String, Option<u16>)> = prefills
@@ -127,6 +129,7 @@ async fn pd_router_with_kv_sources(
         kv_connector,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
+        api_key,
         ..RouterConfig::default()
     };
     vllm_router_rs::config::ConfigValidator::validate(&config).unwrap();
@@ -308,6 +311,7 @@ async fn grpc_pd_mooncake_v2_rejects_missing_handoff_before_decode() {
         PolicyConfig::RoundRobin,
         HashMap::new(),
         KvConnector::MooncakeV2,
+        None,
     )
     .await;
     router.pin_test_token_ids(vec![1, 2, 3]);
@@ -800,6 +804,7 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
             policy,
             sources,
             KvConnector::Nixl,
+            None,
         )
         .await;
         let prompt: Vec<u32> = (0..33).collect();
@@ -1125,8 +1130,12 @@ async fn grpc_pd_client_disconnect_cancels_decode_stream() {
         ..Default::default()
     })
     .await;
-    let decode = MockVllmRsServer::spawn_with_state(slow_decode()).await;
-    let router = pd_router(&prefill, &decode).await;
+    let decode = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".into()),
+        ..slow_decode()
+    })
+    .await;
+    let router = pd_router_with_api_key(&prefill, &decode, "worker-secret").await;
 
     disconnect_before_first_token(&router, &decode, 0).await;
     let p = router
@@ -1180,9 +1189,25 @@ async fn grpc_pd_aborted_decode_stream_records_decode_error() {
 
 #[tokio::test]
 async fn grpc_pd_info_endpoints_use_grpc_control() {
-    let prefill = MockVllmRsServer::spawn().await;
-    let decode = MockVllmRsServer::spawn().await;
-    let router = pd_router(&prefill, &decode).await;
+    let worker = || MockVllmRs {
+        authorization: AuthorizationCheck::Bearer("worker-secret".into()),
+        ..MockVllmRs::default()
+    };
+    let prefill = MockVllmRsServer::spawn_with_state(worker()).await;
+    let decode = MockVllmRsServer::spawn_with_state(worker()).await;
+    let router = pd_router_with_kv_sources(
+        &[&prefill],
+        &decode,
+        1,
+        serde_json::from_value(json!({"type": "kv_aware"})).unwrap(),
+        HashMap::new(),
+        KvConnector::Nixl,
+        Some("worker-secret".into()),
+    )
+    .await;
+    prefill.assert_control_authorization(&["GetModelInfo", "GetServerInfo", "GetKvEventSources"]);
+    // The decode worker only receives the startup engine-version probe.
+    decode.assert_control_authorization(&["GetServerInfo"]);
     let get = |uri: &str| {
         axum::http::Request::builder()
             .uri(uri)
@@ -1465,4 +1490,81 @@ async fn send_chat(
         p.last().unwrap().token_ids.clone(),
         d.last().unwrap().token_ids.clone(),
     )
+}
+
+async fn pd_router_with_api_key(
+    prefill: &MockVllmRsServer,
+    decode: &MockVllmRsServer,
+    api_key: &str,
+) -> VllmPDRouter {
+    let router = pd_router_with_kv_sources(
+        &[prefill],
+        decode,
+        1,
+        PolicyConfig::RoundRobin,
+        HashMap::new(),
+        KvConnector::Nixl,
+        Some(api_key.to_string()),
+    )
+    .await;
+    router.pin_test_token_ids(vec![1, 2, 3]);
+    router
+}
+
+#[tokio::test]
+async fn grpc_pd_sends_the_api_key_on_both_legs() {
+    let check = AuthorizationCheck::Bearer("worker-secret".to_string());
+    let prefill = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        finish_kv_transfer_params: Some(prefill_kv()),
+        authorization: check.clone(),
+        ..MockVllmRs::default()
+    })
+    .await;
+    let decode = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: check,
+        ..MockVllmRs::default()
+    })
+    .await;
+    let router = pd_router_with_api_key(&prefill, &decode, "worker-secret").await;
+
+    let response = router.route_chat(None, &chat(false), None).await;
+    assert!(response.status().is_success());
+
+    for (leg, captured) in [
+        ("prefill", prefill.captured()),
+        ("decode", decode.captured()),
+    ] {
+        assert_eq!(captured.len(), 1, "{leg} leg");
+        assert_eq!(
+            captured[0].authorization.as_deref(),
+            Some("Bearer worker-secret"),
+            "{leg} leg must send the api key as authorization metadata"
+        );
+    }
+
+    router
+        .remove_prefill_server(&prefill.grpc_url)
+        .await
+        .unwrap();
+    let rank_url = format!("{}@0", prefill.grpc_url);
+    router
+        .add_prefill_server(rank_url.clone(), None)
+        .await
+        .unwrap();
+
+    let discovered = MockVllmRsServer::spawn_with_state(MockVllmRs {
+        authorization: AuthorizationCheck::Absent,
+        ..Default::default()
+    })
+    .await;
+    router
+        .add_decode_server(discovered.grpc_url.clone())
+        .await
+        .unwrap();
+
+    // Exercise the same probe the periodic health checker calls on each worker.
+    for url in [&decode.grpc_url, &rank_url, &discovered.grpc_url] {
+        let worker = router.worker_registry().get_by_url(url).unwrap();
+        worker.check_health_async().await.unwrap();
+    }
 }

@@ -24,10 +24,10 @@ impl KvIndexSupervisor {
         worker_url: &str,
         observers: &Mutex<HashMap<String, WorkerObservation>>,
     ) -> Result<WorkerKvInfo, String> {
-        let api_key = self.api_key.as_deref();
+        let api_key = self.worker_auth.key_for(worker_url);
         let (sources, info) = tokio::join!(
-            fetch_kv_event_sources(&self.client, worker_url, api_key),
-            query_worker_metadata_and_models(&self.client, worker_url, api_key),
+            fetch_kv_event_sources(&self.client, worker_url, api_key.as_deref()),
+            query_worker_metadata_and_models(&self.client, worker_url, api_key.as_deref()),
         );
         let sources = match sources {
             Ok(sources) => sources,

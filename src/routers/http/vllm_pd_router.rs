@@ -3338,6 +3338,7 @@ impl VllmPDRouter {
                 .filter(|url| crate::backend::is_grpc_url(url))
                 .collect();
             let pd_router = PdRouterBase::new(prefill_urls.clone(), decode_urls, ctx).await?;
+            let grpc_frontend = grpc_frontend.with_worker_auth(pd_router.worker_auth.clone());
 
             // No service discovery in direct URL mode
             let service_registry = Arc::new(ServiceRegistry::new());
@@ -3402,8 +3403,11 @@ impl VllmPDRouter {
             }
 
             if !grpc_workers.is_empty() {
-                crate::backend::warn_old_grpc_pd_workers(grpc_workers.iter().map(String::as_str))
-                    .await;
+                crate::backend::control::warn_old_grpc_pd_workers_with_auth(
+                    grpc_workers.iter().map(String::as_str),
+                    &pd_router.worker_auth,
+                )
+                .await;
             }
 
             Ok(Self {
@@ -4521,7 +4525,7 @@ mod tests {
         router.pd_router.kv_state = Some(
             super::super::pd_kv_state::PdKvState::start(
                 reqwest::Client::new(),
-                None,
+                Default::default(),
                 HashMap::new(),
                 router.kv_connector,
                 HashMap::new(),

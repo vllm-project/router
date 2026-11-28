@@ -105,11 +105,15 @@ impl KvIndexSupervisor {
             };
             worker.base_models = Some(match cached {
                 Some(models) => models,
-                None => query_model_list(&self.client, base, self.api_key.as_deref())
-                    .await
-                    .as_ref()
-                    .map(base_model_names)
-                    .unwrap_or_default(),
+                None => query_model_list(
+                    &self.client,
+                    base,
+                    self.worker_auth.key_for(base).as_deref(),
+                )
+                .await
+                .as_ref()
+                .map(base_model_names)
+                .unwrap_or_default(),
             });
         }
         if !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
@@ -141,7 +145,11 @@ impl KvIndexSupervisor {
         }
         match tokio::time::timeout(
             OPTIONAL_METADATA_BUDGET,
-            query_engine_cache_configs(&self.client, base, self.api_key.as_deref()),
+            query_engine_cache_configs(
+                &self.client,
+                base,
+                self.worker_auth.key_for(base).as_deref(),
+            ),
         )
         .await
         {
@@ -251,7 +259,15 @@ pub async fn get_grpc_kv_event_sources(
     worker_url: &str,
     timeout: Duration,
 ) -> Result<GrpcKvEventSourcesResponse, tonic::Status> {
-    let channel = control_channel(worker_url, timeout)
+    get_grpc_kv_event_sources_with_auth(worker_url, None, timeout).await
+}
+
+async fn get_grpc_kv_event_sources_with_auth(
+    worker_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<GrpcKvEventSourcesResponse, tonic::Status> {
+    let channel = control_channel(worker_url, api_key, timeout)
         .await
         .map_err(tonic::Status::unavailable)?;
     let mut client = Grpc::new(channel);
@@ -285,7 +301,7 @@ pub(super) async fn fetch_kv_event_sources(
     api_key: Option<&str>,
 ) -> Result<KvEventSourcesResponse, SourcesUnavailable> {
     if crate::backend::is_grpc_url(worker_url) {
-        let response = get_grpc_kv_event_sources(worker_url, CONTROL_TIMEOUT)
+        let response = get_grpc_kv_event_sources_with_auth(worker_url, api_key, CONTROL_TIMEOUT)
             .await
             .map_err(|status| grpc_sources_unavailable(worker_url, status))?;
         return Ok(grpc_kv_event_source_entries(worker_url, response.sources));
@@ -328,7 +344,8 @@ pub(super) async fn fetch_native_sources(
     Result<Option<CacheCapabilities>, String>,
 ) {
     if crate::backend::is_grpc_url(worker_url) {
-        let response = match get_grpc_kv_event_sources(worker_url, timeout).await {
+        let response = match get_grpc_kv_event_sources_with_auth(worker_url, api_key, timeout).await
+        {
             Ok(response) => response,
             Err(status) => return (Err(grpc_sources_unavailable(worker_url, status)), Ok(None)),
         };
@@ -483,9 +500,13 @@ pub(super) async fn query_vllm_version(
     api_key: Option<&str>,
 ) -> Option<(u32, u32)> {
     if crate::backend::is_grpc_url(worker_url) {
-        let info = crate::backend::control::get_grpc_server_info(worker_url, CONTROL_TIMEOUT)
-            .await
-            .ok()?;
+        let info = crate::backend::control::get_grpc_server_info_with_auth(
+            worker_url,
+            api_key,
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .ok()?;
         return parse_vllm_version(&info.engine_version);
     }
     let info: serde_json::Value = query_worker_json(client, worker_url, "version", true, api_key)

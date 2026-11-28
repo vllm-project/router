@@ -400,7 +400,7 @@ impl KvIndexSupervisor {
         let client = self.client.clone();
         let signals = Some(self.signal_tx.clone());
         let worker = worker_url.to_owned();
-        let api_key = self.api_key.clone();
+        let api_key = self.worker_auth.key_for(worker_url);
         let static_config = self.resolved_static_source(worker_url);
         let installed = Arc::downgrade(&self.installed);
         let strict_recovery = self.strict_recovery;

@@ -402,11 +402,15 @@ impl Router {
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         let pool_kind = crate::backend::classify_worker_urls(&worker_urls)?;
+        let worker_auth = crate::backend::WorkerAuth::new(
+            ctx.router_config.api_key.as_deref(),
+            worker_urls.iter().map(String::as_str),
+        )?;
         let default_policy = ctx.policy_registry.get_default_policy();
         let pending_kv_supervisor = if kv_aware_ops(default_policy.as_ref()).is_some() {
             let (mut supervisor, signals) =
                 crate::kv_index::KvIndexSupervisor::new_http_full_attention(ctx.client.clone());
-            supervisor.set_api_key(ctx.router_config.api_key.clone());
+            supervisor.set_worker_auth(worker_auth.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
@@ -443,7 +447,8 @@ impl Router {
         } else {
             crate::backend::EngineFrontend::from_env(request_timeout)
                 .map_err(|error| format!("tokenizer cache: {error}"))?
-        };
+        }
+        .with_worker_auth(worker_auth.clone());
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
             Self::wait_for_healthy_workers(
@@ -1289,36 +1294,34 @@ impl Router {
 
     /// Wait until at least one of `worker_urls` passes its health check.
     ///
-    /// `api_key` is the bearer token for HTTP health requests. With `None`
-    /// they carry no `Authorization` header.
+    /// Use the same bearer token for all of these workers.
     pub(crate) async fn wait_for_healthy_workers(
         worker_urls: &[String],
         worker_startup_timeout_secs: u64,
         worker_startup_check_interval_secs: u64,
         api_key: Option<&str>,
     ) -> Result<(), String> {
+        let api_key = api_key.map(Arc::<str>::from);
+        Self::wait_for_healthy_workers_with_auth(
+            worker_urls,
+            worker_startup_timeout_secs,
+            worker_startup_check_interval_secs,
+            |_| api_key.clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn wait_for_healthy_workers_with_auth(
+        worker_urls: &[String],
+        worker_startup_timeout_secs: u64,
+        worker_startup_check_interval_secs: u64,
+        key_for: impl Fn(&str) -> Option<Arc<str>>,
+    ) -> Result<(), String> {
         if worker_urls.is_empty() {
             return Err(
                 "Timeout waiting for workers to become healthy: no workers provided".to_string(),
             );
         }
-
-        // Perform health check asynchronously
-        Self::wait_for_healthy_workers_async(
-            worker_urls,
-            worker_startup_timeout_secs,
-            worker_startup_check_interval_secs,
-            api_key,
-        )
-        .await
-    }
-
-    async fn wait_for_healthy_workers_async(
-        worker_urls: &[String],
-        worker_startup_timeout_secs: u64,
-        worker_startup_check_interval_secs: u64,
-        api_key: Option<&str>,
-    ) -> Result<(), String> {
         // Extract unique base URLs (hosts) for health checks
         // This deduplicates DP-aware URLs like http://host:8081@0, @1, @2, @3
         // to only check http://host:8081 once
@@ -1354,7 +1357,6 @@ impl Router {
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        let api_key: Option<Arc<str>> = api_key.map(Arc::from);
         let mut unhealthy_hosts: Vec<(String, String)> = Vec::new();
 
         loop {
@@ -1376,11 +1378,17 @@ impl Router {
             for base_url in &unique_hosts_vec {
                 let client_clone = client.clone();
                 let url_clone = base_url.clone();
-                let api_key = api_key.clone();
+                let api_key = key_for(base_url);
 
                 let check_health = tokio::spawn(async move {
                     if crate::backend::is_grpc_url(&url_clone) {
-                        match check_grpc_health_within(&url_clone, probe_timeout).await {
+                        match check_grpc_health_within(
+                            &url_clone,
+                            api_key.as_deref(),
+                            probe_timeout,
+                        )
+                        .await
+                        {
                             Ok(()) => None,
                             Err(e) => Some((url_clone, e)),
                         }
@@ -1497,7 +1505,13 @@ impl Router {
         };
 
         if crate::backend::is_grpc_url(health_url) {
-            return match check_grpc_health_within(health_url, Duration::from_secs(2)).await {
+            return match check_grpc_health_within(
+                health_url,
+                self.frontend.worker_key(health_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(()) => StatusCode::OK.into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             };
@@ -2800,7 +2814,7 @@ impl Router {
             .timeout(health_timeout)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-        let worker_api_key: Option<Arc<str>> = self.api_key.as_deref().map(Arc::from);
+        let worker_api_key = self.frontend.worker_key(worker_url);
         let mut last_health_error = String::from("none");
 
         loop {
@@ -2816,7 +2830,12 @@ impl Router {
             let health_result = if crate::backend::is_grpc_url(worker_url) {
                 // No test covers this limit: it shortens a 2 s probe, so a test
                 // would hinge on a sub-second wall-clock bound.
-                check_grpc_health_within(worker_url, budget.probe(Duration::from_secs(2))).await
+                check_grpc_health_within(
+                    worker_url,
+                    worker_api_key.as_deref(),
+                    budget.probe(Duration::from_secs(2)),
+                )
+                .await
             } else {
                 let health_url = format!("{}/health", worker_url);
                 match worker_get(&client, &health_url, self.api_key.as_deref())
@@ -3297,8 +3316,9 @@ impl RouterTrait for Router {
     async fn get_server_info(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_server_info(
+                return match crate::backend::control::get_grpc_server_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3320,8 +3340,9 @@ impl RouterTrait for Router {
     async fn get_models(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_model_info(
+                return match crate::backend::control::get_grpc_model_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await
@@ -3343,8 +3364,9 @@ impl RouterTrait for Router {
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         match self.select_first_worker() {
             Ok(worker_url) if crate::backend::is_grpc_url(&worker_url) => {
-                return match crate::backend::get_grpc_model_info(
+                return match crate::backend::control::get_grpc_model_info_with_auth(
                     &worker_url,
+                    self.frontend.worker_key(&worker_url).as_deref(),
                     Duration::from_secs(2),
                 )
                 .await

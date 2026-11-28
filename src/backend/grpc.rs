@@ -15,10 +15,11 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::Channel;
+use tonic::{metadata::AsciiMetadataValue, transport::Channel};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::auth::set_bearer_metadata;
 use super::convert::{
     chat_to_generate_request, limit_to_prefill, proto_struct_to_json, requires_worker_output_text,
     set_kv_transfer_params,
@@ -61,14 +62,21 @@ pub(crate) struct KvHandoff {
 struct EngineAbortGuard {
     target: Option<(Channel, String)>,
     timeout: Duration,
+    authorization: Option<AsciiMetadataValue>,
     answered: bool,
 }
 
 impl EngineAbortGuard {
-    fn new(channel: &Channel, engine_request_id: Option<&str>, timeout: Duration) -> Self {
+    fn new(
+        channel: &Channel,
+        engine_request_id: Option<&str>,
+        timeout: Duration,
+        authorization: Option<AsciiMetadataValue>,
+    ) -> Self {
         Self {
             target: engine_request_id.map(|id| (channel.clone(), id.to_string())),
             timeout,
+            authorization,
             answered: false,
         }
     }
@@ -91,21 +99,28 @@ impl Drop for EngineAbortGuard {
             return;
         };
         let timeout = self.timeout;
+        let authorization = self.authorization.take();
         let retry = !self.answered;
         runtime.spawn(async move {
-            send_engine_abort(&channel, &request_id, timeout).await;
+            send_engine_abort(&channel, authorization.clone(), &request_id, timeout).await;
             if retry {
                 tokio::time::sleep(ENGINE_ABORT_RETRY_DELAY).await;
-                send_engine_abort(&channel, &request_id, timeout).await;
+                send_engine_abort(&channel, authorization, &request_id, timeout).await;
             }
         });
     }
 }
 
-async fn send_engine_abort(channel: &Channel, request_id: &str, timeout: Duration) {
-    let request = AbortRequest {
+async fn send_engine_abort(
+    channel: &Channel,
+    authorization: Option<AsciiMetadataValue>,
+    request_id: &str,
+    timeout: Duration,
+) {
+    let mut request = tonic::Request::new(AbortRequest {
         request_ids: vec![request_id.to_string()],
-    };
+    });
+    set_bearer_metadata(&mut request, authorization);
     let result =
         tokio::time::timeout(timeout, ControlClient::new(channel.clone()).abort(request)).await;
     match result {
@@ -211,6 +226,7 @@ pub struct GrpcEngineBackend {
     clients: Arc<DashMap<String, Channel>>,
     connect_timeout: Duration,
     request_timeout: Duration,
+    pub(super) auth: super::WorkerAuth,
 }
 
 impl std::fmt::Debug for GrpcEngineBackend {
@@ -241,6 +257,7 @@ impl GrpcEngineBackend {
             clients: Arc::new(DashMap::new()),
             connect_timeout,
             request_timeout,
+            auth: Default::default(),
         }
     }
 
@@ -288,7 +305,13 @@ impl GrpcEngineBackend {
             error!(error = %error, "grpc prefill connect failed");
             (StatusCode::BAD_GATEWAY, error).into_response()
         })?;
-        let abort = EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let authorization = self.auth.grpc_bearer_for(worker_url).cloned();
+        let abort = EngineAbortGuard::new(
+            &channel,
+            Some(&engine_request_id),
+            self.connect_timeout,
+            authorization.clone(),
+        );
         let mut client = InferenceClient::new(channel);
         let mut tonic_req = tonic::Request::new(proto);
         tonic_req.set_timeout(self.request_timeout);
@@ -297,6 +320,7 @@ impl GrpcEngineBackend {
                 .metadata_mut()
                 .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
         }
+        set_bearer_metadata(&mut tonic_req, authorization);
         let response = match tokio::time::timeout(self.request_timeout, client.generate(tonic_req))
             .await
         {
@@ -394,8 +418,13 @@ impl GrpcEngineBackend {
                 return (StatusCode::BAD_GATEWAY, e).into_response();
             }
         };
-        let mut abort =
-            EngineAbortGuard::new(&channel, abort_request_id.as_deref(), self.connect_timeout);
+        let authorization = self.auth.grpc_bearer_for(worker_url).cloned();
+        let mut abort = EngineAbortGuard::new(
+            &channel,
+            abort_request_id.as_deref(),
+            self.connect_timeout,
+            authorization.clone(),
+        );
         let mut client = InferenceClient::new(channel);
         let grpc_connect_ms = t_connect.elapsed().as_secs_f64() * 1000.0;
 
@@ -406,6 +435,7 @@ impl GrpcEngineBackend {
                 .metadata_mut()
                 .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
         }
+        set_bearer_metadata(&mut tonic_req, authorization);
 
         let t_invoke = Instant::now();
         let stream =

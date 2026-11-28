@@ -1610,20 +1610,35 @@ async fn prefill_discovers_mooncake_compressed_truncation() {
             false,
         ),
     ] {
-        let app = axum::Router::new().route(
-            "/server_info",
-            axum::routing::get(move || {
-                let hf_config = hf_config.clone();
-                async move {
-                    // Model diagnostics can take longer than the initial 750 ms probe.
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    axum::Json(serde_json::json!({"vllm_config": {
-                        "kv_transfer_config": {"kv_connector": worker_connector},
-                        "model_config": {"hf_config": hf_config}
-                    }}))
-                }
-            }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/server_info",
+                axum::routing::get(move || {
+                    let hf_config = hf_config.clone();
+                    async move {
+                        // Model diagnostics can take longer than the initial 750 ms probe.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        axum::Json(serde_json::json!({"vllm_config": {
+                            "kv_transfer_config": {"kv_connector": worker_connector},
+                            "model_config": {"hf_config": hf_config}
+                        }}))
+                    }
+                }),
+            )
+            .route("/metrics", axum::routing::get(|| async { METRICS_ONLY }))
+            .layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer worker-secret")
+                    {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    Ok(next.run(request).await)
+                },
+            ));
         let (worker, server) = spawn_metrics_only_worker(app).await;
         let sources = HashMap::from([(
             worker.clone(),
@@ -1635,9 +1650,21 @@ async fn prefill_discovers_mooncake_compressed_truncation() {
                 hybrid: Some(layout.clone()),
             },
         )]);
-        let (supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
+        let (mut supervisor, _signals) = KvIndexSupervisor::new_pd(reqwest::Client::new(), sources);
+        supervisor.set_worker_auth(
+            crate::backend::WorkerAuth::new(Some("worker-secret"), std::iter::empty()).unwrap(),
+        );
 
-        let discovery = supervisor.discover_for_role(&worker, Some(connector)).await;
+        let mut discovery = supervisor.discover_for_role(&worker, Some(connector)).await;
+        supervisor
+            .probe_admission_hashes(&worker, &mut discovery, None)
+            .await;
+        assert_eq!(
+            discovery.engine_cache_configs.as_ref().unwrap()[&0]
+                .prefix_caching_hash_algo
+                .as_deref(),
+            Some("sha256_cbor")
+        );
         assert!(discovery.sources.is_ok());
         assert_eq!(
             discovery.server_info.unwrap().mooncake_truncates_compressed,

@@ -565,6 +565,7 @@ impl Worker for PolicyWorker {
 
 #[derive(Debug, Clone)]
 pub struct PdRouterBase {
+    pub(super) worker_auth: crate::backend::WorkerAuth,
     pub(super) kv_state: Option<Arc<PdKvState>>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub(super) pd_load: Arc<PdLoadManager>,
@@ -585,12 +586,11 @@ fn build_dp_workers(
     url: &str,
     dp_size: usize,
     worker_type: WorkerType,
+    api_key: Option<Arc<str>>,
     circuit_breaker_config: &CircuitBreakerConfig,
     health_config: Option<&HealthConfig>,
-    api_key: Option<&str>,
 ) -> Result<Vec<Arc<dyn Worker>>, String> {
     let (base_url, _) = dp_utils::parse_worker_url(url);
-    let api_key = api_key.map(Arc::<str>::from);
 
     // DPAwareWorker strips the @rank suffix in endpoint_url(), preventing
     // IPv6+DP URL corruption where HTTP clients read @N as userinfo (RFC 3986).
@@ -858,12 +858,16 @@ impl PdRouterBase {
     }
 
     // Private helper method to perform health check on a new server
-    async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+    async fn wait_for_server_health(
+        &self,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
             self.worker_startup_timeout_secs,
             self.worker_startup_check_interval_secs,
-            self.api_key.as_deref(),
+            api_key,
         )
         .await
         .map_err(|_| PDRouterError::HealthCheckFailed {
@@ -1071,16 +1075,18 @@ impl PdRouterBase {
         worker_type: WorkerType,
     ) -> Result<String, PDRouterError> {
         // Wait for the new server to be healthy
-        self.wait_for_server_health(&url).await?;
+        let api_key = self.worker_auth.key_for(&url);
+        self.wait_for_server_health(&url, api_key.as_deref())
+            .await?;
 
         let dp_size = dp_utils::discover_dp_size(&self.client, &url, self.dp_size).await;
         let workers = build_dp_workers(
             &url,
             dp_size,
             worker_type,
+            api_key,
             &self.circuit_breaker_config,
             None,
-            self.api_key.as_deref(),
         )
         .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
@@ -1286,13 +1292,20 @@ impl PdRouterBase {
         // Workers must be up before they can report their engine count.
         let prefill_base_urls: Vec<String> =
             prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+        let worker_auth = crate::backend::WorkerAuth::new(
+            ctx.router_config.api_key.as_deref(),
+            prefill_base_urls
+                .iter()
+                .chain(decode_urls.iter())
+                .map(String::as_str),
+        )?;
         for urls in [&prefill_base_urls, &decode_urls] {
             if !urls.is_empty() {
-                crate::routers::http::router::Router::wait_for_healthy_workers(
+                crate::routers::http::router::Router::wait_for_healthy_workers_with_auth(
                     urls,
                     ctx.router_config.worker_startup_timeout_secs,
                     ctx.router_config.worker_startup_check_interval_secs,
-                    ctx.router_config.api_key.as_deref(),
+                    |url| worker_auth.key_for(url),
                 )
                 .await?;
             }
@@ -1322,9 +1335,9 @@ impl PdRouterBase {
                 url,
                 dp_size,
                 worker_type,
+                worker_auth.key_for(url),
                 &core_cb_config,
                 Some(&health_config),
-                ctx.router_config.api_key.as_deref(),
             )? {
                 ctx.worker_registry.register(worker);
             }
@@ -1399,7 +1412,7 @@ impl PdRouterBase {
             Some(
                 PdKvState::start(
                     ctx.client.clone(),
-                    ctx.router_config.api_key.clone(),
+                    worker_auth.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.router_config.kv_connector,
                     ctx.router_config.pd_worker_pairs.clone(),
@@ -1420,6 +1433,7 @@ impl PdRouterBase {
             None
         };
         Ok(PdRouterBase {
+            worker_auth,
             kv_state,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
@@ -1714,8 +1728,12 @@ impl PdRouterBase {
 
     pub async fn get_server_info(&self, _req: Request<Body>) -> Response {
         if let Some(worker_url) = self.first_grpc_prefill_url() {
-            return match crate::backend::get_grpc_server_info(&worker_url, Duration::from_secs(2))
-                .await
+            return match crate::backend::control::get_grpc_server_info_with_auth(
+                &worker_url,
+                self.worker_auth.key_for(&worker_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
             {
                 Ok(info) => (
                     StatusCode::OK,
@@ -1738,7 +1756,13 @@ impl PdRouterBase {
     ) -> Option<Response> {
         let worker_url = self.first_grpc_prefill_url()?;
         Some(
-            match crate::backend::get_grpc_model_info(&worker_url, Duration::from_secs(2)).await {
+            match crate::backend::control::get_grpc_model_info_with_auth(
+                &worker_url,
+                self.worker_auth.key_for(&worker_url).as_deref(),
+                Duration::from_secs(2),
+            )
+            .await
+            {
                 Ok(info) => (StatusCode::OK, Json(render(&info))).into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
             },
@@ -1955,6 +1979,7 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            worker_auth: Default::default(),
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,
@@ -1976,6 +2001,7 @@ mod tests {
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
         PdRouterBase {
+            worker_auth: Default::default(),
             kv_state: None,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry,

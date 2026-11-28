@@ -5,6 +5,7 @@ use crate::backend::preprocess::{
     http_cache_read_fallback, http_input_requires_render, prepare_http_token_inputs,
     router_token_inputs,
 };
+use crate::backend::WorkerAuth;
 use crate::config::KvConnector;
 use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::CONTROL_TIMEOUT;
@@ -32,7 +33,7 @@ struct TargetRegistration {
 
 pub(super) struct PdKvState {
     client: reqwest::Client,
-    api_key: Option<String>,
+    worker_auth: WorkerAuth,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<WorkerRegistry>>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
@@ -59,7 +60,7 @@ impl PdKvState {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn start(
         client: reqwest::Client,
-        api_key: Option<String>,
+        worker_auth: WorkerAuth,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         connector: KvConnector,
         pairs: HashMap<String, Vec<String>>,
@@ -70,18 +71,16 @@ impl PdKvState {
         allow_hybrid_layouts: bool,
         render_images: bool,
     ) -> Arc<Self> {
-        let mut state = Self::new_with_statics(client, sources);
+        let mut state = Self::new_with_statics(client, sources, worker_auth);
         state.worker_pairs = (!pairs.is_empty()).then(|| {
             pairs
                 .into_iter()
                 .map(|(prefill, decodes)| (prefill, decodes.into_iter().collect()))
                 .collect()
         });
-        state.api_key = api_key;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
         state.render_images = render_images;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
-        state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
         state.supervisor.set_pd_connector(connector);
         state.registry = Some(registry);
@@ -103,7 +102,7 @@ impl PdKvState {
     #[cfg(all(test, feature = "cpu", feature = "ready"))]
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(client: reqwest::Client) -> Self {
-        Self::new_with_statics(client, HashMap::new())
+        Self::new_with_statics(client, HashMap::new(), WorkerAuth::default())
     }
 
     /// Pause credit preparation so a commit test can remove a Decode worker.
@@ -116,12 +115,14 @@ impl PdKvState {
     fn new_with_statics(
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
+        worker_auth: WorkerAuth,
     ) -> Self {
-        let (supervisor, signals) = KvIndexSupervisor::new_pd(client.clone(), static_sources);
+        let (mut supervisor, signals) = KvIndexSupervisor::new_pd(client.clone(), static_sources);
+        supervisor.set_worker_auth(worker_auth.clone());
         drop(signals);
         Self {
             client,
-            api_key: None,
+            worker_auth,
             supervisor,
             registry: None,
             prefill_policy: None,
@@ -427,7 +428,7 @@ impl PdKvState {
                     request,
                     route,
                     headers,
-                    self.api_key.as_deref(),
+                    self.worker_auth.http_key(),
                     Duration::from_secs(1),
                     self.render_images,
                 )
@@ -845,8 +846,9 @@ mod kv_input_tests {
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let mut state = PdKvState::new(reqwest::Client::new());
-            state.api_key = configured_key.map(str::to_owned);
+            let worker_auth = WorkerAuth::new(configured_key, std::iter::empty()).unwrap();
+            let state =
+                PdKvState::new_with_statics(reqwest::Client::new(), HashMap::new(), worker_auth);
             let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
                 base.clone(),
@@ -1056,9 +1058,8 @@ mod kv_input_tests {
             } else {
                 HashMap::new()
             };
-            let mut state = PdKvState::new_with_statics(reqwest::Client::new(), sources);
-            state.api_key = Some("pd-test-key".to_owned());
-            state.supervisor.set_api_key(state.api_key.clone());
+            let worker_auth = WorkerAuth::new(Some("pd-test-key"), std::iter::empty()).unwrap();
+            let state = PdKvState::new_with_statics(reqwest::Client::new(), sources, worker_auth);
             let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
             let ops = kv_aware_ops(policy.as_ref()).unwrap();
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
@@ -1231,7 +1232,7 @@ mod kv_input_tests {
         }
         let state = PdKvState::start(
             reqwest::Client::new(),
-            None,
+            WorkerAuth::default(),
             HashMap::from([
                 (p_base.clone(), prefill_publisher.static_source("m")),
                 (d_base.clone(), decode_publisher.static_source("m")),

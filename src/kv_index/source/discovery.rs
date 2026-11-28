@@ -227,7 +227,7 @@ struct InstalledWorkers {
 /// Discovers workers and keeps one shared index per cache identity.
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
-    api_key: Option<String>,
+    worker_auth: crate::backend::WorkerAuth,
     full_attention_http: bool,
     http_pd: bool,
     pd_connector: Option<KvConnector>,
@@ -270,7 +270,7 @@ impl KvIndexSupervisor {
         let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
         let supervisor = KvIndexSupervisor {
             client,
-            api_key: None,
+            worker_auth: Default::default(),
             full_attention_http: false,
             http_pd: false,
             pd_connector: None,
@@ -332,8 +332,8 @@ impl KvIndexSupervisor {
             .collect()
     }
 
-    pub(crate) fn set_api_key(&mut self, api_key: Option<String>) {
-        self.api_key = api_key;
+    pub(crate) fn set_worker_auth(&mut self, worker_auth: crate::backend::WorkerAuth) {
+        self.worker_auth = worker_auth;
     }
 
     pub(crate) fn set_pd_connector(&mut self, connector: KvConnector) {
@@ -491,6 +491,7 @@ impl KvIndexSupervisor {
         worker_url: &str,
         prefill_connector: Option<KvConnector>,
     ) -> WorkerDiscovery {
+        let api_key = self.worker_auth.key_for(worker_url);
         let static_source = if self.http_pd {
             self.static_pd_sources
                 .get(worker_url)
@@ -503,14 +504,16 @@ impl KvIndexSupervisor {
         };
         let mut discovery = match static_source {
             Some(discovery) if layout_only(&discovery) => {
-                self.discover_declared_layout(worker_url, discovery).await
+                self.discover_declared_layout(worker_url, api_key.as_deref(), discovery)
+                    .await
             }
             Some(mut discovery) => {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                if let Err((probe, reason)) =
-                    self.verify_static_source(worker_url, &discovery).await
+                if let Err((probe, reason)) = self
+                    .verify_static_source(worker_url, api_key.as_deref(), &discovery)
+                    .await
                 {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
@@ -526,7 +529,7 @@ impl KvIndexSupervisor {
                     &self.client,
                     worker_url,
                     self.http_pd || self.full_attention_http,
-                    self.api_key.as_deref(),
+                    api_key.as_deref(),
                 )
                 .await;
                 if discovery.assumed_plain_full
@@ -575,7 +578,7 @@ impl KvIndexSupervisor {
             {
                 info.vllm_version = tokio::time::timeout(
                     lifecycle::OPTIONAL_METADATA_BUDGET,
-                    probe::query_vllm_version(&self.client, base, self.api_key.as_deref()),
+                    probe::query_vllm_version(&self.client, base, api_key.as_deref()),
                 )
                 .await
                 .ok()
@@ -607,7 +610,7 @@ impl KvIndexSupervisor {
                 };
             if let Ok(Ok(runtime)) = tokio::time::timeout(
                 metadata_timeout,
-                probe::query_server_info_json(&self.client, base, self.api_key.as_deref()),
+                probe::query_server_info_json(&self.client, base, api_key.as_deref()),
             )
             .await
             {
@@ -620,10 +623,10 @@ impl KvIndexSupervisor {
     async fn discover_declared_layout(
         &self,
         worker_url: &str,
+        api_key: Option<&str>,
         mut discovery: WorkerDiscovery,
     ) -> WorkerDiscovery {
         let (base, _) = split_worker_rank(worker_url);
-        let api_key = self.api_key.as_deref();
         let grpc = crate::backend::is_grpc_url(base);
         let (sources, (model, base_models)) =
             tokio::join!(fetch_kv_event_sources(&self.client, base, api_key), async {
@@ -637,7 +640,12 @@ impl KvIndexSupervisor {
                     (Some(model.clone()), None)
                 } else if grpc {
                     let model = grpc_model_id(
-                        crate::backend::control::get_grpc_model_info(base, CONTROL_TIMEOUT).await,
+                        crate::backend::control::get_grpc_model_info_with_auth(
+                            base,
+                            api_key,
+                            CONTROL_TIMEOUT,
+                        )
+                        .await,
                     )
                     .ok()
                     .flatten();
@@ -748,19 +756,13 @@ impl KvIndexSupervisor {
     async fn verify_static_source(
         &self,
         worker_url: &str,
+        api_key: Option<&str>,
         discovery: &WorkerDiscovery,
     ) -> Result<(), (SourcesProbe, &'static str)> {
         if discovery.hybrid.is_none() {
             return Ok(());
         }
-        match static_hybrid_sources_match(
-            &self.client,
-            worker_url,
-            self.api_key.as_deref(),
-            discovery,
-            None,
-        )
-        .await
+        match static_hybrid_sources_match(&self.client, worker_url, api_key, discovery, None).await
         {
             StaticHybridMatch::Differs
             | StaticHybridMatch::Unavailable(SourcesProbe::StaticMismatch) => Err((
@@ -866,8 +868,8 @@ async fn discover_worker(
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
         let (server, model, (sources, layout)) = tokio::join!(
-            crate::backend::control::get_grpc_server_info(worker_url, timeout),
-            crate::backend::control::get_grpc_model_info(worker_url, timeout),
+            crate::backend::control::get_grpc_server_info_with_auth(worker_url, api_key, timeout),
+            crate::backend::control::get_grpc_model_info_with_auth(worker_url, api_key, timeout),
             fetch_native_sources(client, worker_url, api_key, timeout),
         );
         let model_id = grpc_model_id(model);
