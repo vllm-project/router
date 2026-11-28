@@ -96,16 +96,22 @@ mod test_pd_routing {
     async fn http_pd_bypass_only_redispatches_after_tagged_refusal() {
         use crate::kv_fixture::{KvPublisher, TOPIC};
         use axum::{
-            http::{Method, StatusCode},
+            body::Body,
+            http::{header, Request, StatusCode},
             response::{IntoResponse, Response},
             routing::{get, post},
             Json, Router,
         };
+        use metrics_exporter_prometheus::PrometheusBuilder;
         use serde_json::{json, Value};
+        use std::future::{poll_fn, Future};
+        use std::pin::pin;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
+        use tower::ServiceExt;
         use vllm_router_rs::config::KvConnector;
         use vllm_router_rs::routers::http::vllm_pd_router::PdPrefillBypassConfig;
+        use vllm_router_rs::server::{build_app, AppContext, AppState};
 
         #[derive(Clone, Copy)]
         enum Refusal {
@@ -224,9 +230,9 @@ mod test_pd_routing {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let ctx =
-            vllm_router_rs::server::AppContext::new(config, client, 64, None, vec![]).unwrap();
-        let router = RouterFactory::create_router(&Arc::new(ctx)).await.unwrap();
+        // Exercise the API with one ingress slot and no queue.
+        let context = Arc::new(AppContext::new(config, client, 1, None, vec![]).unwrap());
+        let router = RouterFactory::create_router(&context).await.unwrap();
         router
             .as_any()
             .downcast_ref::<vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouter>()
@@ -236,6 +242,18 @@ mod test_pd_routing {
                 ..Default::default()
             })
             .unwrap();
+        let app = build_app(
+            Arc::new(AppState {
+                router: Arc::from(router),
+                context,
+                concurrency_queue_tx: None,
+                router_manager: None,
+            }),
+            4096,
+            vec![],
+            vec![],
+            false,
+        );
         let prompt: Vec<u32> = (0..33).collect();
         publisher.restore(&prompt[..32], 16).await;
         let request = json!({"model": "mock-model", "prompt": prompt, "max_tokens": 8});
@@ -247,10 +265,27 @@ mod test_pd_routing {
             (Refusal::NoResponse, StatusCode::GATEWAY_TIMEOUT, false),
         ] {
             *refusal.lock().unwrap() = result;
-            let response = router
-                .route_transparent(None, "/v1/completions", &Method::POST, request.clone())
-                .await;
+            let request = Request::post("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap();
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let mut response = pin!(app.clone().oneshot(request));
+            let response = poll_fn(|cx| {
+                metrics::with_local_recorder(&recorder, || response.as_mut().poll(cx))
+            })
+            .await
+            .unwrap();
             assert_eq!(response.status(), status);
+            let metrics = recorder.handle().render();
+            let request_counter = metrics
+                .lines()
+                .find(|line| line.starts_with("vllm_router_pd_requests_total{"));
+            assert_eq!(
+                request_counter,
+                Some(r#"vllm_router_pd_requests_total{route="/v1/completions"} 1"#),
+                "{metrics}"
+            );
             axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();

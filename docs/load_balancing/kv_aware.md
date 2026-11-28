@@ -185,8 +185,12 @@ support, have verified reusable KV on device, and have no other pending or
 active Decode requests in the Router. Its estimated uncached prompt tokens must
 be below the configured token limit for every policy.
 
-The hook runs before Prefill dispatch. A typed refusal releases the attempt
-and reruns normal P/D admission once inside the current API request.
+The hook runs before Prefill dispatch. On a typed refusal, HTTP re-enters the
+Router's internal `route_transparent` method and gRPC re-enters
+`route_grpc_prepared`, each once with bypass disabled. The retry reruns P/D
+selection and dispatch within the original API request. Ingress middleware
+and its concurrency limiter run once. HTTP may render the prompt again,
+and gRPC reuses the prepared tokens.
 
 See [Prefill/decode CLI options](../cli_reference.md#prefilldecode-disaggregation)
 for the available flags and defaults.
