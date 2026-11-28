@@ -19,7 +19,8 @@ use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
+    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, RequestHeaders,
+    WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
 use crate::protocols::spec::GenerationRequest;
@@ -134,13 +135,11 @@ pub struct VllmPDRouter {
 /// the pool to see removals and replacements that happened during Prefill.
 pub(super) struct DecodeCommitInput {
     pub pool: DecodePoolSource,
-    /// Admission-time provisional pick, used only for the changed counter.
+    /// Provisional target for push transfers and dispatch metrics.
     pub provisional_endpoint: PdEndpoint,
-    /// Admission-time token inputs, reused to refresh cache matches at dispatch.
-    pub decode_tokens: Option<WorkerTokenInputs>,
+    policy_inputs: DecodePolicyInputs,
     /// Prompts admission already tokenized for the policy.
     pub router_prompts: Option<Arc<[Vec<u32>]>>,
-    pub affinity_key: Option<AffinityKey>,
     pub cache_salt: Option<String>,
     pub model_id: Option<String>,
     pub route: String,
@@ -150,12 +149,10 @@ impl DecodeCommitInput {
     /// Commitment inputs for one request. The policy inputs are the ones
     /// admission resolved, so every path reads them the same way and the
     /// commitment never re-parses the headers or the body.
-    #[allow(clippy::too_many_arguments)]
     fn for_request(
         pool: DecodePoolSource,
         provisional_endpoint: PdEndpoint,
-        decode_tokens: Option<WorkerTokenInputs>,
-        affinity_key: Option<AffinityKey>,
+        policy_inputs: DecodePolicyInputs,
         request: &Value,
         route: &str,
         router_prompts: Option<Arc<[Vec<u32>]>>,
@@ -163,9 +160,8 @@ impl DecodeCommitInput {
         Self {
             pool,
             provisional_endpoint,
-            decode_tokens,
+            policy_inputs,
             router_prompts,
-            affinity_key,
             cache_salt: request
                 .get("cache_salt")
                 .and_then(Value::as_str)
@@ -204,10 +200,16 @@ struct AdmittedPair {
 struct Admission {
     selection: super::pd_types::PdSelection,
     attempt: PdAttempt,
-    decode_tokens: Option<WorkerTokenInputs>,
-    /// Resolved once at admission so the commitment does not re-read the
-    /// headers and body.
+    deferred_inputs: Option<DecodePolicyInputs>,
+}
+
+/// Policy inputs prepared at admission for a deferred Decode.
+struct DecodePolicyInputs {
+    tokens: Option<WorkerTokenInputs>,
     affinity_key: Option<AffinityKey>,
+    text: Option<String>,
+    request_body: Option<String>,
+    headers: Option<RequestHeaders>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -1325,9 +1327,16 @@ impl VllmPDRouter {
     ) -> Option<Admission> {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
-            .iter()
-            .any(|policy| !policy.needs_cache_routing_key() && policy.needs_request_text())
+        let needs_text = |policy: &dyn LoadBalancingPolicy| {
+            if policy.needs_request_body() {
+                // Only typed generate separates token text from the JSON body.
+                generate.is_none()
+            } else {
+                !policy.needs_cache_routing_key() && policy.needs_request_text()
+            }
+        };
+        let decode_needs_text = needs_text(decode_policy.as_ref());
+        let text = (decode_needs_text || needs_text(prefill_policy.as_ref()))
             .then(|| match generate {
                 Some(body) => Some(body.extract_text_for_routing()),
                 None => serde_json::to_string(request).ok(),
@@ -1455,11 +1464,18 @@ impl VllmPDRouter {
             &context,
             defer_decode,
         )?;
+        // Move only the inputs Decode needs across Prefill.
+        let deferred_inputs = attempt.decode_pending_commit().then(|| DecodePolicyInputs {
+            tokens: decode_cache.map(|_| decode_tokens),
+            affinity_key,
+            text: text.filter(|_| decode_needs_text),
+            request_body: request_body.filter(|_| decode_policy.needs_request_body()),
+            headers: policy_headers.filter(|_| decode_policy.needs_headers()),
+        });
         Some(Admission {
             selection,
             attempt,
-            decode_tokens: decode_cache.map(|_| decode_tokens),
-            affinity_key,
+            deferred_inputs,
         })
     }
 
@@ -1537,8 +1553,8 @@ impl VllmPDRouter {
     /// already addressed it (push-addressed Nixl); moving it would strand the
     /// KV the Prefill just produced.
     ///
-    /// The body and headers are borrowed from the caller instead of being
-    /// carried in the input: only the cache refresh below reads them.
+    /// Cache refresh borrows the client request. Policy selection reuses
+    /// the inputs prepared at admission.
     async fn select_and_commit_decode(
         &self,
         attempt: &PdAttempt,
@@ -1561,7 +1577,7 @@ impl VllmPDRouter {
         // live candidate immediately before selecting against the current
         // loads. An unavailable or model-mismatched worker must not consume the
         // preparation budget while a healthy Decode is ready.
-        let mut tokens = input.decode_tokens.clone();
+        let mut tokens = input.policy_inputs.tokens.clone();
         if let Some(tokens) = tokens.as_mut() {
             let missing: Vec<_> = candidates
                 .iter()
@@ -1625,12 +1641,12 @@ impl VllmPDRouter {
             worker_pairs: None,
             prefill_inputs: None,
             model_id: input.model_id.as_deref(),
-            legacy_policy_input: None,
-            request_body: None,
+            legacy_policy_input: input.policy_inputs.text.as_deref(),
+            request_body: input.policy_inputs.request_body.as_deref(),
             prefill_cache: None,
             decode_cache: decode_cache.as_ref(),
-            headers: None,
-            affinity_key: input.affinity_key.clone(),
+            headers: input.policy_inputs.headers.as_ref(),
+            affinity_key: input.policy_inputs.affinity_key.clone(),
             lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
             cache_salt: input.cache_salt.as_deref(),
             prefill_pricing: None,
@@ -2079,8 +2095,7 @@ impl VllmPDRouter {
             decode_worker,
             Admission {
                 attempt,
-                decode_tokens,
-                affinity_key,
+                deferred_inputs,
                 ..
             },
         ) = match self
@@ -2099,12 +2114,11 @@ impl VllmPDRouter {
         };
         // The admission-time decode pick is provisional when the commitment is
         // deferred: it seeds the request id and the Prefill parameters only.
-        let commit = attempt.decode_pending_commit().then(|| {
+        let commit = deferred_inputs.map(|inputs| {
             DecodeCommitInput::for_request(
                 DecodePoolSource::Discovery(model_id.map(str::to_owned)),
                 PdEndpoint::for_worker(decode_worker.as_ref()),
-                decode_tokens,
-                affinity_key,
+                inputs,
                 &request,
                 token_input_path(path, generate),
                 None,
@@ -2348,8 +2362,7 @@ impl VllmPDRouter {
         let Some(Admission {
             selection,
             attempt,
-            decode_tokens,
-            affinity_key,
+            deferred_inputs,
         }) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -2378,15 +2391,14 @@ impl VllmPDRouter {
         );
         // The gRPC handshake carries the same connector JSON as HTTP, so a
         // connector that tolerates a late decode choice gets one here too.
-        let commit = attempt.decode_pending_commit().then(|| {
+        let commit = deferred_inputs.map(|inputs| {
             DecodeCommitInput::for_request(
                 DecodePoolSource::Registry {
                     model: None,
                     require_label: false,
                 },
                 selection.decode.endpoint.clone(),
-                decode_tokens,
-                affinity_key,
+                inputs,
                 &request_json,
                 path,
                 Some(router_prompts),
@@ -3989,8 +4001,7 @@ impl VllmPDRouter {
             let Admission {
                 selection,
                 attempt,
-                decode_tokens,
-                affinity_key,
+                deferred_inputs,
             } = match self
                 .admit_pair(
                     &prefill_workers,
@@ -4019,15 +4030,14 @@ impl VllmPDRouter {
 
             // Mirrors the discovery path: a deferred commitment re-selects the
             // decode target once the Prefill response is in.
-            let commit = attempt.decode_pending_commit().then(|| {
+            let commit = deferred_inputs.map(|inputs| {
                 DecodeCommitInput::for_request(
                     DecodePoolSource::Registry {
                         model: model_id.map(str::to_owned),
                         require_label: model_scope.is_some(),
                     },
                     selection.decode.endpoint.clone(),
-                    decode_tokens,
-                    affinity_key,
+                    inputs,
                     &request_json,
                     token_input_path(path, generate),
                     None,
@@ -4095,7 +4105,6 @@ impl WorkerManagement for VllmPDRouter {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use crate::policies::RequestHeaders;
     use crate::protocols::spec::{
         ChatCompletionRequest, CompletionRequest, InferenceGenerateRequest,
     };
@@ -4621,6 +4630,109 @@ mod tests {
                     assert_eq!(sticky.active_session_count(), 0);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_generate_decode_honors_body_and_header_session_pins() {
+        use crate::policies::StickyLeastLoadedPolicy;
+
+        // Built-in sticky routing commits at admission. Opt in to deferral
+        // here so the session lookup runs after Prefill.
+        #[derive(Debug)]
+        struct DeferredSticky(StickyLeastLoadedPolicy);
+
+        impl LoadBalancingPolicy for DeferredSticky {
+            fn select_worker_with_headers(
+                &self,
+                workers: &[Arc<dyn Worker>],
+                text: Option<&str>,
+                headers: Option<&RequestHeaders>,
+            ) -> Option<usize> {
+                self.0.select_worker_with_headers(workers, text, headers)
+            }
+
+            fn can_redecide_at_dispatch(&self, _: bool) -> bool {
+                true
+            }
+            fn needs_request_body(&self) -> bool {
+                true
+            }
+            fn needs_headers(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &'static str {
+                "deferred_sticky"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let router = test_vllm_pd_router().await;
+        register_model_pair(&router, "model-a");
+        let registry = router.worker_registry();
+        registry.register(Arc::new(BasicWorker::new(
+            "http://decode-2:8000".into(),
+            WorkerType::Decode,
+        )));
+        let prefill = registry.get_prefill_workers();
+        let decode = registry.get_decode_workers();
+        let sticky = Arc::new(DeferredSticky(StickyLeastLoadedPolicy::new()));
+        router.policy_registry.set_decode_policy(sticky.clone());
+        // Without the pin, the worker with no active sessions wins.
+        assert_eq!(
+            sticky.select_worker(&decode[1..], Some(r#"{"session_id":"pinned"}"#)),
+            Some(0)
+        );
+
+        let path = "/skyrl/v1/generate";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "pinned".parse().unwrap());
+        for (typed, session, headers) in [
+            (true, "pinned", None),
+            (true, "other", Some(&headers)),
+            (false, "pinned", None),
+        ] {
+            let request = json!({"token_ids": [123], "session_params": {"session_id": session}});
+            let body = typed.then(|| serde_json::from_value(request.clone()).unwrap());
+            let admission = router
+                .admit_pair(
+                    &prefill,
+                    &decode,
+                    &request,
+                    path,
+                    headers,
+                    true,
+                    body.as_ref(),
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(admission.attempt.decode_pending_commit());
+            assert_eq!(admission.selection.decode.worker_index, 0);
+            admission.attempt.finish_prefill();
+            let input = DecodeCommitInput::for_request(
+                DecodePoolSource::Registry {
+                    model: None,
+                    require_label: false,
+                },
+                admission.selection.decode.endpoint,
+                admission.deferred_inputs.unwrap(),
+                &request,
+                token_input_path(path, body.as_ref()),
+                None,
+            );
+            let committed = router
+                .select_and_commit_decode(&admission.attempt, &input, &request, headers, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                committed.url(),
+                decode[1].url(),
+                "typed={typed}, session={session}"
+            );
+            admission.attempt.release();
         }
     }
 

@@ -754,8 +754,7 @@ impl PdRouterBase {
     /// a dispatch-time re-selection is still meaningful. kv_aware reads live
     /// occupancy and affinity, and cache_aware re-runs from the prepared prefix
     /// selection, so both can decide at dispatch without re-rendering token
-    /// inputs. Policies that need the admission-time request text keep the
-    /// commitment they made.
+    /// inputs. Policies that do not opt in commit at admission.
     pub(super) fn select_and_admit_with(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
