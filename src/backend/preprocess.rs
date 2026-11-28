@@ -406,17 +406,37 @@ pub(crate) async fn prepare_http_token_inputs(
         1
     };
     let tokenize_fallback = std::sync::OnceLock::new();
+    // Probes run at most eight at a time under one shared deadline, so a
+    // worker can miss the budget without ever being contacted. Workers left
+    // without a result are reported as preparation_timeout if their probe
+    // started and preparation_not_started if it never did.
     let mut inputs: std::collections::HashMap<_, _> = urls
         .iter()
-        .map(|url| (url.clone(), Err("preparation_unavailable")))
+        .map(|url| (url.clone(), Err("preparation_not_started")))
         .collect();
+    // A Mutex rather than a RefCell keeps the future Send for the handlers.
+    let started = std::sync::Mutex::new(std::collections::HashSet::new());
+    let deadline = tokio::time::Instant::now() + budget;
     let results = stream::iter(urls)
         .map(|url| {
+            // Never contact a worker once the shared budget is spent.
+            let late = tokio::time::Instant::now() >= deadline;
+            if !late {
+                started
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(url.clone());
+            }
             let tokenize_fallback = &tokenize_fallback;
             async move {
+                if late {
+                    return (url, Err("preparation_not_started"));
+                }
                 let result = async {
                     let (prompts, source) =
-                        match http_input_json(client, &url, path, body, headers, api_key).await {
+                        match http_input_json(client, &url, path, body, headers, api_key, budget)
+                            .await
+                        {
                             Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
                             Err("render_unavailable") => {
                                 let requests = tokenize_fallback
@@ -432,6 +452,7 @@ pub(crate) async fn prepare_http_token_inputs(
                                         request,
                                         headers,
                                         api_key,
+                                        budget,
                                     )
                                     .await?;
                                     let ids = dense_token_ids(&tokenized["tokens"])?;
@@ -459,9 +480,16 @@ pub(crate) async fn prepare_http_token_inputs(
         })
         .buffer_unordered(8);
     futures_util::pin_mut!(results);
-    let deadline = tokio::time::Instant::now() + budget;
     while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
         inputs.insert(url, result);
+    }
+    let started = started
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for url in started.iter() {
+        if let Some(entry @ Err("preparation_not_started")) = inputs.get_mut(url) {
+            *entry = Err("preparation_timeout");
+        }
     }
     inputs
 }
@@ -473,20 +501,27 @@ async fn http_input_json(
     body: &serde_json::Value,
     headers: Option<&http::HeaderMap>,
     api_key: Option<&str>,
+    timeout: Duration,
 ) -> Result<serde_json::Value, &'static str> {
     let mut request = client
         .post(format!("{}{path}", base.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(timeout)
         .json(body);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     } else if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
         request = request.header("authorization", value);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "preparation_unavailable")?;
+    // The per-request timeout starts after the caller's shared deadline, but
+    // both can land on the same timer tick, and `timeout_at` polls the probes
+    // before its own deadline, so a request timeout here does surface.
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            "preparation_timeout"
+        } else {
+            "preparation_unavailable"
+        }
+    })?;
     match response.status() {
         reqwest::StatusCode::NOT_FOUND
         | reqwest::StatusCode::METHOD_NOT_ALLOWED
@@ -494,10 +529,13 @@ async fn http_input_json(
         status if !status.is_success() => return Err("preparation_rejected"),
         _ => {}
     }
-    response
-        .json()
-        .await
-        .map_err(|_| "invalid_preparation_response")
+    response.json().await.map_err(|error| {
+        if error.is_timeout() {
+            "preparation_timeout"
+        } else {
+            "invalid_preparation_response"
+        }
+    })
 }
 
 pub(crate) fn http_tokenize_fallback(
@@ -662,7 +700,7 @@ pub(crate) async fn prepare_http_kv_inputs(
             }
             Err(reason) => {
                 RouterMetrics::record_kv_routing_input("http", reason);
-                debug!(worker = %url, reason, "Prefix input preparation unavailable");
+                debug!(worker = %url, reason, "Prefix input preparation failed");
             }
         }
     }
@@ -1286,6 +1324,106 @@ mod tests {
             &[vec![7, 8, 9]]
         );
         assert!(results[&bad].is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_preparation_reports_slow_workers_and_honors_the_budget() {
+        use super::prepare_http_token_inputs;
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        let app = Router::new()
+            .route(
+                "/fast/v1/completions/render",
+                post(|| async { Json(json!([{"token_ids":[1,2,3]}])) }),
+            )
+            .route(
+                "/slow/v1/completions/render",
+                post(|| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Json(json!([{"token_ids":[1,2,3]}]))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let (fast, slow) = (format!("{base}/fast"), format!("{base}/slow"));
+        let body = json!({"model":"m","prompt":"hello"});
+        let client = reqwest::Client::new();
+        let prepare = |budget| {
+            prepare_http_token_inputs(
+                &client,
+                vec![fast.clone(), slow.clone(), closed.clone()],
+                &body,
+                "/v1/completions",
+                None,
+                None,
+                budget,
+            )
+        };
+
+        let results = prepare(Duration::from_millis(100)).await;
+        assert_eq!(
+            results[&fast].as_ref().ok().unwrap().prompts.as_ref(),
+            &[vec![1, 2, 3]]
+        );
+        assert_eq!(results[&slow].as_ref().err(), Some(&"preparation_timeout"));
+        assert_eq!(
+            results[&closed].as_ref().err(),
+            Some(&"preparation_unavailable")
+        );
+
+        // A budget longer than the slow render keeps that worker comparable.
+        let results = prepare(Duration::from_secs(2)).await;
+        assert_eq!(
+            results[&slow].as_ref().ok().unwrap().prompts.as_ref(),
+            &[vec![1, 2, 3]]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_preparation_reports_workers_never_contacted_apart_from_slow_ones() {
+        use super::prepare_http_token_inputs;
+        use axum::{routing::post, Json, Router};
+        use serde_json::json;
+        // Nine slow workers: eight probes start at once and run past the
+        // budget, so the ninth (last in sorted order) is never contacted.
+        let app = Router::new().route(
+            "/{worker}/v1/completions/render",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Json(json!([{"token_ids":[1]}]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let urls: Vec<String> = (0..9).map(|i| format!("{base}/w{i}")).collect();
+        let body = json!({"model":"m","prompt":"hello"});
+        let client = reqwest::Client::new();
+
+        let results = prepare_http_token_inputs(
+            &client,
+            urls.clone(),
+            &body,
+            "/v1/completions",
+            None,
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+        for url in &urls[..8] {
+            assert_eq!(results[url].as_ref().err(), Some(&"preparation_timeout"));
+        }
+        assert_eq!(
+            results[&urls[8]].as_ref().err(),
+            Some(&"preparation_not_started")
+        );
         server.abort();
     }
 

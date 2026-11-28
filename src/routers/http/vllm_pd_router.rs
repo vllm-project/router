@@ -4422,6 +4422,9 @@ mod tests {
             super::super::pd_kv_state::PdKvState::start(
                 reqwest::Client::new(),
                 None,
+                std::time::Duration::from_millis(
+                    crate::config::types::DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
+                ),
                 HashMap::new(),
                 router.kv_connector,
                 HashMap::new(),
@@ -5667,6 +5670,7 @@ mod tests {
                 static_kv_event_sources: Default::default(),
             },
             kv_aware_session_affinity_ttl_secs: Some(1800),
+            prefix_preparation_timeout_ms: 1000,
             ..Default::default()
         };
         let ctx = Arc::new(

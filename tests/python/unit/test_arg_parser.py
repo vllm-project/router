@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -572,6 +573,24 @@ class TestParseRouterArgs:
     def test_kv_aware_affinity_ttl_rejects_invalid_values(self, ttl):
         with pytest.raises(ValueError, match="kv_aware_session_affinity_ttl_secs"):
             RouterArgs(kv_aware_session_affinity_ttl_secs=ttl)._validate_router_args()
+
+    def test_prefix_preparation_timeout_parses_and_forwards(self):
+        assert parse_router_args([]).prefix_preparation_timeout_ms == 1000
+        args = parse_router_args(["--prefix-preparation-timeout-ms", "2500"])
+        assert args.prefix_preparation_timeout_ms == 2500
+        with patch("vllm_router.router._Router") as native_router:
+            Router.from_args(args)
+        assert native_router.call_args.kwargs["prefix_preparation_timeout_ms"] == 2500
+
+    def test_prefix_preparation_timeout_keeps_positional_fields(self):
+        # Adding the field last keeps existing positional arguments bound.
+        last = dataclasses.fields(RouterArgs)[-1]
+        assert last.name == "prefix_preparation_timeout_ms"
+
+    @pytest.mark.parametrize("ms", [0, -1, 60_001])
+    def test_prefix_preparation_timeout_rejects_invalid_values(self, ms):
+        with pytest.raises(ValueError, match="prefix_preparation_timeout_ms"):
+            RouterArgs(prefix_preparation_timeout_ms=ms)._validate_router_args()
 
     def test_kv_aware_is_a_pd_stage_policy(self):
         for stage in ["prefill", "decode"]:

@@ -236,6 +236,8 @@ Trees are trimmed to `max_tree_size` during periodic eviction and may grow beyon
 
 If several candidate workers have the same lowest load, the policy picks one of them uniformly at random.
 
+HTTP workers prepare each request's token IDs (render or `/tokenize`) within `--prefix-preparation-timeout-ms` (default 1000). A worker that misses the budget cannot be compared, so the request goes to the least loaded worker; if busy workers render slowly, raise the budget.
+
 ### Best For
 
 - Workloads with repeated prompt prefixes (system prompts, few-shot examples)

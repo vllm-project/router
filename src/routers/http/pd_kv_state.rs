@@ -33,6 +33,7 @@ struct TargetRegistration {
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
+    preparation_budget: Duration,
     supervisor: KvIndexSupervisor,
     registry: Option<Arc<WorkerRegistry>>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
@@ -59,6 +60,7 @@ impl PdKvState {
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
+        preparation_budget: Duration,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         connector: KvConnector,
         pairs: HashMap<String, Vec<String>>,
@@ -76,6 +78,7 @@ impl PdKvState {
                 .collect()
         });
         state.api_key = api_key;
+        state.preparation_budget = preparation_budget;
         state.allow_hybrid_layouts = allow_hybrid_layouts;
         state.nixl_decode_replay = connector == KvConnector::Nixl;
         state.supervisor.set_api_key(state.api_key.clone());
@@ -119,6 +122,9 @@ impl PdKvState {
         Self {
             client,
             api_key: None,
+            preparation_budget: Duration::from_millis(
+                crate::config::types::DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
+            ),
             supervisor,
             registry: None,
             prefill_policy: None,
@@ -432,7 +438,7 @@ impl PdKvState {
                     route,
                     headers,
                     self.api_key.as_deref(),
-                    Duration::from_secs(1),
+                    self.preparation_budget,
                 )
                 .await
             }
@@ -1175,6 +1181,7 @@ mod kv_input_tests {
         let state = PdKvState::start(
             reqwest::Client::new(),
             None,
+            Duration::from_millis(crate::config::types::DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS),
             HashMap::from([
                 (p_base.clone(), prefill_publisher.static_source("m")),
                 (d_base.clone(), decode_publisher.static_source("m")),

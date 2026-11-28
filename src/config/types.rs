@@ -87,6 +87,12 @@ pub struct RouterConfig {
     /// `None` disables affinity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Time budget, in milliseconds, for asking HTTP workers to prepare a
+    /// request's token IDs (`/render`, or `/tokenize`) before cache-aware or
+    /// KV-aware selection. A worker that has not answered by then has no
+    /// tokens for that request, and the policy falls back to load.
+    #[serde(default = "default_prefix_preparation_timeout_ms")]
+    pub prefix_preparation_timeout_ms: u64,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -111,6 +117,12 @@ pub struct RouterConfig {
 
 fn default_profile_timeout_secs() -> u64 {
     10
+}
+
+pub const DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS: u64 = 1000;
+
+fn default_prefix_preparation_timeout_ms() -> u64 {
+    DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1416,6 +1428,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_timeout_ms: DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1437,6 +1450,11 @@ impl RouterConfig {
             policy,
             ..Default::default()
         }
+    }
+
+    /// Time HTTP workers get to prepare a request's token IDs.
+    pub fn prefix_preparation_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.prefix_preparation_timeout_ms)
     }
 
     /// Validate the configuration
@@ -2318,6 +2336,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_timeout_ms: DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2390,6 +2409,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_timeout_ms: DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2458,6 +2478,7 @@ mod tests {
             disable_retries: false,
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
+            prefix_preparation_timeout_ms: DEFAULT_PREFIX_PREPARATION_TIMEOUT_MS,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

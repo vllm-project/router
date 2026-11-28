@@ -107,6 +107,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Last so existing positional RouterArgs(...) calls keep their binding;
+    # dataclass kw_only needs Python 3.10 and this package supports 3.8.
+    prefix_preparation_timeout_ms: int = 1000
 
     @staticmethod
     def add_cli_args(
@@ -243,6 +246,15 @@ class RouterArgs:
             "(1-31536000). P/D uses decode-only soft affinity based on pending "
             "plus active decode requests. Prefill remains token-cost based. "
             "Omit to disable affinity.",
+        )
+        parser.add_argument(
+            f"--{prefix}prefix-preparation-timeout-ms",
+            type=int,
+            default=RouterArgs.prefix_preparation_timeout_ms,
+            help="Milliseconds to wait for HTTP workers to prepare token IDs "
+            "(/render or /tokenize) for cache_aware and kv_aware (1-60000). "
+            "A worker that answers later has no tokens for the request, and "
+            "selection falls back to load.",
         )
         parser.add_argument(
             f"--{prefix}kv-event-source",
@@ -682,6 +694,11 @@ class RouterArgs:
         ):
             raise ValueError(
                 "kv_aware_session_affinity_ttl_secs must be between 1 and 31536000"
+            )
+
+        if not 1 <= self.prefix_preparation_timeout_ms <= 60_000:
+            raise ValueError(
+                "prefix_preparation_timeout_ms must be between 1 and 60000"
             )
 
         if self.wasm_middleware_sha256 and not self.wasm_middleware:

@@ -40,6 +40,8 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
+Each worker gets `--prefix-preparation-timeout-ms` (default 1000) to prepare a request; a worker that answers later is counted as `preparation_timeout` in `vllm_router_kv_routing_inputs_total`. At most eight workers are probed at a time under that shared budget, so a worker that was never contacted before it ran out is counted as `preparation_not_started` instead.
+
 ### Set the event ports
 
 Run this in each worker terminal. The default live port is `5557`. Set `LIVE_PORT` to override it and choose a free `REPLAY_PORT` (the example uses `5558`). Reserve separate port ranges for workers on the same host because vLLM offsets fixed event ports by DP rank. For [P/D](#pd-routing), set each stage's ports first.
