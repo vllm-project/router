@@ -1296,8 +1296,15 @@ impl PdRouterBase {
         let mut removed_count = 0;
         for w in all_workers.iter() {
             if w.url().starts_with(&prefix) {
-                let model_id = w.model_id().to_string();
                 if let Some(removed) = self.worker_registry.remove_by_url(w.url()) {
+                    // The registry removes whatever worker the URL points
+                    // at at removal time, which can differ from this
+                    // snapshot if the URL was re-registered with a
+                    // different role or model mid-sweep. Per-model
+                    // bookkeeping and role eviction below therefore read
+                    // the worker remove_by_url actually returned, as the
+                    // exact-URL paths do.
+                    let model_id = removed.model_id().to_string();
                     self.unregister_kv_worker(w.url(), role == "decode").await;
                     self.policy_registry.on_worker_removed(&model_id);
                     if let Some(policy) = self.policy_registry.get_policy(&model_id) {
@@ -1310,12 +1317,6 @@ impl PdRouterBase {
                             }
                         }
                     }
-                    // The registry removes whatever worker the URL points
-                    // at at removal time, which can differ from this
-                    // snapshot if the URL was re-registered with a
-                    // different role mid-sweep. Evict from the role tree
-                    // that owns the worker remove_by_url actually
-                    // returned, as the exact-URL paths do.
                     match removed.worker_type() {
                         WorkerType::Prefill { .. } => {
                             self.evict_prefill_role_tenants(w.url());
