@@ -185,6 +185,7 @@ impl KvIndexSupervisor {
                 .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
             if let Some((expected, reported)) =
                 capability.rank_capability(rank).and_then(|contract| {
+                    // Either report can veto admission, even when the other matches.
                     contract
                         .reported_hash_mismatch(reported)
                         .or_else(|| contract.reported_hash_mismatch(native_hash))
@@ -310,7 +311,7 @@ impl KvIndexSupervisor {
         }
         if load_only {
             lifecycle.state.lock().fenced_vllm_instance_id =
-                server_info.vllm_instance.map(|(id, _)| id);
+                server_info.vllm_instance.map(|instance| instance.id);
             let info = WorkerKvInfo {
                 instance_id,
                 block_size: Some(block_size),

@@ -2399,8 +2399,12 @@ async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
             *boot.lock() = ("later", Some("sha256"));
             *worker.metrics.lock() = incompatible.clone();
             worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
+            let revision = old.state.lock().revision;
             assert!(supervisor.on_worker_added(url).await.is_err());
             assert!(supervisor.match_provider_for_worker(url).is_none());
+            let registration = &supervisor.worker_registrations()[url];
+            assert!(registration.revision > revision);
+            assert!(registration.info.as_ref().unwrap().cache_key.is_none());
             *worker.sources.lock() = sources.clone();
         }
 

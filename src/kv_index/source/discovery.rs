@@ -76,13 +76,19 @@ pub struct ServerInfo {
     /// Engine revision used to interpret versioned cache lookup rules.
     #[serde(skip)]
     pub(crate) vllm_version: Option<(u32, u32)>,
-    /// The native vLLM process ID and its optional prefix hash from the same response.
+    /// Native vLLM startup evidence from /server_info.
     #[serde(skip)]
-    pub(crate) vllm_instance: Option<(String, Option<String>)>,
+    pub(crate) vllm_instance: Option<VllmInstance>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default)]
     pub served_model_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VllmInstance {
+    id: String,
+    prefix_hash: Option<String>,
 }
 
 /// One DP rank's event publisher, reported by the worker control plane.
@@ -467,7 +473,7 @@ impl KvIndexSupervisor {
                 .as_ref()
                 .ok()
                 .and_then(|info| info.vllm_instance.as_ref())
-                .map(|(id, _)| id.clone());
+                .map(|instance| instance.id.clone());
             Some((hashes, id))
         });
         let installation = self.install_observed_worker(
@@ -493,7 +499,8 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
-        // Automatic readmission applies only to a single worker rank, rank 0.
+        // A rank 0 mismatch can establish the initial fence for a single-rank worker.
+        // Later retries use the recorded fence to decide when to probe.
         let reported = discovery
             .engine_cache_configs
             .as_ref()

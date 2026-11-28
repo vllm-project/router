@@ -14,7 +14,7 @@ use super::metrics_meta::EngineCacheConfigs;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
-    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
+    SourcesUnavailable, VllmInstance, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -648,6 +648,8 @@ pub(super) async fn query_server_info_json(
         _ => None,
     };
     let parallel = &config["parallel_config"];
+    // Older vLLM versions can omit the internal API process count. Require a
+    // single DP rank and reject any explicit count other than one.
     let vllm_instance = config["instance_id"]
         .as_str()
         .map(str::trim)
@@ -663,7 +665,10 @@ pub(super) async fn query_server_info_json(
                 .as_str()
                 .filter(|algorithm| !algorithm.trim().is_empty())
                 .map(str::to_owned);
-            (id.to_owned(), hash)
+            VllmInstance {
+                id: id.to_owned(),
+                prefix_hash: hash,
+            }
         });
     Ok(ServerInfo {
         model_id: model.clone(),

@@ -63,11 +63,11 @@ pub(super) struct LifecycleState {
 impl LifecycleState {
     pub(super) fn readmission_hash<'a>(&self, report: Option<&'a ServerInfo>) -> Option<&'a str> {
         let fenced = self.fenced_vllm_instance_id.as_ref()?;
-        let (id, hash) = report?.vllm_instance.as_ref()?;
-        if id == fenced {
+        let instance = report?.vllm_instance.as_ref()?;
+        if &instance.id == fenced {
             return None;
         }
-        hash.as_deref()
+        instance.prefix_hash.as_deref()
     }
 }
 
@@ -230,6 +230,7 @@ impl WorkerLifecycle {
             }
             Some(_) => {
                 state.info = None;
+                // Keep the aliases available if replacement admission fails.
                 state.base_models = discovery
                     .and_then(|worker| worker.base_models.clone())
                     .unwrap_or_default();
@@ -346,6 +347,7 @@ impl LayoutWorkerProvider {
                 if vllm_instance_id.is_some() {
                     info.cache_key = None;
                     state.fenced_vllm_instance_id = vllm_instance_id;
+                    state.revision = crate::kv_index::next_owner_incarnation();
                 }
             }
         }
