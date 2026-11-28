@@ -1,10 +1,7 @@
 //! Shared event transport, frame parsing and connection readiness.
 
-use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
-
-use sha2::{Digest, Sha256};
 
 pub(super) const IDLE_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -126,29 +123,29 @@ mod tests {
                 .unwrap();
         }
         let mut receiver = ReadableSocket::new(receiver);
-        let mut pending = PendingLive::default();
+        let mut received = Vec::new();
         let replay = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Some(0)
+            0
         };
         let result = while_connected(
             &mut monitor,
             replay,
             false,
             &mut receiver,
-            &mut pending,
             b"topic",
+            |frames, _topic| {
+                received.push(frames);
+                false
+            },
         )
         .await
         .unwrap();
-        assert!(matches!(result, ReplayPoll::Finished(Some(0))));
-        for seq in 0_i64..1025 {
-            assert_eq!(
-                live_sequence(&pending.pop().unwrap(), b"topic"),
-                Ok(Some(seq))
-            );
+        assert!(matches!(result, ReplayPoll::Finished(0)));
+        assert_eq!(received.len(), 1025);
+        for (seq, frames) in (0_i64..).zip(received) {
+            assert_eq!(live_sequence(&frames, b"topic"), Ok(Some(seq)));
         }
-        assert!(pending.pop().is_none());
     }
 
     #[tokio::test]
@@ -415,52 +412,21 @@ impl ConnectionMonitor {
     }
 }
 
-#[derive(Default)]
-pub(super) struct PendingLive {
-    frames: VecDeque<Vec<Vec<u8>>>,
-    bytes: usize,
-}
-
-pub(super) const MAX_PENDING_LIVE_FRAMES: usize = 4096;
-
-impl PendingLive {
-    pub(super) fn pop(&mut self) -> Option<Vec<Vec<u8>>> {
-        let frames = self.frames.pop_front()?;
-        self.bytes -= frames.iter().map(Vec::len).sum::<usize>();
-        Some(frames)
-    }
-
-    pub(super) fn discard(&mut self, topic: &[u8]) -> Option<i64> {
-        let through = self
-            .frames
-            .drain(..)
-            .filter_map(|frames| {
-                live_sequence(&frames, topic)
-                    .ok()
-                    .flatten()
-                    .filter(|seq| (0..i64::MAX).contains(seq))
-            })
-            .max();
-        self.bytes = 0;
-        through
-    }
-}
-
-pub(super) enum ReplayPoll {
-    Finished(Option<i64>),
+pub(super) enum ReplayPoll<T> {
+    Finished(T),
     Disconnected,
     BufferFull,
 }
 
 /// Watch the connection and drain the live socket while replay is in progress.
-pub(super) async fn while_connected(
+pub(super) async fn while_connected<T>(
     connection: &mut ConnectionMonitor,
-    replay: impl std::future::Future<Output = Option<i64>>,
+    replay: impl std::future::Future<Output = T>,
     watch: bool,
     sub: &mut ReadableSocket,
-    pending: &mut PendingLive,
     topic: &[u8],
-) -> io::Result<ReplayPoll> {
+    mut queue_live: impl FnMut(Vec<Vec<u8>>, &[u8]) -> bool,
+) -> io::Result<ReplayPoll<T>> {
     tokio::pin!(replay);
     loop {
         tokio::select! {
@@ -482,10 +448,7 @@ pub(super) async fn while_connected(
                     if frames.first().is_some_and(|frame| frame.as_slice() != topic) {
                         continue;
                     }
-                    pending.bytes += frames.iter().map(Vec::len).sum::<usize>();
-                    pending.frames.push_back(frames);
-                    if pending.frames.len() >= MAX_PENDING_LIVE_FRAMES || pending.bytes >= super::MAX_KV_EVENT_BYTES
-                    {
+                    if queue_live(frames, topic) {
                         return Ok(ReplayPoll::BufferFull);
                     }
                 }
@@ -558,21 +521,4 @@ mod frame_tests {
         frames[2].pop();
         assert_eq!(replay_frame(&frames), None);
     }
-}
-
-pub(super) type ReplayOverlap = HashMap<u64, [u8; 32]>;
-
-pub(super) fn remember_replay(replayed: &mut ReplayOverlap, seq: u64, payload: &[u8]) {
-    // Verify the payload as well as the sequence without buffering entire batches.
-    replayed.insert(seq, Sha256::digest(payload).into());
-    if replayed.len() > 4096 {
-        let floor = seq.saturating_sub(2048);
-        replayed.retain(|known, _| *known >= floor);
-    }
-}
-
-pub(super) fn replay_overlap(replayed: &ReplayOverlap, seq: u64, payload: &[u8]) -> bool {
-    replayed
-        .get(&seq)
-        .is_some_and(|known| *known == <[u8; 32]>::from(Sha256::digest(payload)))
 }

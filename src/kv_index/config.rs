@@ -360,18 +360,13 @@ impl StaticKvEventSources {
     }
 }
 
-fn is_reachable_tcp_endpoint(endpoint: &str) -> bool {
-    url::Url::parse(endpoint).is_ok_and(|parsed| {
-        parsed.scheme() == "tcp"
-            && parsed.host_str().is_some_and(|host| {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host != "*"
-                    && !host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_unspecified())
-            })
-            && parsed.port().is_some_and(|port| port != 0)
-    })
+fn validate_pd_kv_endpoint(endpoint: &str) -> Result<(), String> {
+    match endpoint.strip_prefix("ipc://") {
+        Some(path) if !path.is_empty() => return Ok(()),
+        Some(_) => return Err("ipc:// requires a non-empty path".into()),
+        None => {}
+    }
+    crate::kv_index::canonical_endpoint(endpoint).map(|_| ())
 }
 
 pub(crate) fn validate_regular_sources(config: &RouterConfig) -> ConfigResult<()> {
@@ -543,15 +538,10 @@ pub(crate) fn validate_pd_sources(config: &RouterConfig) -> ConfigResult<()> {
                     .iter()
                     .chain(sources.replay_endpoints.iter().flatten())
                 {
-                    if !is_reachable_tcp_endpoint(endpoint)
-                        && endpoint
-                            .strip_prefix("ipc://")
-                            .is_none_or(|path| path.is_empty())
-                    {
+                    if let Err(reason) = validate_pd_kv_endpoint(endpoint) {
                         return Err(ConfigError::IncompatibleConfig {
                             reason: format!(
-                                "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
-                                 a reachable ZMQ address (tcp://HOST:PORT or ipc://PATH)"
+                                "pd_kv_event_sources['{url}'] endpoint '{endpoint}' is invalid: {reason}"
                             ),
                         });
                     }

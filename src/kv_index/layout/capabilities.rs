@@ -78,6 +78,15 @@ pub struct GroupCapability {
 }
 
 impl RankCapability {
+    pub(crate) fn reported_hash_mismatch<'a>(
+        &'a self,
+        reported: Option<&'a str>,
+    ) -> Option<(&'a str, &'a str)> {
+        let reported = reported?;
+        let expected = self.hash_algorithm.as_str();
+        (expected != reported).then_some((expected, reported))
+    }
+
     pub(crate) fn has_plain_full_attention_shape(&self) -> bool {
         self.declared_groups == Some(1)
             && self.hash_lookahead_tokens == 0
@@ -310,9 +319,10 @@ impl CacheCapabilities {
                         && group
                             .cache_role
                             .as_deref()
-                            .is_none_or(|role| role == "sparse") =>
+                            .is_none_or(|role| matches!(role, "sparse" | "indexer")) =>
                 {
-                    // A compressed group names the tokens one state covers.
+                    // Sparse MLA and its persistent indexer use the same
+                    // full-prefix lookup with an explicit token-to-state ratio.
                     match group.tokens_per_state.as_deref() {
                         // Declared but malformed: the engine would not honor
                         // this shape, so the layout is refused.
@@ -323,8 +333,8 @@ impl CacheCapabilities {
                                 .ok_or("unsupported compressed attention group")?;
                             GroupRule::CompressedFullAttention { tokens_per_state }
                         }
-                        None if group.cache_role.as_deref() == Some("sparse") => {
-                            return Err("sparse MLA group must declare tokens_per_state");
+                        None if group.cache_role.is_some() => {
+                            return Err("MLA cache role requires tokens_per_state");
                         }
                         None => GroupRule::FullAttention,
                     }

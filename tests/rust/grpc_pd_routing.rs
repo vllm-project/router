@@ -89,7 +89,15 @@ async fn pd_router_with_pools(
     dp_size: usize,
     prefill_policy: PolicyConfig,
 ) -> VllmPDRouter {
-    pd_router_with_kv_sources(prefills, decode, dp_size, prefill_policy, HashMap::new()).await
+    pd_router_with_kv_sources(
+        prefills,
+        decode,
+        dp_size,
+        prefill_policy,
+        HashMap::new(),
+        KvConnector::Nixl,
+    )
+    .await
 }
 
 async fn pd_router_with_kv_sources(
@@ -98,6 +106,7 @@ async fn pd_router_with_kv_sources(
     dp_size: usize,
     prefill_policy: PolicyConfig,
     pd_kv_event_sources: HashMap<String, PdKvEventSources>,
+    kv_connector: KvConnector,
 ) -> VllmPDRouter {
     metrics();
     let prefill_urls: Vec<(String, Option<u16>)> = prefills
@@ -115,7 +124,7 @@ async fn pd_router_with_kv_sources(
         policy: PolicyConfig::RoundRobin,
         pd_kv_event_sources,
         pd_worker_pairs: Default::default(),
-        kv_connector: KvConnector::Nixl,
+        kv_connector,
         worker_startup_timeout_secs: 5,
         intra_node_data_parallel_size: dp_size,
         ..RouterConfig::default()
@@ -286,6 +295,30 @@ async fn grpc_pd_unavailable_pool_rejects_before_request_preparation() {
     }
     assert!(prefill.captured().is_empty());
     assert!(decode.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_pd_mooncake_v2_rejects_missing_handoff_before_decode() {
+    let prefill = MockVllmRsServer::spawn().await;
+    let decode = MockVllmRsServer::spawn().await;
+    let router = pd_router_with_kv_sources(
+        &[&prefill],
+        &decode,
+        1,
+        PolicyConfig::RoundRobin,
+        HashMap::new(),
+        KvConnector::MooncakeV2,
+    )
+    .await;
+    router.pin_test_token_ids(vec![1, 2, 3]);
+
+    let response = router
+        .route_completion(None, &completion(json!([11, 12, 13]), false), None)
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(prefill.captured().len(), 1);
+    assert!(decode.captured().is_empty());
+    assert_eq!(router.worker_registry().get_decode_workers()[0].load(), 0);
 }
 
 #[tokio::test]
@@ -760,9 +793,15 @@ async fn grpc_pd_kv_aware_prefers_the_prefill_holding_the_prefix() {
             kv_penalty_disk: 0.4,
             static_kv_event_sources: Default::default(),
         };
-        let router =
-            pd_router_with_kv_sources(&[&prefills[0], &prefills[1]], &decode, 1, policy, sources)
-                .await;
+        let router = pd_router_with_kv_sources(
+            &[&prefills[0], &prefills[1]],
+            &decode,
+            1,
+            policy,
+            sources,
+            KvConnector::Nixl,
+        )
+        .await;
         let prompt: Vec<u32> = (0..33).collect();
         router.pin_test_token_ids(prompt.clone());
 
