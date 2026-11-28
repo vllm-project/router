@@ -221,6 +221,7 @@ def post_chat(
     stages = None
     saw_done = False
     saw_finish = False
+    saw_abort = False
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             headers = {k.lower(): v for k, v in resp.headers.items()}
@@ -248,8 +249,11 @@ def post_chat(
                 if not choices:
                     continue
                 choice = choices[0]
-                if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None:
                     saw_finish = True
+                if finish_reason == "abort":
+                    saw_abort = True
                 delta_obj = choice.get("delta") or {}
                 delta = (
                     delta_obj.get("content")
@@ -274,6 +278,8 @@ def post_chat(
             f"stream failed after partial_chars={sum(map(len, text_parts))}: {exc}"
         ) from exc
     total_duration_ms = (time.perf_counter() - t0) * 1000.0
+    if saw_abort:
+        raise SystemExit("aborted SSE stream: finish_reason=abort")
     if ttft_ms is None:
         raise SystemExit(
             f"no streamed first output from {url} after {total_duration_ms:.1f}ms "

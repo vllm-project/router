@@ -94,6 +94,38 @@ class PrefixKvhitSseTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 BENCH_PREFIX_KVHIT.post_chat(url, "model", HELLO, 2, 2)
 
+    def test_abort_fails_even_with_usage_and_done(self):
+        events = self._complete_stream_events("abort")
+        with sse_server(events) as url:
+            with self.assertRaisesRegex(SystemExit, "finish_reason=abort"):
+                BENCH_PREFIX_KVHIT.post_chat(url, "model", HELLO, 2, 2)
+
+    def test_length_is_a_valid_completed_sample(self):
+        events = self._complete_stream_events("length")
+        with sse_server(events) as url:
+            result = BENCH_PREFIX_KVHIT.post_chat(url, "model", HELLO, 2, 2)
+        self.assertEqual(result["completion_tokens"], 2)
+        self.assertIsNotNone(result["ttft_ms"])
+        self.assertIsNotNone(result["tpot_ms"])
+
+    @staticmethod
+    def _complete_stream_events(finish_reason):
+        return [
+            (0, chunk("a")),
+            (0, chunk("b")),
+            (0, chunk(finish_reason=finish_reason)),
+            (
+                0,
+                json.dumps(
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                    }
+                ),
+            ),
+            (0, "[DONE]"),
+        ]
+
     def test_missing_done_fails_measurement(self):
         events = [
             (0, chunk("partial")),
