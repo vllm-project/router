@@ -633,10 +633,9 @@ mod tests {
             },
             8,
         )
-        .with_source_binding(SourceLease {
-            gate: Arc::new(parking_lot::Mutex::new(())),
-            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+        .with_source_binding(SourceLease::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
         assert_eq!(
             EventStream::new(Arc::new(index)).begin_replay(),
             Err(StreamError::Index(SourceError::Untrusted))

@@ -237,13 +237,15 @@ impl KvIndexSupervisor {
                 let connector = self
                     .pd_connector
                     .filter(|_| prefill_bases.is_some_and(|pool| pool.contains(&base)));
-                let probe = tokio::time::timeout(
-                    CONTROL_TIMEOUT,
+                let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+                let probe = tokio::time::timeout_at(
+                    deadline,
                     self.probe_registration(
                         &base,
                         plain_only.contains(&base),
                         connector,
                         &lifecycle,
+                        deadline,
                     ),
                 )
                 .await

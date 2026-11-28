@@ -99,7 +99,7 @@ fn visible_tiers(
     let version = evidence
         .validate_source(index, &owner.target(), &[key])
         .unwrap();
-    if index.source_version_is_current(&version) {
+    if version.is_current() {
         evidence.runs_for_owner(owner).get(0).unwrap_or_default()
     } else {
         TierBits::default()
@@ -168,7 +168,7 @@ fn read_snapshot_does_not_recreate_unknown_or_retired_source() {
     assert!(index.source_locks.read().is_empty());
 
     store(&index, &owner, 0, [2; 32], StorageTier::Device);
-    assert!(!index.source_version_is_current(&before));
+    assert!(!before.is_current());
     assert_eq!(
         visible_tiers(&index, &owner, 0, [1; 32]),
         TierBits::default()
