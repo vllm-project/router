@@ -36,7 +36,7 @@ A manual layout describes the worker's cache groups, hashing and reuse rules. Ro
 | Hash algorithm | Pass `--prefix-caching-hash-algo sha256_cbor` so Router and vLLM compute the same block keys. |
 | Event hashes | Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` to publish the full 32-byte hashes. |
 | KV events | Enable events through `--kv-events-config` and keep incremental reporting. Router uses live events to track cache changes and replay to recover missed events. |
-| HTTP text and chat | KV scoring uses the worker's render endpoint. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
+| HTTP text and chat | KV scoring uses the worker's render endpoint. Pass `--enable-scale-out` to vLLM if required to enable rendering. Simple text completions can use `/tokenize`. If preparation is unavailable, the request still routes using load and keeps its original body. Explicit token ID prompts can be scored directly. |
 
 Worker retries can reuse prepared inputs. If preparation fails, Router sends the original request body and skips cache scoring for that worker.
 
@@ -292,6 +292,30 @@ Expand the profile for your checkpoint and mode, then replace the object inside 
 </details>
 
 <details>
+<summary>GPU · HY4 Flash</summary>
+
+Use vLLM `0.34.1rc0` or later over HTTP with `tencent/Hy4-flash-FP8` (FP8) or `tencent/Hy4-flash` (BF16).
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 256,
+  "speculative_tokens": 0,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 256, "cache_role": "indexer", "tokens_per_state": "4"},
+    {"kind": "scratch", "block_size": 4, "tokens_per_state": "1"},
+    {"kind": "sliding_window_mla", "block_size": 256, "sliding_window": 512},
+    {"kind": "sliding_window_mla", "block_size": 256, "sliding_window": 512}
+  ]
+}
+```
+
+- For colocated FP8 with five DFly tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0` (also required for single-image HTTP chat Prefill scoring), `tail_drop_groups` to `[]`, and `groups[1].block_size` to `16`.
+- For NIXL P/D, use the Prefill worker URL and leave DFly disabled.
+
+</details>
+
+<details>
 <summary>GPU · DeepSeek-V4-Flash-0731</summary>
 
 ```json
@@ -491,6 +515,28 @@ Expand the profile for your checkpoint and mode, then replace the object inside 
 
 </details>
 
+<details>
+<summary>Ascend A5 · HY4 Flash</summary>
+
+Serve HY4 Flash over HTTP using the image from the [vLLM-Ascend HY4 Flash recipe](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/HY4-Flash.html).
+
+```json
+{
+  "rank": 0,
+  "hash_block_size": 64,
+  "speculative_tokens": 0,
+  "declared_groups": 1,
+  "groups": [
+    {"kind": "mla_attention", "block_size": 64, "cache_role": "sparse", "tokens_per_state": "1"}
+  ]
+}
+```
+
+- For colocated DFly with five speculative tokens, set `speculative_tokens` to `5`, `hash_lookahead_tokens` to `0` (also required for single-image HTTP chat Prefill scoring), and `tail_drop_groups` to `[]`.
+- For P/D, use the Prefill worker URL and set `--kv-connector mooncake-v2`.
+
+</details>
+
 ### MTP and DSpark
 
 Use a [model example](#model-layout-reference) that matches the worker's cache groups. Set the fields below next to `rank` and `groups`, replacing any existing values for those fields. Use the worker's `num_speculative_tokens` for `speculative_tokens`.
@@ -589,7 +635,7 @@ Both the Rust and Python launchers accept these options. Configure vLLM workers 
 | `--decode` | `URL`, repeatable | No workers | Register a Decode worker. |
 | `--prefill-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to score Prefill prefix reuse. |
 | `--decode-policy` | Policy name | Inherits `--policy` | Set `kv_aware` to route Decode by context load. Enable Decode KV events to credit cache reuse. |
-| `--kv-connector` | `nixl`, `mooncake`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. |
+| `--kv-connector` | `nixl`, `mooncake`, `mooncake-v2`, or `moriio` | `nixl` | Match the connector used by the P/D workers. MoRI-IO requires vLLM ZMQ discovery. Use `mooncake-v2` with vLLM-Ascend `MooncakeConnectorV2` in pull mode. |
 | `--vllm-discovery-address` | `HOST:PORT` | Unset | Listen for vLLM ZMQ worker registration when using P/D discovery. Use explicit URLs for gRPC P/D. |
 | `--pd-pair` | `PREFILL=DECODE[,DECODE...]`, repeatable | All peers in one compatible pool | Restrict a mixed pool to the declared P/D pairs. Supply one entry per Prefill. |
 | `--kv-hybrid-layout` | JSON file path | Unset | Supply cache groups, hashing, and reuse rules when the Router cannot derive them or read them from the worker. |
@@ -638,3 +684,4 @@ Transfer credits are fractions of reusable tokens counted as work avoided. `0` i
 | Worker reports `Address already in use` | Check HTTP, gRPC, event and connector ports. Reserve separate ranges for DP ranks. |
 | Worker restarted | Generate a new publisher topic. Update `--kv-event-topic` for a static source. A Router restart uses the available replay history. |
 | Decode has no remote read | Check whether the prompt was already cached on Decode, the connector and role settings, and Decode's transfer log. |
+| Mooncake V2 P/D handoff fails for HY4 Flash | Use the vLLM-Ascend HY4 Flash recipe image with `MooncakeConnectorV2` in pull mode on both workers. |

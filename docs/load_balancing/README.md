@@ -246,6 +246,9 @@ If several candidate workers have the same lowest load, the policy picks one of 
 
 ## KV Aware
 
+For colocated and P/D prefill routing, `kv_aware` uses worker KV events to
+track reusable prefixes and scores remaining prefill work alongside worker load.
+
 See the [KV-aware deployment guide](kv_aware.md) for worker requirements, routing modes and model recipes.
 
 ### P/D decode load
@@ -268,43 +271,14 @@ Multiple router replicas need ingress stickiness to preserve affinity.
 
 ## Choosing a Policy
 
-```
-                                    ┌─────────────────────┐
-                                    │  Need session       │
-                                    │  affinity?          │
-                                    └─────────┬───────────┘
-                                              │
-                              ┌───────────────┴───────────────┐
-                              │                               │
-                             Yes                              No
-                              │                               │
-                              ▼                               ▼
-                    ┌─────────────────┐             ┌─────────────────┐
-                    │  Multi-turn or  │             │  Load-sensitive │
-                    │  KV cache reuse?│             │  workload?      │
-                    └────────┬────────┘             └────────┬────────┘
-                             │                               │
-                 ┌───────────┴───────────┐       ┌───────────┴───────────┐
-                 │                       │       │                       │
-                Yes                      No     Yes                      No
-                 │                       │       │                       │
-                 ▼                       ▼       ▼                       ▼
-        ┌────────────────┐     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-        │ consistent_hash│     │  cache_aware   │ │  power_of_two  │ │  round_robin   │
-        │                │     │                │ │                │ │  or random     │
-        └────────────────┘     └────────────────┘ └────────────────┘ └────────────────┘
-```
-
-### Quick Reference
-
-| Scenario | Recommended Policy |
-|----------|-------------------|
-| Chat applications with conversation history | `consistent_hash` |
-| Batch inference with no state | `round_robin` |
-| Variable request complexity | `power_of_two` |
-| Repeated system prompts / few-shot | `cache_aware` |
-| Repeated prefixes with worker KV events | `kv_aware` |
-| Simple testing / development | `random` |
+| Workload or routing goal | Recommended policy |
+|--------------------------|--------------------|
+| Repeated prefixes with compatible worker KV events, when both KV reuse and worker load matter | `kv_aware` |
+| Repeated prefixes (for example, a shared system prompt) without compatible worker KV events | `cache_aware` |
+| Send requests with the same session ID to the same worker | `consistent_hash` |
+| Uneven worker load, such as when request complexity varies | `power_of_two` |
+| Even request counts across workers for stateless workloads such as batch inference | `round_robin` |
+| Uniform random worker selection for simple testing or development | `random` |
 
 ---
 
@@ -322,8 +296,10 @@ vllm-router \
 ```
 
 This allows optimizing each stage independently:
-- **Prefill**: Use `consistent_hash` for cache locality
-- **Decode**: Inherits the main policy; override with `--decode-policy` (for example `round_robin`)
+- **Prefill**: Use `consistent_hash` for cache locality or
+  [`kv_aware`](#kv-aware) for event-based prefix reuse.
+- **Decode**: Inherits the main policy. Override it with `--decode-policy`
+  (for example, `round_robin` or [`kv_aware`](#pd-decode-load)).
 
 `grpc://` prefill and decode workers must run vLLM ≥ 0.30.0. The router
 warns at startup when a worker reports an older `engine_version`, and

@@ -2075,6 +2075,7 @@ impl Router {
                                         route,
                                         self.api_key.as_deref(),
                                         Duration::from_secs(1),
+                                        kv_ops.is_some(),
                                     )
                                     .await,
                                 ),
@@ -3674,6 +3675,7 @@ impl RouterTrait for Router {
                     path,
                     self.api_key.as_deref(),
                     Duration::from_secs(1),
+                    kv_ops.is_some(),
                 )
                 .await,
             )
@@ -5549,10 +5551,22 @@ mod tests {
         warm: usize,
         render_available: bool,
     ) -> HttpKvFixture {
-        use crate::kv_index::source::test_support::{full_binding, warm_full};
+        http_kv_fixture_with_media(inputs, warm, render_available, false).await
+    }
+
+    async fn http_kv_fixture_with_media(
+        inputs: [Vec<Vec<u32>>; 2],
+        warm: usize,
+        render_available: bool,
+        with_image: bool,
+    ) -> HttpKvFixture {
+        use crate::kv_index::source::test_support::{
+            full_binding, warm_full, warm_test_image, TEST_IMAGE_HASH,
+        };
         use crate::kv_index::{CacheKey, RoutableTarget};
         use crate::policies::KvAwarePolicy;
         use axum::{extract::OriginalUri, routing::post};
+        let block_size = if with_image { 64 } else { 2 };
         let router = create_test_kv_router();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let loads = Arc::new(Mutex::new(Vec::new()));
@@ -5577,7 +5591,15 @@ mod tests {
                             return StatusCode::SERVICE_UNAVAILABLE.into_response();
                         }
                         if !render_available { return StatusCode::NOT_FOUND.into_response(); }
-                        let values: Vec<_> = prompts.iter().map(|ids| serde_json::json!({"token_ids": ids, "features": null})).collect();
+                        let features = if with_image {
+                            serde_json::json!({
+                                "mm_hashes": {"image": [TEST_IMAGE_HASH]},
+                                "mm_placeholders": {"image": [{"offset": 60, "length": 8}]},
+                            })
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        let values: Vec<_> = prompts.iter().map(|ids| serde_json::json!({"token_ids": ids, "features": features})).collect();
                         return Json(if path == "/v1/completions/render" { serde_json::json!(values) } else { values[0].clone() }).into_response();
                     }
                     if path == "/tokenize" { return Json(serde_json::json!({"tokens": prompts[0], "count": prompts[0].len()})).into_response(); }
@@ -5604,21 +5626,25 @@ mod tests {
                 instance_id: Arc::from(format!("worker-{worker_index}")),
                 dp_rank: 0,
             };
-            let index = Arc::new(full_binding(target.clone(), 2));
+            let index = Arc::new(full_binding(target.clone(), block_size));
             index.begin_empty(0);
             policy.register_target_with_cache_identity(
                 worker.url(),
                 target.clone(),
                 CacheKey {
                     model: Arc::from("model"),
-                    block_size: 2,
+                    block_size,
                 },
                 index.clone(),
             );
             if worker_index == warm {
                 worker.increment_load();
-                for (prompt_index, ids) in inputs[warm].iter().enumerate() {
-                    warm_full(&index, prompt_index as u64, &ids[..4]);
+                if with_image {
+                    warm_test_image(&index);
+                } else {
+                    for (prompt_index, ids) in inputs[warm].iter().enumerate() {
+                        warm_full(&index, prompt_index as u64, &ids[..4]);
+                    }
                 }
             }
             workers.push(worker);
@@ -5641,6 +5667,38 @@ mod tests {
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["worker"]
             .as_u64()
             .unwrap() as usize
+    }
+
+    #[tokio::test]
+    async fn http_chat_uses_rendered_image_for_prefix_placement() {
+        let ids: Vec<u32> = (0..129).collect();
+        let fixture =
+            http_kv_fixture_with_media([vec![ids.clone()], vec![ids]], 0, true, true).await;
+        let body = serde_json::json!({"model": "model", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]}]});
+        let request = serde_json::from_value(body.clone()).unwrap();
+        for transparent in [false, true] {
+            let response = if transparent {
+                fixture
+                    .router
+                    .route_transparent(None, "/v1/chat/completions", &Method::POST, body.clone())
+                    .await
+            } else {
+                fixture.router.route_chat(None, &request, None).await
+            };
+            assert_eq!(selected_http_worker(response).await, 0);
+        }
+        assert_eq!(
+            fixture.loads.lock().as_slice(),
+            &[(
+                0,
+                crate::policies::LoadSample {
+                    active_prefill_tokens: 1,
+                    active_requests: 1
+                }
+            ); 2]
+        );
     }
 
     #[tokio::test]

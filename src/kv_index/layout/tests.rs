@@ -790,6 +790,7 @@ mod declarations {
             (None, 528),
             (Some(KvConnector::Nixl), 0),
             (Some(KvConnector::Mooncake), 0),
+            (Some(KvConnector::MooncakeV2), 0),
         ] {
             let binding = bind_layout(&value, "epoch-1")
                 .unwrap()
@@ -1010,16 +1011,17 @@ mod declarations {
             320
         );
 
-        let ratio = value["ranks"][0]["groups"][4]
-            .as_object_mut()
-            .unwrap()
-            .remove("tokens_per_state")
-            .unwrap();
-        assert!(matches!(
-            bind_layout(&value, "kv-events"),
-            Err("sparse MLA group must declare tokens_per_state")
-        ));
+        let group = &mut value["ranks"][0]["groups"][4];
+        let ratio = group["tokens_per_state"].take();
+        for role in ["sparse", "indexer"] {
+            value["ranks"][0]["groups"][4]["cache_role"] = role.into();
+            assert!(matches!(
+                bind_layout(&value, "kv-events"),
+                Err("MLA cache role requires tokens_per_state")
+            ));
+        }
         value["ranks"][0]["groups"][4]["tokens_per_state"] = ratio;
+        value["ranks"][0]["groups"][4]["cache_role"] = "sparse".into();
 
         for (path, invalid) in [(4, serde_json::json!("3")), (4, serde_json::json!("field"))] {
             let saved = value["ranks"][0]["groups"][path]["tokens_per_state"].clone();
@@ -1027,7 +1029,7 @@ mod declarations {
             assert!(bind_layout(&value, "kv-events").is_err(), "{path}");
             value["ranks"][0]["groups"][path]["tokens_per_state"] = saved;
         }
-        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("indexer");
+        value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("unknown");
         assert!(bind_layout(&value, "kv-events").is_err());
         value["ranks"][0]["groups"][4]["cache_role"] = serde_json::json!("sparse");
         value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("FullAttentionSpec");
@@ -1035,5 +1037,110 @@ mod declarations {
         value["ranks"][0]["groups"][3]["spec_type"] = serde_json::json!("CircularBufferSpec");
         value["ranks"][0]["groups"][4]["kind"] = serde_json::json!("full_attention");
         assert!(bind_layout(&value, "kv-events").is_err());
+    }
+
+    #[test]
+    fn documented_hy4_flash_layouts_restore_the_expected_prefix() {
+        use crate::config::{KvConnector, RoutingMode};
+        use crate::kv_index::source::test_support::{event_batch, stored_block};
+        use crate::kv_index::wire::{ExternalBlockHash, KVEvent};
+
+        let guide = include_str!("../../../docs/load_balancing/kv_aware.md").replace("\r\n", "\n");
+        let worker = "http://prefill";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let mode = RoutingMode::VllmPrefillDecode {
+            prefill_urls: vec![(worker.into(), None)],
+            decode_urls: vec!["http://decode".into()],
+            prefill_policy: None,
+            decode_policy: None,
+            discovery_address: None,
+        };
+        let source = EventSource {
+            source: Arc::from(worker),
+            dp_rank: 0,
+            pub_endpoint: "inproc://pub".into(),
+            replay_endpoint: Some("inproc://replay".into()),
+            topic: "epoch".into(),
+            hwm: None,
+        };
+        for (label, page, ratio, hit, pull_hit) in [
+            ("GPU · HY4 Flash", 256, 4, 2048, 0),
+            ("Ascend A5 · HY4 Flash", 64, 1, 64, 64),
+        ] {
+            let (_, section) = guide
+                .split_once(&format!("<summary>{label}</summary>"))
+                .unwrap();
+            let (_, example) = section.split_once("\n```json\n").unwrap();
+            let rank: serde_json::Value =
+                serde_json::from_str(example.split_once("\n```").unwrap().0).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({(worker): {"ranks": [rank]}})).unwrap(),
+            )
+            .unwrap();
+            let mut pd = std::collections::HashMap::new();
+            crate::kv_index::apply_kv_layout_file(&path, &mode, &mut Default::default(), &mut pd)
+                .unwrap();
+            let layout = pd.get_mut(worker).unwrap().hybrid.as_mut().unwrap();
+            // Discovery supplies the worker model and its live publisher topic.
+            layout.ranks[0].model = "hy4-flash".into();
+            layout.ranks[0].publisher_topic = Some(source.topic.clone());
+            let binding = layout
+                .bind_worker_source(&source, "hy4-flash", 128)
+                .unwrap();
+            assert_eq!(
+                binding.groups[0].kind,
+                GroupRule::CompressedFullAttention {
+                    tokens_per_state: ratio
+                }
+            );
+            let tokens: Vec<u32> = (0..=hit as u32).collect();
+            let hashes = binding
+                .keys
+                .generate_block_keys(&tokens[..hit])
+                .iter()
+                .map(|hash| ExternalBlockHash::Bytes(hash.to_vec()))
+                .collect();
+            let store = stored_block(hashes, tokens[..hit].to_vec(), page);
+            let events = binding
+                .groups
+                .iter()
+                .map(|group| {
+                    let mut store = store.clone();
+                    store.group_idx = Some(group.group_idx);
+                    if group.group_idx == 0 {
+                        store.kv_cache_spec_kind = Some("mla_attention".into());
+                    } else {
+                        // A sliding group retains only the final two pages in this case.
+                        let first = store.block_hashes.len() - 2;
+                        store.parent_block_hash = Some(store.block_hashes[first - 1].clone());
+                        store.block_hashes = store.block_hashes.split_off(first);
+                        store.token_ids = store.token_ids.split_off(first * page as usize);
+                        store.kv_cache_spec_kind = Some("sliding_window_mla".into());
+                        store.kv_cache_spec_sliding_window = Some(512);
+                    }
+                    KVEvent::BlockStored(store)
+                })
+                .collect();
+            binding.begin_empty(0);
+            binding.apply_batch(0, &event_batch(events)).unwrap();
+            assert_eq!(
+                binding.reusable_tokens(&tokens, usize::MAX),
+                hit as u64,
+                "{label}"
+            );
+            let binding = binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, None);
+            assert_eq!(
+                binding.reusable_tokens(&tokens, usize::MAX),
+                pull_hit,
+                "{label}"
+            );
+            if pull_hit != 0 {
+                let hf_compressed =
+                    binding.with_pd_prefill(Some(KvConnector::MooncakeV2), false, Some(true));
+                assert_eq!(hf_compressed.reusable_tokens(&tokens, usize::MAX), 0);
+            }
+        }
     }
 }
