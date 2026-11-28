@@ -494,19 +494,19 @@ impl KvIndexSupervisor {
         let mut discovery = self.discover_for_role(worker_url, None).await;
         self.probe_admission_hashes(worker_url, &mut discovery, None)
             .await;
-        if let Some(rank) = discovery
+        let reported = discovery
+            .engine_cache_configs
+            .as_ref()
+            .and_then(|configs| metrics_meta::reported_prefix_hash(configs, worker_url, 0));
+        if discovery
             .hybrid
             .as_ref()
             .and_then(|layout| layout.rank_capability(0))
+            .and_then(|rank| rank.reported_hash_mismatch(reported))
+            .is_some()
         {
-            let reported = discovery
-                .engine_cache_configs
-                .as_ref()
-                .and_then(|configs| metrics_meta::reported_prefix_hash(configs, worker_url, 0));
-            if rank.reported_hash_mismatch(reported).is_some() {
-                self.probe_static_vllm_instance(worker_url, &mut discovery)
-                    .await;
-            }
+            self.probe_static_vllm_instance(worker_url, &mut discovery)
+                .await;
         }
         discovery
     }
@@ -650,9 +650,9 @@ impl KvIndexSupervisor {
 
     async fn probe_static_vllm_instance(&self, worker_url: &str, discovery: &mut WorkerDiscovery) {
         if !self.tracks_vllm_instance(worker_url, discovery)
-            || !self
+            || self
                 .resolved_static_source(worker_url)
-                .is_some_and(|source| !layout_only(&source))
+                .is_none_or(|source| layout_only(&source))
         {
             return;
         }
@@ -671,7 +671,6 @@ impl KvIndexSupervisor {
 
     fn tracks_vllm_instance(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
         self.full_attention_http
-            && !self.http_pd
             && !crate::backend::is_grpc_url(worker_url)
             && split_worker_rank(worker_url).1.is_none()
             && discovery

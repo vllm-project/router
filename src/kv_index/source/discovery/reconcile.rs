@@ -189,11 +189,11 @@ impl KvIndexSupervisor {
                 .lock()
                 .iter()
                 .filter(|(base, lifecycle)| {
-                    if lifecycle.fenced_readmission_due() {
-                        return true;
-                    }
                     lifecycle.layout_rebind_due()
                         && self.resolved_static_source(base).is_none_or(|source| {
+                            if lifecycle.state.lock().fenced_vllm_instance_id.is_some() {
+                                return true;
+                            }
                             super::layout_only(&source)
                                 && source.hybrid.as_ref().is_some_and(|layout| {
                                     layout

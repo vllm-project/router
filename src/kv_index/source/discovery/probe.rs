@@ -81,6 +81,13 @@ impl KvIndexSupervisor {
         let fenced = lifecycle.state.lock().fenced_vllm_instance_id.is_some();
         if fenced {
             self.probe_static_vllm_instance(base, &mut worker).await;
+            let replacement = lifecycle
+                .state
+                .lock()
+                .reported_vllm_restart(worker.server_info.as_ref().ok());
+            if !replacement {
+                return Err("hash-fenced worker has no verified replacement instance".into());
+            }
         }
         if plain_only
             && worker
@@ -119,15 +126,7 @@ impl KvIndexSupervisor {
                     .unwrap_or_default(),
             });
         }
-        let needs_admission = {
-            let state = lifecycle.state.lock();
-            if state.fenced_vllm_instance_id.is_some() {
-                state.reported_vllm_restart(worker.server_info.as_ref().ok())
-            } else {
-                !lifecycle.keeps_descriptor(&state, &descriptor)
-            }
-        };
-        if needs_admission {
+        if fenced || !lifecycle.keeps_descriptor(&lifecycle.state.lock(), &descriptor) {
             self.probe_admission_hashes(base, &mut worker, Some(deadline))
                 .await;
         }

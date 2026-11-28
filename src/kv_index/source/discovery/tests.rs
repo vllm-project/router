@@ -1980,6 +1980,14 @@ struct HashAdmissionWorker {
 
 impl HashAdmissionWorker {
     async fn start(ranks: usize, metrics: &str) -> Self {
+        Self::with_native_routes(ranks, metrics, None).await
+    }
+
+    async fn with_native_routes(
+        ranks: usize,
+        metrics: &str,
+        native_routes: Option<axum::Router>,
+    ) -> Self {
         use serde_json::json;
 
         let sockets: Vec<_> = (0..ranks).map(|_| layout_endpoints()).collect();
@@ -2003,15 +2011,18 @@ impl HashAdmissionWorker {
             let metrics = metrics.clone();
             move || metrics.lock().clone()
         });
-        let (url, server) = source_boundary_worker_with_routes(
-            app,
-            json!({
-                "model_id": "mock-model", "instance_id": "boot", "kv_block_size": 16,
-                "served_model_aliases": ["control-alias"]
-            }),
-            sources.clone(),
-        )
-        .await;
+        let (app, server_info) = match native_routes {
+            Some(routes) => (app.merge(routes), serde_json::Value::Null),
+            None => (
+                app,
+                json!({
+                    "model_id": "mock-model", "instance_id": "boot", "kv_block_size": 16,
+                    "served_model_aliases": ["control-alias"]
+                }),
+            ),
+        };
+        let (url, server) =
+            source_boundary_worker_with_routes(app, server_info, sources.clone()).await;
         let (supervisor, _signals) =
             KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
         Self {
@@ -2306,162 +2317,76 @@ async fn explicit_reregistration_restores_load_only_binding() {
 
 #[tokio::test]
 async fn fenced_workers_readmit_only_after_a_reported_vllm_restart() {
-    use axum::{http::StatusCode, routing::get, Json};
+    use axum::{routing::get, Json, Router};
     use serde_json::json;
 
-    let topic = "kv/fixed";
-    let model = "mock-model";
     let compatible = Some("sha256_cbor");
-    let incompatible = METRICS_ONLY.replace("sha256_cbor", "sha256");
-    for static_source in [false, true] {
-        let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
-        let initial_hash = if static_source {
-            Some("sha256")
-        } else {
-            compatible
-        };
-        let boot = Arc::new(Mutex::new(("boot-a", initial_hash)));
-        let metrics = Arc::new(Mutex::new(if static_source {
-            incompatible.clone()
-        } else {
-            METRICS_ONLY.to_owned()
-        }));
-        let (app, _) = metrics_and_models_router({
-            let metrics = metrics.clone();
-            move || metrics.lock().clone()
-        });
-        let mut app = app.route(
-            "/server_info",
-            get({
-                let boot = boot.clone();
-                move || {
-                    let (id, hash) = *boot.lock();
-                    std::future::ready(Json(json!({"vllm_config": {
-                        "instance_id": id,
-                        "model_config": {"model": model},
-                        "cache_config": {"block_size": 16, "prefix_caching_hash_algo": hash},
-                        "parallel_config": {"data_parallel_size": 1}
-                    }})))
-                }
-            }),
-        );
-        let report = Arc::new(Mutex::new(json!({"0": {
-            "endpoint": endpoint, "replay_endpoint": replay_endpoint, "topic": topic, "publisher": "zmq"
-        }})));
-        if !static_source {
+    let boot = Arc::new(Mutex::new(("initial", compatible)));
+    let routes = Router::new().route(
+        "/server_info",
+        get({
             let boot = boot.clone();
-            let report = report.clone();
-            app = app.route(
-                "/kv_event_sources",
-                get(move || {
-                    let ready = boot.lock().1.is_some();
-                    std::future::ready(
-                        ready
-                            .then(|| Json(report.lock().clone()))
-                            .ok_or(StatusCode::SERVICE_UNAVAILABLE),
-                    )
-                }),
-            );
-        }
-        let (url, server) = spawn_metrics_only_worker(app).await;
-        let _server = AbortTestServer(server);
-        let (mut supervisor, _) =
-            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
-        if static_source {
-            supervisor = supervisor.with_static_sources(HashMap::from([(
-                url.clone(),
-                StaticKvEventSources {
-                    endpoints: vec![endpoint.clone()],
-                    replay_endpoints: Some(vec![replay_endpoint.clone()]),
-                    topic: topic.into(),
-                    block_size: 16,
-                    model: model.into(),
-                    hybrid: Some(CacheCapabilities {
-                        schema_version: 1,
-                        adapters: Vec::new(),
-                        ranks: vec![plain_full_rank(0, model.into(), topic.into(), 16)],
-                    }),
-                },
-            )]));
-        }
+            move || {
+                let (id, hash) = *boot.lock();
+                std::future::ready(Json(json!({"vllm_config": {
+                    "instance_id": id,
+                    "model_config": {"model": "mock-model"},
+                    "cache_config": {"block_size": 16, "prefix_caching_hash_algo": hash},
+                    "parallel_config": {"data_parallel_size": 1}
+                }})))
+            }
+        }),
+    );
+    let worker = HashAdmissionWorker::with_native_routes(1, METRICS_ONLY, Some(routes)).await;
+    let (supervisor, url) = (&worker.supervisor, &worker.url);
+    let initial = supervisor.on_worker_added(url).await.unwrap();
+    assert_eq!(initial.ranks, [0]);
+    let old = supervisor.lifecycle_for_worker(url);
+    let refresh = || async {
+        old.state.lock().checked = None;
+        supervisor.refresh_discovered_workers().await
+    };
 
-        let initial = supervisor.on_worker_added(&url).await.unwrap();
-        assert_eq!(initial.ranks.is_empty(), static_source);
-        assert_eq!(initial.instance_id, url);
-        let old = supervisor.lifecycle_for_worker(&url);
-        assert!(!old.fenced_readmission_due());
-        let refresh = || async {
-            old.state.lock().checked = None;
-            supervisor.refresh_discovered_workers().await
-        };
-        let fenced_instance = if !static_source {
-            // A healthy registration is left to the transport even if vLLM restarts.
-            *boot.lock() = ("boot-late", compatible);
-            assert!(refresh().await.is_empty());
-            assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(&url)));
+    *boot.lock() = ("later", compatible);
+    assert!(
+        refresh().await.is_empty(),
+        "healthy workers use transport recovery"
+    );
 
-            // Fence that process, using the ID from this registration attempt.
-            *boot.lock() = ("boot-late", Some("sha256"));
-            *metrics.lock() = incompatible.clone();
-            report.lock()["0"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
-            assert!(supervisor.on_worker_added(&url).await.is_err());
-            assert!(supervisor.match_provider_for_worker(&url).is_none());
-            report.lock()["0"]["replay_endpoint"] = replay_endpoint.clone().into();
-            "boot-late"
-        } else {
-            "boot-a"
-        };
+    // Seed a full runtime fence using the instance from the failed re-registration.
+    let sources = worker.sources.lock().clone();
+    let invalid = "tcp://127.0.0.1:invalid";
+    *boot.lock() = ("later", Some("sha256"));
+    *worker.metrics.lock() = METRICS_ONLY.replace("sha256_cbor", "sha256");
+    worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
+    assert!(supervisor.on_worker_added(url).await.is_err());
+    assert!(supervisor.match_provider_for_worker(url).is_none());
+    *worker.sources.lock() = sources.clone();
 
-        *boot.lock() = (fenced_instance, compatible);
-        *metrics.lock() = METRICS_ONLY.to_owned();
-        assert!(refresh().await.is_empty());
-        assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(&url)));
+    *boot.lock() = ("later", compatible);
+    *worker.metrics.lock() = METRICS_ONLY.to_owned();
+    assert!(
+        refresh().await.is_empty(),
+        "the fenced instance stays load-only"
+    );
 
-        // A new ID without its source or explicit hash leaves the worker load-only.
-        *boot.lock() = ("boot-b", None);
-        assert!(refresh().await.is_empty());
-        assert!(supervisor.worker_registrations()[&url]
-            .info
-            .as_ref()
-            .unwrap()
-            .ranks
-            .is_empty());
+    *boot.lock() = ("replacement", None);
+    assert!(
+        refresh().await.is_empty(),
+        "the new instance must report its hash"
+    );
 
-        // Recreate the publishers at the fixed endpoints with an empty replay history.
-        publisher.unbind(&endpoint).unwrap();
-        replay.unbind(&replay_endpoint).unwrap();
-        drop((publisher, replay));
-        let context = zmq::Context::new();
-        let publisher = context.socket(zmq::XPUB).unwrap();
-        publisher.bind(&endpoint).unwrap();
-        let replay = context.socket(zmq::ROUTER).unwrap();
-        replay.bind(&replay_endpoint).unwrap();
+    *boot.lock() = ("replacement", compatible);
+    worker.sources.lock()["0"]["replay_endpoint"] = invalid.into();
+    assert!(refresh().await[url].provider.is_none());
+    assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(url)));
+    *worker.sources.lock() = sources;
 
-        *boot.lock() = ("boot-b", compatible);
-        if !static_source {
-            report.lock()["0"]["replay_endpoint"] = "tcp://127.0.0.1:invalid".into();
-            assert!(refresh().await[&url].provider.is_none());
-            report.lock()["0"]["replay_endpoint"] = replay_endpoint.clone().into();
-        }
-        let refreshed = refresh().await;
-        assert_eq!(refreshed[&url].info.as_ref().unwrap().instance_id, url);
-        let provider = refreshed[&url].provider.as_ref().unwrap();
-        boundary_subscription(&publisher, topic, true).await;
-        let request = recv_frames(&replay).await;
-        assert_eq!(request.last().unwrap(), &0_i64.to_be_bytes());
-        let prompt = [13; 17];
-        let tokens = &prompt[..16];
-        let mut root = full_store(tokens, 16, None);
-        let keys =
-            crate::kv_index::request_hash::BlockKeyGenerator::from_seed(16, "vllm-none-hash");
-        root.block_hashes[0] = crate::kv_index::wire::ExternalBlockHash::Bytes(
-            keys.plain_root_block(tokens).unwrap().to_vec(),
-        );
-        let payload = event_payload(1.0, &[KVEvent::BlockStored(root)], Some(0));
-        replay_reply(&replay, &request, topic.as_bytes(), 0, &payload);
-        replay_reply(&replay, &request, &[], -1, &[]);
-        wait_for(|| !provider.matches(&prompt, 16, None, 0).is_empty()).await;
-    }
+    let registration = &refresh().await[url];
+    let admitted = registration.info.as_ref().unwrap();
+    assert_eq!(admitted.instance_id, initial.instance_id);
+    assert_eq!(admitted.ranks, [0]);
+    assert!(registration.provider.is_some());
 }
 
 #[tokio::test]

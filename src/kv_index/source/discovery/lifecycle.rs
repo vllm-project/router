@@ -181,24 +181,18 @@ impl WorkerLifecycle {
         })
     }
 
-    pub(super) fn fenced_readmission_due(&self) -> bool {
-        let state = self.state.lock();
-        state.fenced_vllm_instance_id.is_some()
-            && state
-                .checked
-                .is_none_or(|checked| checked.elapsed() >= REFRESH_INTERVAL)
-    }
-
     pub(super) fn layout_rebind_due(&self) -> bool {
-        if !self.layout {
-            return false;
-        }
         let state = self.state.lock();
-        state.fenced_vllm_instance_id.is_none()
-            && !state.trusted
-            && state
-                .checked
-                .is_none_or(|checked| checked.elapsed() >= CONTROL_TIMEOUT)
+        let interval = if state.fenced_vllm_instance_id.is_some() {
+            REFRESH_INTERVAL
+        } else if self.layout && !state.trusted {
+            CONTROL_TIMEOUT
+        } else {
+            return false;
+        };
+        state
+            .checked
+            .is_none_or(|checked| checked.elapsed() >= interval)
     }
 
     pub(super) fn keeps_descriptor(
@@ -310,10 +304,10 @@ impl LayoutWorkerProvider {
         worker: &str,
         configs: &EngineCacheConfigs,
         vllm_instance_id: Option<String>,
-    ) -> bool {
+    ) {
         let mut state = self.lifecycle.state.lock();
         let Some(layout) = state.descriptor.as_ref().and_then(WorkerDescriptor::layout) else {
-            return false;
+            return;
         };
         let mut fenced = Vec::new();
         for (&rank, index) in &self.indexes {
@@ -337,7 +331,6 @@ impl LayoutWorkerProvider {
             lease.fence_hash();
             fenced.push((rank, index, lease));
         }
-        let mut retire = false;
         if let Some(info) = &mut state.info {
             info.ranks
                 .retain(|rank| !fenced.iter().any(|(fenced, _, _)| fenced == rank));
@@ -349,7 +342,6 @@ impl LayoutWorkerProvider {
                 if vllm_instance_id.is_some() {
                     info.cache_key = None;
                     state.fenced_vllm_instance_id = vllm_instance_id;
-                    retire = true;
                 }
             }
         }
@@ -358,7 +350,6 @@ impl LayoutWorkerProvider {
             let _guard = lease.gate.lock();
             index.invalidate();
         }
-        retire
     }
 }
 
@@ -418,15 +409,18 @@ impl KvIndexSupervisor {
         configs: &EngineCacheConfigs,
         vllm_instance_id: Option<String>,
     ) {
-        let mut workers = self.installed.workers.lock();
-        if workers.get(worker_url).is_some_and(|previous| {
-            Arc::ptr_eq(&previous.provider.lifecycle, observed)
-                && previous
-                    .provider
-                    .fence_runtime_hashes(worker_url, configs, vllm_instance_id)
-        }) {
-            self.installed
-                .retire_worker(workers.remove(worker_url).unwrap());
+        let workers = self.installed.workers.lock();
+        if let Some(previous) = workers
+            .get(worker_url)
+            .filter(|previous| Arc::ptr_eq(&previous.provider.lifecycle, observed))
+        {
+            previous
+                .provider
+                .fence_runtime_hashes(worker_url, configs, vllm_instance_id);
+            if observed.state.lock().fenced_vllm_instance_id.is_some() {
+                drop(workers);
+                self.installed.retire_if_current(worker_url, observed);
+            }
         }
     }
 
