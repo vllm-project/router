@@ -121,6 +121,16 @@ before it publishes a result. Every metric needs finite, nonnegative mean,
 p50, p95, and p99 values. A known sample count must be positive. Precomputed
 JCT aggregates with an unknown count (`n: null`) remain supported. Failed
 measurement checks are recorded in `missing_latency_metrics` and fail the cell.
+TTFT requires one valid sample per successful request. TPOT requires one valid
+sample per successful request with more than one output token; its expected
+count includes requests with missing or invalid timing fields. Individual timing
+values must be numeric, finite, nonnegative, and TPOT also requires latency to be
+at least TTFT. Zero timings are valid. `latency_coverage` records `expected` and
+`actual` sample counts for both metrics. Incomplete coverage sets `ok=false`,
+records the affected metrics in `incomplete_latency_metrics`, and prevents
+dashboard publication. The console diagnostic includes each actual/expected
+count; `calibration.json` retains the available samples for diagnosis. These
+are measurement-completeness checks with no performance thresholds.
 These checks apply to both merged and disaggregated cells. A replay with all
 requests successful still fails if no valid TPOT samples remain (for example,
 all outputs have at most one token) or JCT durations are unavailable. Its

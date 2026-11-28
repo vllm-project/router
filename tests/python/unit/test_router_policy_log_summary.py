@@ -78,6 +78,11 @@ def test_calibration_counts_filtered_samples(summary_module, tmp_path, monkeypat
     assert stats["ttft_s"]["mean"] == pytest.approx(0.15)
     assert stats["tpot_ms"]["mean"] == pytest.approx(200)
     assert stats["jct_s"]["mean"] == pytest.approx(1.5)
+    assert stats["latency_coverage"] == {
+        "ttft_s": {"expected": 3, "actual": 2},
+        "tpot_ms": {"expected": 2, "actual": 1},
+    }
+    assert stats["incomplete_latency_metrics"] == ["ttft_s", "tpot_ms"]
 
 
 def test_empty_samples(summary_module, calibration_run):
@@ -205,6 +210,186 @@ def test_invalid_measurements_fail_before_publication(
         in capsys.readouterr().out
     )
     assert not list((run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "prefill_count,task_num,request_count",
+    [(0, 8, 28), (2, 12, 144)],
+    ids=["pd_merge", "pd_disagg"],
+)
+@pytest.mark.parametrize("missing_field", ["ttft_seconds", "latency_seconds"])
+def test_incomplete_timing_coverage_blocks_publication(
+    summary_module,
+    calibration_run,
+    prefill_count,
+    task_num,
+    request_count,
+    missing_field,
+    capsys,
+):
+    run = calibration_run
+    run.case.prefill_count = prefill_count
+    run.case.task_num = run.case.concurrency = task_num
+    run.case.policy = "cache_aware"
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    run.case.scenario = f"{prefix}_cache_aware"
+    rows = []
+    for index in range(request_count):
+        row = dict(
+            request_id=f"request-{index}",
+            session_id=f"session-{index % task_num}",
+            status="success",
+            ttft_seconds=0.1,
+            latency_seconds=0.5,
+            output_tokens=3,
+            duration_seconds=1.0,
+        )
+        if index:
+            row[missing_field] = None
+        rows.append(row)
+    (run.out / "result/requests.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        summary_module.write_calibration(
+            run,
+            replay_validator=accepted_replay,
+            result_dir=run.out / "result",
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
+        )
+
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["ok"] is False
+    assert stats["requests"] == stats["success"] == request_count
+    expected_ttft = 1 if missing_field == "ttft_seconds" else request_count
+    assert stats["latency_coverage"] == {
+        "ttft_s": {"expected": request_count, "actual": expected_ttft},
+        "tpot_ms": {"expected": request_count, "actual": 1},
+    }
+    assert stats["ttft_s"]["n"] == expected_ttft
+    assert stats["tpot_ms"]["n"] == 1
+    assert "tpot_ms" in stats["incomplete_latency_metrics"]
+    assert "missing_latency_metrics" not in stats
+    assert f"tpot_ms=1/{request_count}" in capsys.readouterr().out
+    assert not list((run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ttft_seconds", float("nan")),
+        ("latency_seconds", float("inf")),
+        ("ttft_seconds", -0.1),
+        ("latency_seconds", 0.01),
+        ("ttft_seconds", True),
+        ("latency_seconds", "invalid"),
+    ],
+    ids=["nan", "infinity", "negative", "latency_before_ttft", "boolean", "text"],
+)
+def test_invalid_timing_samples_cannot_satisfy_coverage(
+    summary_module, calibration_run, prefill_count, field, value
+):
+    run = calibration_run
+    run.case.prefill_count = prefill_count
+    run.case.policy = "cache_aware"
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    run.case.scenario = f"{prefix}_cache_aware"
+    rows = [
+        dict(
+            request_id=f"request-{index}",
+            session_id="session-0",
+            status="success",
+            ttft_seconds=0.1,
+            latency_seconds=0.5,
+            output_tokens=3,
+            duration_seconds=1.0,
+        )
+        for index in range(3)
+    ]
+    rows[-1][field] = value
+    (run.out / "result/requests.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        summary_module.write_calibration(
+            run,
+            replay_validator=accepted_replay,
+            result_dir=run.out / "result",
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
+        )
+
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["requests"] == stats["success"] == 3
+    assert stats["latency_coverage"]["tpot_ms"] == {"expected": 3, "actual": 2}
+    assert stats["tpot_ms"]["n"] == 2
+    assert not list((run.out / "published").rglob("*.json"))
+
+
+@pytest.mark.parametrize("prefill_count", [0, 2], ids=["pd_merge", "pd_disagg"])
+@pytest.mark.parametrize("include_failed", [False, True])
+def test_coverage_counts_eligible_successes_and_publishes_complete_metrics(
+    summary_module, calibration_run, prefill_count, include_failed
+):
+    run = calibration_run
+    run.case.prefill_count = prefill_count
+    run.case.policy = "cache_aware"
+    prefix = "pd_disagg" if prefill_count else "pd_merge"
+    run.case.scenario = f"{prefix}_cache_aware"
+    rows = [
+        dict(
+            request_id=f"request-{index}",
+            session_id="session-0",
+            status="success",
+            ttft_seconds=0.0,
+            latency_seconds=None if output <= 1 else 0.0,
+            output_tokens=output,
+            duration_seconds=1.0,
+        )
+        for index, output in enumerate((0, 1, 3, 5))
+    ]
+    if include_failed:
+        rows.append(dict(status="error", output_tokens=3))
+    (run.out / "result/requests.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    def calibrate():
+        summary_module.write_calibration(
+            run,
+            replay_validator=accepted_replay,
+            result_dir=run.out / "result",
+            replay_rc=0,
+            wall_seconds=1,
+            stalled=False,
+        )
+
+    if include_failed:
+        with pytest.raises(SystemExit, match="1"):
+            calibrate()
+    else:
+        calibrate()
+
+    stats = json.loads((run.out / "calibration.json").read_text(encoding="utf-8"))
+    assert stats["success"] == 4
+    assert stats["ok"] is (not include_failed)
+    assert stats["latency_coverage"] == {
+        "ttft_s": {"expected": 4, "actual": 4},
+        "tpot_ms": {"expected": 2, "actual": 2},
+    }
+    assert "incomplete_latency_metrics" not in stats
+    assert stats["ttft_s"]["n"] == 4
+    assert stats["tpot_ms"]["n"] == 2
+    published = list((run.out / "published").rglob("*.json"))
+    assert len(published) == (0 if include_failed else 1)
+    if published:
+        assert published[0].read_bytes() == (run.out / "calibration.json").read_bytes()
 
 
 @pytest.mark.parametrize("topology", ["pd_merged", "pd_disaggregated"])

@@ -119,6 +119,16 @@ def emit_run_summary(
                     + ", ".join(stats["missing_latency_metrics"]),
                     flush=True,
                 )
+            elif stats.get("incomplete_latency_metrics"):
+                coverage = stats["latency_coverage"]
+                print(
+                    "DIAGNOSTIC incomplete latency measurements: "
+                    + ", ".join(
+                        f"{metric}={coverage[metric]['actual']}/{coverage[metric]['expected']}"
+                        for metric in stats["incomplete_latency_metrics"]
+                    ),
+                    flush=True,
+                )
             elif stats.get("replay_validation", {}).get("errors"):
                 for error in stats["replay_validation"]["errors"]:
                     print(f"DIAGNOSTIC replay completeness: {error}", flush=True)
@@ -374,6 +384,10 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _valid_latency(value: Any) -> bool:
+    return _is_number(value) and math.isfinite(value) and value >= 0
+
+
 def _collect_duration_samples(node: Any, found: list[float]) -> None:
     """Collect numeric ``duration_seconds`` fields. Skip percentile objects."""
 
@@ -479,18 +493,27 @@ def write_calibration(
         else []
     )
     ok = [r for r in rows if r.get("status") == "success"]
-    ttft = [float(r["ttft_seconds"]) for r in ok if r.get("ttft_seconds") is not None]
-    lat = [r["latency_seconds"] for r in ok if r.get("latency_seconds") is not None]
-    # TPOT ms/token: 1000 * (latency - ttft) / (output_tokens - 1); drop out <= 1.
-    tpot_ms = [
-        1000.0
-        * (float(r["latency_seconds"]) - float(r["ttft_seconds"]))
-        / (int(r["output_tokens"]) - 1)
-        for r in ok
-        if r.get("ttft_seconds") is not None
-        and r.get("latency_seconds") is not None
-        and (r.get("output_tokens") or 0) > 1
-    ]
+    ttft: list[float] = []
+    lat: list[float] = []
+    tpot_ms: list[float] = []
+    expected_tpot = 0
+    for row in ok:
+        first_token, latency = row.get("ttft_seconds"), row.get("latency_seconds")
+        valid_ttft, valid_latency = _valid_latency(first_token), _valid_latency(latency)
+        if valid_ttft:
+            ttft.append(float(first_token))
+        if valid_latency:
+            lat.append(float(latency))
+        output = row.get("output_tokens") or 0
+        if output <= 1:
+            continue
+        # The denominator includes every successful multi-token request,
+        # even when its timing fields are absent or invalid.
+        expected_tpot += 1
+        if valid_ttft and valid_latency and latency >= first_token:
+            sample = 1000.0 * (float(latency) - float(first_token)) / (output - 1)
+            if math.isfinite(sample):
+                tpot_ms.append(sample)
     output_tokens = sum(r.get("output_tokens") or 0 for r in ok)
     makespan = _makespan_seconds(ok)
     stats = {
@@ -514,6 +537,10 @@ def write_calibration(
             "max": max(ttft) if ttft else None,
         },
         "tpot_ms": _quantiles(tpot_ms),
+        "latency_coverage": {
+            "ttft_s": {"expected": len(ok), "actual": len(ttft)},
+            "tpot_ms": {"expected": expected_tpot, "actual": len(tpot_ms)},
+        },
         "jct_s": _jct_quantiles(result_dir, ok),
         "latency_s": {
             "mean": statistics.mean(lat) if lat else None,
@@ -566,6 +593,14 @@ def write_calibration(
     if missing_metrics:
         stats["ok"] = False
         stats["missing_latency_metrics"] = missing_metrics
+    incomplete_metrics = [
+        metric
+        for metric, coverage in stats["latency_coverage"].items()
+        if coverage["actual"] != coverage["expected"]
+    ]
+    if incomplete_metrics:
+        stats["ok"] = False
+        stats["incomplete_latency_metrics"] = incomplete_metrics
     if stats["router_policy_checks"]["errors"]:
         stats["ok"] = False
     if stats["replay_validation"]["errors"]:
