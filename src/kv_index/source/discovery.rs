@@ -50,6 +50,13 @@ pub struct CacheKey {
     pub block_size: u32,
 }
 
+/// A boot observation from stock vLLM's single-rank HTTP frontend.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VllmBoot {
+    id: String,
+    prefix_hash: Option<String>,
+}
+
 /// Worker metadata used when constructing a KV cache identity.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ServerInfo {
@@ -76,6 +83,8 @@ pub struct ServerInfo {
     /// Engine revision used to interpret versioned cache lookup rules.
     #[serde(skip)]
     pub(crate) vllm_version: Option<(u32, u32)>,
+    #[serde(skip)]
+    pub(crate) vllm_boot: Option<VllmBoot>,
     /// `--served-model-name` aliases, so the router can tell a base-model alias
     /// from a LoRA adapter selected through the request's `model`.
     #[serde(default)]
@@ -510,9 +519,28 @@ impl KvIndexSupervisor {
                 if discovery.sources.is_err() {
                     return discovery;
                 }
-                if let Err((probe, reason)) =
-                    self.verify_static_source(worker_url, &discovery).await
-                {
+                let (verified, boot) =
+                    tokio::join!(self.verify_static_source(worker_url, &discovery), async {
+                        if !self.tracks_vllm_boot(worker_url, &discovery) {
+                            return None;
+                        }
+                        tokio::time::timeout(
+                            CONTROL_TIMEOUT,
+                            probe::query_server_info_json(
+                                &self.client,
+                                worker_url,
+                                self.api_key.as_deref(),
+                            ),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|info| info.vllm_boot)
+                    });
+                if let Ok(info) = &mut discovery.server_info {
+                    info.vllm_boot = boot;
+                }
+                if let Err((probe, reason)) = verified {
                     discovery.sources = Err(SourcesUnavailable {
                         probe,
                         detail: reason.into(),
@@ -551,6 +579,13 @@ impl KvIndexSupervisor {
                 discovery
             }
         };
+        if !self.supports_vllm_boot(worker_url)
+            || (discovery.hybrid.is_some() && !self.tracks_vllm_boot(worker_url, &discovery))
+        {
+            if let Ok(info) = &mut discovery.server_info {
+                info.vllm_boot = None;
+            }
+        }
         let Some(layout) = discovery.hybrid.as_ref() else {
             return discovery;
         };
@@ -614,6 +649,25 @@ impl KvIndexSupervisor {
             }
         }
         discovery
+    }
+
+    fn supports_vllm_boot(&self, worker_url: &str) -> bool {
+        self.full_attention_http
+            && !self.http_pd
+            && !crate::backend::is_grpc_url(worker_url)
+            && split_worker_rank(worker_url).1.is_none()
+    }
+
+    fn tracks_vllm_boot(&self, worker_url: &str, discovery: &WorkerDiscovery) -> bool {
+        self.supports_vllm_boot(worker_url)
+            && discovery
+                .hybrid
+                .as_ref()
+                .is_some_and(|layout| layout.ranks.len() == 1)
+            && discovery
+                .sources
+                .as_ref()
+                .is_ok_and(|sources| sources.len() == 1 && sources.contains_key("0"))
     }
 
     async fn discover_declared_layout(

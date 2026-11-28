@@ -190,15 +190,16 @@ impl KvIndexSupervisor {
                 .iter()
                 .filter(|(base, lifecycle)| {
                     lifecycle.layout_rebind_due()
-                        && self.resolved_static_source(base).is_none_or(|source| {
-                            super::layout_only(&source)
-                                && source.hybrid.as_ref().is_some_and(|layout| {
-                                    layout
-                                        .ranks
-                                        .iter()
-                                        .any(|rank| rank.publisher_topic.is_none())
-                                })
-                        })
+                        && (lifecycle.state.lock().vllm_boot_id().is_some()
+                            || self.resolved_static_source(base).is_none_or(|source| {
+                                super::layout_only(&source)
+                                    && source.hybrid.as_ref().is_some_and(|layout| {
+                                        layout
+                                            .ranks
+                                            .iter()
+                                            .any(|rank| rank.publisher_topic.is_none())
+                                    })
+                            }))
                 })
                 .map(|(base, lifecycle)| {
                     (
@@ -260,11 +261,15 @@ impl KvIndexSupervisor {
             {
                 continue;
             }
-            let action =
-                lifecycle.observe_descriptor(probe.as_ref().map(|probe| &probe.descriptor));
+            let descriptor = probe.as_ref().and_then(|probe| probe.descriptor.as_ref());
+            let boot = probe
+                .as_ref()
+                .and_then(|probe| probe.worker.server_info.as_ref().ok())
+                .and_then(|info| info.vllm_boot.as_ref());
+            let action = lifecycle.observe_descriptor(descriptor, boot);
             match action {
                 SourceAction::Keep => {
-                    if let Some(probe) = probe {
+                    if let Some(probe) = probe.filter(|probe| probe.descriptor.is_some()) {
                         lifecycle.state.lock().base_models =
                             probe.worker.base_models.unwrap_or_default();
                     }

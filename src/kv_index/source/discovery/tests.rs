@@ -93,7 +93,7 @@ fn changed_layout_rebinds_without_waiting_for_the_descriptor_interval() {
     assert!(lifecycle.layout_rebind_due());
     assert!(lifecycle.refresh_due());
 
-    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
+    assert_eq!(lifecycle.observe_descriptor(None, None), SourceAction::Keep);
     assert!(!lifecycle.layout_rebind_due());
     assert!(!lifecycle.refresh_due());
 }
@@ -156,7 +156,7 @@ async fn registration_probe_reuses_aliases_until_the_worker_changes() {
     {
         let mut state = lifecycle.state.lock();
         state.info = Some(WorkerKvInfo::default());
-        state.descriptor = Some(first.descriptor);
+        state.descriptor = first.descriptor;
         state.base_models = first.worker.base_models.unwrap();
     }
     let repeated = probe().await.unwrap();
@@ -2363,6 +2363,164 @@ async fn fully_fenced_worker_rebinds_only_replacement_publishers() {
 }
 
 #[tokio::test]
+async fn fixed_publishers_rebind_after_a_verified_vllm_restart() {
+    use axum::{http::StatusCode, routing::get, Json};
+    use serde_json::json;
+
+    let topic = "kv/fixed";
+    for (static_source, initial_hash) in [(false, "sha256_cbor"), (true, "sha256")] {
+        let (endpoint, replay_endpoint, publisher, replay) = layout_endpoints();
+        let metadata = |id, hash| {
+            json!({"vllm_config": {
+                "instance_id": id,
+                "cache_config": {"block_size": 16, "prefix_caching_hash_algo": hash},
+                "model_config": {"model": "mock-model"},
+                "parallel_config": {"data_parallel_size": 1}
+            }})
+        };
+        let info = Arc::new(Mutex::new(metadata("boot-a", Some(initial_hash))));
+        let metrics = Arc::new(Mutex::new(
+            METRICS_ONLY.replace("sha256_cbor", initial_hash),
+        ));
+        let (app, _) = metrics_and_models_router({
+            let metrics = metrics.clone();
+            move || metrics.lock().clone()
+        });
+        let app = app.route(
+            "/server_info",
+            get({
+                let info = info.clone();
+                move || std::future::ready(Json(info.lock().clone()))
+            }),
+        );
+        let sources_healthy = Arc::new(AtomicBool::new(true));
+        let app = if static_source {
+            app
+        } else {
+            let report = json!({"0": {
+                "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                "topic": topic, "publisher": "zmq"
+            }});
+            let sources_healthy = sources_healthy.clone();
+            app.route(
+                "/kv_event_sources",
+                get(move || {
+                    let report = report.clone();
+                    let ok = sources_healthy.load(Ordering::Relaxed);
+                    async move {
+                        ok.then_some(Json(report))
+                            .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+                    }
+                }),
+            )
+        };
+        let (url, server) = spawn_metrics_only_worker(app).await;
+        let _server = AbortTestServer(server);
+        let (mut supervisor, _) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new());
+        if static_source {
+            supervisor = supervisor.with_static_sources(HashMap::from([(
+                url.clone(),
+                StaticKvEventSources {
+                    endpoints: vec![endpoint.clone()],
+                    replay_endpoints: Some(vec![replay_endpoint.clone()]),
+                    topic: topic.into(),
+                    block_size: 16,
+                    model: "mock-model".into(),
+                    hybrid: Some(CacheCapabilities {
+                        schema_version: 1,
+                        adapters: Vec::new(),
+                        ranks: vec![plain_full_rank(0, "mock-model".into(), topic.into(), 16)],
+                    }),
+                },
+            )]));
+        }
+
+        let record = supervisor.on_worker_added(&url).await.unwrap();
+        assert_eq!(record.ranks.is_empty(), static_source);
+        let old = supervisor.lifecycle_for_worker(&url);
+        assert_eq!(old.state.lock().vllm_boot_id(), Some("boot-a"));
+        assert!(!old.layout_rebind_due());
+        let refresh = || async {
+            old.state.lock().checked = None;
+            assert!(old.layout_rebind_due());
+            supervisor.refresh_discovered_workers().await
+        };
+        let payload = |prompt: &[u32]| {
+            let tokens = &prompt[..16];
+            let mut root = full_store(tokens, 16, None);
+            let keys =
+                crate::kv_index::request_hash::BlockKeyGenerator::from_seed(16, "vllm-none-hash");
+            root.block_hashes[0] = crate::kv_index::wire::ExternalBlockHash::Bytes(
+                keys.plain_root_block(tokens).unwrap().to_vec(),
+            );
+            event_payload(1.0, &[KVEvent::BlockStored(root)], Some(0))
+        };
+        let old_prompt = [7; 17];
+        let old_provider = supervisor.match_provider_for_worker(&url);
+        if let Some(provider) = &old_provider {
+            boundary_subscription(&publisher, topic, true).await;
+            finish_empty_startup_replay(&replay).await;
+            live_frame(&publisher, topic.as_bytes(), 0, &payload(&old_prompt));
+            wait_for(|| !provider.matches(&old_prompt, 16, None, 0).is_empty()).await;
+        }
+
+        *info.lock() = metadata("boot-a", Some("sha256_cbor"));
+        *metrics.lock() = METRICS_ONLY.to_owned();
+        old.state.lock().trusted = false;
+        assert!(refresh().await.is_empty());
+        assert!(Arc::ptr_eq(&old, &supervisor.lifecycle_for_worker(&url)));
+        assert_eq!(
+            supervisor.match_provider_for_worker(&url).is_none(),
+            static_source
+        );
+
+        // A new boot invalidates the old provider even when admission has to wait
+        // for its source report or an explicit compatible prefix hash.
+        if !static_source {
+            sources_healthy.store(false, Ordering::Relaxed);
+        }
+        *info.lock() = metadata("boot-b", (!static_source).then_some("sha256_cbor"));
+        assert!(refresh().await[&url].provider.is_none());
+        if let Some(provider) = &old_provider {
+            assert!(provider.matches(&old_prompt, 16, None, 0).is_empty());
+        }
+
+        // Replace the publisher's sockets as in a real restart. The endpoints
+        // stay fixed, but queued messages and replay history are newly created.
+        publisher.unbind(&endpoint).unwrap();
+        replay.unbind(&replay_endpoint).unwrap();
+        drop((publisher, replay));
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        let replay = context.socket(zmq::ROUTER).unwrap();
+        publisher.bind(&endpoint).unwrap();
+        replay.bind(&replay_endpoint).unwrap();
+
+        sources_healthy.store(true, Ordering::Relaxed);
+        *info.lock() = metadata("boot-b", Some("sha256_cbor"));
+        let refreshed = refresh().await;
+        let provider = refreshed[&url].provider.as_ref().unwrap();
+        assert_ne!(refreshed[&url].revision, old.state.lock().revision);
+        assert!(provider.matches(&old_prompt, 16, None, 0).is_empty());
+        boundary_subscription(&publisher, topic, true).await;
+        let request = recv_frames(&replay).await;
+        assert_eq!(request.last().unwrap(), &0_i64.to_be_bytes());
+        let new_prompt = [13; 17];
+        replay_reply(
+            &replay,
+            &request,
+            topic.as_bytes(),
+            0,
+            &payload(&new_prompt),
+        );
+        replay_reply(&replay, &request, &[], -1, &[]);
+        wait_for(|| !provider.matches(&new_prompt, 16, None, 0).is_empty()).await;
+        assert!(provider.matches(&old_prompt, 16, None, 0).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn metrics_only_worker_supplies_cache_metadata() {
     let metrics = "vllm:cache_config_info{engine=\"0\"} 1.0\n\
         vllm:cache_config_info{block_size=\"8\",effective_attention_block_size=\"16\",engine=\"1\"} 1.0\n";
@@ -2541,7 +2699,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
             Some(descriptor("initial")),
         );
         lifecycle.state.lock().info = installed.then(WorkerKvInfo::default);
-        assert_eq!(lifecycle.observe_descriptor(signature), expected);
+        assert_eq!(lifecycle.observe_descriptor(signature, None), expected);
     }
     let lifecycle = WorkerLifecycle::new(
         Arc::new(AtomicBool::new(true)),
@@ -2550,10 +2708,10 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     );
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     for failures in 1..MAX_PROBE_FAILURES {
-        assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Keep);
+        assert_eq!(lifecycle.observe_descriptor(None, None), SourceAction::Keep);
         assert_eq!(lifecycle.state.lock().probe_failures, failures);
     }
-    assert_eq!(lifecycle.observe_descriptor(None), SourceAction::Stop);
+    assert_eq!(lifecycle.observe_descriptor(None, None), SourceAction::Stop);
     assert!(lifecycle.state.lock().info.is_none());
 
     let lifecycle = WorkerLifecycle::new(
@@ -2564,7 +2722,7 @@ fn descriptor_refresh_covers_identity_changes_and_failure_threshold() {
     lifecycle.state.lock().info = Some(WorkerKvInfo::default());
     lifecycle.state.lock().trusted = false;
     assert_eq!(
-        lifecycle.observe_descriptor(Some(&initial)),
+        lifecycle.observe_descriptor(Some(&initial), None),
         SourceAction::Rebuild
     );
 }

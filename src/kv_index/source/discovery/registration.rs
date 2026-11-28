@@ -197,6 +197,14 @@ impl KvIndexSupervisor {
         let nixl_truncates_replay = server_info
             .vllm_version
             .is_none_or(|version| version >= (0, 32));
+        let boot = server_info.vllm_boot.as_ref();
+        if expected_lifecycle
+            .as_ref()
+            .is_some_and(|old| old.vllm_restarted(boot))
+            && boot.and_then(|boot| boot.prefix_hash.as_deref()).is_none()
+        {
+            return Err("restarted vLLM worker did not explicitly report its prefix hash".into());
+        }
         let mut bindings = HashMap::new();
         let reported_ranks = event_sources.len();
         let mut incompatible_ranks = 0;
@@ -206,9 +214,12 @@ impl KvIndexSupervisor {
                 .engine_cache_configs
                 .as_ref()
                 .and_then(|configs| reported_prefix_hash(configs, worker_url, rank));
-            if let Some((expected, reported)) = capability
-                .rank_capability(rank)
-                .and_then(|contract| contract.reported_hash_mismatch(reported))
+            if let Some((expected, reported)) =
+                capability.rank_capability(rank).and_then(|contract| {
+                    [reported, boot.and_then(|boot| boot.prefix_hash.as_deref())]
+                        .into_iter()
+                        .find_map(|report| contract.reported_hash_mismatch(report))
+                })
             {
                 warn!(
                     worker_url,

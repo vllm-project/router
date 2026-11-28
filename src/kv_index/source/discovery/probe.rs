@@ -14,7 +14,7 @@ use super::metrics_meta::EngineCacheConfigs;
 use super::{
     discovered_block_size, events_enabled, metrics_meta, split_worker_rank, CacheCapabilities,
     KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, ServerInfo, SourcesProbe,
-    SourcesUnavailable, WorkerDiscovery, CONTROL_TIMEOUT,
+    SourcesUnavailable, VllmBoot, WorkerDiscovery, CONTROL_TIMEOUT,
 };
 use crate::backend::control::control_channel;
 use crate::backend::pb::{GetKvEventSourcesRequest, KvEventSource};
@@ -22,13 +22,14 @@ use crate::core::worker::{worker_get, UNLABELED_WORKER_MODEL_ID};
 use crate::core::Worker;
 
 pub(super) struct RegistrationProbe {
-    pub(super) descriptor: WorkerDescriptor,
+    pub(super) descriptor: Option<WorkerDescriptor>,
     pub(super) worker: WorkerDiscovery,
 }
 
 #[derive(PartialEq)]
 pub(super) struct WorkerDescriptor {
     server_info: ServerInfo,
+    pub(super) vllm_boot_id: Option<String>,
     sources: Option<KvEventSourcesResponse>,
     model_id: Result<Option<String>, String>,
     hybrid: Option<CacheCapabilities>,
@@ -53,7 +54,8 @@ impl WorkerDescriptor {
 }
 
 pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescriptor, String> {
-    let server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
+    let mut server_info = worker.server_info.as_ref().map_err(Clone::clone)?.clone();
+    let vllm_boot_id = server_info.vllm_boot.take().map(|boot| boot.id);
     let sources = match &worker.sources {
         Ok(sources) => Some(sources.clone()),
         Err(unavailable) if !unavailable.probe.retryable() => None,
@@ -61,6 +63,7 @@ pub(super) fn worker_descriptor(worker: &WorkerDiscovery) -> Result<WorkerDescri
     };
     Ok(WorkerDescriptor {
         server_info,
+        vllm_boot_id,
         sources,
         model_id: worker.model_id.clone(),
         hybrid: worker.hybrid.clone(),
@@ -91,7 +94,25 @@ impl KvIndexSupervisor {
             );
             worker.hybrid = None;
         }
-        let mut descriptor = worker_descriptor(&worker)?;
+        let mut descriptor = match worker_descriptor(&worker) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                if lifecycle.vllm_restarted(
+                    worker
+                        .server_info
+                        .as_ref()
+                        .ok()
+                        .and_then(|info| info.vllm_boot.as_ref()),
+                ) {
+                    // Preserve a confirmed restart even when source discovery failed.
+                    return Ok(RegistrationProbe {
+                        descriptor: None,
+                        worker,
+                    });
+                }
+                return Err(error);
+            }
+        };
         descriptor.connector = connector;
         if worker.base_models.is_none() {
             let cached = {
@@ -120,7 +141,10 @@ impl KvIndexSupervisor {
             self.probe_admission_hashes(base, &mut worker, Some(deadline))
                 .await;
         }
-        Ok(RegistrationProbe { descriptor, worker })
+        Ok(RegistrationProbe {
+            descriptor: Some(descriptor),
+            worker,
+        })
     }
 
     pub(super) async fn probe_admission_hashes(
@@ -628,9 +652,34 @@ pub(super) async fn query_server_info_json(
         Some("MooncakeConnector") => Some(false),
         _ => None,
     };
+    let vllm_boot = (config
+        .pointer("/parallel_config/data_parallel_size")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+        && config
+            .pointer("/parallel_config/_api_process_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|count| count == 1))
+    .then(|| {
+        let id = config.get("instance_id")?.as_str()?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let prefix_hash = config
+            .pointer("/cache_config/prefix_caching_hash_algo")
+            .and_then(serde_json::Value::as_str)
+            .filter(|algorithm| !algorithm.trim().is_empty())
+            .map(str::to_owned);
+        Some(VllmBoot {
+            id: id.to_owned(),
+            prefix_hash,
+        })
+    })
+    .flatten();
     Ok(ServerInfo {
         model_id: model.clone(),
         model_path: model,
+        vllm_boot,
         kv_block_size: block_size,
         effective_attention_block_size,
         mooncake_truncates_compressed,

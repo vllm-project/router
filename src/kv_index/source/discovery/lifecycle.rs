@@ -14,7 +14,7 @@ use super::reconcile::{
     native_sources_match, probe_keeps_trust, probe_renews_trust, static_hybrid_sources_match,
     BoundSource, BoundSources, StaticHybridMatch,
 };
-use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, WorkerKvInfo, WorkerSubs};
+use super::{CacheKey, InstalledWorkers, KvIndexSupervisor, VllmBoot, WorkerKvInfo, WorkerSubs};
 use crate::kv_index::routing_provider::PlacementMatch;
 use crate::kv_index::subscriber::EventSource;
 use crate::kv_index::{
@@ -57,6 +57,16 @@ pub(super) struct LifecycleState {
 }
 
 impl LifecycleState {
+    pub(super) fn vllm_boot_id(&self) -> Option<&str> {
+        self.descriptor.as_ref()?.vllm_boot_id.as_deref()
+    }
+
+    pub(super) fn vllm_restarted(&self, boot: Option<&VllmBoot>) -> bool {
+        self.vllm_boot_id()
+            .zip(boot)
+            .is_some_and(|(old, new)| old != new.id)
+    }
+
     fn all_hash_fenced(&self) -> bool {
         // An empty published registration comes from hash rejection at admission
         // or from revoking its last installed rank.
@@ -180,14 +190,18 @@ impl WorkerLifecycle {
         })
     }
 
+    pub(super) fn vllm_restarted(&self, boot: Option<&VllmBoot>) -> bool {
+        self.state.lock().vllm_restarted(boot)
+    }
+
     pub(super) fn layout_rebind_due(&self) -> bool {
         let state = self.state.lock();
-        if state.all_hash_fenced() {
+        if state.all_hash_fenced() || (state.vllm_boot_id().is_some() && self.trusted(&state)) {
             return state
                 .checked
                 .is_none_or(|checked| checked.elapsed() >= REFRESH_INTERVAL);
         }
-        self.layout
+        (self.layout || state.vllm_boot_id().is_some())
             && !state.trusted
             && state
                 .checked
@@ -201,13 +215,32 @@ impl WorkerLifecycle {
     ) -> bool {
         state.info.is_some()
             && state.descriptor.as_ref() == Some(descriptor)
-            && (!self.layout || state.all_hash_fenced() || self.trusted(state))
+            && (!self.layout
+                || state.all_hash_fenced()
+                || self.trusted(state)
+                // The layout monitor owns transient recovery for this same boot.
+                || (state.vllm_boot_id().is_some() && self.active.load(Ordering::Acquire)))
     }
 
     /// Descriptor probes run every 30s; three failures retire an installed owner.
-    pub(super) fn observe_descriptor(&self, descriptor: Option<&WorkerDescriptor>) -> SourceAction {
+    pub(super) fn observe_descriptor(
+        &self,
+        descriptor: Option<&WorkerDescriptor>,
+        boot: Option<&VllmBoot>,
+    ) -> SourceAction {
         let mut state = self.state.lock();
         state.checked = Some(Instant::now());
+        if state.vllm_restarted(boot) {
+            // Invalidate placement before trying admission, even if this probe
+            // found the new boot before its event source became available.
+            self.stop_layout(&mut state);
+            state.checked = Some(Instant::now());
+            return SourceAction::Rebuild;
+        }
+        if state.vllm_boot_id().is_some() && boot.is_none() {
+            // Missing startup evidence on an optional refresh is not a new boot.
+            return SourceAction::Keep;
+        }
         match descriptor {
             Some(descriptor) if self.keeps_descriptor(&state, descriptor) => {
                 state.probe_failures = 0;
