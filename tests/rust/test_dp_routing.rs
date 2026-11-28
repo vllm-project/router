@@ -399,6 +399,7 @@ mod dp_e2e_tests {
                 .collect();
             app = app
                 .route(&format!("/{role}/health"), get(|| async { "ok" }))
+                .route(&format!("/{role}/generate"), post(backend))
                 .route(&format!("/{role}/v1/chat/completions"), post(backend))
                 .route(
                     &format!("/{role}/metrics"),
@@ -413,6 +414,79 @@ mod dp_e2e_tests {
         let app = app.with_state(seen.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (base, seen, server)
+    }
+
+    #[tokio::test]
+    async fn generate_keeps_legacy_ids_out_of_worker_json() {
+        let (base, seen, server) = epd_server().await;
+        let request = serde_json::from_value(json!({
+            "prompt": "hello", "session_id": "legacy", "user_id": 42,
+            "session_params": {"session_id": "native"}
+        }))
+        .unwrap();
+        let expected = json!({
+            "prompt": "hello", "session_params": {"session_id": "native"},
+            "stream": false, "return_logprob": false, "return_hidden_states": false
+        });
+        for dp_size in [1, 2] {
+            let mut config = make_regular_config(vec![format!("{base}/pd")], dp_size);
+            config.policy = PolicyConfig::StickyLeastLoaded;
+            let context = common::create_test_context(config);
+            let router = RouterFactory::create_router(&context).await.unwrap();
+            let response = router.route_generate(None, &request, None).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let (_, headers, body) = seen.lock().unwrap().pop().unwrap();
+            assert_eq!(headers.contains_key("x-data-parallel-rank"), dp_size > 1);
+            assert_eq!(body, expected, "dp_size={dp_size}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pd_generate_keeps_legacy_ids_for_selection_only() {
+        use vllm_router_rs::policies::StickyLeastLoadedPolicy;
+
+        let (base, seen, server) = epd_server().await;
+        let mut config = make_pd_config(
+            vec![(format!("{base}/p"), None)],
+            vec![format!("{base}/d")],
+            2,
+        );
+        config.policy = PolicyConfig::StickyLeastLoaded;
+        let context = common::create_test_context(config);
+        let router = RouterFactory::create_router(&context).await.unwrap();
+        for body in [
+            json!({"prompt": "hello"}),
+            json!({"prompt": "hello", "session_id": "legacy"}),
+            json!({"prompt": "hello", "user_id": 42}),
+        ] {
+            let request = serde_json::from_value(body).unwrap();
+            let response = router.route_generate(None, &request, None).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+        let registry = &context.policy_registry;
+        for policy in [registry.get_prefill_policy(), registry.get_decode_policy()] {
+            let sticky = policy
+                .as_any()
+                .downcast_ref::<StickyLeastLoadedPolicy>()
+                .unwrap();
+            assert_eq!(sticky.active_session_count(), 2);
+            policy.finish_session("legacy");
+            policy.finish_session("42");
+            assert_eq!(sticky.active_session_count(), 0);
+        }
+        let requests = seen.lock().unwrap();
+        for stage in ["/p/generate", "/d/generate"] {
+            let bodies: Vec<_> = requests
+                .iter()
+                .filter(|(path, _, _)| path == stage)
+                .map(|(_, _, body)| body)
+                .collect();
+            assert_eq!(bodies.len(), 3);
+            assert_eq!(bodies[1], bodies[0], "{stage} with session_id");
+            assert_eq!(bodies[2], bodies[0], "{stage} with user_id");
+        }
+        server.abort();
     }
 
     #[tokio::test]

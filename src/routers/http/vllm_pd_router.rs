@@ -2333,7 +2333,7 @@ impl VllmPDRouter {
     #[allow(clippy::too_many_arguments)]
     async fn process_vllm_two_stage_request(
         &self,
-        original_request: Value,
+        mut original_request: Value,
         prefill_worker: Arc<dyn Worker>,
         mut decode_worker: Arc<dyn Worker>,
         path: &str,
@@ -2353,12 +2353,17 @@ impl VllmPDRouter {
             )
                 .into_response());
         }
-        if !original_request.is_object() {
+        let Value::Object(fields) = &mut original_request else {
             return Ok((
                 StatusCode::BAD_REQUEST,
                 "Request body must be a JSON object",
             )
                 .into_response());
+        };
+        if path == "/generate" {
+            // Admission is complete. Omit routing-only IDs from both worker requests.
+            fields.remove("session_id");
+            fields.remove("user_id");
         }
 
         // The encoder rewrites the body before dispatch, but a deferred
@@ -3562,7 +3567,7 @@ impl RouterTrait for VllmPDRouter {
         body: &crate::protocols::spec::GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        let request_json = match serde_json::to_value(body) {
+        let mut request_json = match serde_json::to_value(body) {
             Ok(json) => json,
             Err(e) => {
                 return (
@@ -3572,6 +3577,13 @@ impl RouterTrait for VllmPDRouter {
                     .into_response()
             }
         };
+        // P/D policies read JSON during admission. Dispatch removes these legacy IDs.
+        if let Some(id) = &body.session_id {
+            request_json["session_id"] = id.clone();
+        }
+        if let Some(id) = &body.user_id {
+            request_json["user_id"] = id.clone();
+        }
         self.route_transparent(headers, "/generate", &Method::POST, request_json)
             .await
     }

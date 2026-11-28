@@ -208,6 +208,17 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         request_text: Option<&str>,
         headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        let session_id = hash_key::extract_session_id(request_text, headers);
+        self.select_worker_for_session(workers, request_text, None, session_id.as_deref())
+    }
+
+    fn select_worker_for_session(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+        session_id: Option<&str>,
+    ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
         if healthy_indices.is_empty() {
             return None;
@@ -218,17 +229,22 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
             .map(|&idx| (idx, workers[idx].url().to_string()))
             .collect();
 
-        let session_id = hash_key::extract_session_id(request_text, headers);
-        let now = Instant::now();
-
+        // Without text, a fixed key would send all tied requests to one worker.
+        let stateless_tie_break = session_id.is_none().then(|| {
+            let digest = request_text
+                .filter(|text| !text.is_empty())
+                .map_or_else(rand::random::<u64>, ConsistentHashPolicy::fbi_hash);
+            format!("{digest:016x}")
+        });
         let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
         Self::sweep_expired(&mut state, self.session_expiration, now);
 
         // Requests without a session id: load-balance but don't record state.
         let session_id = match session_id {
             Some(id) => id,
             None => {
-                let tie_break = request_text.unwrap_or("");
+                let tie_break = stateless_tie_break.as_deref().unwrap_or("");
                 let idx = Self::select_least_loaded(&state.active_counts, &candidates, tie_break);
                 drop(state);
                 self.record_selection(&workers[idx]);
@@ -240,7 +256,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         // Existing session: route to the same replica if it's still healthy and
         // the session hasn't expired. The sweep runs at most once per
         // SWEEP_INTERVAL_SECS, so check the expiration here too.
-        if let Some((worker_url, expired)) = state.sessions.get(&session_id).map(|e| {
+        if let Some((worker_url, expired)) = state.sessions.get(session_id).map(|e| {
             (
                 e.worker_url.clone(),
                 now.duration_since(e.last_access) >= self.session_expiration,
@@ -252,7 +268,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
                 candidates.iter().find(|(_, url)| *url == worker_url)
             };
             if let Some(&(idx, _)) = assigned {
-                if let Some(entry) = state.sessions.get_mut(&session_id) {
+                if let Some(entry) = state.sessions.get_mut(session_id) {
                     entry.last_access = now;
                 }
                 drop(state);
@@ -266,7 +282,7 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
 
             // Session expired, or its replica is gone/unhealthy: drop the stale
             // mapping and reassign below.
-            state.sessions.remove(&session_id);
+            state.sessions.remove(session_id);
             Self::decrement_count(&mut state.active_counts, &worker_url);
             debug!(
                 "SLL: session '{}' on replica '{}' {}, reassigning",
@@ -277,10 +293,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
         }
 
         // New session: assign to least-loaded replica (tie-broken by hashing).
-        let idx = Self::select_least_loaded(&state.active_counts, &candidates, &session_id);
+        let idx = Self::select_least_loaded(&state.active_counts, &candidates, session_id);
         let worker_url = workers[idx].url().to_string();
         state.sessions.insert(
-            session_id.clone(),
+            session_id.to_owned(),
             SessionEntry {
                 worker_url: worker_url.clone(),
                 last_access: now,
@@ -316,6 +332,10 @@ impl LoadBalancingPolicy for StickyLeastLoadedPolicy {
     }
 
     fn needs_request_text(&self) -> bool {
+        true
+    }
+
+    fn needs_session_id(&self) -> bool {
         true
     }
 
@@ -472,6 +492,30 @@ mod tests {
         assert!(idx.is_some());
         // No session identifier -> nothing tracked.
         assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
+    fn test_typed_json_prompt_does_not_create_a_session() {
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let prompt = r#"{"session_id":"inside-prompt"}"#;
+
+        let idx = policy.select_worker_for_session(&workers, Some(prompt), None, None);
+        assert!(idx.is_some());
+        assert_eq!(policy.active_session_count(), 0);
+    }
+
+    #[test]
+    fn test_stateless_requests_without_text_spread_across_tied_workers() {
+        let policy = StickyLeastLoadedPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        for text in [None, Some("")] {
+            let selected: std::collections::HashSet<_> = (0..64)
+                .filter_map(|_| policy.select_worker_for_session(&workers, text, None, None))
+                .collect();
+            assert_eq!(selected.len(), workers.len(), "text: {text:?}");
+        }
     }
 
     #[test]

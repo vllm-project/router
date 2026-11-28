@@ -7,6 +7,7 @@
 //! - `edge/cache_aware`: long keys, match thresholds, load balance and UTF-8.
 //! - `edge/long_input`: parse, extract and serialize long request bodies.
 //! - `edge/rendezvous`: long prompts with and without session headers.
+//! - `edge/sticky_least_loaded_stateless`: serialized bodies without a session ID.
 //! - `edge/token_ids`: parse and extract pre-tokenized prompts.
 //! - `edge/workers`: selection across 1 to 64 workers.
 //!
@@ -25,6 +26,7 @@ use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
 use vllm_router_rs::policies::{
     CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, RendezvousHashPolicy,
+    StickyLeastLoadedPolicy,
 };
 use vllm_router_rs::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, GenerationRequest,
@@ -333,6 +335,9 @@ fn bench_edge_long_input(c: &mut Criterion) {
         group.bench_function(format!("extract/chat/{label}"), |b| {
             b.iter(|| black_box(chat_req.extract_text_for_routing()));
         });
+        group.bench_function(format!("sticky_session_id/chat/{label}"), |b| {
+            b.iter(|| black_box(black_box(&chat_req).sticky_session_id()));
+        });
 
         // Equal byte sizes of CJK text expose character-dependent parsing cost.
         let utf8_prompt = seeded_utf8_text(SEED ^ size as u64, size);
@@ -384,6 +389,29 @@ fn bench_edge_rendezvous(c: &mut Criterion) {
         group.bench_function(format!("json_like_prompt/{}", size_label(size)), |b| {
             b.iter(|| black_box(policy.select_worker(&workers, Some(&prompt))));
         });
+    }
+    group.finish();
+}
+
+fn bench_edge_sticky_least_loaded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge/sticky_least_loaded_stateless");
+    group.throughput(Throughput::Elements(1));
+    for size in LONG_SIZES {
+        let prompt = seeded_text(SEED ^ size as u64, size);
+        let body = serde_json::to_string(&completion_text(&prompt)).expect("completion body");
+        for worker_count in [4, 16, 64] {
+            edge_timing(&mut group, body.len());
+            let workers = workers(worker_count);
+            let policy = StickyLeastLoadedPolicy::new();
+            group.bench_function(
+                format!("{}/workers/{worker_count}", size_label(size)),
+                |b| {
+                    b.iter(|| {
+                        black_box(policy.select_worker_with_headers(&workers, Some(&body), None))
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -450,6 +478,7 @@ criterion_group!(
     bench_edge_cache_aware,
     bench_edge_long_input,
     bench_edge_rendezvous,
+    bench_edge_sticky_least_loaded,
     bench_edge_token_ids,
     bench_edge_workers
 );

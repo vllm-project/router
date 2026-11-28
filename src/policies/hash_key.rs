@@ -5,8 +5,10 @@
 
 use super::RequestHeaders;
 use crate::policies::ConsistentHashPolicy;
+use crate::request_identity::sticky_id_value;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use tracing::debug;
 
 /// HTTP header names to check for session ID (case-insensitive, checked in order)
@@ -77,27 +79,41 @@ pub(crate) fn extract_session_id(
     request_text: Option<&str>,
     headers: Option<&RequestHeaders>,
 ) -> Option<String> {
-    if let Some(hdrs) = headers {
-        for header_name in SESSION_HEADER_NAMES {
-            if let Some(value) = hdrs.get(*header_name) {
-                if !value.is_empty() {
-                    return Some(value.clone());
-                }
-            }
-        }
-    }
+    sticky_session_id(headers, || {
+        session_id_from_text(request_text?).map(Cow::Owned)
+    })
+    .map(Cow::into_owned)
+}
 
+/// Resolve a sticky session ID. Session headers take priority over `body_id`.
+///
+/// Every route resolves its ID here. `body_id` reads the ID from the body in
+/// the form that the route has, and runs only if no header carries an ID.
+pub(crate) fn sticky_session_id<'a>(
+    headers: Option<&'a RequestHeaders>,
+    body_id: impl FnOnce() -> Option<Cow<'a, str>>,
+) -> Option<Cow<'a, str>> {
+    headers
+        .and_then(session_id_from_headers)
+        .map(Cow::Borrowed)
+        .or_else(body_id)
+}
+
+/// Keep the field priority the same as `IdentityFields::sticky_session_id`.
+fn session_id_from_text(text: &str) -> Option<String> {
     // Fields not listed here, such as messages and prompt, are skipped
     // without being allocated.
-    let fields: SessionIdFields = serde_json::from_str(request_text?).ok()?;
+    let fields: SessionIdFields = serde_json::from_str(text).ok()?;
     let nested = fields
         .session_params
         .as_ref()
         .and_then(|params| params.get("session_id"));
-    session_id_value(nested)
-        .or_else(|| session_id_value(fields.user.as_ref()))
-        .or_else(|| session_id_value(fields.session_id.as_ref()))
-        .or_else(|| session_id_value(fields.user_id.as_ref()))
+    nested
+        .and_then(sticky_id_value)
+        .or_else(|| fields.user.as_ref().and_then(sticky_id_value))
+        .or_else(|| fields.session_id.as_ref().and_then(sticky_id_value))
+        .or_else(|| fields.user_id.as_ref().and_then(sticky_id_value))
+        .map(Cow::into_owned)
 }
 
 /// Top-level request body fields that can carry a session id.
@@ -109,13 +125,13 @@ struct SessionIdFields {
     user_id: Option<Value>,
 }
 
-/// A non-empty string or a number; other JSON types are not session ids.
-fn session_id_value(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
+fn session_id_from_headers(headers: &RequestHeaders) -> Option<&str> {
+    SESSION_HEADER_NAMES.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 /// Extract hash key from HTTP headers
@@ -299,6 +315,12 @@ pub(crate) fn extract_field_value(text: &str, field_name: &str) -> Option<String
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::protocols::spec::{
+        ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+        GenerationRequest, InferenceGenerateRequest, RerankRequest, ResponsesRequest,
+    };
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
     use std::collections::HashMap;
 
     // === extract_field_value tests ===
@@ -647,5 +669,87 @@ mod tests {
         assert_eq!(extract_session_id(Some(body), None), Some("u".to_string()));
         let body = r#"{"session_params": "s", "user": {"id": 1}, "session_id": "c"}"#;
         assert_eq!(extract_session_id(Some(body), None), Some("c".to_string()));
+    }
+
+    #[test]
+    fn test_typed_and_text_session_ids_agree() {
+        fn typed_id<T: GenerationRequest + DeserializeOwned>(body: &Value) -> Option<String> {
+            let request: T = serde_json::from_value(body.clone()).unwrap();
+            request.sticky_session_id().map(Cow::into_owned)
+        }
+
+        for (ids, expected) in [
+            (json!({}), None),
+            (
+                json!({"session_params": {"session_id": "a"}, "user": "b", "session_id": "c", "user_id": "d"}),
+                Some("a"),
+            ),
+            (
+                json!({"user": "b", "session_id": "c", "user_id": "d"}),
+                Some("b"),
+            ),
+            (json!({"session_id": "c", "user_id": "d"}), Some("c")),
+            (json!({"user_id": "d"}), Some("d")),
+            (
+                json!({"session_params": {"session_id": 42}, "user": "b"}),
+                Some("42"),
+            ),
+            (
+                json!({"session_params": {"session_id": ""}, "user": " b "}),
+                Some(" b "),
+            ),
+            (
+                json!({"session_params": {}, "user": "", "session_id": 41}),
+                Some("41"),
+            ),
+            (json!({"session_id": true, "user_id": "d"}), Some("d")),
+            (json!({"session_id": null, "user_id": ["d"]}), None),
+        ] {
+            let mut body = json!({
+                "model": "m",
+                "prompt": r#"{"session_id":"inside-prompt"}"#,
+                "messages": [{"role": "user", "content": "hi"}],
+                "token_ids": [1, 2, 3]
+            });
+            let fields = body.as_object_mut().unwrap();
+            fields.extend(ids.as_object().unwrap().clone());
+            let has_user = fields.contains_key("user");
+
+            let text = body.to_string();
+            assert_eq!(
+                extract_session_id(Some(&text), None).as_deref(),
+                expected,
+                "{text}"
+            );
+            let mut typed = vec![
+                typed_id::<CompletionRequest>(&body),
+                typed_id::<ChatCompletionRequest>(&body),
+                typed_id::<InferenceGenerateRequest>(&body),
+            ];
+            // `GenerateRequest` has no `user` field.
+            if !has_user {
+                typed.push(typed_id::<GenerateRequest>(&body));
+            }
+            for id in typed {
+                assert_eq!(id.as_deref(), expected, "{text}");
+            }
+        }
+
+        // These types carry only `user`.
+        let body = json!({"input": "hi", "query": "q", "documents": ["d"], "user": "b"});
+        for id in [
+            typed_id::<ResponsesRequest>(&body),
+            typed_id::<EmbeddingRequest>(&body),
+            typed_id::<RerankRequest>(&body),
+        ] {
+            assert_eq!(id.as_deref(), Some("b"));
+        }
+
+        // An untyped `user` can be a number.
+        let body = json!({"token_ids": [1], "user": 7});
+        assert_eq!(
+            typed_id::<InferenceGenerateRequest>(&body),
+            extract_session_id(Some(&body.to_string()), None)
+        );
     }
 }

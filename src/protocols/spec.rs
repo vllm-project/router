@@ -1,6 +1,7 @@
-use crate::request_identity::IdentityFields;
+use crate::request_identity::{sticky_id_value, IdentityFields};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // # Protocol Specifications
@@ -714,6 +715,7 @@ impl GenerationRequest for ChatCompletionRequest {
         IdentityFields {
             other: Some(&self.other),
             session_params: self.session_params.as_ref(),
+            user: self.user.as_deref(),
         }
     }
 
@@ -978,6 +980,7 @@ impl GenerationRequest for CompletionRequest {
         IdentityFields {
             other: Some(&self.other),
             session_params: self.session_params.as_ref(),
+            user: self.user.as_deref(),
         }
     }
 
@@ -1593,6 +1596,13 @@ impl ResponsesRequest {
 }
 
 impl GenerationRequest for ResponsesRequest {
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            user: self.user.as_deref(),
+            ..IdentityFields::default()
+        }
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -2181,6 +2191,14 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_params: Option<HashMap<String, serde_json::Value>>,
 
+    /// Legacy session ID used only for routing.
+    #[serde(skip_serializing)]
+    pub session_id: Option<Value>,
+
+    /// Legacy user ID used only for routing.
+    #[serde(skip_serializing)]
+    pub user_id: Option<Value>,
+
     /// Return model hidden states
     #[serde(default)]
     pub return_hidden_states: bool,
@@ -2191,6 +2209,13 @@ pub struct GenerateRequest {
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity()
+            .sticky_session_id()
+            .or_else(|| self.session_id.as_ref().and_then(sticky_id_value))
+            .or_else(|| self.user_id.as_ref().and_then(sticky_id_value))
+    }
+
     fn extract_cache_routing_key(&self) -> String {
         if let Some(key) = cache_routing::session(
             self.session_params
@@ -2263,8 +2288,8 @@ impl GenerationRequest for GenerateRequest {
 
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields {
-            other: None,
             session_params: self.session_params.as_ref(),
+            ..IdentityFields::default()
         }
     }
 }
@@ -2315,7 +2340,7 @@ impl GenerationRequest for InferenceGenerateRequest {
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields {
             other: Some(&self.other),
-            session_params: None,
+            ..IdentityFields::default()
         }
     }
 
@@ -2441,6 +2466,13 @@ impl From<V1RerankReqInput> for RerankRequest {
 
 /// Implementation of GenerationRequest trait for RerankRequest
 impl GenerationRequest for RerankRequest {
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            user: self.user.as_deref(),
+            ..IdentityFields::default()
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }
@@ -2561,6 +2593,13 @@ pub struct EmbeddingRequest {
 }
 
 impl GenerationRequest for EmbeddingRequest {
+    fn affinity_identity(&self) -> IdentityFields<'_> {
+        IdentityFields {
+            user: self.user.as_deref(),
+            ..IdentityFields::default()
+        }
+    }
+
     fn is_stream(&self) -> bool {
         // Embeddings are non-streaming
         false
@@ -2659,6 +2698,11 @@ pub trait GenerationRequest: Send + Sync {
     /// Borrow identity fields without serializing a separate payload.
     fn affinity_identity(&self) -> IdentityFields<'_> {
         IdentityFields::default()
+    }
+
+    /// Read the body ID used by sticky routing. String IDs borrow from the request.
+    fn sticky_session_id(&self) -> Option<Cow<'_, str>> {
+        self.affinity_identity().sticky_session_id()
     }
 
     /// LoRA adapter name and cache salt carried as passthrough body fields,
